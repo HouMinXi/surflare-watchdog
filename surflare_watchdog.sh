@@ -12,6 +12,7 @@ NODE="your_node_tag"                  # Set to your node tag (run: surflare node
 CHECK_INTERVAL=60                     # Exit IP check interval in seconds
 FAIL_THRESHOLD=2                      # Consecutive failures before reconnect
 LOCK_FILE=/run/surflare_watchdog.lock # Mutex lock to prevent concurrent reconnects
+PIDFILE=/run/surflare_watchdog.pid    # PID file for reliable daemon shutdown
 
 # Validate NODE is configured (fail fast if placeholder is unchanged)
 if [ "$NODE" = "your_node_tag" ]; then
@@ -124,7 +125,16 @@ if [ -n "$1" ]; then
 fi
 
 # === Daemon mode (started manually with no arguments) ===
-trap 'log "watchdog stopped"; exit 0' INT TERM
+
+# Prevent duplicate daemon instances
+if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
+	echo "watchdog already running (PID $(cat "$PIDFILE"))" >&2
+	exit 1
+fi
+
+# Set trap before writing PID to minimise stale-file window on early kill
+trap 'log "watchdog stopped"; rm -f "$PIDFILE"; exit 0' INT TERM
+echo $$ >"$PIDFILE"
 
 fail_count=0
 log "watchdog started: node=${NODE} interval=${CHECK_INTERVAL}s threshold=${FAIL_THRESHOLD}"

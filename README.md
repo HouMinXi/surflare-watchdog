@@ -54,8 +54,9 @@ sudo ln -sf "$(pwd)/surflare_watchdog.sh" \
 # Start watchdog (background, survives terminal close)
 nohup sudo /path/to/surflare_watchdog.sh &
 
-# Stop
-sudo pkill -f surflare_watchdog.sh
+# Stop (recommended)
+# Reliable shutdown via PID file
+sudo kill "$(cat /run/surflare_watchdog.pid)"
 
 # View logs
 sudo dmesg | grep surflare_watchdog
