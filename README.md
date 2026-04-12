@@ -39,35 +39,39 @@ Supports Fedora, Ubuntu, Debian, Arch, openSUSE and other systemd-based distros.
 
 ```bash
 # 1. Clone
-git clone git@github.com:HouMinXi/surflare-watchdog.git
+git clone https://github.com/HouMinXi/surflare-watchdog.git
 cd surflare-watchdog
 
 # 2. Make executable
 chmod +x surflare_watchdog.sh 99-surflare-resume
 
 # 3. Set your node tag — run: surflare nodes, then edit NODE= in the script
+nano surflare_watchdog.sh   # set NODE="your_node_tag"
 
-# 4. Install watchdog to a stable root-owned path (dispatcher runs as root and verifies this)
-# Use a system location instead of $HOME to avoid path/ownership surprises
-sudo install -o root -g root -m 0755 surflare_watchdog.sh /usr/local/sbin/surflare_watchdog.sh
+# 4. Check your suspend mode FIRST — this determines which hook to install
+cat /sys/power/mem_sleep
+# Output examples:
+#   s2idle [mem]   → S3 mode  → do step 5a
+#   [s2idle] mem   → s2idle   → do step 5b  (most modern laptops)
+#   [s2idle]       → s2idle   → do step 5b
 
-# 5. Install the S3 (mem) suspend wake hook
+# 5. Install watchdog to a stable root-owned path
+sudo install -o root -g root -m 0755 surflare_watchdog.sh \
+    /usr/local/sbin/surflare_watchdog.sh
+
+# 5a. S3 (mem) suspend — only if step 4 showed [mem]
+sudo mkdir -p /etc/systemd/system-sleep
 sudo ln -sf /usr/local/sbin/surflare_watchdog.sh \
     /etc/systemd/system-sleep/surflare-resume.sh
 
-# 6. Install the s2idle (S0ix/freeze) wake hook — needed on most modern laptops
-#    Check your suspend mode: cat /sys/power/mem_sleep
-#    If output shows [s2idle], install this hook instead of (or in addition to) step 5
+# 5b. s2idle (S0ix/freeze) suspend — most modern laptops, do this if step 4 showed [s2idle]
 sudo cp 99-surflare-resume /etc/NetworkManager/dispatcher.d/
 sudo chown root:root /etc/NetworkManager/dispatcher.d/99-surflare-resume
 ```
 
-> **Which hook do you need?** Run `cat /sys/power/mem_sleep`. If it shows `[s2idle]`, install
-> step 6. If it shows `[mem]` (S3), step 5 is sufficient. When in doubt, install both.
-
 > **Security note**: `99-surflare-resume` runs as root and calls `/usr/local/sbin/surflare_watchdog.sh`.
 > It verifies the watchdog is `root`-owned and not group/world-writable before executing —
-> step 4 above satisfies this requirement.
+> step 5 above satisfies this requirement.
 
 ## Usage
 
