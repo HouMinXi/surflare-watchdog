@@ -1,0 +1,43 @@
+#!/bin/bash
+# Reconnect Surflare VPN after s2idle resume (systemd-sleep hooks not called for s2idle)
+# Triggered by NetworkManager when a physical interface comes up
+#
+# Security note: this script runs as root. Ensure WATCHDOG is owned by root:root
+# and not writable by non-root (chmod 0755, chown root:root).
+
+IFACE="$1"
+ACTION="$2"
+WATCHDOG=/usr/local/sbin/surflare_watchdog.sh
+
+# Only act when a physical interface (eth/wl/en) comes up
+[ "$ACTION" = "up" ] || exit 0
+case "$IFACE" in
+    eth*|wl*|en*) ;;
+    *) exit 0 ;;
+esac
+
+# Fail loudly if watchdog is missing or not executable — silent failure is worse
+if [ ! -x "$WATCHDOG" ]; then
+    printf '<3>surflare_resume: watchdog not found or not executable: %s\n' "$WATCHDOG" >/dev/kmsg
+    exit 1
+fi
+
+# Security: refuse to exec watchdog that is not root-owned or is writable by non-root
+# Guards against delete-and-recreate or chmod attack by the home directory owner
+watchdog_uid=$(stat -c '%u' "$WATCHDOG" 2>/dev/null)
+if [ "$watchdog_uid" != "0" ]; then
+    printf '<3>surflare_resume: watchdog not root-owned (uid=%s), refusing exec\n' "${watchdog_uid:-unknown}" >/dev/kmsg
+    exit 1
+fi
+watchdog_mode=$(stat -c '%a' "$WATCHDOG" 2>/dev/null)
+# Fail-closed: treat stat failure (empty mode) the same as unsafe permissions
+if [ -z "$watchdog_mode" ] || [ $(( 0${watchdog_mode} & 022 )) -ne 0 ]; then
+    printf '<3>surflare_resume: watchdog is group/other writable or mode unreadable (mode=%s), refusing exec\n' "${watchdog_mode:-unknown}" >/dev/kmsg
+    exit 1
+fi
+
+# Brief wait for DHCP/routing to stabilise before reconnecting VPN
+# concurrent triggers (multiple interfaces up) are serialised by flock inside connect_vpn()
+sleep 5
+
+exec "$WATCHDOG" post

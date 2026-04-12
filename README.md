@@ -8,12 +8,18 @@ Solves two problems:
 
 ## How it works
 
-- Checks exit IP country every 60 seconds via `curl ipinfo.io/country`
-- If exit country is `CN` (or check times out) for 2 consecutive cycles, reconnects automatically
-- On system resume, reconnects immediately via a `systemd-sleep` hook
+- Checks exit IP country every 60 seconds via `curl ipinfo.io/country` (with Cloudflare
+  CDN trace as fallback — two independent endpoints prevent false reconnects)
+- If exit country is `CN` (or both health checks time out) for 2 consecutive cycles, reconnects
+- On system resume, reconnects immediately — two hooks cover different suspend modes:
+  - **S3 (mem) suspend**: `systemd-sleep` hook (`surflare-resume.sh` symlink)
+  - **s2idle (S0ix/freeze) suspend**: NetworkManager dispatcher (`99-surflare-resume`),
+    triggered when a physical interface comes up after wake — most modern laptops use s2idle
 - Before reconnecting, runs `surflare disconnect` to cleanly remove nftables tproxy rules and
   iproute2 policy routing — preventing the network from being locked to a dead proxy port
 - Uses `flock` to prevent the watchdog loop and sleep hook from reconnecting simultaneously
+- Storm protection: after 5 consecutive reconnects without health confirmation, enters a 10-minute
+  cooling period — prevents reconnect storms when the health check endpoint is temporarily down
 - Logs to `/dev/kmsg` (visible via `dmesg`), no log files created
 
 ## Requirements
@@ -37,14 +43,31 @@ git clone git@github.com:HouMinXi/surflare-watchdog.git
 cd surflare-watchdog
 
 # 2. Make executable
-chmod +x surflare_watchdog.sh
+chmod +x surflare_watchdog.sh 99-surflare-resume
 
 # 3. Set your node tag — run: surflare nodes, then edit NODE= in the script
 
-# 4. Install the wake hook (one-time)
-sudo ln -sf "$(pwd)/surflare_watchdog.sh" \
+# 4. Install watchdog to a stable root-owned path (dispatcher runs as root and verifies this)
+# Use a system location instead of $HOME to avoid path/ownership surprises
+sudo install -o root -g root -m 0755 surflare_watchdog.sh /usr/local/sbin/surflare_watchdog.sh
+
+# 5. Install the S3 (mem) suspend wake hook
+sudo ln -sf /usr/local/sbin/surflare_watchdog.sh \
     /etc/systemd/system-sleep/surflare-resume.sh
+
+# 6. Install the s2idle (S0ix/freeze) wake hook — needed on most modern laptops
+#    Check your suspend mode: cat /sys/power/mem_sleep
+#    If output shows [s2idle], install this hook instead of (or in addition to) step 5
+sudo cp 99-surflare-resume /etc/NetworkManager/dispatcher.d/
+sudo chown root:root /etc/NetworkManager/dispatcher.d/99-surflare-resume
 ```
+
+> **Which hook do you need?** Run `cat /sys/power/mem_sleep`. If it shows `[s2idle]`, install
+> step 6. If it shows `[mem]` (S3), step 5 is sufficient. When in doubt, install both.
+
+> **Security note**: `99-surflare-resume` runs as root and calls `/usr/local/sbin/surflare_watchdog.sh`.
+> It verifies the watchdog is `root`-owned and not group/world-writable before executing —
+> step 4 above satisfies this requirement.
 
 ## Usage
 
@@ -67,15 +90,25 @@ sudo dmesg -w | grep surflare_watchdog   # live
 
 ## Configuration
 
-Edit the three variables at the top of `surflare_watchdog.sh`:
+Edit variables at the top of `surflare_watchdog.sh`:
 
 ```bash
 NODE="your_node_tag"  # Your node tag from: surflare nodes
 CHECK_INTERVAL=60     # Seconds between exit IP checks
 FAIL_THRESHOLD=2      # Consecutive failures before reconnect
+
+# Tunable timeouts (seconds)
+DISCONNECT_SETTLE=2   # Wait after surflare disconnect before killing processes
+CONNECT_SETTLE=10     # Wait after surflare connect --daemon for VPN to establish
+PROCESS_EXIT_TIMEOUT=20  # SIGTERM grace period before escalating to SIGKILL
+
+# Storm protection — prevents reconnect loops when the health check endpoint is down
+STORM_MAX=5           # Consecutive unconfirmed reconnects before cooling
+STORM_COOLING=600     # Cooling period in seconds (default: 10 minutes)
 ```
 
-A **failure** is: exit country = `CN`, or the `ipinfo.io` request times out.
+A **failure** is: exit country = `CN`, or both health check endpoints (`ipinfo.io` and
+Cloudflare CDN trace) return empty (timeout or unreachable).
 
 ## Log output
 
