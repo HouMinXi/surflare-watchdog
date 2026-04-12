@@ -67,7 +67,14 @@ sudo ln -sf /usr/local/sbin/surflare_watchdog.sh \
 # 5b. s2idle (S0ix/freeze) suspend — most modern laptops, do this if step 4 showed [s2idle]
 sudo cp 99-surflare-resume /etc/NetworkManager/dispatcher.d/
 sudo chown root:root /etc/NetworkManager/dispatcher.d/99-surflare-resume
+
+# 6. Start the watchdog daemon — see Usage section below
+nohup sudo /usr/local/sbin/surflare_watchdog.sh &
 ```
+
+> **Note**: The resume hook (step 5a/5b) only reconnects after sleep/wake.
+> The watchdog daemon (step 6) monitors the tunnel continuously and reconnects
+> when it silently fails. **Both are needed.**
 
 > **Security note**: `99-surflare-resume` runs as root and calls `/usr/local/sbin/surflare_watchdog.sh`.
 > It verifies the watchdog is `root`-owned and not group/world-writable before executing —
