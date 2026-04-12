@@ -68,7 +68,12 @@ sudo ln -sf /usr/local/sbin/surflare_watchdog.sh \
 sudo cp 99-surflare-resume /etc/NetworkManager/dispatcher.d/
 sudo chown root:root /etc/NetworkManager/dispatcher.d/99-surflare-resume
 
-# 6. Start the watchdog daemon — see Usage section below
+# 6. Start the watchdog daemon (pick one — see Usage section for details)
+# Option A: systemd (recommended — auto-start on boot, restart on crash)
+sudo cp surflare-watchdog.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now surflare-watchdog
+# Option B: nohup
 nohup sudo /usr/local/sbin/surflare_watchdog.sh &
 ```
 
@@ -84,15 +89,34 @@ nohup sudo /usr/local/sbin/surflare_watchdog.sh &
 
 **Requires root.** The script writes to `/dev/kmsg`, calls `surflare`, and manages system processes.
 
+### Option A: systemd (recommended)
+
+```bash
+sudo cp surflare-watchdog.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now surflare-watchdog
+
+# Status / stop / restart
+sudo systemctl status surflare-watchdog
+sudo systemctl stop surflare-watchdog
+sudo systemctl restart surflare-watchdog
+```
+
+Benefits: auto-start on boot, automatic restart on crash, `systemctl status` integration.
+
+### Option B: nohup
+
 ```bash
 # Start watchdog (background, survives terminal close)
 nohup sudo /usr/local/sbin/surflare_watchdog.sh &
 
 # Stop (recommended)
-# Reliable shutdown via PID file
 sudo kill "$(cat /run/surflare_watchdog.pid)"
+```
 
-# View logs
+### View logs
+
+```bash
 sudo dmesg | grep surflare_watchdog
 sudo dmesg -w | grep surflare_watchdog   # live
 ```

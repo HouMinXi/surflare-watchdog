@@ -38,6 +38,7 @@ fi
 
 # Brief wait for DHCP/routing to stabilise before reconnecting VPN
 # concurrent triggers (multiple interfaces up) are serialised by flock inside connect_vpn()
+printf '<6>surflare_resume: triggered by %s %s\n' "$IFACE" "$ACTION" >/dev/kmsg
 sleep 5
 
 exec "$WATCHDOG" post

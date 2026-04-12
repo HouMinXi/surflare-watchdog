@@ -1,0 +1,16 @@
+[Unit]
+Description=Surflare VPN Watchdog
+Documentation=https://github.com/HouMinXi/surflare-watchdog
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=3
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/surflare_watchdog.sh
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

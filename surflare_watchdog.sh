@@ -199,7 +199,8 @@ while true; do
 					log "Post-reconnect health check anomalous (reconnect_count=${reconnect_count})"
 					if [ "$reconnect_count" -ge "$STORM_MAX" ]; then
 						log "Storm protection triggered: cooling for ${STORM_COOLING}s"
-						sleep "$STORM_COOLING"
+						sleep "$STORM_COOLING" &
+						wait $!
 						reconnect_count=0
 						fail_count=0
 					fi
@@ -210,7 +211,8 @@ while true; do
 				log "Reconnect attempt failed (reconnect_count=${reconnect_count})"
 				if [ "$reconnect_count" -ge "$STORM_MAX" ]; then
 					log "Storm protection triggered (connect failure): cooling for ${STORM_COOLING}s"
-					sleep "$STORM_COOLING"
+					sleep "$STORM_COOLING" &
+					wait $!
 					reconnect_count=0
 					fail_count=0
 				fi
@@ -221,5 +223,8 @@ while true; do
 		reconnect_count=0
 	fi
 
-	sleep "$CHECK_INTERVAL"
+	# "sleep & wait" allows bash to handle SIGTERM immediately instead of
+	# blocking until sleep finishes (up to 60s or 600s during storm cooling)
+	sleep "$CHECK_INTERVAL" &
+	wait $!
 done
