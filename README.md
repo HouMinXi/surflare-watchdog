@@ -75,7 +75,7 @@ sudo chown root:root /etc/NetworkManager/dispatcher.d/99-surflare-resume
 
 ```bash
 # Start watchdog (background, survives terminal close)
-nohup sudo /path/to/surflare_watchdog.sh &
+nohup sudo /usr/local/sbin/surflare_watchdog.sh &
 
 # Stop (recommended)
 # Reliable shutdown via PID file
