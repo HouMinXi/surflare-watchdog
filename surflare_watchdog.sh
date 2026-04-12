@@ -27,6 +27,10 @@ if [ "$EUID" -ne 0 ]; then
 	exit 1
 fi
 
+umask 0177
+# Restrict new file permissions to 600 (root-only) — prevents non-root users from
+# opening the lock file for reading and holding flock to block reconnects
+
 # Dependency check
 # Package reference (if missing, install the corresponding package):
 #   curl          -> curl         (all major distros)
@@ -140,7 +144,7 @@ fail_count=0
 log "watchdog started: node=${NODE} interval=${CHECK_INTERVAL}s threshold=${FAIL_THRESHOLD}"
 
 while true; do
-	country=$(curl -s --max-time 5 ipinfo.io/country 2>/dev/null | tr -d '[:space:]')
+	country=$(curl -s --max-time 5 --max-filesize 16 https://ipinfo.io/country 2>/dev/null | tr -d '[:space:]')
 
 	if [ "$country" = "CN" ] || [ -z "$country" ]; then
 		fail_count=$((fail_count + 1))
@@ -148,7 +152,7 @@ while true; do
 		if [ "$fail_count" -ge "$FAIL_THRESHOLD" ]; then
 			log "Consecutive failures: ${fail_count}, starting reconnect..."
 			if connect_vpn; then
-				new_country=$(curl -s --max-time 5 ipinfo.io/country 2>/dev/null | tr -d '[:space:]')
+				new_country=$(curl -s --max-time 5 --max-filesize 16 https://ipinfo.io/country 2>/dev/null | tr -d '[:space:]')
 				log "Post-reconnect exit IP: ${new_country:-failed}"
 				fail_count=0
 			fi
