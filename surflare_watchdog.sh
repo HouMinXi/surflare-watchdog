@@ -16,7 +16,7 @@
 # View logs    : sudo dmesg | grep surflare_watchdog
 
 NODE="your_node_tag"                  # Set to your node tag (run: surflare nodes)
-CHECK_INTERVAL=60                     # Exit IP check interval in seconds
+CHECK_INTERVAL=30                     # Exit IP check interval in seconds
 FAIL_THRESHOLD=2                      # Consecutive failures before reconnect
 LOCK_FILE=/run/surflare_watchdog.lock # Mutex lock to prevent concurrent reconnects
 PIDFILE=/run/surflare_watchdog.pid    # PID file for reliable daemon shutdown
