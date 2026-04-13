@@ -16,7 +16,7 @@
 # View logs    : sudo dmesg | grep surflare_watchdog
 
 NODE="Tokyo"                          # Set to your node tag (run: surflare nodes)
-MODE="rule"                           # Connection mode: global, rule, direct
+MODE="global"                         # Connection mode: global, rule, direct
 TRANSIT=""                            # Transit server for multi-hop: auto, or "" to disable
 CHECK_INTERVAL=30                     # Exit IP check interval in seconds
 FAIL_THRESHOLD=4                      # Consecutive failures before reconnect
