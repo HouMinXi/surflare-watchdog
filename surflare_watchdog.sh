@@ -16,6 +16,8 @@
 # View logs    : sudo dmesg | grep surflare_watchdog
 
 NODE="your_node_tag"                  # Set to your node tag (run: surflare nodes)
+MODE="rule"                           # Connection mode: global, rule, direct
+TRANSIT="auto"                        # Transit server for multi-hop: auto, or "" to disable
 CHECK_INTERVAL=30                     # Exit IP check interval in seconds
 FAIL_THRESHOLD=4                      # Consecutive failures before reconnect
 LOCK_FILE=/run/surflare_watchdog.lock # Mutex lock to prevent concurrent reconnects
@@ -172,8 +174,11 @@ connect_vpn() {
 		# reachable briefly after nftables flush restores direct network access
 		refresh_auth || true
 
-		log "Connecting to ${NODE} (daemon mode)..."
-		if ! surflare connect --node "$NODE" --daemon; then
+		log "Connecting to ${NODE} mode=${MODE:-global} transit=${TRANSIT:-off} (daemon mode)..."
+		if ! surflare connect --node "$NODE" \
+			${MODE:+--mode "$MODE"} \
+			${TRANSIT:+--transit "$TRANSIT"} \
+			--daemon; then
 			log "Connection failed, will retry on next check cycle"
 			exit 1
 		fi
