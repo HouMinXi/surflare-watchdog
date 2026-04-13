@@ -116,6 +116,23 @@ connect_vpn() {
 		wait_for_exit surflare
 		wait_for_exit surflare-proxy
 
+		# Flush residual nftables/routing rules that surflare disconnect may have missed.
+		# Without this, all TCP/UDP traffic stays fwmark'd → routed to table 100 → loopback
+		# → ECONNREFUSED, causing "Account check failed" on the next connect attempt.
+		log "Flushing residual nftables rules and policy routing..."
+		if nft list table inet surflare >/dev/null 2>&1; then
+			nft flush table inet surflare 2>/dev/null || true
+			nft delete table inet surflare 2>/dev/null &&
+				log "Removed residual nftables table inet surflare" || true
+		fi
+		# Loop: ip rule del only removes one entry at a time; drain all matching rules
+		local rule_count=0
+		while ip rule del fwmark 0x1 lookup 100 2>/dev/null; do
+			rule_count=$((rule_count + 1))
+		done
+		[ "$rule_count" -gt 0 ] && log "Removed ${rule_count} residual ip rule(s) fwmark 0x1 lookup 100"
+		ip route flush table 100 2>/dev/null || true
+
 		log "Connecting to ${NODE} (daemon mode)..."
 		if ! surflare connect --node "$NODE" --daemon; then
 			log "Connection failed, will retry on next check cycle"
