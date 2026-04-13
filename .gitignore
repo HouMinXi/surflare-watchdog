@@ -1,2 +1,5 @@
 # Runtime lock file (created in /run, not tracked)
 *.lock
+
+# Git linked worktrees (not part of project source)
+.worktrees/
