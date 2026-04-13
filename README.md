@@ -1,10 +1,12 @@
 # surflare-watchdog
 
 A watchdog daemon for [Surflare VPN](https://www.surflare.com) on Linux laptops.
-Solves two problems:
+Solves two problems (with optional headless support):
 
 1. **Silent tunnel failure**: Surflare UI shows "Connected" but traffic leaks through local ISP
 2. **Resume after sleep**: VPN is not reconnected after opening the laptop lid
+3. *(Optional)* **Headless / lid-closed use**: Closing the lid while the external monitor is
+   powered off triggers suspend and interrupts the watchdog — `lid-ignore.conf` prevents this
 
 ## How it works
 
@@ -25,6 +27,9 @@ Solves two problems:
 - Storm protection: after 5 consecutive reconnects without health confirmation, enters a 10-minute
   cooling period — prevents reconnect storms when the health check endpoint is temporarily down
 - Logs to `/dev/kmsg` (visible via `dmesg`), no log files created
+- *(Optional)* `lid-ignore.conf` configures systemd-logind to ignore lid-switch events in
+  all power states — keeps the machine awake when running headless (lid closed, no external
+  monitor), so the watchdog is never interrupted by accidental suspend
 
 ## Requirements
 
