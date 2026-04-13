@@ -17,7 +17,7 @@
 
 NODE="your_node_tag"                  # Set to your node tag (run: surflare nodes)
 CHECK_INTERVAL=30                     # Exit IP check interval in seconds
-FAIL_THRESHOLD=2                      # Consecutive failures before reconnect
+FAIL_THRESHOLD=4                      # Consecutive failures before reconnect
 LOCK_FILE=/run/surflare_watchdog.lock # Mutex lock to prevent concurrent reconnects
 PIDFILE=/run/surflare_watchdog.pid    # PID file for reliable daemon shutdown
 DISCONNECT_SETTLE=2                   # seconds after surflare disconnect before killing processes
@@ -73,18 +73,21 @@ log() {
 }
 
 # check_vpn_health: returns exit country code, or empty string on any failure.
-# Tries ipinfo.io first; falls back to Cloudflare CDN trace on failure.
-# Two independent endpoints prevent false reconnects when one endpoint is down.
+# Primary: Google reachability — Google is blocked by GFW, so HTTP 200 = VPN is working.
+# Fallback: ip-api.com country code (plain HTTP, no TLS — faster than ipinfo.io).
+# This replaces the ipinfo.io/cloudflare approach which caused frequent false-positive
+# timeouts through VPN exit nodes, triggering unnecessary reconnects.
 check_vpn_health() {
-	local result
-	result=$(curl -s --max-time 5 --max-filesize 16 https://ipinfo.io/country 2>/dev/null | tr -d '[:space:]')
-	if [ -n "$result" ]; then
-		echo "$result"
+	# Primary: Google reachability (0.9s avg, most reliable from behind GFW)
+	local http_code
+	http_code=$(curl -s --max-time 3 -o /dev/null -w '%{http_code}' https://www.google.com 2>/dev/null)
+	if [ "$http_code" = "200" ] || [ "$http_code" = "301" ] || [ "$http_code" = "302" ]; then
+		echo "OK"
 		return
 	fi
-	# Fallback: Cloudflare CDN trace (different CDN — independent failure domain)
-	result=$(curl -s --max-time 5 --max-filesize 256 https://cloudflare.com/cdn-cgi/trace 2>/dev/null |
-		grep '^loc=' | cut -d= -f2 | tr -d '[:space:]')
+	# Fallback: ip-api.com returns country code directly (plain HTTP, no TLS)
+	local result
+	result=$(curl -s --max-time 3 'http://ip-api.com/line/?fields=countryCode' 2>/dev/null | tr -d '[:space:]')
 	echo "$result"
 }
 
@@ -134,7 +137,7 @@ connect_vpn() {
 	(
 		flock -n 9 || {
 			log "connect_vpn already running, skipping"
-			exit 0
+			exit 2
 		}
 
 		log "Disconnecting cleanly, flushing nftables tproxy rules and policy routing..."
@@ -239,23 +242,30 @@ last_refresh=$(date +%s)
 log "watchdog started: node=${NODE} interval=${CHECK_INTERVAL}s threshold=${FAIL_THRESHOLD}"
 
 while true; do
-	country=$(check_vpn_health)
+	health=$(check_vpn_health)
 
-	if [ "$country" = "CN" ] || [ -z "$country" ]; then
+	if [ "$health" = "OK" ]; then
+		# VPN is healthy (Google reachable = not behind GFW)
+		fail_count=0
+		reconnect_count=0
+	elif [ "$health" = "CN" ] || [ -z "$health" ]; then
+		# VPN is down: exit country is CN, or both health checks failed/timed out
 		fail_count=$((fail_count + 1))
-		log "Exit IP anomaly (${country:-timeout}), consecutive count: ${fail_count}"
+		log "Health check failed (${health:-timeout}), consecutive count: ${fail_count}"
 		if [ "$fail_count" -ge "$FAIL_THRESHOLD" ]; then
 			log "Consecutive failures: ${fail_count}, starting reconnect..."
-			if connect_vpn; then
-				new_country=$(check_vpn_health)
-				log "Post-reconnect exit IP: ${new_country:-failed}"
-				if [ "$new_country" != "CN" ] && [ -n "$new_country" ]; then
-					# Health check confirmed — reset all counters
+			connect_vpn
+			rc=$?
+			if [ "$rc" -eq 2 ]; then
+				# connect_vpn was skipped (another instance holds flock) — don't check health
+				log "Reconnect skipped (flock held), will retry next cycle"
+			elif [ "$rc" -eq 0 ]; then
+				new_health=$(check_vpn_health)
+				log "Post-reconnect health: ${new_health:-failed}"
+				if [ "$new_health" = "OK" ] || { [ "$new_health" != "CN" ] && [ -n "$new_health" ]; }; then
 					fail_count=0
 					reconnect_count=0
 				else
-					# Reconnect succeeded but health endpoint still anomalous
-					# (endpoint may be temporarily down — avoid reconnect storm)
 					reconnect_count=$((reconnect_count + 1))
 					log "Post-reconnect health check anomalous (reconnect_count=${reconnect_count})"
 					if [ "$reconnect_count" -ge "$STORM_MAX" ]; then
@@ -267,7 +277,6 @@ while true; do
 					fi
 				fi
 			else
-				# Connection attempt failed — also count toward storm protection
 				reconnect_count=$((reconnect_count + 1))
 				log "Reconnect attempt failed (reconnect_count=${reconnect_count})"
 				if [ "$reconnect_count" -ge "$STORM_MAX" ]; then
@@ -280,6 +289,7 @@ while true; do
 			fi
 		fi
 	else
+		# Non-CN country returned by fallback — VPN is working
 		fail_count=0
 		reconnect_count=0
 		# Proactive token refresh while VPN is healthy — keeps auth.dat fresh so
