@@ -8,9 +8,9 @@ Solves two problems:
 
 ## How it works
 
-- Checks exit IP country every 30 seconds via `curl ipinfo.io/country` (with Cloudflare
-  CDN trace as fallback — two independent endpoints prevent false reconnects)
-- If exit country is `CN` (or both health checks time out) for 2 consecutive cycles, reconnects
+- Checks VPN health every 30 seconds: primary via Google reachability (Google is blocked by
+  GFW, so HTTP 200/301/302 = VPN working); fallback via `ip-api.com` country code
+- If health checks fail for 4 consecutive cycles (CN exit or both endpoints timeout), reconnects
 - On system resume, reconnects immediately — two hooks cover different suspend modes:
   - **S3 (mem) suspend**: `systemd-sleep` hook (`surflare-resume.sh` symlink)
   - **s2idle (S0ix/freeze) suspend**: NetworkManager dispatcher (`99-surflare-resume`),
@@ -209,8 +209,10 @@ Edit variables at the top of `surflare_watchdog.sh` **before deploying**:
 
 ```bash
 NODE="auto"           # "auto" = Surflare picks best node, or set a specific tag
+MODE="rule"           # Connection mode: global, rule, direct (rule = Smart Routing)
+TRANSIT="auto"        # Transit server for multi-hop: "auto", or "" to disable
 CHECK_INTERVAL=30     # Seconds between exit IP checks
-FAIL_THRESHOLD=2      # Consecutive failures before reconnect
+FAIL_THRESHOLD=4      # Consecutive failures before reconnect
 
 # Tunable timeouts (seconds)
 DISCONNECT_SETTLE=2   # Wait after surflare disconnect before killing processes
@@ -227,8 +229,8 @@ LOGIN_RETRIES=5              # Max login attempts per refresh (API is intermitte
 LOGIN_RETRY_DELAY=3          # Seconds between login retries
 ```
 
-A **failure** is: exit country = `CN`, or both health check endpoints (`ipinfo.io` and
-Cloudflare CDN trace) return empty (timeout or unreachable).
+A **failure** is: Google (`https://www.google.com`) unreachable AND `ip-api.com` returns
+`CN` or times out. Google is blocked by GFW, so HTTP 200/301/302 confirms VPN is working.
 
 After editing, redeploy with:
 
@@ -241,16 +243,17 @@ sudo systemctl restart surflare-watchdog
 ## Log output
 
 ```
-surflare_watchdog: watchdog started: node=auto interval=30s threshold=2
-surflare_watchdog: Exit IP anomaly (CN), consecutive count: 2
-surflare_watchdog: Consecutive failures: 2, starting reconnect...
+surflare_watchdog: watchdog started: node=auto interval=30s threshold=4
+surflare_watchdog: Health check failed (CN), consecutive count: 4
+surflare_watchdog: Consecutive failures: 4, starting reconnect...
 surflare_watchdog: Disconnecting cleanly, flushing nftables tproxy rules and policy routing...
 surflare_watchdog: Killing remaining processes...
 surflare_watchdog: Flushing residual nftables rules and policy routing...
 surflare_watchdog: Removed residual nftables table inet surflare
 surflare_watchdog: Removed 1 residual ip rule(s) fwmark 0x1 lookup 100
-surflare_watchdog: Connecting to auto (daemon mode)...
-surflare_watchdog: Post-reconnect exit IP: US
+surflare_watchdog: Auth token refreshed successfully (attempt 1/5)
+surflare_watchdog: Connecting to auto mode=rule transit=auto (daemon mode)...
+surflare_watchdog: Post-reconnect health: OK
 ```
 
 ## Background
