@@ -2,10 +2,17 @@
 # Surflare VPN watchdog + resume auto-reconnect
 #
 # Usage:
-#   Daemon mode : sudo /path/to/surflare_watchdog.sh
+#   Daemon mode : sudo /usr/local/sbin/surflare_watchdog.sh
 #   Wake hook   : called automatically by systemd-sleep (do not run manually)
-#   Install hook: sudo ln -sf /path/to/surflare_watchdog.sh \
+#   Deploy      : # Run from repo root; set NODE below before copying (e.g. NODE="auto")
+#                 sudo cp surflare_watchdog.sh /usr/local/sbin/
+#                 sudo chown root:root /usr/local/sbin/surflare_watchdog.sh
+#                 sudo chmod 755 /usr/local/sbin/surflare_watchdog.sh
+#                 sudo ln -sf /usr/local/sbin/surflare_watchdog.sh \
 #                     /etc/systemd/system-sleep/surflare-resume.sh
+#                 sudo cp 99-surflare-resume /etc/NetworkManager/dispatcher.d/
+#                 sudo chown root:root /etc/NetworkManager/dispatcher.d/99-surflare-resume
+#                 sudo chmod 755 /etc/NetworkManager/dispatcher.d/99-surflare-resume
 # View logs    : sudo dmesg | grep surflare_watchdog
 
 NODE="your_node_tag"                  # Set to your node tag (run: surflare nodes)
