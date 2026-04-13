@@ -257,8 +257,11 @@ while true; do
 			connect_vpn
 			rc=$?
 			if [ "$rc" -eq 2 ]; then
-				# connect_vpn was skipped (another instance holds flock) — don't check health
+				# connect_vpn was skipped (another instance holds flock).
+				# Reset fail_count to FAIL_THRESHOLD-1 so we retry once next cycle
+				# instead of re-triggering every 30s and spamming the log.
 				log "Reconnect skipped (flock held), will retry next cycle"
+				fail_count=$((FAIL_THRESHOLD - 1))
 			elif [ "$rc" -eq 0 ]; then
 				new_health=$(check_vpn_health)
 				log "Post-reconnect health: ${new_health:-failed}"
