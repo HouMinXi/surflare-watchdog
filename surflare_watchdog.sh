@@ -178,7 +178,7 @@ connect_vpn() {
 		if ! surflare connect --node "$NODE" \
 			${MODE:+--mode "$MODE"} \
 			${TRANSIT:+--transit "$TRANSIT"} \
-			--daemon; then
+			--daemon 9>&-; then
 			log "Connection failed, will retry on next check cycle"
 			exit 1
 		fi
