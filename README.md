@@ -80,6 +80,16 @@ echo -n 'YOUR_PASSWORD' | sudo systemd-creds encrypt \
 sudo cp surflare-watchdog.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now surflare-watchdog
+
+# 7. (Optional) Prevent suspend when lid is closed — for headless / lid-closed use
+#    Without this, closing the lid while the external monitor is off will suspend
+#    the machine and interrupt the watchdog.
+sudo mkdir -p /etc/systemd/logind.conf.d
+sudo install -o root -g root -m 0644 lid-ignore.conf \
+    /etc/systemd/logind.conf.d/lid-ignore.conf
+sudo systemctl kill -s HUP systemd-logind
+# Verify:
+systemd-analyze cat-config systemd/logind.conf | grep -i HandleLid
 ```
 
 > **Note**: The resume hook (step 4a/4b) only reconnects after sleep/wake.
