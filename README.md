@@ -8,15 +8,16 @@ Solves two problems:
 
 ## How it works
 
-- Checks exit IP country every 60 seconds via `curl ipinfo.io/country` (with Cloudflare
+- Checks exit IP country every 30 seconds via `curl ipinfo.io/country` (with Cloudflare
   CDN trace as fallback — two independent endpoints prevent false reconnects)
 - If exit country is `CN` (or both health checks time out) for 2 consecutive cycles, reconnects
 - On system resume, reconnects immediately — two hooks cover different suspend modes:
   - **S3 (mem) suspend**: `systemd-sleep` hook (`surflare-resume.sh` symlink)
   - **s2idle (S0ix/freeze) suspend**: NetworkManager dispatcher (`99-surflare-resume`),
     triggered when a physical interface comes up after wake — most modern laptops use s2idle
-- Before reconnecting, runs `surflare disconnect` to cleanly remove nftables tproxy rules and
-  iproute2 policy routing — preventing the network from being locked to a dead proxy port
+- Before reconnecting, explicitly flushes `table inet surflare` nftables rules and drains
+  all `fwmark 0x1 → table 100` ip rules — prevents "Account check failed" deadlock when
+  `surflare disconnect` leaves residual routing rules after a partial failure
 - Uses `flock` to prevent the watchdog loop and sleep hook from reconnecting simultaneously
 - Storm protection: after 5 consecutive reconnects without health confirmation, enters a 10-minute
   cooling period — prevents reconnect storms when the health check endpoint is temporarily down
@@ -30,6 +31,7 @@ Solves two problems:
 | `killall` | psmisc |
 | `pgrep` | procps-ng / procps |
 | `flock` | util-linux |
+| `nft` | nftables |
 | `surflare` / `surflare-proxy` | from Surflare installation |
 | `nm-online` | NetworkManager *(optional — falls back to `sleep 15s` if not found)* |
 
@@ -42,11 +44,8 @@ Supports Fedora, Ubuntu, Debian, Arch, openSUSE and other systemd-based distros.
 git clone https://github.com/HouMinXi/surflare-watchdog.git
 cd surflare-watchdog
 
-# 2. Make executable
-chmod +x surflare_watchdog.sh 99-surflare-resume
-
-# 3. Set your node tag — run: surflare nodes, then edit NODE= in the script
-nano surflare_watchdog.sh   # set NODE="your_node_tag"
+# 2. Set your node — use "auto" or a specific tag from: surflare nodes
+nano surflare_watchdog.sh   # set NODE="auto"
 
 # 4. Check your suspend mode FIRST — this determines which hook to install
 cat /sys/power/mem_sleep
@@ -65,16 +64,13 @@ sudo ln -sf /usr/local/sbin/surflare_watchdog.sh \
     /etc/systemd/system-sleep/surflare-resume.sh
 
 # 5b. s2idle (S0ix/freeze) suspend — most modern laptops, do this if step 4 showed [s2idle]
-sudo cp 99-surflare-resume /etc/NetworkManager/dispatcher.d/
-sudo chown root:root /etc/NetworkManager/dispatcher.d/99-surflare-resume
+sudo install -o root -g root -m 0755 99-surflare-resume \
+    /etc/NetworkManager/dispatcher.d/99-surflare-resume
 
-# 6. Start the watchdog daemon (pick one — see Usage section for details)
-# Option A: systemd (recommended — auto-start on boot, restart on crash)
+# 6. Install and start the watchdog as a systemd service (recommended)
 sudo cp surflare-watchdog.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now surflare-watchdog
-# Option B: nohup
-nohup sudo /usr/local/sbin/surflare_watchdog.sh &
 ```
 
 > **Note**: The resume hook (step 5a/5b) only reconnects after sleep/wake.
@@ -85,32 +81,94 @@ nohup sudo /usr/local/sbin/surflare_watchdog.sh &
 > It verifies the watchdog is `root`-owned and not group/world-writable before executing —
 > step 5 above satisfies this requirement.
 
-## Usage
+## Migration from older setup
 
-**Requires root.** The script writes to `/dev/kmsg`, calls `surflare`, and manages system processes.
+If you installed an earlier version (script in `~/surflare_watchdog.sh`, no systemd
+service, or hooks pointing to the home directory), follow these steps.
 
-### Option A: systemd (recommended)
+### What changed
+
+| Component | Old | New |
+|-----------|-----|-----|
+| Script location | `~/surflare_watchdog.sh` (user-owned) | `/usr/local/sbin/surflare_watchdog.sh` (root-owned) |
+| systemd-sleep hook | symlink → home dir | symlink → `/usr/local/sbin/` |
+| NetworkManager dispatcher | `WATCHDOG=~/surflare_watchdog.sh` | `WATCHDOG=/usr/local/sbin/surflare_watchdog.sh` |
+| Daemon startup | manual `nohup` | systemd service (auto-start on boot) |
+| nftables cleanup | relied on `surflare disconnect` only | explicit flush of residual rules after killall |
+| Poll interval | 60 s | 30 s |
+| NODE default | fixed node tag | `auto` (Surflare picks best node) |
+
+**Old symptom 1** — resume hook logged and did nothing:
+```
+surflare_resume: watchdog not root-owned (uid=1000), refusing exec
+```
+**Cause**: script in home dir is user-owned; the dispatcher refuses to exec it.
+
+**Old symptom 2** — watchdog logged repeatedly during reconnect and required manual login:
+```
+✘ Account check failed — Could not verify account status. Check network.
+```
+**Cause**: `surflare disconnect` left residual nftables rules; all traffic was routed to
+loopback after `killall surflare-proxy`, blocking the next connect attempt.
+
+### Migration steps
 
 ```bash
+# Run from the cloned/updated repo root
+
+# 1. Stop the old watchdog if running
+sudo kill "$(cat /run/surflare_watchdog.pid 2>/dev/null)" 2>/dev/null || true
+
+# 2. Set your node — edit NODE= in surflare_watchdog.sh before copying
+#    Use NODE="auto" (recommended) or a specific tag from: surflare nodes
+nano surflare_watchdog.sh
+
+# 3. Deploy script to /usr/local/sbin/ (root-owned — required by security check)
+sudo install -o root -g root -m 0755 surflare_watchdog.sh \
+    /usr/local/sbin/surflare_watchdog.sh
+
+# 4. Update the systemd-sleep symlink to point to the new location
+sudo ln -sf /usr/local/sbin/surflare_watchdog.sh \
+    /etc/systemd/system-sleep/surflare-resume.sh
+
+# 5. Redeploy the NetworkManager dispatcher (now points to /usr/local/sbin/)
+sudo install -o root -g root -m 0755 99-surflare-resume \
+    /etc/NetworkManager/dispatcher.d/99-surflare-resume
+
+# 6. Install and enable the systemd service
 sudo cp surflare-watchdog.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now surflare-watchdog
 
-# Status / stop / restart
+# 7. Verify
+sudo systemctl status surflare-watchdog
+stat -c 'uid=%u mode=%a' /usr/local/sbin/surflare_watchdog.sh  # expect uid=0 mode=755
+grep "^WATCHDOG=" /etc/NetworkManager/dispatcher.d/99-surflare-resume
+# expect: WATCHDOG=/usr/local/sbin/surflare_watchdog.sh
+
+# 8. Optional: remove the old script from home directory
+rm -f ~/surflare_watchdog.sh
+```
+
+## Usage
+
+**Requires root.** The script writes to `/dev/kmsg`, calls `surflare`, and manages system processes.
+
+### systemd (recommended)
+
+```bash
 sudo systemctl status surflare-watchdog
 sudo systemctl stop surflare-watchdog
 sudo systemctl restart surflare-watchdog
 ```
 
-Benefits: auto-start on boot, automatic restart on crash, `systemctl status` integration.
-
-### Option B: nohup
+### Manual / fallback
 
 ```bash
-# Start watchdog (background, survives terminal close)
+# Start
 nohup sudo /usr/local/sbin/surflare_watchdog.sh &
 
-# Stop (recommended)
+# Stop
 sudo kill "$(cat /run/surflare_watchdog.pid)"
 ```
 
@@ -125,11 +183,11 @@ sudo dmesg -w | grep surflare_watchdog   # live
 
 ## Configuration
 
-Edit variables at the top of `surflare_watchdog.sh`:
+Edit variables at the top of `surflare_watchdog.sh` **before deploying**:
 
 ```bash
-NODE="your_node_tag"  # Your node tag from: surflare nodes
-CHECK_INTERVAL=60     # Seconds between exit IP checks
+NODE="auto"           # "auto" = Surflare picks best node, or set a specific tag
+CHECK_INTERVAL=30     # Seconds between exit IP checks
 FAIL_THRESHOLD=2      # Consecutive failures before reconnect
 
 # Tunable timeouts (seconds)
@@ -145,13 +203,26 @@ STORM_COOLING=600     # Cooling period in seconds (default: 10 minutes)
 A **failure** is: exit country = `CN`, or both health check endpoints (`ipinfo.io` and
 Cloudflare CDN trace) return empty (timeout or unreachable).
 
+After editing, redeploy with:
+
+```bash
+sudo install -o root -g root -m 0755 surflare_watchdog.sh \
+    /usr/local/sbin/surflare_watchdog.sh
+sudo systemctl restart surflare-watchdog
+```
+
 ## Log output
 
 ```
-surflare_watchdog: watchdog started: node=your_node_tag interval=60s threshold=2
+surflare_watchdog: watchdog started: node=auto interval=30s threshold=2
 surflare_watchdog: Exit IP anomaly (CN), consecutive count: 2
+surflare_watchdog: Consecutive failures: 2, starting reconnect...
 surflare_watchdog: Disconnecting cleanly, flushing nftables tproxy rules and policy routing...
-surflare_watchdog: Connecting to your_node_tag (daemon mode)...
+surflare_watchdog: Killing remaining processes...
+surflare_watchdog: Flushing residual nftables rules and policy routing...
+surflare_watchdog: Removed residual nftables table inet surflare
+surflare_watchdog: Removed 1 residual ip rule(s) fwmark 0x1 lookup 100
+surflare_watchdog: Connecting to auto (daemon mode)...
 surflare_watchdog: Post-reconnect exit IP: US
 ```
 
@@ -161,9 +232,16 @@ Surflare on Linux uses nftables tproxy to redirect all TCP/UDP to `surflare-prox
 10800, plus an iproute2 policy routing rule (`fwmark 0x1 → table 100`). When the tunnel
 silently drops, these rules stay but the proxy is dead — all traffic hits a closed port.
 
-Killing `surflare` directly leaves orphaned rules, causing a deadlock where even the
-reconnection attempt is blocked. This watchdog calls `surflare disconnect` first so Surflare
-can clean up its own rules before any new connection is attempted.
+Killing `surflare` directly leaves orphaned rules. Even calling `surflare disconnect` does
+not always clean up fully — if the VPN was not fully established when disconnect is called,
+it returns non-zero and leaves `table inet surflare` and the `fwmark 0x1 → table 100` ip
+rules intact. After `killall surflare-proxy`, all traffic is routed via those rules to
+loopback, causing `surflare connect` to fail immediately with "Account check failed —
+Could not verify account status. Check network."
+
+This watchdog explicitly flushes `table inet surflare`, drains all matching ip rules, and
+clears routing table 100 after each `killall` — ensuring the system has clean network state
+before the next connection attempt.
 
 ## Supported distros
 
