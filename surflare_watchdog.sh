@@ -121,7 +121,7 @@ refresh_auth() {
 
 	local i=0
 	while [ "$i" -lt "$LOGIN_RETRIES" ]; do
-		if surflare login -u "$email" -p "$password" --remember >/dev/null 2>&1; then
+		if timeout 15 surflare login -u "$email" -p "$password" --remember >/dev/null 2>&1; then
 			log "Auth token refreshed successfully (attempt $((i + 1))/${LOGIN_RETRIES})"
 			return 0
 		fi
