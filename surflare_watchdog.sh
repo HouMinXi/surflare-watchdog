@@ -27,6 +27,9 @@ NETWORK_WAIT_TIMEOUT=30               # nm-online timeout in seconds
 PROCESS_EXIT_TIMEOUT=20               # seconds to wait for SIGTERM before escalating to SIGKILL
 STORM_MAX=5                           # consecutive unconfirmed reconnects before cooling
 STORM_COOLING=600                     # seconds to cool down after storm protection triggers
+TOKEN_REFRESH_INTERVAL=1800           # seconds between proactive auth token refreshes (30 min)
+LOGIN_RETRIES=5                       # max login attempts per refresh cycle
+LOGIN_RETRY_DELAY=3                   # seconds between login retries
 
 # Validate NODE is configured (fail fast if placeholder is unchanged)
 if [ "$NODE" = "your_node_tag" ]; then
@@ -97,6 +100,35 @@ wait_for_exit() {
 	fi
 }
 
+# refresh_auth: refresh surflare auth token using stored credentials (TPM2-encrypted via systemd-creds).
+# Retries LOGIN_RETRIES times with LOGIN_RETRY_DELAY between attempts — surflare API is
+# sometimes unreachable even with VPN up. Returns 0 if any attempt succeeds.
+refresh_auth() {
+	local email="${SURFLARE_EMAIL:-}"
+	local password=""
+
+	# Read password from systemd credentials directory (TPM2-decrypted at runtime)
+	if [ -n "$CREDENTIALS_DIRECTORY" ] && [ -f "$CREDENTIALS_DIRECTORY/surflare-password" ]; then
+		password=$(cat "$CREDENTIALS_DIRECTORY/surflare-password")
+	fi
+
+	if [ -z "$email" ] || [ -z "$password" ]; then
+		return 1 # no credentials available — skip silently
+	fi
+
+	local i=0
+	while [ "$i" -lt "$LOGIN_RETRIES" ]; do
+		if surflare login -u "$email" -p "$password" --remember >/dev/null 2>&1; then
+			log "Auth token refreshed successfully (attempt $((i + 1))/${LOGIN_RETRIES})"
+			return 0
+		fi
+		i=$((i + 1))
+		[ "$i" -lt "$LOGIN_RETRIES" ] && sleep "$LOGIN_RETRY_DELAY"
+	done
+	log "Auth token refresh failed after ${LOGIN_RETRIES} attempts"
+	return 1
+}
+
 connect_vpn() {
 	# flock prevents concurrent calls from watchdog loop and systemd-sleep post hook
 	(
@@ -132,6 +164,10 @@ connect_vpn() {
 		done
 		[ "$rule_count" -gt 0 ] && log "Removed ${rule_count} residual ip rule(s) fwmark 0x1 lookup 100"
 		ip route flush table 100 2>/dev/null || true
+
+		# Attempt auth refresh before connecting — surflare API may still be
+		# reachable briefly after nftables flush restores direct network access
+		refresh_auth || true
 
 		log "Connecting to ${NODE} (daemon mode)..."
 		if ! surflare connect --node "$NODE" --daemon; then
@@ -199,6 +235,7 @@ echo $$ >"$PIDFILE"
 
 fail_count=0
 reconnect_count=0
+last_refresh=$(date +%s)
 log "watchdog started: node=${NODE} interval=${CHECK_INTERVAL}s threshold=${FAIL_THRESHOLD}"
 
 while true; do
@@ -245,6 +282,12 @@ while true; do
 	else
 		fail_count=0
 		reconnect_count=0
+		# Proactive token refresh while VPN is healthy — keeps auth.dat fresh so
+		# reconnects after VPN failure don't need to reach surflare API (blocked by GFW)
+		now=$(date +%s)
+		if [ $((now - last_refresh)) -ge "$TOKEN_REFRESH_INTERVAL" ]; then
+			refresh_auth && last_refresh=$(date +%s)
+		fi
 	fi
 
 	# "sleep & wait" allows bash to handle SIGTERM immediately instead of
