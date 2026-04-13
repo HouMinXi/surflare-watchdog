@@ -18,6 +18,9 @@ Solves two problems:
 - Before reconnecting, explicitly flushes `table inet surflare` nftables rules and drains
   all `fwmark 0x1 → table 100` ip rules — prevents "Account check failed" deadlock when
   `surflare disconnect` leaves residual routing rules after a partial failure
+- Proactively refreshes surflare auth token every 30 minutes while VPN is healthy — prevents
+  the chicken-and-egg deadlock where reconnect needs a valid token but the token server is
+  blocked by GFW without VPN. Credentials are stored TPM2-encrypted via `systemd-creds`
 - Uses `flock` to prevent the watchdog loop and sleep hook from reconnecting simultaneously
 - Storm protection: after 5 consecutive reconnects without health confirmation, enters a 10-minute
   cooling period — prevents reconnect storms when the health check endpoint is temporarily down
@@ -47,39 +50,49 @@ cd surflare-watchdog
 # 2. Set your node — use "auto" or a specific tag from: surflare nodes
 nano surflare_watchdog.sh   # set NODE="auto"
 
-# 4. Check your suspend mode FIRST — this determines which hook to install
+# 3. Check your suspend mode FIRST — this determines which hook to install
 cat /sys/power/mem_sleep
 # Output examples:
-#   s2idle [mem]   → S3 mode  → do step 5a
-#   [s2idle] mem   → s2idle   → do step 5b  (most modern laptops)
-#   [s2idle]       → s2idle   → do step 5b
+#   s2idle [mem]   → S3 mode  → do step 4a
+#   [s2idle] mem   → s2idle   → do step 4b  (most modern laptops)
+#   [s2idle]       → s2idle   → do step 4b
 
-# 5. Install watchdog to a stable root-owned path
+# 4. Install watchdog to a stable root-owned path (required by the resume hook security check)
 sudo install -o root -g root -m 0755 surflare_watchdog.sh \
     /usr/local/sbin/surflare_watchdog.sh
 
-# 5a. S3 (mem) suspend — only if step 4 showed [mem]
+# 4a. S3 (mem) suspend — only if step 3 showed [mem]
 sudo mkdir -p /etc/systemd/system-sleep
 sudo ln -sf /usr/local/sbin/surflare_watchdog.sh \
     /etc/systemd/system-sleep/surflare-resume.sh
 
-# 5b. s2idle (S0ix/freeze) suspend — most modern laptops, do this if step 4 showed [s2idle]
+# 4b. s2idle (S0ix/freeze) suspend — most modern laptops, do this if step 3 showed [s2idle]
 sudo install -o root -g root -m 0755 99-surflare-resume \
     /etc/NetworkManager/dispatcher.d/99-surflare-resume
 
-# 6. Install and start the watchdog as a systemd service (recommended)
+# 5. Encrypt surflare password with TPM2 for proactive auth token refresh
+#    (the watchdog refreshes the token every 30 min while VPN is up, so reconnects
+#    after VPN failure don't need to reach surflare API — which is blocked by GFW)
+echo -n 'YOUR_PASSWORD' | sudo systemd-creds encrypt \
+    --name=surflare-password - /etc/surflare/surflare-password.cred
+
+# 6. Install and start the watchdog as a systemd service
 sudo cp surflare-watchdog.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now surflare-watchdog
 ```
 
-> **Note**: The resume hook (step 5a/5b) only reconnects after sleep/wake.
+> **Note**: The resume hook (step 4a/4b) only reconnects after sleep/wake.
 > The watchdog daemon (step 6) monitors the tunnel continuously and reconnects
 > when it silently fails. **Both are needed.**
 
 > **Security note**: `99-surflare-resume` runs as root and calls `/usr/local/sbin/surflare_watchdog.sh`.
 > It verifies the watchdog is `root`-owned and not group/world-writable before executing —
-> step 5 above satisfies this requirement.
+> step 4 above satisfies this requirement.
+
+> **Credential note**: The TPM2-encrypted password in step 5 never appears in plain text on disk.
+> `systemd-creds` encrypts it with the machine's TPM2 chip; it is only decrypted at runtime
+> into a tmpfs that only the watchdog service can read (`$CREDENTIALS_DIRECTORY`).
 
 ## Migration from older setup
 
@@ -95,6 +108,7 @@ service, or hooks pointing to the home directory), follow these steps.
 | NetworkManager dispatcher | `WATCHDOG=~/surflare_watchdog.sh` | `WATCHDOG=/usr/local/sbin/surflare_watchdog.sh` |
 | Daemon startup | manual `nohup` | systemd service (auto-start on boot) |
 | nftables cleanup | relied on `surflare disconnect` only | explicit flush of residual rules after killall |
+| Auth token | no refresh, expired token → deadlock | proactive refresh every 30 min via TPM2-encrypted creds |
 | Poll interval | 60 s | 30 s |
 | NODE default | fixed node tag | `auto` (Surflare picks best node) |
 
@@ -108,8 +122,10 @@ surflare_resume: watchdog not root-owned (uid=1000), refusing exec
 ```
 ✘ Account check failed — Could not verify account status. Check network.
 ```
-**Cause**: `surflare disconnect` left residual nftables rules; all traffic was routed to
+**Cause 1**: `surflare disconnect` left residual nftables rules; all traffic was routed to
 loopback after `killall surflare-proxy`, blocking the next connect attempt.
+**Cause 2**: auth token in `auth.dat` expired; surflare API is blocked by GFW without VPN,
+so `surflare connect` could not refresh the token — a chicken-and-egg deadlock.
 
 ### Migration steps
 
@@ -135,18 +151,24 @@ sudo ln -sf /usr/local/sbin/surflare_watchdog.sh \
 sudo install -o root -g root -m 0755 99-surflare-resume \
     /etc/NetworkManager/dispatcher.d/99-surflare-resume
 
-# 6. Install and enable the systemd service
+# 6. Encrypt surflare password for proactive token refresh (requires TPM2)
+echo -n 'YOUR_PASSWORD' | sudo systemd-creds encrypt \
+    --name=surflare-password - /etc/surflare/surflare-password.cred
+
+# 7. Install and enable the systemd service
 sudo cp surflare-watchdog.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now surflare-watchdog
 
-# 7. Verify
+# 8. Verify
 sudo systemctl status surflare-watchdog
 stat -c 'uid=%u mode=%a' /usr/local/sbin/surflare_watchdog.sh  # expect uid=0 mode=755
 grep "^WATCHDOG=" /etc/NetworkManager/dispatcher.d/99-surflare-resume
 # expect: WATCHDOG=/usr/local/sbin/surflare_watchdog.sh
+sudo dmesg | grep "Auth token refreshed" | tail -1
+# expect: surflare_watchdog: Auth token refreshed successfully
 
-# 8. Optional: remove the old script from home directory
+# 9. Optional: remove the old script from home directory
 rm -f ~/surflare_watchdog.sh
 ```
 
@@ -198,6 +220,11 @@ PROCESS_EXIT_TIMEOUT=20  # SIGTERM grace period before escalating to SIGKILL
 # Storm protection — prevents reconnect loops when the health check endpoint is down
 STORM_MAX=5           # Consecutive unconfirmed reconnects before cooling
 STORM_COOLING=600     # Cooling period in seconds (default: 10 minutes)
+
+# Auth token refresh — keeps token valid so reconnects don't need surflare API
+TOKEN_REFRESH_INTERVAL=1800  # Seconds between proactive refreshes (30 min)
+LOGIN_RETRIES=5              # Max login attempts per refresh (API is intermittent)
+LOGIN_RETRY_DELAY=3          # Seconds between login retries
 ```
 
 A **failure** is: exit country = `CN`, or both health check endpoints (`ipinfo.io` and
