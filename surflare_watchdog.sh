@@ -15,9 +15,9 @@
 #                 sudo chmod 755 /etc/NetworkManager/dispatcher.d/99-surflare-resume
 # View logs    : sudo dmesg | grep surflare_watchdog
 
-NODE="your_node_tag"                  # Set to your node tag (run: surflare nodes)
+NODE="Tokyo"                          # Set to your node tag (run: surflare nodes)
 MODE="rule"                           # Connection mode: global, rule, direct
-TRANSIT="auto"                        # Transit server for multi-hop: auto, or "" to disable
+TRANSIT=""                            # Transit server for multi-hop: auto, or "" to disable
 CHECK_INTERVAL=30                     # Exit IP check interval in seconds
 FAIL_THRESHOLD=4                      # Consecutive failures before reconnect
 LOCK_FILE=/run/surflare_watchdog.lock # Mutex lock to prevent concurrent reconnects
