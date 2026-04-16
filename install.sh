@@ -13,11 +13,18 @@
 
 set -euo pipefail
 
-# ── Colours ──────────────────────────────────────────────────────────────────
-RED='\033[0;31m'
-YEL='\033[1;33m'
-GRN='\033[0;32m'
-NC='\033[0m'
+# ── Colours (disabled when stdout is not a TTY) ──────────────────────────────
+if [ -t 1 ]; then
+	RED='\033[0;31m'
+	YEL='\033[1;33m'
+	GRN='\033[0;32m'
+	NC='\033[0m'
+else
+	RED=''
+	YEL=''
+	GRN=''
+	NC=''
+fi
 ok() { printf "${GRN}[ok]${NC}    %s\n" "$*"; }
 skip() { printf "[skip]  %s\n" "$*"; }
 info() { printf "${YEL}[info]${NC}  %s\n" "$*"; }
@@ -35,7 +42,7 @@ done
 
 # ── Preflight ─────────────────────────────────────────────────────────────────
 [ "$EUID" -eq 0 ] || die "Run as root: sudo $0"
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
 
 echo "=== surflare-watchdog installer ==="
 echo
@@ -54,7 +61,19 @@ install_file() {
 	ok "$dst"
 }
 
+# ── Preflight: warn about common configuration mistakes ──────────────────────
+if grep -q 'NODE="your_node_tag"' "$SCRIPT_DIR/surflare_watchdog.sh" 2>/dev/null; then
+	warn "surflare_watchdog.sh: NODE is still set to 'your_node_tag'"
+	warn "  Edit NODE= before running, or the service will exit immediately on start"
+fi
+
 # ── 1. Watchdog script ────────────────────────────────────────────────────────
+# Track whether the script actually changed — used in step 6 to decide restart vs skip
+WATCHDOG_CHANGED=0
+if [ ! -f /usr/local/sbin/surflare_watchdog.sh ] ||
+	! diff -q "$SCRIPT_DIR/surflare_watchdog.sh" /usr/local/sbin/surflare_watchdog.sh >/dev/null 2>&1; then
+	WATCHDOG_CHANGED=1
+fi
 install_file "$SCRIPT_DIR/surflare_watchdog.sh" /usr/local/sbin/surflare_watchdog.sh 755
 
 # ── 2. systemd service ────────────────────────────────────────────────────────
@@ -68,6 +87,7 @@ SLEEP_HOOK=/etc/systemd/system-sleep/surflare-resume.sh
 if [ -L "$SLEEP_HOOK" ] && [ "$(readlink "$SLEEP_HOOK")" = /usr/local/sbin/surflare_watchdog.sh ]; then
 	skip "$SLEEP_HOOK (symlink ok)"
 else
+	mkdir -p /etc/systemd/system-sleep
 	ln -sf /usr/local/sbin/surflare_watchdog.sh "$SLEEP_HOOK"
 	ok "$SLEEP_HOOK → /usr/local/sbin/surflare_watchdog.sh"
 fi
@@ -97,8 +117,11 @@ else
 		if [ "$CURRENT_PS" = "off" ]; then
 			skip "iw $WIFI_IFACE power_save (already off)"
 		else
-			iw dev "$WIFI_IFACE" set power_save off
-			ok "iw $WIFI_IFACE set power_save off"
+			if iw dev "$WIFI_IFACE" set power_save off 2>/dev/null; then
+				ok "iw $WIFI_IFACE set power_save off"
+			else
+				warn "iw $WIFI_IFACE set power_save off failed — reboot may be needed"
+			fi
 		fi
 	else
 		warn "No managed Wi-Fi interface found — skipping iw power_save"
@@ -155,8 +178,19 @@ else
 	ok "surflare-watchdog.service enabled"
 fi
 
+if [ ! -f /etc/surflare/surflare-password.cred ]; then
+	warn "Credential file not found: /etc/surflare/surflare-password.cred"
+	warn "  Proactive token refresh will be disabled — create it with:"
+	warn "  echo -n 'YOUR_PASSWORD' | sudo systemd-creds encrypt --name=surflare-password - /etc/surflare/surflare-password.cred"
+fi
+
 if systemctl is-active --quiet surflare-watchdog 2>/dev/null; then
-	skip "surflare-watchdog.service (already running)"
+	if [ "$WATCHDOG_CHANGED" -eq 1 ]; then
+		systemctl restart surflare-watchdog
+		ok "surflare-watchdog.service restarted (new script deployed)"
+	else
+		skip "surflare-watchdog.service restart (script unchanged)"
+	fi
 else
 	systemctl start surflare-watchdog
 	ok "surflare-watchdog.service started"
