@@ -47,6 +47,38 @@ Supports Fedora, Ubuntu, Debian, Arch, openSUSE and other systemd-based distros.
 
 ## Installation
 
+### Quick install (recommended)
+
+```bash
+# 1. Clone
+git clone https://github.com/HouMinXi/surflare-watchdog.git
+cd surflare-watchdog
+
+# 2. Set your node — use "auto" or a specific tag from: surflare nodes
+nano surflare_watchdog.sh   # set NODE="auto"
+
+# 3. Encrypt surflare password with TPM2 for proactive auth token refresh
+echo -n 'YOUR_PASSWORD' | sudo systemd-creds encrypt \
+    --name=surflare-password - /etc/surflare/surflare-password.cred
+
+# 4. Run the installer (installs watchdog, service, hooks, and Wi-Fi tuning)
+sudo ./install.sh
+
+# 5. (Optional) Prevent suspend when lid is closed — for headless / lid-closed use
+sudo mkdir -p /etc/systemd/logind.conf.d
+sudo install -o root -g root -m 0644 lid-ignore.conf \
+    /etc/systemd/logind.conf.d/lid-ignore.conf
+sudo systemctl kill -s HUP systemd-logind
+```
+
+`install.sh` is idempotent — safe to re-run after updates.
+Pass `--no-wifi` to skip Wi-Fi power-save tuning (non-Intel cards or headless machines).
+
+### Manual install
+
+<details>
+<summary>Expand for step-by-step manual instructions</summary>
+
 ```bash
 # 1. Clone
 git clone https://github.com/HouMinXi/surflare-watchdog.git
@@ -108,6 +140,8 @@ systemd-analyze cat-config systemd/logind.conf | grep -i HandleLid
 > **Credential note**: The TPM2-encrypted password in step 5 never appears in plain text on disk.
 > `systemd-creds` encrypts it with the machine's TPM2 chip; it is only decrypted at runtime
 > into a tmpfs that only the watchdog service can read (`$CREDENTIALS_DIRECTORY`).
+
+</details>
 
 ## Migration from older setup
 
@@ -217,6 +251,35 @@ sudo dmesg -w | grep surflare_watchdog   # live
 ```
 
 > On systems with `dmesg_restrict=1` (e.g. Ubuntu), use `sudo dmesg`.
+
+## Wi-Fi Stability
+
+On Intel Wi-Fi cards, the default driver power-saving scheme causes the firmware to
+periodically miss beacon frames from the AP. This triggers the kernel message:
+
+```
+iwlwifi: missed beacons exceeds threshold, but receiving data. Stay connected, Expect bugs.
+```
+
+followed by AP disconnects and immediate re-associations — even at excellent signal strength.
+The symptoms look like VPN instability (health check timeouts) but originate at the Wi-Fi
+hardware layer.
+
+`install.sh` applies two fixes automatically:
+
+| Layer | Config file | Effect |
+|-------|------------|--------|
+| NetworkManager | `conf/nm-wifi-power.conf` | Sets `wifi.powersave = 2` (disabled) |
+| Intel driver (`iwlmld` / `iwlmvm`) | `conf/modprobe-iwlmld.conf` or `conf/modprobe-iwlmvm.conf` | Sets `power_scheme=1` (CAM — Continuously Active Mode) |
+
+Both layers must be disabled independently; NM's power_save setting alone does not override
+the driver-level power scheme.
+
+If you are not using an Intel Wi-Fi card, or are on a headless/wired-only machine, run:
+
+```bash
+sudo ./install.sh --no-wifi
+```
 
 ## Configuration
 
