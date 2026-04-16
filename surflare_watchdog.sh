@@ -80,16 +80,16 @@ log() {
 # This replaces the ipinfo.io/cloudflare approach which caused frequent false-positive
 # timeouts through VPN exit nodes, triggering unnecessary reconnects.
 check_vpn_health() {
-	# Primary: Google reachability (0.9s avg, most reliable from behind GFW)
+	# Primary: Google reachability (most reliable from behind GFW)
 	local http_code
-	http_code=$(curl -s --max-time 3 -o /dev/null -w '%{http_code}' https://www.google.com 2>/dev/null)
+	http_code=$(curl -s --max-time 5 -o /dev/null -w '%{http_code}' https://www.google.com 2>/dev/null)
 	if [ "$http_code" = "200" ] || [ "$http_code" = "301" ] || [ "$http_code" = "302" ]; then
 		echo "OK"
 		return
 	fi
 	# Fallback: ip-api.com returns country code directly (plain HTTP, no TLS)
 	local result
-	result=$(curl -s --max-time 3 'http://ip-api.com/line/?fields=countryCode' 2>/dev/null | tr -d '[:space:]')
+	result=$(curl -s --max-time 5 'http://ip-api.com/line/?fields=countryCode' 2>/dev/null | tr -d '[:space:]')
 	echo "$result"
 }
 
