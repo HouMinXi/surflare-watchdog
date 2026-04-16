@@ -163,6 +163,29 @@ else
 			fi
 		fi
 	fi
+
+	# 5c. iwlwifi base driver config (disable_11ax workaround)
+	echo
+	echo "--- iwlwifi base driver config ---"
+	IWLWIFI_SRC="$SCRIPT_DIR/conf/modprobe-iwlwifi.conf"
+	IWLWIFI_DST="/etc/modprobe.d/iwlwifi.conf"
+	if [ -f "$IWLWIFI_SRC" ]; then
+		install_file "$IWLWIFI_SRC" "$IWLWIFI_DST" 644
+
+		CURRENT_11AX=$(cat /sys/module/iwlwifi/parameters/disable_11ax 2>/dev/null || echo "unknown")
+		case "$CURRENT_11AX" in
+		1 | Y | y)
+			skip "iwlwifi disable_11ax (already disabled)"
+			;;
+		unknown)
+			ok "iwlwifi modprobe config installed (module not loaded — applies on next boot)"
+			;;
+		*)
+			warn "iwlwifi config written — reboot to apply disable_11ax=1"
+			warn "  (Reloading iwlwifi requires removing all dependent modules and risks hang)"
+			;;
+		esac
+	fi
 fi
 
 # ── 6. systemd daemon-reload + enable ────────────────────────────────────────
