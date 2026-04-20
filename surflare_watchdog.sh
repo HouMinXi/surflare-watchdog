@@ -33,6 +33,7 @@ TOKEN_REFRESH_INTERVAL=1800           # seconds between proactive auth token ref
 LOGIN_RETRIES=5                       # max login attempts per refresh cycle
 LOGIN_RETRY_DELAY=3                   # seconds between login retries
 HEARTBEAT_INTERVAL=600                # seconds between periodic "VPN healthy" log entries (0=off)
+TRANSIENT_THRESHOLD=6                 # consecutive external timeouts (local state OK) before escalating to fail_count
 
 # Validate NODE is configured (fail fast if placeholder is unchanged)
 if [ "$NODE" = "your_node_tag" ]; then
@@ -75,22 +76,65 @@ log() {
 	printf '<6>surflare_watchdog: %s\n' "$*" >/dev/kmsg
 }
 
-# check_vpn_health: returns "OK", a country code, or empty string on failure.
-# Primary: Google reachability — Google is blocked by GFW, so HTTP 200/30x = VPN working.
-# Fallback: ip-api.com over HTTPS — returns country code to confirm VPN exit country.
-# Both use --max-time 8 to tolerate transpacific VPN latency spikes without false positives.
+# check_vpn_local_state: fast local-only check — no network calls.
+# Returns 0 if all three local VPN indicators are present, 1 if any is missing.
+# Indicators: surflare-proxy process + nftables table + fwmark policy routing rule.
+# A LOCAL_FAIL means the VPN is definitively down (not a transient network timeout).
+check_vpn_local_state() {
+	pgrep -x surflare-proxy >/dev/null 2>&1 || return 1
+	nft list table inet surflare >/dev/null 2>&1 || return 1
+	ip rule show | grep -q 'fwmark 0x1 lookup 100' || return 1
+	return 0
+}
+
+# check_vpn_health: two-layer check — local state first, then parallel external probes.
+# Returns:
+#   "OK"         — Google 200/30x (VPN is working, GFW bypassed)
+#   "LOCAL_FAIL" — local VPN state lost (process/nftables/routing gone)
+#   <country>    — ip-api.com returned a country code (non-empty)
+#   ""           — both external probes timed out (but local state was OK = transient)
+# "CN" is a valid country code return (VPN up but routing via China = broken exit).
 check_vpn_health() {
-	# Primary: Google reachability (most reliable from behind GFW)
-	local http_code
-	http_code=$(curl -s --max-time 8 -o /dev/null -w '%{http_code}' https://www.google.com 2>/dev/null)
-	if [ "$http_code" = "200" ] || [ "$http_code" = "301" ] || [ "$http_code" = "302" ]; then
-		echo "OK"
+	# Layer 1: local state — deterministic, milliseconds, no network dependency
+	if ! check_vpn_local_state; then
+		echo "LOCAL_FAIL"
 		return
 	fi
-	# Fallback: ip-api.com over HTTPS — avoids plain-HTTP MITM on local network
-	local result
-	result=$(curl -s --max-time 8 'https://ip-api.com/line/?fields=countryCode' 2>/dev/null | tr -d '[:space:]')
-	echo "$result"
+
+	# Layer 2: parallel external probes — both run concurrently, max wait = one timeout
+	local tmp_g tmp_i r_g r_i
+	tmp_g=$(mktemp /tmp/surflare_hc.XXXXXX)
+	tmp_i=$(mktemp /tmp/surflare_hc.XXXXXX)
+	# Ensure temp files are removed even if this function is interrupted mid-wait.
+	# Stored in a global so the main EXIT trap can also clean up on unclean exit.
+	_hc_tmp="$tmp_g $tmp_i"
+
+	# Google: blocked by GFW → 200/30x means VPN is working
+	(
+		code=$(curl -s --connect-timeout 3 --max-time 8 \
+		       -o /dev/null -w '%{http_code}' https://www.google.com 2>/dev/null)
+		case "$code" in 200|301|302) echo "OK" ;; esac
+	) >"$tmp_g" 2>/dev/null &
+	local pid_g=$!
+
+	# ip-api.com: returns exit country code over HTTPS (avoids plain-HTTP MITM)
+	(
+		curl -s --connect-timeout 3 --max-time 8 \
+		     'https://ip-api.com/line/?fields=countryCode' 2>/dev/null \
+		| tr -d '[:space:]'
+	) >"$tmp_i" 2>/dev/null &
+	local pid_i=$!
+
+	wait "$pid_g" "$pid_i"
+	r_g=$(cat "$tmp_g" 2>/dev/null)
+	r_i=$(cat "$tmp_i" 2>/dev/null)
+	rm -f "$tmp_g" "$tmp_i"
+	_hc_tmp=""
+
+	# Google result takes priority (most reliable GFW indicator)
+	[ "$r_g" = "OK" ] && echo "OK" && return
+	# ip-api.com result (may be a country code, "CN", or empty)
+	echo "$r_i"
 }
 
 wait_for_exit() {
@@ -256,36 +300,48 @@ if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
 fi
 
 # Set trap before writing PID to minimise stale-file window on early kill
-# storm_sleep_pid: tracks background sleep during storm cooling so SIGTERM kills it cleanly
+# storm_sleep_pid: background sleep PID during storm cooling — killed on SIGTERM
+# _hc_tmp: health-check temp files — cleaned on SIGTERM in case wait is interrupted
 storm_sleep_pid=""
-trap 'log "watchdog stopped"; [ -n "$storm_sleep_pid" ] && kill "$storm_sleep_pid" 2>/dev/null; rm -f "$PIDFILE"; exit 0' INT TERM
-trap 'rm -f "$PIDFILE"' EXIT
+_hc_tmp=""
+trap 'log "watchdog stopped"; [ -n "$storm_sleep_pid" ] && kill "$storm_sleep_pid" 2>/dev/null; [ -n "$_hc_tmp" ] && rm -f $_hc_tmp; rm -f "$PIDFILE"; exit 0' INT TERM
+trap '[ -n "$_hc_tmp" ] && rm -f $_hc_tmp; rm -f "$PIDFILE"' EXIT
 echo $$ >"$PIDFILE"
 
 fail_count=0
 reconnect_count=0
+transient_count=0
 last_refresh=$(date +%s)
 last_heartbeat=$(date +%s)
-log "watchdog started: node=${NODE} interval=${CHECK_INTERVAL}s threshold=${FAIL_THRESHOLD}"
+log "watchdog started: node=${NODE} interval=${CHECK_INTERVAL}s threshold=${FAIL_THRESHOLD} transient=${TRANSIENT_THRESHOLD}"
 
 while true; do
 	health=$(check_vpn_health)
 
-	# Healthy: Google returned 200/30x (primary), OR ip-api.com returned non-CN (fallback)
-	if [ "$health" = "OK" ] || { [ "$health" != "CN" ] && [ -n "$health" ]; }; then
+	# ── Classify health result ──────────────────────────────────────────────
+	if [ "$health" = "LOCAL_FAIL" ]; then
+		# Local VPN state lost (process/nftables/routing gone) — definitive failure,
+		# no network uncertainty. Skip accumulation and force reconnect immediately.
+		log "Local VPN state lost (process/nftables/routing), triggering immediate reconnect"
+		transient_count=0
+		fail_count=$FAIL_THRESHOLD
+
+	elif [ "$health" = "OK" ] || \
+	     { [ "$health" != "CN" ] && [ "$health" != "LOCAL_FAIL" ] && [ -n "$health" ]; }; then
+		# VPN healthy — Google 200/30x (GFW bypassed) OR ip-api.com returned non-CN country
 		fail_count=0
 		reconnect_count=0
+		transient_count=0
 
 		# Proactive token refresh — runs whenever VPN is confirmed healthy so tokens stay
-		# fresh before reconnects. Previously only ran in the fallback branch; now covers
-		# both primary (Google OK) and fallback paths.
+		# fresh for reconnects. Covers both Google-OK and ip-api.com-fallback paths.
 		now=$(date +%s)
 		if [ $((now - last_refresh)) -ge "$TOKEN_REFRESH_INTERVAL" ]; then
 			refresh_auth
 			refresh_rc=$?
 			if [ "$refresh_rc" -eq 0 ] || [ "$refresh_rc" -eq 2 ]; then
-				# rc=0: success; rc=2: no credentials configured — both back off a full interval
-				# rc=1 (login failure) intentionally leaves last_refresh unchanged for prompt retry
+				# rc=0: success; rc=2: no credentials — both back off a full interval.
+				# rc=1 (login failure) leaves last_refresh unchanged for prompt retry.
 				last_refresh=$(date +%s)
 			fi
 		fi
@@ -296,51 +352,72 @@ while true; do
 			last_heartbeat=$now
 		fi
 
-	elif [ "$health" = "CN" ] || [ -z "$health" ]; then
-		# VPN is down: exit country is CN, or both health checks failed/timed out
+	elif [ "$health" = "CN" ]; then
+		# External confirmed: traffic is exiting via China — VPN is routing incorrectly
+		transient_count=0
 		fail_count=$((fail_count + 1))
-		log "Health check failed (${health:-timeout}), consecutive count: ${fail_count}"
-		if [ "$fail_count" -ge "$FAIL_THRESHOLD" ]; then
-			log "Consecutive failures: ${fail_count}, starting reconnect..."
-			connect_vpn
-			rc=$?
-			if [ "$rc" -eq 2 ]; then
-				# connect_vpn was skipped (another instance holds flock).
-				# Reset fail_count to FAIL_THRESHOLD-1 so we retry once next cycle
-				# instead of re-triggering every 30s and spamming the log.
-				log "Reconnect skipped (flock held), will retry next cycle"
-				fail_count=$((FAIL_THRESHOLD - 1))
-			elif [ "$rc" -eq 0 ]; then
-				new_health=$(check_vpn_health)
-				log "Post-reconnect health: ${new_health:-failed}"
-				if [ "$new_health" = "OK" ] || { [ "$new_health" != "CN" ] && [ -n "$new_health" ]; }; then
-					fail_count=0
-					reconnect_count=0
-				else
-					reconnect_count=$((reconnect_count + 1))
-					log "Post-reconnect health check anomalous (reconnect_count=${reconnect_count})"
-					if [ "$reconnect_count" -ge "$STORM_MAX" ]; then
-						log "Storm protection triggered: cooling for ${STORM_COOLING}s"
-						sleep "$STORM_COOLING" &
-						storm_sleep_pid=$!
-						wait "$storm_sleep_pid"
-						storm_sleep_pid=""
-						reconnect_count=0
-						fail_count=0
-					fi
-				fi
+		log "Health check failed (CN exit), consecutive count: ${fail_count}"
+
+	else
+		# health="" — both external probes timed out; local state was OK (check_vpn_health
+		# returns LOCAL_FAIL if local state is bad, so here local is confirmed healthy).
+		# This is a transient network spike, not a definitive VPN failure.
+		transient_count=$((transient_count + 1))
+		log "Health check transient timeout (local state OK), transient ${transient_count}/${TRANSIENT_THRESHOLD}"
+		if [ "$transient_count" -ge "$TRANSIENT_THRESHOLD" ]; then
+			# Too many consecutive transients — escalate in case of silent L3 breakage
+			fail_count=$((fail_count + 1))
+			transient_count=0
+			log "Transient threshold reached, escalating to fail_count: ${fail_count}"
+		fi
+	fi
+
+	# ── Shared reconnect path ───────────────────────────────────────────────
+	# Triggered by: LOCAL_FAIL (immediate), CN failure, or transient escalation
+	if [ "$fail_count" -ge "$FAIL_THRESHOLD" ]; then
+		log "Consecutive failures: ${fail_count}, starting reconnect..."
+		connect_vpn
+		rc=$?
+		if [ "$rc" -eq 2 ]; then
+			# connect_vpn was skipped (another instance holds flock).
+			# Reset fail_count to FAIL_THRESHOLD-1 so we retry once next cycle
+			# instead of re-triggering every 30s and spamming the log.
+			log "Reconnect skipped (flock held), will retry next cycle"
+			fail_count=$((FAIL_THRESHOLD - 1))
+		elif [ "$rc" -eq 0 ]; then
+			new_health=$(check_vpn_health)
+			log "Post-reconnect health: ${new_health:-failed}"
+			if [ "$new_health" = "OK" ] || \
+			   { [ "$new_health" != "CN" ] && [ "$new_health" != "LOCAL_FAIL" ] && [ -n "$new_health" ]; }; then
+				fail_count=0
+				reconnect_count=0
+				transient_count=0
 			else
 				reconnect_count=$((reconnect_count + 1))
-				log "Reconnect attempt failed (reconnect_count=${reconnect_count})"
+				log "Post-reconnect health check anomalous (reconnect_count=${reconnect_count})"
 				if [ "$reconnect_count" -ge "$STORM_MAX" ]; then
-					log "Storm protection triggered (connect failure): cooling for ${STORM_COOLING}s"
+					log "Storm protection triggered: cooling for ${STORM_COOLING}s"
 					sleep "$STORM_COOLING" &
 					storm_sleep_pid=$!
 					wait "$storm_sleep_pid"
 					storm_sleep_pid=""
 					reconnect_count=0
 					fail_count=0
+					transient_count=0
 				fi
+			fi
+		else
+			reconnect_count=$((reconnect_count + 1))
+			log "Reconnect attempt failed (reconnect_count=${reconnect_count})"
+			if [ "$reconnect_count" -ge "$STORM_MAX" ]; then
+				log "Storm protection triggered (connect failure): cooling for ${STORM_COOLING}s"
+				sleep "$STORM_COOLING" &
+				storm_sleep_pid=$!
+				wait "$storm_sleep_pid"
+				storm_sleep_pid=""
+				reconnect_count=0
+				fail_count=0
+				transient_count=0
 			fi
 		fi
 	fi
