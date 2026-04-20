@@ -10,9 +10,45 @@ Solves two problems (with optional headless support):
 
 ## How it works
 
-- Checks VPN health every 30 seconds: primary via Google reachability (Google is blocked by
-  GFW, so HTTP 200/301/302 = VPN working); fallback via `ip-api.com` country code
-- If health checks fail for 4 consecutive cycles (CN exit or both endpoints timeout), reconnects
+### Health check (two-layer)
+
+Every 30 seconds the watchdog runs a two-layer health check:
+
+**Layer 1 — Local state** (< 5 ms, no network):
+Checks three local indicators deterministically:
+1. `surflare-proxy` process is running
+2. `nftables table inet surflare` exists
+3. `fwmark 0x1 → table 100` policy routing rule is present
+
+If any indicator is missing → **LOCAL_FAIL**: VPN is definitively down. Triggers immediate
+reconnect without waiting for the `FAIL_THRESHOLD` accumulation cycle.
+
+**Layer 2 — Parallel external probes** (run concurrently, max 8 s each):
+- **Primary**: `https://www.google.com` — Google is blocked by GFW, so HTTP 200/301/302 = VPN working
+- **Fallback**: `https://ip-api.com/line/?fields=countryCode` — returns exit country code
+
+Result classification:
+
+| Result | Meaning | Action |
+|--------|---------|--------|
+| `OK` | Google returned 200/30x | Reset all counters (fail/transient/reconnect) |
+| `<country>` (non-CN) | ip-api.com confirmed non-China exit | Reset all counters (fail/transient/reconnect) |
+| `CN` | Traffic routing through China — VPN broken | `fail_count++` |
+| `""` (timeout, local OK) | Transient network spike | `transient_count++` only |
+| `LOCAL_FAIL` | Process/nftables/routing lost | Immediate reconnect |
+
+External timeouts with healthy local state are counted separately as *transients* and do
+**not** increment `fail_count` — this eliminates false-positive reconnects caused by
+WiFi congestion or VPN server latency spikes.
+
+### Reconnect triggers
+
+- **LOCAL_FAIL**: reconnects immediately (single cycle)
+- **`fail_count ≥ FAIL_THRESHOLD`** (CN exits): reconnects after N consecutive real failures
+- **`transient_count ≥ TRANSIENT_THRESHOLD`**: escalates one `fail_count` after sustained timeouts
+
+### Other behaviours
+
 - On system resume, reconnects immediately — two hooks cover different suspend modes:
   - **S3 (mem) suspend**: `systemd-sleep` hook (`surflare-resume.sh` symlink)
   - **s2idle (S0ix/freeze) suspend**: NetworkManager dispatcher (`99-surflare-resume`),
@@ -160,6 +196,9 @@ service, or hooks pointing to the home directory), follow these steps.
 | Auth token | no refresh, expired token → deadlock | proactive refresh every 30 min via TPM2-encrypted creds |
 | Poll interval | 60 s | 30 s |
 | NODE default | fixed node tag | `auto` (Surflare picks best node) |
+| Health check | single external HTTP (false positives on congestion) | two-layer: local state + parallel external probes |
+| Timeout handling | timeout = failure → fake reconnects | timeout with healthy local state = transient, no reconnect |
+| Process/routing loss | detected after 4×30s external timeout | detected immediately via local state check (LOCAL_FAIL) |
 
 **Old symptom 1** — resume hook logged and did nothing:
 ```
@@ -290,7 +329,11 @@ NODE="auto"           # "auto" = Surflare picks best node, or set a specific tag
 MODE="rule"           # Connection mode: global, rule, direct (rule = Smart Routing)
 TRANSIT="auto"        # Transit server for multi-hop: "auto", or "" to disable
 CHECK_INTERVAL=30     # Seconds between exit IP checks
-FAIL_THRESHOLD=4      # Consecutive failures before reconnect
+FAIL_THRESHOLD=4      # Consecutive CN-exit failures before reconnect
+
+# Two-layer health check thresholds
+TRANSIENT_THRESHOLD=6 # Consecutive external timeouts (local state OK) before one fail_count escalation
+HEARTBEAT_INTERVAL=600 # Seconds between "VPN healthy" log entries (0 = off)
 
 # Tunable timeouts (seconds)
 DISCONNECT_SETTLE=2   # Wait after surflare disconnect before killing processes
@@ -307,8 +350,16 @@ LOGIN_RETRIES=5              # Max login attempts per refresh (API is intermitte
 LOGIN_RETRY_DELAY=3          # Seconds between login retries
 ```
 
-A **failure** is: Google (`https://www.google.com`) unreachable AND `ip-api.com` returns
-`CN` or times out. Google is blocked by GFW, so HTTP 200/301/302 confirms VPN is working.
+**Reconnect conditions:**
+
+| Trigger | Condition |
+|---------|-----------|
+| Local state lost | Process/nftables/routing gone → immediate reconnect |
+| CN exit | `fail_count ≥ FAIL_THRESHOLD` consecutive CN-exit results |
+| Persistent timeout | `transient_count ≥ TRANSIENT_THRESHOLD` consecutive timeouts escalate `fail_count` by 1 |
+
+Google reachability (HTTP 200/301/302) is the primary health signal — Google is blocked by
+GFW, so a 200 response confirms traffic is exiting via VPN.
 
 After editing, redeploy with:
 
@@ -320,18 +371,48 @@ sudo systemctl restart surflare-watchdog
 
 ## Log output
 
+Normal operation is **silent** — no log entries while VPN is healthy (except the
+optional heartbeat every `HEARTBEAT_INTERVAL` seconds).
+
+**Startup:**
 ```
-surflare_watchdog: watchdog started: node=auto interval=30s threshold=4
-surflare_watchdog: Health check failed (CN), consecutive count: 4
+surflare_watchdog: watchdog started: node=Tokyo interval=30s threshold=4 transient=6
+```
+
+**Transient network timeout (local state OK — not a real failure, no reconnect):**
+```
+surflare_watchdog: Health check transient timeout (local state OK), transient 1/6
+surflare_watchdog: Health check transient timeout (local state OK), transient 2/6
+```
+
+**CN exit detected (real failure — increments fail_count):**
+```
+surflare_watchdog: Health check failed (CN exit), consecutive count: 1
+surflare_watchdog: Health check failed (CN exit), consecutive count: 4
 surflare_watchdog: Consecutive failures: 4, starting reconnect...
+```
+
+**Local state lost — immediate reconnect (no accumulation needed):**
+```
+surflare_watchdog: Local VPN state lost (process/nftables/routing), triggering immediate reconnect
+surflare_watchdog: Consecutive failures: 4, starting reconnect...
+```
+
+**Full reconnect sequence:**
+```
 surflare_watchdog: Disconnecting cleanly, flushing nftables tproxy rules and policy routing...
 surflare_watchdog: Killing remaining processes...
 surflare_watchdog: Flushing residual nftables rules and policy routing...
 surflare_watchdog: Removed residual nftables table inet surflare
 surflare_watchdog: Removed 1 residual ip rule(s) fwmark 0x1 lookup 100
 surflare_watchdog: Auth token refreshed successfully (attempt 1/5)
-surflare_watchdog: Connecting to auto mode=rule transit=auto (daemon mode)...
+surflare_watchdog: Connecting to Tokyo mode=global transit=off (daemon mode)...
 surflare_watchdog: Post-reconnect health: OK
+```
+
+**Periodic heartbeat (if `HEARTBEAT_INTERVAL > 0`):**
+```
+surflare_watchdog: VPN healthy: exit=JP
 ```
 
 ## Background
