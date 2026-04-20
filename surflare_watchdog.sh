@@ -32,6 +32,7 @@ STORM_COOLING=600                     # seconds to cool down after storm protect
 TOKEN_REFRESH_INTERVAL=1800           # seconds between proactive auth token refreshes (30 min)
 LOGIN_RETRIES=5                       # max login attempts per refresh cycle
 LOGIN_RETRY_DELAY=3                   # seconds between login retries
+HEARTBEAT_INTERVAL=600                # seconds between periodic "VPN healthy" log entries (0=off)
 
 # Validate NODE is configured (fail fast if placeholder is unchanged)
 if [ "$NODE" = "your_node_tag" ]; then
@@ -74,22 +75,21 @@ log() {
 	printf '<6>surflare_watchdog: %s\n' "$*" >/dev/kmsg
 }
 
-# check_vpn_health: returns exit country code, or empty string on any failure.
-# Primary: Google reachability — Google is blocked by GFW, so HTTP 200 = VPN is working.
-# Fallback: ip-api.com country code (plain HTTP, no TLS — faster than ipinfo.io).
-# This replaces the ipinfo.io/cloudflare approach which caused frequent false-positive
-# timeouts through VPN exit nodes, triggering unnecessary reconnects.
+# check_vpn_health: returns "OK", a country code, or empty string on failure.
+# Primary: Google reachability — Google is blocked by GFW, so HTTP 200/30x = VPN working.
+# Fallback: ip-api.com over HTTPS — returns country code to confirm VPN exit country.
+# Both use --max-time 8 to tolerate transpacific VPN latency spikes without false positives.
 check_vpn_health() {
 	# Primary: Google reachability (most reliable from behind GFW)
 	local http_code
-	http_code=$(curl -s --max-time 5 -o /dev/null -w '%{http_code}' https://www.google.com 2>/dev/null)
+	http_code=$(curl -s --max-time 8 -o /dev/null -w '%{http_code}' https://www.google.com 2>/dev/null)
 	if [ "$http_code" = "200" ] || [ "$http_code" = "301" ] || [ "$http_code" = "302" ]; then
 		echo "OK"
 		return
 	fi
-	# Fallback: ip-api.com returns country code directly (plain HTTP, no TLS)
+	# Fallback: ip-api.com over HTTPS — avoids plain-HTTP MITM on local network
 	local result
-	result=$(curl -s --max-time 5 'http://ip-api.com/line/?fields=countryCode' 2>/dev/null | tr -d '[:space:]')
+	result=$(curl -s --max-time 8 'https://ip-api.com/line/?fields=countryCode' 2>/dev/null | tr -d '[:space:]')
 	echo "$result"
 }
 
@@ -108,30 +108,49 @@ wait_for_exit() {
 # refresh_auth: refresh surflare auth token using stored credentials (TPM2-encrypted via systemd-creds).
 # Retries LOGIN_RETRIES times with LOGIN_RETRY_DELAY between attempts — surflare API is
 # sometimes unreachable even with VPN up. Returns 0 if any attempt succeeds.
+# Security note: password is passed as a CLI argument (-p), visible in /proc/<pid>/cmdline
+# for the duration of each attempt (~15s). Risk is limited because the daemon runs as root
+# and Linux restricts /proc/<pid>/cmdline cross-process reads to same-UID by default.
+# If surflare ever adds --password-stdin or SURFLARE_PASSWORD env-var support, prefer those.
 refresh_auth() {
 	local email="${SURFLARE_EMAIL:-}"
 	local password=""
 
 	# Read password from systemd credentials directory (TPM2-decrypted at runtime)
-	if [ -n "$CREDENTIALS_DIRECTORY" ] && [ -f "$CREDENTIALS_DIRECTORY/surflare-password" ]; then
-		password=$(cat "$CREDENTIALS_DIRECTORY/surflare-password")
+	if [ -n "$CREDENTIALS_DIRECTORY" ]; then
+		if [ -f "$CREDENTIALS_DIRECTORY/surflare-password" ]; then
+			password=$(cat "$CREDENTIALS_DIRECTORY/surflare-password")
+		else
+			log "Auth credential file not found: ${CREDENTIALS_DIRECTORY}/surflare-password — proactive refresh disabled"
+			return 2  # no credentials: caller should back off for a full interval
+		fi
 	fi
 
-	if [ -z "$email" ] || [ -z "$password" ]; then
-		return 1 # no credentials available — skip silently
+	if [ -z "$email" ]; then
+		log "Auth refresh skipped: SURFLARE_EMAIL not set"
+		return 2  # no credentials: caller should back off for a full interval
+	fi
+	if [ -z "$password" ]; then
+		log "Auth refresh skipped: no credentials configured (set CREDENTIALS_DIRECTORY or SURFLARE_EMAIL)"
+		return 2  # no credentials: caller should back off for a full interval
 	fi
 
-	local i=0
+	local i=0 rc=1
 	while [ "$i" -lt "$LOGIN_RETRIES" ]; do
 		if timeout 15 surflare login -u "$email" -p "$password" --remember >/dev/null 2>&1; then
 			log "Auth token refreshed successfully (attempt $((i + 1))/${LOGIN_RETRIES})"
-			return 0
+			rc=0
+			break
 		fi
 		i=$((i + 1))
 		[ "$i" -lt "$LOGIN_RETRIES" ] && sleep "$LOGIN_RETRY_DELAY"
 	done
-	log "Auth token refresh failed after ${LOGIN_RETRIES} attempts"
-	return 1
+	# Clear password from shell memory immediately after use
+	unset password
+	if [ "$rc" -ne 0 ]; then
+		log "Auth token refresh failed after ${LOGIN_RETRIES} attempts"
+	fi
+	return "$rc"
 }
 
 connect_vpn() {
@@ -237,22 +256,46 @@ if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
 fi
 
 # Set trap before writing PID to minimise stale-file window on early kill
-trap 'log "watchdog stopped"; rm -f "$PIDFILE"; exit 0' INT TERM
+# storm_sleep_pid: tracks background sleep during storm cooling so SIGTERM kills it cleanly
+storm_sleep_pid=""
+trap 'log "watchdog stopped"; [ -n "$storm_sleep_pid" ] && kill "$storm_sleep_pid" 2>/dev/null; rm -f "$PIDFILE"; exit 0' INT TERM
 trap 'rm -f "$PIDFILE"' EXIT
 echo $$ >"$PIDFILE"
 
 fail_count=0
 reconnect_count=0
 last_refresh=$(date +%s)
+last_heartbeat=$(date +%s)
 log "watchdog started: node=${NODE} interval=${CHECK_INTERVAL}s threshold=${FAIL_THRESHOLD}"
 
 while true; do
 	health=$(check_vpn_health)
 
-	if [ "$health" = "OK" ]; then
-		# VPN is healthy (Google reachable = not behind GFW)
+	# Healthy: Google returned 200/30x (primary), OR ip-api.com returned non-CN (fallback)
+	if [ "$health" = "OK" ] || { [ "$health" != "CN" ] && [ -n "$health" ]; }; then
 		fail_count=0
 		reconnect_count=0
+
+		# Proactive token refresh — runs whenever VPN is confirmed healthy so tokens stay
+		# fresh before reconnects. Previously only ran in the fallback branch; now covers
+		# both primary (Google OK) and fallback paths.
+		now=$(date +%s)
+		if [ $((now - last_refresh)) -ge "$TOKEN_REFRESH_INTERVAL" ]; then
+			refresh_auth
+			refresh_rc=$?
+			if [ "$refresh_rc" -eq 0 ] || [ "$refresh_rc" -eq 2 ]; then
+				# rc=0: success; rc=2: no credentials configured — both back off a full interval
+				# rc=1 (login failure) intentionally leaves last_refresh unchanged for prompt retry
+				last_refresh=$(date +%s)
+			fi
+		fi
+
+		# Periodic heartbeat — confirms watchdog is alive during long healthy stretches
+		if [ "${HEARTBEAT_INTERVAL:-0}" -gt 0 ] && [ $((now - last_heartbeat)) -ge "$HEARTBEAT_INTERVAL" ]; then
+			log "VPN healthy: exit=${health}"
+			last_heartbeat=$now
+		fi
+
 	elif [ "$health" = "CN" ] || [ -z "$health" ]; then
 		# VPN is down: exit country is CN, or both health checks failed/timed out
 		fail_count=$((fail_count + 1))
@@ -279,7 +322,9 @@ while true; do
 					if [ "$reconnect_count" -ge "$STORM_MAX" ]; then
 						log "Storm protection triggered: cooling for ${STORM_COOLING}s"
 						sleep "$STORM_COOLING" &
-						wait $!
+						storm_sleep_pid=$!
+						wait "$storm_sleep_pid"
+						storm_sleep_pid=""
 						reconnect_count=0
 						fail_count=0
 					fi
@@ -290,26 +335,18 @@ while true; do
 				if [ "$reconnect_count" -ge "$STORM_MAX" ]; then
 					log "Storm protection triggered (connect failure): cooling for ${STORM_COOLING}s"
 					sleep "$STORM_COOLING" &
-					wait $!
+					storm_sleep_pid=$!
+					wait "$storm_sleep_pid"
+					storm_sleep_pid=""
 					reconnect_count=0
 					fail_count=0
 				fi
 			fi
 		fi
-	else
-		# Non-CN country returned by fallback — VPN is working
-		fail_count=0
-		reconnect_count=0
-		# Proactive token refresh while VPN is healthy — keeps auth.dat fresh so
-		# reconnects after VPN failure don't need to reach surflare API (blocked by GFW)
-		now=$(date +%s)
-		if [ $((now - last_refresh)) -ge "$TOKEN_REFRESH_INTERVAL" ]; then
-			refresh_auth && last_refresh=$(date +%s)
-		fi
 	fi
 
 	# "sleep & wait" allows bash to handle SIGTERM immediately instead of
-	# blocking until sleep finishes (up to 60s or 600s during storm cooling)
+	# blocking until sleep finishes
 	sleep "$CHECK_INTERVAL" &
 	wait $!
 done
