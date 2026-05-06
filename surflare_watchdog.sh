@@ -98,7 +98,7 @@ DESKTOP_CPU_SET=""
 
 compute_proxy_affinity() {
 	local total proxy_count first_proxy
-	total=$(nproc)
+	total=$(nproc --all)
 	if [ "$total" -le 2 ]; then
 		PROXY_CPU_SET=""
 		DESKTOP_CPU_SET=""
