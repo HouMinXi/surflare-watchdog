@@ -1,0 +1,1 @@
+ACTION=="add", SUBSYSTEM=="net", ENV{ID_NET_DRIVER}=="iwlwifi", ATTR{threaded}="1"

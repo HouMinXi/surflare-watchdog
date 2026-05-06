@@ -1,5 +1,5 @@
 #!/bin/bash
-# install.sh — idempotent installer for surflare-watchdog
+# install.sh -- idempotent installer for surflare-watchdog
 #
 # Installs the watchdog daemon, systemd service, NetworkManager hooks,
 # and Wi-Fi stability tuning (disables NM + driver power saving).
@@ -8,12 +8,12 @@
 #   sudo ./install.sh           # full install
 #   sudo ./install.sh --no-wifi # skip Wi-Fi tuning (non-Intel or headless)
 #
-# Safe to run multiple times — each step checks current state and skips
+# Safe to run multiple times -- each step checks current state and skips
 # if already up-to-date.
 
 set -euo pipefail
 
-# ── Colours (disabled when stdout is not a TTY) ──────────────────────────────
+# -- Colours (disabled when stdout is not a TTY) ------------------------------
 if [ -t 1 ]; then
 	RED='\033[0;31m'
 	YEL='\033[1;33m'
@@ -34,20 +34,20 @@ die() {
 	exit 1
 }
 
-# ── Args ─────────────────────────────────────────────────────────────────────
+# -- Args ---------------------------------------------------------------------
 WIFI_TUNING=1
 for arg in "$@"; do
 	[ "$arg" = "--no-wifi" ] && WIFI_TUNING=0
 done
 
-# ── Preflight ─────────────────────────────────────────────────────────────────
+# -- Preflight -----------------------------------------------------------------
 [ "$EUID" -eq 0 ] || die "Run as root: sudo $0"
 SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
 
 echo "=== surflare-watchdog installer ==="
 echo
 
-# ── Helper: install file if changed ──────────────────────────────────────────
+# -- Helper: install file if changed ------------------------------------------
 install_file() {
 	local src="$1" dst="$2" mode="${3:-644}"
 	if [ ! -f "$src" ]; then
@@ -61,14 +61,14 @@ install_file() {
 	ok "$dst"
 }
 
-# ── Preflight: warn about common configuration mistakes ──────────────────────
+# -- Preflight: warn about common configuration mistakes ----------------------
 if grep -q 'NODE="your_node_tag"' "$SCRIPT_DIR/surflare_watchdog.sh" 2>/dev/null; then
 	warn "surflare_watchdog.sh: NODE is still set to 'your_node_tag'"
 	warn "  Edit NODE= before running, or the service will exit immediately on start"
 fi
 
-# ── 1. Watchdog script ────────────────────────────────────────────────────────
-# Track whether the script actually changed — used in step 6 to decide restart vs skip
+# -- 1. Watchdog script --------------------------------------------------------
+# Track whether the script actually changed -- used in step 6 to decide restart vs skip
 WATCHDOG_CHANGED=0
 if [ ! -f /usr/local/sbin/surflare_watchdog.sh ] ||
 	! diff -q "$SCRIPT_DIR/surflare_watchdog.sh" /usr/local/sbin/surflare_watchdog.sh >/dev/null 2>&1; then
@@ -76,23 +76,23 @@ if [ ! -f /usr/local/sbin/surflare_watchdog.sh ] ||
 fi
 install_file "$SCRIPT_DIR/surflare_watchdog.sh" /usr/local/sbin/surflare_watchdog.sh 755
 
-# ── 2. systemd service ────────────────────────────────────────────────────────
+# -- 2. systemd service --------------------------------------------------------
 install_file "$SCRIPT_DIR/surflare-watchdog.service" /etc/systemd/system/surflare-watchdog.service 644
 
-# ── 3. NetworkManager dispatcher hook ────────────────────────────────────────
+# -- 3. NetworkManager dispatcher hook ----------------------------------------
 install_file "$SCRIPT_DIR/99-surflare-resume" /etc/NetworkManager/dispatcher.d/99-surflare-resume 755
 
-# ── 4. systemd-sleep hook (S3 suspend) ───────────────────────────────────────
+# -- 4. systemd-sleep hook (S3 suspend) ---------------------------------------
 SLEEP_HOOK=/etc/systemd/system-sleep/surflare-resume.sh
 if [ -L "$SLEEP_HOOK" ] && [ "$(readlink "$SLEEP_HOOK")" = /usr/local/sbin/surflare_watchdog.sh ]; then
 	skip "$SLEEP_HOOK (symlink ok)"
 else
 	mkdir -p /etc/systemd/system-sleep
 	ln -sf /usr/local/sbin/surflare_watchdog.sh "$SLEEP_HOOK"
-	ok "$SLEEP_HOOK → /usr/local/sbin/surflare_watchdog.sh"
+	ok "$SLEEP_HOOK -> /usr/local/sbin/surflare_watchdog.sh"
 fi
 
-# ── 5. Wi-Fi stability tuning ─────────────────────────────────────────────────
+# -- 5. Wi-Fi stability tuning -------------------------------------------------
 if [ "$WIFI_TUNING" -eq 0 ]; then
 	info "Wi-Fi tuning skipped (--no-wifi)"
 else
@@ -107,7 +107,7 @@ else
 	if nmcli general reload conf 2>/dev/null; then
 		ok "nmcli general reload conf"
 	else
-		warn "nmcli reload failed — reboot may be needed for NM config to take effect"
+		warn "nmcli reload failed -- reboot may be needed for NM config to take effect"
 	fi
 
 	# Disable power save on active Wi-Fi interface
@@ -120,11 +120,11 @@ else
 			if iw dev "$WIFI_IFACE" set power_save off 2>/dev/null; then
 				ok "iw $WIFI_IFACE set power_save off"
 			else
-				warn "iw $WIFI_IFACE set power_save off failed — reboot may be needed"
+				warn "iw $WIFI_IFACE set power_save off failed -- reboot may be needed"
 			fi
 		fi
 	else
-		warn "No managed Wi-Fi interface found — skipping iw power_save"
+		warn "No managed Wi-Fi interface found -- skipping iw power_save"
 	fi
 
 	# 5b. Driver-level power scheme (Intel)
@@ -137,7 +137,7 @@ else
 	fi
 
 	if [ -z "$DRIVER" ]; then
-		info "Intel Wi-Fi driver (iwlmld/iwlmvm) not loaded — skipping driver power_scheme tuning"
+		info "Intel Wi-Fi driver (iwlmld/iwlmvm) not loaded -- skipping driver power_scheme tuning"
 		info "If you use a different driver, set power_scheme=1 (or equivalent) manually."
 	else
 		MODPROBE_SRC="$SCRIPT_DIR/conf/modprobe-${DRIVER}.conf"
@@ -150,16 +150,16 @@ else
 		if [ "$CURRENT_SCHEME" = "1" ]; then
 			skip "${DRIVER} power_scheme (already 1=CAM)"
 		else
-			warn "Reloading ${DRIVER} to apply power_scheme=1 — Wi-Fi will disconnect briefly"
+			warn "Reloading ${DRIVER} to apply power_scheme=1 -- Wi-Fi will disconnect briefly"
 			if modprobe -r "$DRIVER" && modprobe "$DRIVER"; then
 				NEW_SCHEME=$(cat "$PARAM_FILE" 2>/dev/null || echo "unknown")
 				if [ "$NEW_SCHEME" = "1" ]; then
 					ok "${DRIVER} power_scheme=1 (CAM) applied"
 				else
-					warn "${DRIVER} power_scheme is ${NEW_SCHEME} after reload — reboot to apply"
+					warn "${DRIVER} power_scheme is ${NEW_SCHEME} after reload -- reboot to apply"
 				fi
 			else
-				warn "Failed to reload ${DRIVER} — reboot to apply power_scheme=1"
+				warn "Failed to reload ${DRIVER} -- reboot to apply power_scheme=1"
 			fi
 		fi
 	fi
@@ -178,17 +178,36 @@ else
 			skip "iwlwifi disable_11ax (already disabled)"
 			;;
 		unknown)
-			ok "iwlwifi modprobe config installed (module not loaded — applies on next boot)"
+			ok "iwlwifi modprobe config installed (module not loaded -- applies on next boot)"
 			;;
 		*)
-			warn "iwlwifi config written — reboot to apply disable_11ax=1"
+			warn "iwlwifi config written -- reboot to apply disable_11ax=1"
 			warn "  (Reloading iwlwifi requires removing all dependent modules and risks hang)"
 			;;
 		esac
 	fi
+
+	# 5d. Threaded NAPI (prevents softirq CPU monopolization during firmware crashes)
+	echo
+	echo "--- Threaded NAPI ---"
+	NAPI_RULE_SRC="$SCRIPT_DIR/conf/99-wifi-threaded-napi.rules"
+	if [ -f "$NAPI_RULE_SRC" ]; then
+		install_file "$NAPI_RULE_SRC" /etc/udev/rules.d/99-wifi-threaded-napi.rules 644
+		udevadm control --reload-rules 2>/dev/null || true
+		udevadm trigger --subsystem-match=net 2>/dev/null || true
+	fi
+	if [ -n "${WIFI_IFACE:-}" ] && [ -f "/sys/class/net/${WIFI_IFACE}/threaded" ]; then
+		if [ "$(cat "/sys/class/net/${WIFI_IFACE}/threaded" 2>/dev/null)" = "1" ]; then
+			skip "threaded NAPI on ${WIFI_IFACE} (already enabled)"
+		else
+			echo 1 > "/sys/class/net/${WIFI_IFACE}/threaded" 2>/dev/null &&
+				ok "Enabled threaded NAPI on ${WIFI_IFACE}" ||
+				warn "Failed to enable threaded NAPI on ${WIFI_IFACE}"
+		fi
+	fi
 fi
 
-# ── 6. systemd daemon-reload + enable ────────────────────────────────────────
+#-- 6. systemd daemon-reload + enable ----------------------------------------
 echo
 echo "--- systemd ---"
 systemctl daemon-reload
@@ -203,7 +222,7 @@ fi
 
 if [ ! -f /etc/surflare/surflare-password.cred ]; then
 	warn "Credential file not found: /etc/surflare/surflare-password.cred"
-	warn "  Proactive token refresh will be disabled — create it with:"
+	warn "  Proactive token refresh will be disabled -- create it with:"
 	warn "  echo -n 'YOUR_PASSWORD' | sudo systemd-creds encrypt --name=surflare-password - /etc/surflare/surflare-password.cred"
 fi
 
@@ -219,7 +238,7 @@ else
 	ok "surflare-watchdog.service started"
 fi
 
-# ── Summary ──────────────────────────────────────────────────────────────────
+# -- Summary ------------------------------------------------------------------
 echo
 echo "=== Install complete ==="
 echo

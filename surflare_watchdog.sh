@@ -34,6 +34,12 @@ LOGIN_RETRIES=5                       # max login attempts per refresh cycle
 LOGIN_RETRY_DELAY=3                   # seconds between login retries
 HEARTBEAT_INTERVAL=600                # seconds between periodic "VPN healthy" log entries (0=off)
 TRANSIENT_THRESHOLD=6                 # consecutive external timeouts (local state OK) before escalating to fail_count
+WIFI_INTERFACE="wlp9s0f0"             # WiFi interface name (used for threaded NAPI check)
+CRASH_COOLDOWN=60                     # seconds to wait after detecting firmware crash before reconnect
+CRASH_MAX_PER_WINDOW=3                # max crashes in CRASH_WINDOW before extended cooldown
+CRASH_WINDOW=600                      # seconds window for crash rate limiting
+CRASH_EXTENDED_COOLDOWN=300           # seconds extended cooldown after cascade detected
+CRASH_DEDUP_INTERVAL=121              # minimum seconds between counting two crashes as distinct (must exceed detection window)
 
 # Validate NODE is configured (fail fast if placeholder is unchanged)
 if [ "$NODE" = "your_node_tag" ]; then
@@ -49,7 +55,7 @@ if [ "$EUID" -ne 0 ]; then
 fi
 
 umask 0177
-# Restrict new file permissions to 600 (root-only) — prevents non-root users from
+# Restrict new file permissions to 600 (root-only) -- prevents non-root users from
 # opening the lock file for reading and holding flock to block reconnects
 
 # Dependency check
@@ -76,7 +82,7 @@ log() {
 	printf '<6>surflare_watchdog: %s\n' "$*" >/dev/kmsg
 }
 
-# check_vpn_local_state: fast local-only check — no network calls.
+# check_vpn_local_state: fast local-only check -- no network calls.
 # Returns 0 if all three local VPN indicators are present, 1 if any is missing.
 # Indicators: surflare-proxy process + nftables table + fwmark policy routing rule.
 # A LOCAL_FAIL means the VPN is definitively down (not a transient network timeout).
@@ -87,21 +93,92 @@ check_vpn_local_state() {
 	return 0
 }
 
-# check_vpn_health: two-layer check — local state first, then parallel external probes.
+PROXY_CPU_SET=""
+DESKTOP_CPU_SET=""
+
+compute_proxy_affinity() {
+	local total proxy_count first_proxy
+	total=$(nproc)
+	if [ "$total" -le 2 ]; then
+		PROXY_CPU_SET=""
+		DESKTOP_CPU_SET=""
+		return
+	elif [ "$total" -le 4 ]; then
+		proxy_count=1
+	elif [ "$total" -le 8 ]; then
+		proxy_count=2
+	elif [ "$total" -le 16 ]; then
+		proxy_count=4
+	else
+		proxy_count=6
+	fi
+	first_proxy=$((total - proxy_count))
+	PROXY_CPU_SET="${first_proxy}-$((total - 1))"
+	DESKTOP_CPU_SET="0-$((first_proxy - 1))"
+}
+
+recent_wifi_crash() {
+	local window="${1:-120}"
+	local now since_ts
+	now=$(date +%s)
+	since_ts=$((now - window))
+	{
+		timeout 3 journalctl -k --since "@${since_ts}" --no-pager -q 2>/dev/null || true
+		timeout 3 dmesg --since "@${since_ts}" 2>/dev/null || true
+	} | grep -qE "Hardware restart was requested|NMI_INTERRUPT_UNKNOWN"
+}
+
+_crash_timestamps=""
+
+record_crash() {
+	local now last=0
+	now=$(date +%s)
+	local window_start=$((now - CRASH_WINDOW))
+	local pruned=""
+	for ts in $_crash_timestamps; do
+		if [ "$ts" -ge "$window_start" ]; then
+			pruned="${pruned:+$pruned }${ts}"
+			[ "$ts" -gt "$last" ] && last="$ts"
+		fi
+	done
+	_crash_timestamps="$pruned"
+	if [ "$last" -gt 0 ] && [ "$((now - last))" -lt "$CRASH_DEDUP_INTERVAL" ]; then
+		return
+	fi
+	_crash_timestamps="${_crash_timestamps:+$_crash_timestamps }${now}"
+}
+
+crash_rate_exceeded() {
+	local now window_start count
+	now=$(date +%s)
+	window_start=$((now - CRASH_WINDOW))
+	count=0
+	local new_ts=""
+	for ts in $_crash_timestamps; do
+		if [ "$ts" -ge "$window_start" ]; then
+			count=$((count + 1))
+			new_ts="${new_ts:+$new_ts }${ts}"
+		fi
+	done
+	_crash_timestamps="$new_ts"
+	[ "$count" -ge "$CRASH_MAX_PER_WINDOW" ]
+}
+
+# check_vpn_health: two-layer check -- local state first, then parallel external probes.
 # Returns:
-#   "OK"         — Google 200/30x (VPN is working, GFW bypassed)
-#   "LOCAL_FAIL" — local VPN state lost (process/nftables/routing gone)
-#   <country>    — ip-api.com returned a country code (non-empty)
-#   ""           — both external probes timed out (but local state was OK = transient)
+#   "OK"         -- Google 200/30x (VPN is working, GFW bypassed)
+#   "LOCAL_FAIL" -- local VPN state lost (process/nftables/routing gone)
+#   <country>    -- ip-api.com returned a country code (non-empty)
+#   ""           -- both external probes timed out (but local state was OK = transient)
 # "CN" is a valid country code return (VPN up but routing via China = broken exit).
 check_vpn_health() {
-	# Layer 1: local state — deterministic, milliseconds, no network dependency
+	# Layer 1: local state -- deterministic, milliseconds, no network dependency
 	if ! check_vpn_local_state; then
 		echo "LOCAL_FAIL"
 		return
 	fi
 
-	# Layer 2: parallel external probes — both run concurrently, max wait = one timeout
+	# Layer 2: parallel external probes -- both run concurrently, max wait = one timeout
 	local tmp_g tmp_i r_g r_i
 	tmp_g=$(mktemp /tmp/surflare_hc.XXXXXX)
 	tmp_i=$(mktemp /tmp/surflare_hc.XXXXXX)
@@ -109,7 +186,7 @@ check_vpn_health() {
 	# Stored in a global so the main EXIT trap can also clean up on unclean exit.
 	_hc_tmp="$tmp_g $tmp_i"
 
-	# Google: blocked by GFW → 200/30x means VPN is working
+	# Google: blocked by GFW -> 200/30x means VPN is working
 	(
 		code=$(curl -s --connect-timeout 3 --max-time 8 \
 		       -o /dev/null -w '%{http_code}' https://www.google.com 2>/dev/null)
@@ -150,7 +227,7 @@ wait_for_exit() {
 }
 
 # refresh_auth: refresh surflare auth token using stored credentials (TPM2-encrypted via systemd-creds).
-# Retries LOGIN_RETRIES times with LOGIN_RETRY_DELAY between attempts — surflare API is
+# Retries LOGIN_RETRIES times with LOGIN_RETRY_DELAY between attempts -- surflare API is
 # sometimes unreachable even with VPN up. Returns 0 if any attempt succeeds.
 # Security note: password is passed as a CLI argument (-p), visible in /proc/<pid>/cmdline
 # for the duration of each attempt (~15s). Risk is limited because the daemon runs as root
@@ -165,7 +242,7 @@ refresh_auth() {
 		if [ -f "$CREDENTIALS_DIRECTORY/surflare-password" ]; then
 			password=$(cat "$CREDENTIALS_DIRECTORY/surflare-password")
 		else
-			log "Auth credential file not found: ${CREDENTIALS_DIRECTORY}/surflare-password — proactive refresh disabled"
+			log "Auth credential file not found: ${CREDENTIALS_DIRECTORY}/surflare-password -- proactive refresh disabled"
 			return 2  # no credentials: caller should back off for a full interval
 		fi
 	fi
@@ -217,8 +294,8 @@ connect_vpn() {
 		wait_for_exit surflare-proxy
 
 		# Flush residual nftables/routing rules that surflare disconnect may have missed.
-		# Without this, all TCP/UDP traffic stays fwmark'd → routed to table 100 → loopback
-		# → ECONNREFUSED, causing "Account check failed" on the next connect attempt.
+		# Without this, all TCP/UDP traffic stays fwmark'd -> routed to table 100 -> loopback
+		# -> ECONNREFUSED, causing "Account check failed" on the next connect attempt.
 		log "Flushing residual nftables rules and policy routing..."
 		if nft list table inet surflare >/dev/null 2>&1; then
 			nft flush table inet surflare 2>/dev/null || true
@@ -233,9 +310,14 @@ connect_vpn() {
 		[ "$rule_count" -gt 0 ] && log "Removed ${rule_count} residual ip rule(s) fwmark 0x1 lookup 100"
 		ip route flush table 100 2>/dev/null || true
 
-		# Attempt auth refresh before connecting — surflare API may still be
+		# Attempt auth refresh before connecting -- surflare API may still be
 		# reachable briefly after nftables flush restores direct network access
 		refresh_auth || true
+
+		if [ -f "/sys/class/net/${WIFI_INTERFACE}/threaded" ] && \
+		   [ "$(cat "/sys/class/net/${WIFI_INTERFACE}/threaded" 2>/dev/null)" != "1" ]; then
+			echo 1 > "/sys/class/net/${WIFI_INTERFACE}/threaded" 2>/dev/null || true
+		fi
 
 		log "Connecting to ${NODE} mode=${MODE:-global} transit=${TRANSIT:-off} (daemon mode)..."
 		if ! surflare connect --node "$NODE" \
@@ -251,6 +333,25 @@ connect_vpn() {
 			log "VPN establishment timed out: surflare-proxy not running after ${CONNECT_SETTLE}s"
 			exit 1
 		fi
+
+		compute_proxy_affinity
+		local proxy_pid
+		proxy_pid=$(pgrep -x surflare-proxy | head -1)
+		if [ -n "$proxy_pid" ] && [ -n "$PROXY_CPU_SET" ]; then
+			taskset -apc "$PROXY_CPU_SET" "$proxy_pid" >/dev/null 2>&1 &&
+				log "Pinned surflare-proxy (PID ${proxy_pid}) to CPUs ${PROXY_CPU_SET}" || true
+		fi
+
+		if [ -n "$DESKTOP_CPU_SET" ]; then
+			local irq pinned=0
+			for irq in $(grep iwlwifi /proc/interrupts | grep -oP '^\s*\K[0-9]+(?=:)'); do
+				if echo "$DESKTOP_CPU_SET" > "/proc/irq/${irq}/smp_affinity_list" 2>/dev/null; then
+					pinned=$((pinned + 1))
+				fi
+			done
+			[ "$pinned" -gt 0 ] && log "Pinned ${pinned} iwlwifi IRQ(s) to CPUs ${DESKTOP_CPU_SET}"
+		fi
+
 		exit 0
 	) 9>"$LOCK_FILE"
 	return $?
@@ -300,13 +401,14 @@ if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
 fi
 
 # Set trap before writing PID to minimise stale-file window on early kill
-# storm_sleep_pid: background sleep PID during storm cooling — killed on SIGTERM
-# _hc_tmp: health-check temp files — cleaned on SIGTERM in case wait is interrupted
+# storm_sleep_pid: background sleep PID during storm cooling -- killed on SIGTERM
+# _hc_tmp: health-check temp files -- cleaned on SIGTERM in case wait is interrupted
 storm_sleep_pid=""
 _hc_tmp=""
 trap 'log "watchdog stopped"; [ -n "$storm_sleep_pid" ] && kill "$storm_sleep_pid" 2>/dev/null; [ -n "$_hc_tmp" ] && rm -f $_hc_tmp; rm -f "$PIDFILE"; exit 0' INT TERM
 trap '[ -n "$_hc_tmp" ] && rm -f $_hc_tmp; rm -f "$PIDFILE"' EXIT
 echo $$ >"$PIDFILE"
+taskset -pc 0 $$ >/dev/null 2>&1 || true
 
 fail_count=0
 reconnect_count=0
@@ -316,11 +418,53 @@ last_heartbeat=$(date +%s)
 log "watchdog started: node=${NODE} interval=${CHECK_INTERVAL}s threshold=${FAIL_THRESHOLD} transient=${TRANSIENT_THRESHOLD}"
 
 while true; do
+	if recent_wifi_crash 120; then
+		record_crash
+		if crash_rate_exceeded; then
+			log "Crash cascade: ${CRASH_MAX_PER_WINDOW} crashes in ${CRASH_WINDOW}s, cooldown ${CRASH_EXTENDED_COOLDOWN}s"
+			sleep "$CRASH_EXTENDED_COOLDOWN" &
+			storm_sleep_pid=$!; wait "$storm_sleep_pid"; storm_sleep_pid=""
+			_crash_timestamps=""
+			continue
+		fi
+		log "iwlwifi crash detected, waiting ${CRASH_COOLDOWN}s for stabilization"
+		sleep "$CRASH_COOLDOWN" &
+		storm_sleep_pid=$!; wait "$storm_sleep_pid"; storm_sleep_pid=""
+		if recent_wifi_crash 10; then
+			log "Firmware still crashing after cooldown, deferring reconnect"
+			sleep "$CHECK_INTERVAL" & storm_sleep_pid=$!; wait "$storm_sleep_pid"; storm_sleep_pid=""
+			continue
+		fi
+		log "Firmware stable, triggering VPN reconnect"
+		connect_vpn
+		rc=$?
+		if [ "$rc" -eq 2 ]; then
+			log "Post-crash reconnect skipped (flock held), will retry next cycle"
+		elif [ "$rc" -eq 0 ]; then
+			fail_count=0
+			reconnect_count=0
+			transient_count=0
+		else
+			reconnect_count=$((reconnect_count + 1))
+			log "Post-crash reconnect failed (reconnect_count=${reconnect_count})"
+			if [ "$reconnect_count" -ge "$STORM_MAX" ]; then
+				log "Storm protection triggered (post-crash): cooling for ${STORM_COOLING}s"
+				sleep "$STORM_COOLING" &
+				storm_sleep_pid=$!; wait "$storm_sleep_pid"; storm_sleep_pid=""
+				reconnect_count=0
+				fail_count=0
+				transient_count=0
+			fi
+		fi
+		sleep "$CHECK_INTERVAL" & storm_sleep_pid=$!; wait "$storm_sleep_pid"; storm_sleep_pid=""
+		continue
+	fi
+
 	health=$(check_vpn_health)
 
-	# ── Classify health result ──────────────────────────────────────────────
+	# -- Classify health result ----------------------------------------------
 	if [ "$health" = "LOCAL_FAIL" ]; then
-		# Local VPN state lost (process/nftables/routing gone) — definitive failure,
+		# Local VPN state lost (process/nftables/routing gone) -- definitive failure,
 		# no network uncertainty. Skip accumulation and force reconnect immediately.
 		log "Local VPN state lost (process/nftables/routing), triggering immediate reconnect"
 		transient_count=0
@@ -328,51 +472,51 @@ while true; do
 
 	elif [ "$health" = "OK" ] || \
 	     { [ "$health" != "CN" ] && [ "$health" != "LOCAL_FAIL" ] && [ -n "$health" ]; }; then
-		# VPN healthy — Google 200/30x (GFW bypassed) OR ip-api.com returned non-CN country
+		# VPN healthy -- Google 200/30x (GFW bypassed) OR ip-api.com returned non-CN country
 		fail_count=0
 		reconnect_count=0
 		transient_count=0
 
-		# Proactive token refresh — runs whenever VPN is confirmed healthy so tokens stay
+		# Proactive token refresh -- runs whenever VPN is confirmed healthy so tokens stay
 		# fresh for reconnects. Covers both Google-OK and ip-api.com-fallback paths.
 		now=$(date +%s)
 		if [ $((now - last_refresh)) -ge "$TOKEN_REFRESH_INTERVAL" ]; then
 			refresh_auth
 			refresh_rc=$?
 			if [ "$refresh_rc" -eq 0 ] || [ "$refresh_rc" -eq 2 ]; then
-				# rc=0: success; rc=2: no credentials — both back off a full interval.
+				# rc=0: success; rc=2: no credentials -- both back off a full interval.
 				# rc=1 (login failure) leaves last_refresh unchanged for prompt retry.
 				last_refresh=$(date +%s)
 			fi
 		fi
 
-		# Periodic heartbeat — confirms watchdog is alive during long healthy stretches
+		# Periodic heartbeat -- confirms watchdog is alive during long healthy stretches
 		if [ "${HEARTBEAT_INTERVAL:-0}" -gt 0 ] && [ $((now - last_heartbeat)) -ge "$HEARTBEAT_INTERVAL" ]; then
 			log "VPN healthy: exit=${health}"
 			last_heartbeat=$now
 		fi
 
 	elif [ "$health" = "CN" ]; then
-		# External confirmed: traffic is exiting via China — VPN is routing incorrectly
+		# External confirmed: traffic is exiting via China -- VPN is routing incorrectly
 		transient_count=0
 		fail_count=$((fail_count + 1))
 		log "Health check failed (CN exit), consecutive count: ${fail_count}"
 
 	else
-		# health="" — both external probes timed out; local state was OK (check_vpn_health
+		# health="" -- both external probes timed out; local state was OK (check_vpn_health
 		# returns LOCAL_FAIL if local state is bad, so here local is confirmed healthy).
 		# This is a transient network spike, not a definitive VPN failure.
 		transient_count=$((transient_count + 1))
 		log "Health check transient timeout (local state OK), transient ${transient_count}/${TRANSIENT_THRESHOLD}"
 		if [ "$transient_count" -ge "$TRANSIENT_THRESHOLD" ]; then
-			# Too many consecutive transients — escalate in case of silent L3 breakage
+			# Too many consecutive transients -- escalate in case of silent L3 breakage
 			fail_count=$((fail_count + 1))
 			transient_count=0
 			log "Transient threshold reached, escalating to fail_count: ${fail_count}"
 		fi
 	fi
 
-	# ── Shared reconnect path ───────────────────────────────────────────────
+	# -- Shared reconnect path -----------------------------------------------
 	# Triggered by: LOCAL_FAIL (immediate), CN failure, or transient escalation
 	if [ "$fail_count" -ge "$FAIL_THRESHOLD" ]; then
 		log "Consecutive failures: ${fail_count}, starting reconnect..."
