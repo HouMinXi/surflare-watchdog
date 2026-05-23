@@ -18,6 +18,8 @@
 NODE="Dallas"                         # Set to your node tag (run: surflare nodes)
 MODE="global"                         # Connection mode: global, rule, direct
 TRANSIT=""                            # Transit server for multi-hop: auto, or "" to disable
+TRANSIT_CANDIDATES="Tokyo Seoul Singapore"  # Ordered probe list; connect_vpn picks lowest-latency
+TRANSIT_CONNECT_TIMEOUT=12             # max seconds for surflare connect per candidate
 CHECK_INTERVAL=30                     # Exit IP check interval in seconds
 FAIL_THRESHOLD=4                      # Consecutive failures before reconnect
 LOCK_FILE=/run/surflare_watchdog.lock # Mutex lock to prevent concurrent reconnects
@@ -33,7 +35,7 @@ TOKEN_REFRESH_INTERVAL=1800           # seconds between proactive auth token ref
 LOGIN_RETRIES=5                       # max login attempts per refresh cycle
 LOGIN_RETRY_DELAY=3                   # seconds between login retries
 HEARTBEAT_INTERVAL=600                # seconds between periodic "VPN healthy" log entries (0=off)
-TRANSIENT_THRESHOLD=6                 # consecutive external timeouts (local state OK) before escalating to fail_count
+TRANSIENT_THRESHOLD=4                 # consecutive external timeouts (local state OK) before escalating to fail_count
 WIFI_INTERFACE="wlp9s0f0"             # WiFi interface name (used for threaded NAPI check)
 CRASH_COOLDOWN=60                     # seconds to wait after detecting firmware crash before reconnect
 CRASH_MAX_PER_WINDOW=3                # max crashes in CRASH_WINDOW before extended cooldown
@@ -297,6 +299,70 @@ refresh_auth() {
 	return "$rc"
 }
 
+cleanup_probe_state() {
+	surflare disconnect >/dev/null 2>&1
+	killall surflare-proxy 2>/dev/null
+	wait_for_exit surflare-proxy
+	if nft list table inet surflare >/dev/null 2>&1; then
+		nft flush table inet surflare 2>/dev/null || true
+		nft delete table inet surflare 2>/dev/null || true
+	fi
+	while ip rule del fwmark 0x1 lookup 100 2>/dev/null; do :; done
+	ip route flush table 100 2>/dev/null || true
+}
+
+probe_best_transit() {
+	if [ -z "$TRANSIT_CANDIDATES" ]; then
+		echo ""
+		return
+	fi
+	local node best_node="" best_ms=999999
+	for node in $TRANSIT_CANDIDATES; do
+		log "Probing transit candidate: ${node}"
+		if ! timeout "$TRANSIT_CONNECT_TIMEOUT" surflare connect \
+			--node "$NODE" --mode "${MODE:-global}" \
+			--transit "$node" --daemon >/dev/null 2>&1; then
+			log "Probe ${node}: connect failed"
+			cleanup_probe_state
+			continue
+		fi
+		sleep 3
+		if ! pgrep -x surflare-proxy >/dev/null 2>&1; then
+			log "Probe ${node}: proxy not running after connect"
+			cleanup_probe_state
+			continue
+		fi
+		local ms
+		ms=$(curl -s --connect-timeout 4 --max-time 6 \
+			-o /dev/null -w '%{time_connect}' \
+			https://www.google.com 2>/dev/null)
+		if [ -z "$ms" ] || [ "$ms" = "0.000000" ]; then
+			log "Probe ${node}: health check unreachable"
+			cleanup_probe_state
+			continue
+		fi
+		local ms_int
+		ms_int=$(awk "BEGIN {printf \"%.0f\", ${ms} * 1000}" 2>/dev/null)
+		if [ -z "$ms_int" ] || [ "$ms_int" -le 0 ] 2>/dev/null; then
+			log "Probe ${node}: invalid latency measurement"
+			cleanup_probe_state
+			continue
+		fi
+		log "Probe ${node}: ${ms_int}ms"
+		if [ "$ms_int" -lt "$best_ms" ]; then
+			best_ms=$ms_int
+			best_node=$node
+		fi
+		cleanup_probe_state
+	done
+	if [ -n "$best_node" ]; then
+		log "Best transit: ${best_node} (${best_ms}ms)"
+	else
+		log "All transit candidates failed, using direct connection"
+	fi
+	echo "$best_node"
+}
+
 connect_vpn() {
 	# flock prevents concurrent calls from watchdog loop and systemd-sleep post hook
 	(
@@ -342,10 +408,16 @@ connect_vpn() {
 			echo 1 > "/sys/class/net/${WIFI_INTERFACE}/threaded" 2>/dev/null || true
 		fi
 
-		log "Connecting to ${NODE} mode=${MODE:-global} transit=${TRANSIT:-off} (daemon mode)..."
+		local effective_transit="$TRANSIT"
+		if [ -n "$TRANSIT_CANDIDATES" ] && [ -z "$TRANSIT" ]; then
+			effective_transit=$(probe_best_transit)
+			cleanup_probe_state
+		fi
+
+		log "Connecting to ${NODE} mode=${MODE:-global} transit=${effective_transit:-off} (daemon mode)..."
 		if ! surflare connect --node "$NODE" \
 			${MODE:+--mode "$MODE"} \
-			${TRANSIT:+--transit "$TRANSIT"} \
+			${effective_transit:+--transit "$effective_transit"} \
 			--daemon 9>&-; then
 			log "Connection failed, will retry on next check cycle"
 			exit 1
