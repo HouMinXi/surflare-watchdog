@@ -334,7 +334,7 @@ probe_best_transit() {
 		fi
 		local ms
 		ms=$(curl -s --connect-timeout 4 --max-time 6 \
-			-o /dev/null -w '%{time_connect}' \
+			-o /dev/null -w '%{time_starttransfer}' \
 			https://www.google.com 2>/dev/null)
 		if [ -z "$ms" ] || [ "$ms" = "0.000000" ]; then
 			log "Probe ${node}: health check unreachable"
