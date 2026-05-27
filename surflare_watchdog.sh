@@ -326,7 +326,7 @@ probe_best_transit() {
 			cleanup_probe_state
 			continue
 		fi
-		sleep 3
+		sleep 6
 		if ! pgrep -x surflare-proxy >/dev/null 2>&1; then
 			log "Probe ${node}: proxy not running after connect"
 			cleanup_probe_state
@@ -335,7 +335,7 @@ probe_best_transit() {
 		# Require 200/30x from Google -- local proxy errors (502/503) return
 		# instantly and would otherwise produce a falsely-low latency reading.
 		local probe_result http_code ms
-		probe_result=$(curl -s --connect-timeout 4 --max-time 6 \
+		probe_result=$(curl -s --connect-timeout 4 --max-time 10 \
 			-o /dev/null -w '%{http_code}:%{time_starttransfer}' \
 			https://www.google.com 2>/dev/null)
 		http_code="${probe_result%%:*}"
