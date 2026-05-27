@@ -15,7 +15,7 @@
 #                 sudo chmod 755 /etc/NetworkManager/dispatcher.d/99-surflare-resume
 # View logs    : sudo dmesg | grep surflare_watchdog
 
-NODE="Dallas"                         # Set to your node tag (run: surflare nodes)
+NODE="Los Angeles"                    # Set to your node tag (run: surflare nodes)
 MODE="global"                         # Connection mode: global, rule, direct
 TRANSIT=""                            # Transit server for multi-hop: auto, or "" to disable
 TRANSIT_CANDIDATES="Tokyo Seoul Singapore"  # Ordered probe list; connect_vpn picks lowest-latency
