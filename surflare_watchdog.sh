@@ -18,7 +18,7 @@
 NODE="Los Angeles"                    # Set to your node tag (run: surflare nodes)
 MODE="global"                         # Connection mode: global, rule, direct
 TRANSIT=""                            # Transit server for multi-hop: auto, or "" to disable
-TRANSIT_CANDIDATES="Tokyo Seoul Singapore"  # Ordered probe list; connect_vpn picks lowest-latency
+TRANSIT_CANDIDATES="Tokyo Seoul"              # Ordered probe list; connect_vpn picks lowest-latency
 TRANSIT_CONNECT_TIMEOUT=12             # max seconds for surflare connect per candidate
 CHECK_INTERVAL=30                     # Exit IP check interval in seconds
 FAIL_THRESHOLD=4                      # Consecutive failures before reconnect
