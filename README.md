@@ -1,79 +1,83 @@
 # surflare-watchdog
 
-Surflare VPN 守护脚本，适用于 Linux 笔记本。解决两个问题：
+A watchdog daemon for [Surflare VPN](https://www.surflare.com) on Linux laptops.
+Solves two problems:
 
-1. **假连接**：Surflare UI 显示已连接，但实际出口已回落到本地 ISP（静默隧道故障）
-2. **合盖唤醒**：打开笔记本后 VPN 未自动重连
+1. **Silent tunnel failure**: Surflare UI shows "Connected" but traffic leaks through local ISP
+2. **Resume after sleep**: VPN is not reconnected after opening the laptop lid
 
-## 功能
+## Features
 
-- 每 60 秒检测出口 IP 国家，连续 2 次异常自动重连
-- 系统从休眠/挂起唤醒后立即重连（`systemd-sleep` 钩子）
-- 重连前先 `surflare disconnect` 清理 nftables tproxy 规则和 iproute2 策略路由，避免网络被锁死
-- `flock` 互斥锁防止 watchdog 与唤醒钩子并发冲突
-- 日志写入 `/dev/kmsg`，通过 `dmesg` 查看，不产生日志文件
-- 固定连接节点，重连后节点不变
+- Checks exit IP country every 30s; auto-reconnects after consecutive failures
+- Reconnects immediately after suspend/hibernate resume (`systemd-sleep` hook)
+- Probes transit candidates (Tokyo, Seoul) and picks the lowest-latency one
+- Cleans up nftables tproxy rules and policy routing before each reconnect
+- `flock` mutex prevents concurrent reconnects from watchdog loop and resume hook
+- Logs to `/dev/kmsg` (view with `dmesg`); no log files
+- CPU affinity isolation for surflare-proxy and iwlwifi IRQs
+- Firmware crash detection with cascade protection and rate-limited cooldown
 
-## 依赖
+## Dependencies
 
-| 命令 | 包名 |
-|------|------|
+| Command | Package |
+|---------|---------|
 | `curl` | curl |
 | `killall` | psmisc |
 | `pgrep` | procps-ng / procps |
 | `flock` | util-linux |
-| `nm-online` | NetworkManager（可选，缺失时 fallback sleep 15s） |
-| `surflare` / `surflare-proxy` | Surflare 安装包 |
+| `nm-online` | NetworkManager (optional; falls back to fixed sleep) |
+| `surflare` / `surflare-proxy` | Surflare installation |
 
-## 安装
+## Install
 
 ```bash
-# 1. 克隆
 git clone git@github.com:HouMinXi/surflare-watchdog.git
 cd surflare-watchdog
+sudo cp surflare_watchdog.sh /usr/local/sbin/
+sudo chown root:root /usr/local/sbin/surflare_watchdog.sh
+sudo chmod 755 /usr/local/sbin/surflare_watchdog.sh
 
-# 2. 赋予执行权限
-chmod +x surflare_watchdog.sh
-
-# 3. 安装唤醒钩子（一次性）
-sudo ln -sf "$(pwd)/surflare_watchdog.sh" \
+# Resume hook
+sudo ln -sf /usr/local/sbin/surflare_watchdog.sh \
     /etc/systemd/system-sleep/surflare-resume.sh
+
+# NetworkManager dispatcher hook
+sudo cp 99-surflare-resume /etc/NetworkManager/dispatcher.d/
+sudo chown root:root /etc/NetworkManager/dispatcher.d/99-surflare-resume
+sudo chmod 755 /etc/NetworkManager/dispatcher.d/99-surflare-resume
 ```
 
-## 使用
+## Usage
 
 ```bash
-# 启动 watchdog（后台运行）
-sudo /path/to/surflare_watchdog.sh &
-
-# 停止
-sudo pkill -f surflare_watchdog.sh
-
-# 查看日志
-sudo dmesg | grep surflare
-sudo dmesg -w | grep surflare   # 实时
+sudo systemctl start surflare-watchdog    # start
+sudo systemctl stop surflare-watchdog     # stop
+sudo dmesg | grep surflare_watchdog       # view logs
+sudo dmesg -w | grep surflare_watchdog    # live tail
 ```
 
-## 配置
+## Configuration
 
-编辑脚本顶部的三个变量：
+Edit the variables at the top of `surflare_watchdog.sh`:
 
 ```bash
-NODE="public_16"   # 固定服务器 tag（从 surflare nodes 获取）
-CHECK_INTERVAL=60  # 检测间隔（秒）
-FAIL_THRESHOLD=2   # 连续失败 N 次才触发重连
+NODE="Los Angeles"                # Server node (run: surflare nodes)
+TRANSIT_CANDIDATES="Tokyo Seoul"  # Transit probe list (lowest latency wins)
+CHECK_INTERVAL=30                 # Health check interval (seconds)
+FAIL_THRESHOLD=4                  # Consecutive failures before reconnect
 ```
 
-## 日志示例
+## Log example
 
 ```
-[Apr12 09:01] surflare_watchdog: watchdog 启动，节点: public_16，检测间隔: 60s，失败阈值: 2
-[Apr12 09:03] surflare_watchdog: 出口异常（CN），连续第 2 次
-[Apr12 09:03] surflare_watchdog: 优雅断开，清理 nftables 规则和策略路由...
-[Apr12 09:03] surflare_watchdog: 连接到 public_16（daemon 接管）...
-[Apr12 09:03] surflare_watchdog: 重连后出口: US
+surflare_watchdog: watchdog started: node=Los Angeles interval=30s threshold=4 transient=4
+surflare_watchdog: Probing transit candidate: Tokyo
+surflare_watchdog: Probe Tokyo: 1543ms
+surflare_watchdog: Best transit: Tokyo (1543ms)
+surflare_watchdog: Connecting to Los Angeles mode=global transit=Tokyo (daemon mode)...
+surflare_watchdog: Post-reconnect health: OK
 ```
 
-## 适配发行版
+## Supported distributions
 
-Fedora、Ubuntu、Debian、Arch、openSUSE 等主流 systemd Linux 发行版。
+Any systemd-based Linux: Fedora, Ubuntu, Debian, Arch, openSUSE, etc.
