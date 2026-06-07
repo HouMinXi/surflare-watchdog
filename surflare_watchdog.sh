@@ -321,7 +321,6 @@ check_vpn_health() {
 
 	# Final check after wait: a probe may have written between the last poll and exit
 	if [ -z "$result" ]; then
-		local r_g r_country r_ip
 		r_g=$(cat "$tmp_g" 2>/dev/null)
 		[ "$r_g" = "OK" ] && result="OK"
 		if [ -z "$result" ]; then
