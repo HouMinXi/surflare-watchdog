@@ -38,7 +38,9 @@ LOGIN_RETRIES=5                       # max login attempts per refresh cycle
 LOGIN_RETRY_DELAY=3                   # seconds between login retries
 HEARTBEAT_INTERVAL=600                # seconds between periodic "VPN healthy" log entries (0=off)
 TRANSIENT_THRESHOLD=4                 # consecutive external timeouts (local state OK) before escalating to fail_count
-WIFI_INTERFACE="wlp9s0f0"             # WiFi interface name (used for threaded NAPI check)
+# Auto-detect WiFi interface; fallback to wlp9s0f0 if iw is unavailable
+WIFI_INTERFACE=$(iw dev 2>/dev/null | awk '/Interface/{print $2; exit}')
+[ -z "$WIFI_INTERFACE" ] && WIFI_INTERFACE="wlp9s0f0"
 CRASH_COOLDOWN=60                     # seconds to wait after detecting firmware crash before reconnect
 CRASH_MAX_PER_WINDOW=3                # max crashes in CRASH_WINDOW before extended cooldown
 CRASH_WINDOW=600                      # seconds window for crash rate limiting
