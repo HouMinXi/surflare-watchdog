@@ -43,6 +43,17 @@ cleanup() {
     ip route flush table 100 2>/dev/null || true
 }
 
+trap_cleanup() {
+    local rc=$?
+    log "Signal caught (rc=${rc}), cleaning up..."
+    cleanup
+    log "Restarting surflare-watchdog..."
+    systemctl start surflare-watchdog 2>/dev/null
+    log "Aborted. Output: $OUTDIR"
+    exit "$rc"
+}
+trap trap_cleanup INT TERM
+
 snapshot_state() {
     local outfile="$1"
     {
@@ -258,6 +269,7 @@ log "  5. Read T5 seoul_state_*s.txt -- what does surflare status say over time?
 log "  6. Read final_curl_verbose.txt -- connection refused vs timeout vs SSL?"
 log "============================================"
 log ""
+trap - INT TERM
 log "Restarting surflare-watchdog..."
 systemctl start surflare-watchdog
 log "Done."
