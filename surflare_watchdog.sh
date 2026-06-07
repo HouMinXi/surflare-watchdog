@@ -243,7 +243,7 @@ check_vpn_health() {
 		ip=$(curl -s --connect-timeout 5 --max-time 12 \
 		     'https://icanhazip.com' 2>/dev/null | tr -d '[:space:]')
 		# Validate: must look like an IP (v4 or v6), not an error page
-		if [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || [[ "$ip" =~ : ]]; then
+		if [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || [[ "$ip" =~ :.*: ]]; then
 			echo "IP:${ip}"
 		fi
 	) >"$tmp_ich" 2>/dev/null &
@@ -254,7 +254,7 @@ check_vpn_health() {
 		local ip
 		ip=$(curl -s --connect-timeout 5 --max-time 12 \
 		     'https://myip.wtf/text' 2>/dev/null | tr -d '[:space:]')
-		if [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || [[ "$ip" =~ : ]]; then
+		if [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || [[ "$ip" =~ :.*: ]]; then
 			echo "IP:${ip}"
 		fi
 	) >"$tmp_myip" 2>/dev/null &
@@ -429,6 +429,23 @@ get_cached_transit() {
 
 save_transit_cache() {
 	echo "$1" > "$TRANSIT_CACHE_FILE" 2>/dev/null || true
+}
+
+# Increment _transit_fail_count and reprobe if threshold reached.
+# Call this after any reconnect failure or anomalous post-reconnect health check.
+maybe_reprobe_transit() {
+	_transit_fail_count=$((_transit_fail_count + 1))
+	if [ "$_transit_fail_count" -ge "$TRANSIT_REPROBE_AFTER" ]; then
+		log "Transit fail threshold reached, reprobing..."
+		local new_transit
+		new_transit=$(probe_best_transit)
+		cleanup_probe_state
+		if [ -n "$new_transit" ]; then
+			save_transit_cache "$new_transit"
+			log "Transit cache updated: ${new_transit}"
+		fi
+		_transit_fail_count=0
+	fi
 }
 
 cleanup_probe_state() {
@@ -788,18 +805,8 @@ while true; do
 				_transit_fail_count=0
 			else
 				reconnect_count=$((reconnect_count + 1))
-				_transit_fail_count=$((_transit_fail_count + 1))
-				log "Post-reconnect health check anomalous (reconnect_count=${reconnect_count} transit_fails=${_transit_fail_count})"
-				if [ "$_transit_fail_count" -ge "$TRANSIT_REPROBE_AFTER" ]; then
-					log "Transit fail threshold reached, reprobing..."
-					new_transit=$(probe_best_transit)
-					cleanup_probe_state
-					if [ -n "$new_transit" ]; then
-						save_transit_cache "$new_transit"
-						log "Transit cache updated: ${new_transit}"
-					fi
-					_transit_fail_count=0
-				fi
+				log "Post-reconnect health check anomalous (reconnect_count=${reconnect_count})"
+				maybe_reprobe_transit
 				if [ "$reconnect_count" -ge "$STORM_MAX" ]; then
 					log "Storm protection triggered: cooling for ${STORM_COOLING}s"
 					sleep "$STORM_COOLING" &
@@ -813,18 +820,8 @@ while true; do
 			fi
 		else
 			reconnect_count=$((reconnect_count + 1))
-			_transit_fail_count=$((_transit_fail_count + 1))
-			log "Reconnect attempt failed (reconnect_count=${reconnect_count} transit_fails=${_transit_fail_count})"
-			if [ "$_transit_fail_count" -ge "$TRANSIT_REPROBE_AFTER" ]; then
-				log "Transit fail threshold reached, reprobing..."
-				new_transit=$(probe_best_transit)
-				cleanup_probe_state
-				if [ -n "$new_transit" ]; then
-					save_transit_cache "$new_transit"
-					log "Transit cache updated: ${new_transit}"
-				fi
-				_transit_fail_count=0
-			fi
+			log "Reconnect attempt failed (reconnect_count=${reconnect_count})"
+			maybe_reprobe_transit
 			if [ "$reconnect_count" -ge "$STORM_MAX" ]; then
 				log "Storm protection triggered (connect failure): cooling for ${STORM_COOLING}s"
 				sleep "$STORM_COOLING" &
