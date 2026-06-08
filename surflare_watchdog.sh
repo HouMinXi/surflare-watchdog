@@ -134,6 +134,29 @@ recent_wifi_crash() {
 	} | grep -qE "Hardware restart was requested|NMI_INTERRUPT_UNKNOWN"
 }
 
+_classify_timeout() {
+	# Parse curl timing fields and log which network phase stalled.
+	# Args: $1=label  $2=timing_string (dns:tcp:tls:ttfb:total)
+	local label="$1" timing="$2"
+	local dns tcp tls ttfb
+	IFS=: read -r dns tcp tls ttfb _ <<< "$timing"
+	# shellcheck disable=SC2195  # intentional: match non-numeric
+	case "$dns.$tcp.$tls.$ttfb" in
+		(*[!0-9.]|.|*..*) return ;;
+	esac
+	local stuck="unknown"
+	# shellcheck disable=SC2288  # false positive: awk closing brace in single-quoted string
+	awk -v d="$dns" -v t="$tcp" -v l="$tls" -v f="$ttfb" \
+	'BEGIN{exit !(t+0>0 && l+0<=0)}' && stuck="TCP"
+	awk -v d="$dns" -v t="$tcp" -v l="$tls" -v f="$ttfb" \
+	'BEGIN{exit !(d+0>0 && t+0<=0)}' && stuck="TCP"
+	awk -v d="$dns" -v t="$tcp" -v l="$tls" -v f="$ttfb" \
+	'BEGIN{exit !(l+0>0 && f+0<=0)}' && stuck="TLS"
+	awk -v d="$dns" -v t="$tcp" -v l="$tls" -v f="$ttfb" \
+	'BEGIN{exit !(f+0>0)}' && stuck="TTFB"
+	log "probe timeout ${label}: dns=${dns} tcp=${tcp} tls=${tls} ttfb=${ttfb} stuck=${stuck}"
+}
+
 _crash_timestamps=""
 
 record_crash() {
@@ -191,6 +214,7 @@ check_vpn_health() {
 
 	# Layer 2: parallel external probes -- six run concurrently, first success wins
 	local tmp_g tmp_cf tmp_cf2 tmp_ifc tmp_ich tmp_myip
+	local tmp_gt tmp_cft tmp_cf2t tmp_ifct tmp_icht tmp_myt
 	local pid_g pid_cf pid_cf2 pid_ifc pid_ich pid_myip
 	tmp_g=$(mktemp /tmp/surflare_hc.XXXXXX)
 	tmp_cf=$(mktemp /tmp/surflare_hc.XXXXXX)
@@ -198,40 +222,61 @@ check_vpn_health() {
 	tmp_ifc=$(mktemp /tmp/surflare_hc.XXXXXX)
 	tmp_ich=$(mktemp /tmp/surflare_hc.XXXXXX)
 	tmp_myip=$(mktemp /tmp/surflare_hc.XXXXXX)
+	tmp_gt=$(mktemp /tmp/surflare_hc.XXXXXX)
+	tmp_cft=$(mktemp /tmp/surflare_hc.XXXXXX)
+	tmp_cf2t=$(mktemp /tmp/surflare_hc.XXXXXX)
+	tmp_ifct=$(mktemp /tmp/surflare_hc.XXXXXX)
+	tmp_icht=$(mktemp /tmp/surflare_hc.XXXXXX)
+	tmp_myt=$(mktemp /tmp/surflare_hc.XXXXXX)
 	# Ensure temp files are removed even if this function is interrupted mid-wait.
 	# Stored in a global so the main EXIT trap can also clean up on unclean exit.
-	_hc_tmp="$tmp_g $tmp_cf $tmp_cf2 $tmp_ifc $tmp_ich $tmp_myip"
+	_hc_tmp="$tmp_g $tmp_cf $tmp_cf2 $tmp_ifc $tmp_ich $tmp_myip $tmp_gt $tmp_cft $tmp_cf2t $tmp_ifct $tmp_icht $tmp_myt"
 
 	# Probe 1: Google -- blocked externally -> 200/30x means VPN is working
 	(
-		code=$(curl -s --connect-timeout 5 --max-time 12 \
-		       -o /dev/null -w '%{http_code}' https://www.google.com 2>/dev/null)
+		local _raw
+		_raw=$(curl -s --connect-timeout 5 --max-time 12 \
+		       -o /dev/null \
+		       -w '%{http_code}\n%{time_namelookup}:%{time_connect}:%{time_appconnect}:%{time_starttransfer}:%{time_total}' \
+		       https://www.google.com 2>/dev/null)
+		echo "$_raw" | tail -1 >"$tmp_gt"
+		local code
+		code=$(echo "$_raw" | head -1)
 		case "$code" in 200|301|302) echo "OK" ;; esac
 	) >"$tmp_g" 2>/dev/null &
 	pid_g=$!
 
 	# Probe 2: Cloudflare trace via domain (parse loc= field, no rate limit)
 	(
-		curl -s --connect-timeout 5 --max-time 12 \
-		     'https://cloudflare.com/cdn-cgi/trace' 2>/dev/null \
-		| awk -F= '/^loc=/{print $2}' | tr -d '[:space:]'
+		local _body
+		_body=$(curl -s --connect-timeout 5 --max-time 12 \
+		     -w '\n%{time_namelookup}:%{time_connect}:%{time_appconnect}:%{time_starttransfer}:%{time_total}' \
+		     'https://cloudflare.com/cdn-cgi/trace' 2>/dev/null)
+		echo "$_body" | tail -1 >"$tmp_cft"
+		echo "$_body" | head -n -1 | awk -F= '/^loc=/{print $2}' | tr -d '[:space:]'
 	) >"$tmp_cf" 2>/dev/null &
 	pid_cf=$!
 
 	# Probe 3: Cloudflare trace via IP 1.0.0.1 (skips DNS for cloudflare.com,
 	# uses a different Cloudflare anycast edge -- may succeed when domain probe fails)
 	(
-		curl -s --connect-timeout 5 --max-time 12 \
-		     'https://1.0.0.1/cdn-cgi/trace' 2>/dev/null \
-		| awk -F= '/^loc=/{print $2}' | tr -d '[:space:]'
+		local _body
+		_body=$(curl -s --connect-timeout 5 --max-time 12 \
+		     -w '\n%{time_namelookup}:%{time_connect}:%{time_appconnect}:%{time_starttransfer}:%{time_total}' \
+		     'https://1.0.0.1/cdn-cgi/trace' 2>/dev/null)
+		echo "$_body" | tail -1 >"$tmp_cf2t"
+		echo "$_body" | head -n -1 | awk -F= '/^loc=/{print $2}' | tr -d '[:space:]'
 	) >"$tmp_cf2" 2>/dev/null &
 	pid_cf2=$!
 
 	# Probe 4: ifconfig.co ISO country code (degrades gracefully on rate limit)
 	(
-		curl -s --connect-timeout 5 --max-time 12 \
-		     'https://ifconfig.co/country-iso' 2>/dev/null \
-		| tr -d '[:space:]'
+		local _body
+		_body=$(curl -s --connect-timeout 5 --max-time 12 \
+		     -w '\n%{time_namelookup}:%{time_connect}:%{time_appconnect}:%{time_starttransfer}:%{time_total}' \
+		     'https://ifconfig.co/country-iso' 2>/dev/null)
+		echo "$_body" | tail -1 >"$tmp_ifct"
+		echo "$_body" | head -n -1 | tr -d '[:space:]'
 	) >"$tmp_ifc" 2>/dev/null &
 	pid_ifc=$!
 
@@ -239,9 +284,12 @@ check_vpn_health() {
 	# Cannot determine country directly, but a non-empty response from a externally blocked
 	# CDN proves the tunnel is routing correctly. Caller uses the IP to infer status.
 	(
-		local ip
-		ip=$(curl -s --connect-timeout 5 --max-time 12 \
-		     'https://icanhazip.com' 2>/dev/null | tr -d '[:space:]')
+		local ip _body
+		_body=$(curl -s --connect-timeout 5 --max-time 12 \
+		     -w '\n%{time_namelookup}:%{time_connect}:%{time_appconnect}:%{time_starttransfer}:%{time_total}' \
+		     'https://icanhazip.com' 2>/dev/null)
+		echo "$_body" | tail -1 >"$tmp_icht"
+		ip=$(echo "$_body" | head -n -1 | tr -d '[:space:]')
 		# Validate: must look like an IP (v4 or v6), not an error page
 		if [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || [[ "$ip" =~ :.*: ]]; then
 			echo "IP:${ip}"
@@ -251,9 +299,12 @@ check_vpn_health() {
 
 	# Probe 6: myip.wtf (returns raw IP, lightweight)
 	(
-		local ip
-		ip=$(curl -s --connect-timeout 5 --max-time 12 \
-		     'https://myip.wtf/text' 2>/dev/null | tr -d '[:space:]')
+		local ip _body
+		_body=$(curl -s --connect-timeout 5 --max-time 12 \
+		     -w '\n%{time_namelookup}:%{time_connect}:%{time_appconnect}:%{time_starttransfer}:%{time_total}' \
+		     'https://myip.wtf/text' 2>/dev/null)
+		echo "$_body" | tail -1 >"$tmp_myt"
+		ip=$(echo "$_body" | head -n -1 | tr -d '[:space:]')
 		if [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || [[ "$ip" =~ :.*: ]]; then
 			echo "IP:${ip}"
 		fi
@@ -343,7 +394,21 @@ check_vpn_health() {
 		fi
 	fi
 
-	rm -f "$tmp_g" "$tmp_cf" "$tmp_cf2" "$tmp_ifc" "$tmp_ich" "$tmp_myip"
+	# Diagnostic: classify timeout phase from embedded curl timing
+	if [ -z "$result" ]; then
+		local _t _label
+		for _t in "$tmp_gt:google" "$tmp_cft:cf-domain" "$tmp_cf2t:cf-ip" \
+		          "$tmp_ifct:ifconfig" "$tmp_icht:icanhazip" "$tmp_myt:myip"; do
+			_label="${_t#*:}"
+			_t="${_t%%:*}"
+			local _timing
+			_timing=$(cat "$_t" 2>/dev/null)
+			[ -n "$_timing" ] && _classify_timeout "$_label" "$_timing"
+		done
+	fi
+
+	rm -f "$tmp_g" "$tmp_cf" "$tmp_cf2" "$tmp_ifc" "$tmp_ich" "$tmp_myip" \
+	      "$tmp_gt" "$tmp_cft" "$tmp_cf2t" "$tmp_ifct" "$tmp_icht" "$tmp_myt"
 	_hc_tmp=""
 
 	echo "$result"
@@ -622,6 +687,137 @@ connect_vpn() {
 	return $?
 }
 
+# --- Packet trace integration (conditional nflog capture) ---
+_trace_active=0
+_trace_pcap=""
+_trace_tcpdump_pid=""
+_trace_table="inet watchdog_trace"
+_trace_group=12346
+
+start_packet_trace() {
+	[ "${_trace_active:-0}" -eq 1 ] && return 0
+
+	local ts
+	ts=$(date +%Y%m%d_%H%M%S)
+	_trace_pcap="/tmp/surflare_watchdog_${ts}.pcap"
+
+	# Clean stale pcaps (keep last 5, delete older than 30 min)
+	find /tmp -name 'surflare_watchdog_*.pcap' -mmin +30 -delete 2>/dev/null || true
+	find /tmp -name 'surflare_watchdog_*.pcap.err' -mmin +30 -delete 2>/dev/null || true
+
+	# Defensive cleanup: remove orphaned table from previous SIGKILL
+	nft delete table "$_trace_table" 2>/dev/null || true
+
+	# Resolve probe destination IPs (same hosts as check_vpn_health)
+	local probe_ips="" ip ips ip_set=""
+	for host in google.com www.google.com 1.1.1.1 1.0.0.1 \
+	            ifconfig.co icanhazip.com myip.wtf; do
+		ips=$(getent ahosts "$host" 2>/dev/null | \
+		      awk '{print $1}' | sort -u || true)
+		[ -n "$ips" ] && probe_ips="$probe_ips $ips"
+	done
+	probe_ips=$(echo "$probe_ips" | tr ' ' '\n' | sort -u | tr '\n' ' ')
+
+	if [ -z "$probe_ips" ]; then
+		log "Packet trace: cannot resolve any probe IPs, skipping"
+		return 1
+	fi
+
+	for ip in $probe_ips; do
+		ip_set="${ip_set:+$ip_set, }$ip"
+	done
+
+	# Bitwise OR preserves surflare's fwmark 0x1 for VPN routing
+	if ! nft -f - <<EOF
+table $_trace_table {
+    chain output {
+        type filter hook output priority mangle;
+        ip daddr { $ip_set } tcp dport { 80, 443 } mark set mark | 0xface ct mark set ct mark | 0xface
+        mark 0xface log prefix "WD_TRACE_OUT" group $_trace_group
+    }
+    chain input {
+        type filter hook input priority mangle;
+        ct mark 0xface log prefix "WD_TRACE_IN" group $_trace_group
+    }
+}
+EOF
+	then
+		log "Packet trace: nft rule install failed"
+		return 1
+	fi
+
+	# Ring buffer: max 2MB x 3 files = 6MB hard cap
+	tcpdump -i "nflog:$_trace_group" -w "$_trace_pcap" \
+		-C 2 -W 3 2>"${_trace_pcap}.err" &
+	_trace_tcpdump_pid=$!
+
+	local ready=0
+	for _ in $(seq 1 20); do
+		if kill -0 "$_trace_tcpdump_pid" 2>/dev/null; then
+			ready=1; break
+		fi
+		sleep 0.1
+	done
+
+	if [ "$ready" -eq 1 ]; then
+		_trace_active=1
+		log "Packet trace started: pcap=$_trace_pcap"
+	else
+		log "Packet trace failed to start (tcpdump error)"
+		nft delete table "$_trace_table" 2>/dev/null || true
+		_trace_active=0
+	fi
+}
+
+stop_packet_trace() {
+	[ "${_trace_active:-0}" -eq 0 ] && return 0
+
+	if [ -n "${_trace_tcpdump_pid:-}" ]; then
+		kill "$_trace_tcpdump_pid" 2>/dev/null || true
+		local waited=0
+		while kill -0 "$_trace_tcpdump_pid" 2>/dev/null && [ $waited -lt 20 ]; do
+			sleep 0.1; waited=$((waited + 1))
+		done
+		kill -0 "$_trace_tcpdump_pid" 2>/dev/null && \
+			kill -9 "$_trace_tcpdump_pid" 2>/dev/null || true
+	fi
+
+	nft delete table "$_trace_table" 2>/dev/null || true
+	_trace_active=0
+	log "Packet trace stopped: pcap=$_trace_pcap"
+}
+
+_manage_trace() {
+	local health="$1"
+	local is_healthy=0
+	case "$health" in
+		OK|TUNNEL_OK) is_healthy=1 ;;
+		"") ;;
+		LOCAL_FAIL|CN) ;;
+		*) ;;  # unknown: do not assume healthy
+	esac
+
+	if [ "$is_healthy" -eq 1 ]; then
+		[ "${_trace_active:-0}" -eq 1 ] && stop_packet_trace
+		return 0
+	fi
+
+	# LOCAL_FAIL: VPN process dead, start trace directly
+	if [ "$health" = "LOCAL_FAIL" ]; then
+		[ "${_trace_active:-0}" -eq 0 ] && start_packet_trace
+	fi
+	# CN and "": caller handles fail_count logic, start on first failure
+}
+
+_check_trace_alive() {
+	[ "${_trace_active:-0}" -eq 0 ] && return 0
+	if ! kill -0 "$_trace_tcpdump_pid" 2>/dev/null; then
+		log "WARNING: tcpdump died (PID $_trace_tcpdump_pid), cleaning up"
+		nft delete table "$_trace_table" 2>/dev/null || true
+		_trace_active=0
+	fi
+}
+
 # === Wake hook mode (called by systemd-sleep with $1=pre|post) ===
 if [ "$1" = "pre" ]; then
 	exit 0 # Nothing to do before sleep
@@ -670,10 +866,19 @@ fi
 # _hc_tmp: health-check temp files -- cleaned on SIGTERM in case wait is interrupted
 storm_sleep_pid=""
 _hc_tmp=""
-trap 'log "watchdog stopped"; [ -n "$storm_sleep_pid" ] && kill "$storm_sleep_pid" 2>/dev/null; [ -n "$_hc_tmp" ] && rm -f $_hc_tmp; rm -f "$PIDFILE"; exit 0' INT TERM
-trap '[ -n "$_hc_tmp" ] && rm -f $_hc_tmp; rm -f "$PIDFILE"' EXIT
+cleanup() {
+	stop_packet_trace >/dev/null 2>&1
+	[ -n "$storm_sleep_pid" ] && kill "$storm_sleep_pid" 2>/dev/null
+	[ -n "$_hc_tmp" ] && rm -f $_hc_tmp
+	rm -f "$PIDFILE"
+}
+trap 'log "watchdog stopped"; cleanup; exit 0' INT TERM
+trap 'cleanup' EXIT
 echo $$ >"$PIDFILE"
 taskset -pc 0 $$ >/dev/null 2>&1 || true
+
+# Clean up orphaned trace table from previous SIGKILL
+nft delete table inet watchdog_trace 2>/dev/null || true
 
 fail_count=0
 reconnect_count=0
@@ -701,6 +906,7 @@ while true; do
 			continue
 		fi
 		log "Firmware stable, triggering VPN reconnect"
+		[ "${_trace_active:-0}" -eq 0 ] && start_packet_trace
 		connect_vpn
 		rc=$?
 		if [ "$rc" -eq 2 ]; then
@@ -713,6 +919,7 @@ while true; do
 			reconnect_count=$((reconnect_count + 1))
 			log "Post-crash reconnect failed (reconnect_count=${reconnect_count})"
 			if [ "$reconnect_count" -ge "$STORM_MAX" ]; then
+				stop_packet_trace >/dev/null 2>&1
 				log "Storm protection triggered (post-crash): cooling for ${STORM_COOLING}s"
 				sleep "$STORM_COOLING" &
 				storm_sleep_pid=$!; wait "$storm_sleep_pid"; storm_sleep_pid=""
@@ -781,6 +988,9 @@ while true; do
 		fi
 	fi
 
+	_manage_trace "$health"
+	_check_trace_alive
+
 	# -- Shared reconnect path -----------------------------------------------
 	# Triggered by: LOCAL_FAIL (immediate), CN failure, or transient escalation
 	if [ "$fail_count" -ge "$FAIL_THRESHOLD" ]; then
@@ -798,6 +1008,7 @@ while true; do
 			log "Post-reconnect health: ${new_health:-failed}"
 			if [ "$new_health" = "OK" ] || \
 			   { [ "$new_health" != "CN" ] && [ "$new_health" != "LOCAL_FAIL" ] && [ -n "$new_health" ]; }; then
+				stop_packet_trace >/dev/null 2>&1
 				fail_count=0
 				reconnect_count=0
 				transient_count=0
@@ -807,6 +1018,7 @@ while true; do
 				log "Post-reconnect health check anomalous (reconnect_count=${reconnect_count})"
 				maybe_reprobe_transit
 				if [ "$reconnect_count" -ge "$STORM_MAX" ]; then
+					stop_packet_trace >/dev/null 2>&1
 					log "Storm protection triggered: cooling for ${STORM_COOLING}s"
 					sleep "$STORM_COOLING" &
 					storm_sleep_pid=$!
@@ -822,6 +1034,7 @@ while true; do
 			log "Reconnect attempt failed (reconnect_count=${reconnect_count})"
 			maybe_reprobe_transit
 			if [ "$reconnect_count" -ge "$STORM_MAX" ]; then
+				stop_packet_trace >/dev/null 2>&1
 				log "Storm protection triggered (connect failure): cooling for ${STORM_COOLING}s"
 				sleep "$STORM_COOLING" &
 				storm_sleep_pid=$!
