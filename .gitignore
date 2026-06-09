@@ -1,2 +1,4 @@
 # Runtime lock file (created in /run, not tracked)
 *.lock
+.idea/
+.worktrees/

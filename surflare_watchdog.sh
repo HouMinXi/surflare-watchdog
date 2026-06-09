@@ -17,8 +17,8 @@
 
 NODE="Los Angeles"                    # Set to your node tag (run: surflare nodes)
 NODE_CANDIDATES=("Los Angeles" "Dallas" "Atlanta" "Seoul" "Chicago" "Miami" "New York")
-MODE="rule"                         # Connection mode: global, rule, direct
-TRANSIT=""                            # Transit server for multi-hop: auto, or "" to disable
+MODE="global"                         # Connection mode: global, rule, direct
+TRANSIT="auto"                            # Transit server for multi-hop: auto, or "" to disable
 TRANSIT_CANDIDATES="Tokyo Seoul"            # Ordered probe list; connect_vpn picks lowest-latency
 TRANSIT_CONNECT_TIMEOUT=12             # max seconds for surflare connect per candidate
 TRANSIT_ROUTE_READY_TIMEOUT=15        # max seconds to poll for routing readiness after connect
@@ -74,7 +74,7 @@ umask 0177
 #   flock         -> util-linux   (all major distros)
 #   surflare/surflare-proxy -> from surflare installation
 # Note: nm-online is optional (NetworkManager package); falls back to sleep 15s.
-for cmd in curl killall pgrep flock surflare surflare-proxy; do
+for cmd in curl killall pgrep flock surflare surflare-proxy python3; do
 	if ! command -v "$cmd" >/dev/null 2>&1; then
 		printf '<3>surflare_watchdog: missing dependency: %s, exiting\n' "$cmd" >/dev/kmsg
 		exit 1
@@ -103,6 +103,103 @@ check_vpn_local_state() {
 
 PROXY_CPU_SET=""
 DESKTOP_CPU_SET=""
+
+_dns_fallback_active=0
+_dns_fallback_gw=""
+DNS_STUCK_FILE="/run/surflare_dns_stuck"
+
+_cleanup_dns_fallback_rules() {
+	local gw="${1:-}"
+	[ -z "$gw" ] && return 0
+	local h removed=0
+	for h in $(nft -a list chain inet surflare output 2>/dev/null \
+		| grep -E "ip daddr ${gw//./\\.} (tcp|udp) dport 53 accept" | grep -oP 'handle \K[0-9]+'); do
+		if ! nft delete rule inet surflare output handle "$h" 2>/dev/null; then
+			log "DNS fallback: WARN: failed to delete handle ${h}"
+		fi
+		removed=$((removed + 1))
+	done
+	return 0
+}
+
+_insert_dns_fallback() {
+	local gw handle
+	gw=$(ip route show default | awk '/default/{print $3; exit}')
+	[ -z "$gw" ] && return 0
+	[[ "$gw" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 0
+	if [ "$_dns_fallback_active" -eq 1 ]; then
+		if nft -a list chain inet surflare output 2>/dev/null \
+			| grep -qE "ip daddr ${gw//./\\.} (tcp|udp) dport 53 accept"; then
+			return 0
+		fi
+		_dns_fallback_active=0
+	fi
+	_cleanup_dns_fallback_rules "$gw"
+	handle=$(nft -a list chain inet surflare output 2>/dev/null \
+		| grep 'dport 53 meta mark set' | head -1 | grep -oP 'handle \K[0-9]+')
+	if [ -z "$handle" ]; then
+		log "DNS fallback: WARN: no dport 53 mark rule found in inet surflare"
+		return 0
+	fi
+	if nft insert rule inet surflare output position "$handle" ip daddr "$gw" udp dport 53 accept 2>/dev/null &&
+	   nft insert rule inet surflare output position "$handle" ip daddr "$gw" tcp dport 53 accept 2>/dev/null; then
+		_dns_fallback_active=1
+		_dns_fallback_gw="$gw"
+		log "DNS fallback: exempted gateway ${gw}:53 from tproxy"
+	else
+		_cleanup_dns_fallback_rules "$gw"
+		log "DNS fallback: WARN: nft insert failed, cleaned partial rules"
+	fi
+}
+
+_remove_dns_fallback() {
+	[ "$_dns_fallback_active" -eq 0 ] && return 0
+	local gw="${_dns_fallback_gw:-}"
+	[ -z "$gw" ] && gw=$(ip route show default | awk '/default/{print $3; exit}')
+	[ -z "$gw" ] && return 0
+	_cleanup_dns_fallback_rules "$gw"
+	_dns_fallback_active=0
+	_dns_fallback_gw=""
+	log "DNS fallback: restored tunnel DNS"
+}
+
+_startup_cleanup_dns_fallback() {
+	local gw
+	gw=$(ip route show default | awk '/default/{print $3; exit}')
+	[ -z "$gw" ] && return 0
+	_cleanup_dns_fallback_rules "$gw"
+	_dns_fallback_active=0
+	_dns_fallback_gw=""
+	rm -f "$DNS_STUCK_FILE"
+}
+
+CONTROL_PROBE_TARGETS="114.114.114.114:53 223.5.5.5:53"
+CONTROL_PROBE_TIMEOUT=3
+
+_control_probe() {
+	local target ip port
+	for target in $CONTROL_PROBE_TARGETS; do
+		IFS=: read -r ip port <<< "$target"
+		if timeout $((CONTROL_PROBE_TIMEOUT + 1)) python3 -c "
+import socket
+s=socket.socket(socket.AF_INET,socket.SOCK_STREAM)
+s.setsockopt(socket.SOL_SOCKET,socket.SO_MARK,0xff)
+s.settimeout($CONTROL_PROBE_TIMEOUT)
+rc=1
+try:
+ s.connect(('$ip',$port))
+ rc=0
+except Exception:
+ pass
+finally:
+ s.close()
+raise SystemExit(rc)
+" 2>/dev/null; then
+			return 0
+		fi
+	done
+	return 1
+}
 
 compute_proxy_affinity() {
 	local total proxy_count first_proxy
@@ -209,6 +306,7 @@ crash_rate_exceeded() {
 # killed and the result is returned immediately. This avoids waiting the full
 # max-time when at least one probe succeeds quickly.
 check_vpn_health() {
+	echo 0 > "$DNS_STUCK_FILE" 2>/dev/null || true
 	# Layer 1: local state -- deterministic, milliseconds, no network dependency
 	if ! check_vpn_local_state; then
 		echo "LOCAL_FAIL"
@@ -401,7 +499,7 @@ check_vpn_health() {
 	if [ -z "$result" ]; then
 		local _t _label
 		local all_tcp_stuck=1  # assume TCP-stuck until proven otherwise
-		local has_timing=0
+		local has_timing=0 unknown_count=0
 		for _t in "$tmp_gt:google" "$tmp_cft:cf-domain" "$tmp_cf2t:cf-ip" \
 		          "$tmp_ifct:ifconfig" "$tmp_icht:icanhazip" "$tmp_myt:myip"; do
 			_label="${_t#*:}"
@@ -413,6 +511,7 @@ check_vpn_health() {
 				local _stuck
 				_stuck=$(_classify_timeout "$_label" "$_timing")
 				[ "$_stuck" != "TCP" ] && all_tcp_stuck=0
+				[ "$_stuck" = "unknown" ] && unknown_count=$((unknown_count + 1))
 			else
 				all_tcp_stuck=0
 			fi
@@ -423,6 +522,7 @@ check_vpn_health() {
 		if [ "$has_timing" -eq 1 ] && [ "$all_tcp_stuck" -eq 1 ]; then
 			result="TCP_BLOCK"
 		fi
+		echo "$unknown_count" > "$DNS_STUCK_FILE" 2>/dev/null || true
 	fi
 
 	rm -f "$tmp_g" "$tmp_cf" "$tmp_cf2" "$tmp_ifc" "$tmp_ich" "$tmp_myip" \
@@ -476,7 +576,7 @@ refresh_auth() {
 
 	local i=0 rc=1
 	while [ "$i" -lt "$LOGIN_RETRIES" ]; do
-		if timeout 15 surflare login -u "$email" -p "$password" --remember >/dev/null 2>&1; then
+		if timeout 15 surflare login -u "$email" -p "$password" >/dev/null 2>&1; then
 			log "Auth token refreshed successfully (attempt $((i + 1))/${LOGIN_RETRIES})"
 			rc=0
 			break
@@ -695,6 +795,7 @@ connect_vpn() {
 		fi
 
 		compute_proxy_affinity
+		_remove_dns_fallback
 		local proxy_pid
 		proxy_pid=$(pgrep -x surflare-proxy | head -1)
 		if [ -n "$proxy_pid" ] && [ -n "$PROXY_CPU_SET" ]; then
@@ -909,6 +1010,7 @@ taskset -pc 0 $$ >/dev/null 2>&1 || true
 
 # Clean up orphaned trace table from previous SIGKILL
 nft delete table inet watchdog_trace 2>/dev/null || true
+_startup_cleanup_dns_fallback
 
 fail_count=0
 reconnect_count=0
@@ -966,11 +1068,13 @@ while true; do
 			fail_count=0
 			reconnect_count=0
 			transient_count=0
+			_remove_dns_fallback
 		else
 			reconnect_count=$((reconnect_count + 1))
 			log "Post-crash reconnect failed (reconnect_count=${reconnect_count})"
 			if [ "$reconnect_count" -ge "$STORM_MAX" ]; then
 				stop_packet_trace >/dev/null 2>&1
+				_remove_dns_fallback
 				log "Storm protection triggered (post-crash): cooling for ${STORM_COOLING}s"
 				sleep "$STORM_COOLING" &
 				storm_sleep_pid=$!; wait "$storm_sleep_pid"; storm_sleep_pid=""
@@ -1002,13 +1106,15 @@ while true; do
 		fail_count=$FAIL_THRESHOLD
 
 	elif [ "$health" = "TCP_BLOCK" ]; then
-		# All probes timed out at TCP or TLS-handshake phase -- DPI block detected.
-		# reconnect_count is intentionally not reset here so storm protection still applies
-		# if TCP_BLOCK fires repeatedly (matching LOCAL_FAIL behaviour).
-		_rotate_node
-		log "Health check TCP block (all probes stuck at TCP layer), triggering immediate reconnect"
-		transient_count=0
-		fail_count=$FAIL_THRESHOLD
+		if _control_probe; then
+			_rotate_node
+			log "Health check TCP block (tunnel confirmed, local network OK), triggering reconnect"
+			transient_count=0
+			fail_count=$FAIL_THRESHOLD
+		else
+			transient_count=$((transient_count + 1))
+			log "Health check TCP block but local network also down, treating as transient ${transient_count}/${TRANSIENT_THRESHOLD}"
+		fi
 
 	elif [ "$health" = "OK" ] || \
 	     { [ "$health" != "CN" ] && [ "$health" != "LOCAL_FAIL" ] && [ "$health" != "TCP_BLOCK" ] && [ -n "$health" ]; }; then
@@ -1016,6 +1122,7 @@ while true; do
 		fail_count=0
 		reconnect_count=0
 		transient_count=0
+		_remove_dns_fallback
 
 		# Proactive token refresh -- runs whenever VPN is confirmed healthy so tokens stay
 		# fresh for reconnects. Covers both Google-OK and country-probe-fallback paths.
@@ -1048,11 +1155,18 @@ while true; do
 		# This is a transient network spike, not a definitive VPN failure.
 		transient_count=$((transient_count + 1))
 		log "Health check transient timeout (local state OK), transient ${transient_count}/${TRANSIENT_THRESHOLD}"
+		if [ "$transient_count" -ge 2 ] && [ "$(cat "$DNS_STUCK_FILE" 2>/dev/null || echo 0)" -ge 4 ]; then
+			_insert_dns_fallback
+		fi
 		if [ "$transient_count" -ge "$TRANSIENT_THRESHOLD" ]; then
-			# Too many consecutive transients -- escalate in case of silent L3 breakage
-			fail_count=$((fail_count + 1))
-			transient_count=0
-			log "Transient threshold reached, escalating to fail_count: ${fail_count}"
+			if _control_probe; then
+				fail_count=$((fail_count + 1))
+				transient_count=0
+				log "Transient threshold reached (local network OK), escalating to fail_count: ${fail_count}"
+			else
+				transient_count=0
+				log "Transient threshold reached but local network down, resetting (not escalating)"
+			fi
 		fi
 	fi
 
@@ -1081,12 +1195,14 @@ while true; do
 				reconnect_count=0
 				transient_count=0
 				_transit_fail_count=0
+				_remove_dns_fallback
 			else
 				reconnect_count=$((reconnect_count + 1))
 				log "Post-reconnect health check anomalous (reconnect_count=${reconnect_count})"
 				maybe_reprobe_transit
 				if [ "$reconnect_count" -ge "$STORM_MAX" ]; then
 					stop_packet_trace >/dev/null 2>&1
+					_remove_dns_fallback
 					log "Storm protection triggered: cooling for ${STORM_COOLING}s"
 					sleep "$STORM_COOLING" & storm_sleep_pid=$!; wait "$storm_sleep_pid"; storm_sleep_pid=""
 					reconnect_count=0
@@ -1100,6 +1216,7 @@ while true; do
 			maybe_reprobe_transit
 			if [ "$reconnect_count" -ge "$STORM_MAX" ]; then
 				stop_packet_trace >/dev/null 2>&1
+				_remove_dns_fallback
 				log "Storm protection triggered (connect failure): cooling for ${STORM_COOLING}s"
 				sleep "$STORM_COOLING" & storm_sleep_pid=$!; wait "$storm_sleep_pid"; storm_sleep_pid=""
 				reconnect_count=0
