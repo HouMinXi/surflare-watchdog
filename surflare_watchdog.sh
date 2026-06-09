@@ -16,8 +16,8 @@
 # View logs    : sudo dmesg | grep surflare_watchdog
 
 NODE="Los Angeles"                    # Set to your node tag (run: surflare nodes)
-NODE_CANDIDATES=("Los Angeles" "Dallas" "Atlanta" "Chicago" "Miami" "New York")
-MODE="global"                         # Connection mode: global, rule, direct
+NODE_CANDIDATES=("Los Angeles" "Dallas" "Atlanta" "Seoul" "Chicago" "Miami" "New York")
+MODE="rule"                         # Connection mode: global, rule, direct
 TRANSIT=""                            # Transit server for multi-hop: auto, or "" to disable
 TRANSIT_CANDIDATES="Tokyo Seoul"            # Ordered probe list; connect_vpn picks lowest-latency
 TRANSIT_CONNECT_TIMEOUT=12             # max seconds for surflare connect per candidate
@@ -27,6 +27,7 @@ CHECK_INTERVAL=30                     # Exit IP check interval in seconds
 FAIL_THRESHOLD=4                      # Consecutive failures before reconnect
 LOCK_FILE=/run/surflare_watchdog.lock # Mutex lock to prevent concurrent reconnects
 PIDFILE=/run/surflare_watchdog.pid    # PID file for reliable daemon shutdown
+ROTATION_STATE=/var/tmp/surflare_rotation  # Persists active node across restarts
 DISCONNECT_SETTLE=2                   # seconds after surflare disconnect before killing processes
 CONNECT_SETTLE=10                     # seconds after surflare connect --daemon for VPN to establish
 NETWORK_WAIT_FALLBACK=15              # seconds to wait for network when nm-online is unavailable
@@ -622,6 +623,7 @@ _rotate_node() {
 	_node_idx=$(( (_node_idx + 1) % n ))
 	_active_node="${NODE_CANDIDATES[$_node_idx]}"
 	log "Node rotation: ${prev} -> ${_active_node} ($((_node_idx + 1))/${n})"
+	printf '%s\t%d\n' "$_active_node" "$_node_idx" > "$ROTATION_STATE" 2>/dev/null || true
 }
 
 connect_vpn() {
@@ -915,7 +917,26 @@ last_refresh=$(date +%s)
 last_heartbeat=$(date +%s)
 _active_node="$NODE"
 _node_idx=0
-log "watchdog started: node=${NODE} candidates=${#NODE_CANDIDATES[@]} interval=${CHECK_INTERVAL}s threshold=${FAIL_THRESHOLD} transient=${TRANSIENT_THRESHOLD}"
+if [ -f "$ROTATION_STATE" ]; then
+	IFS=$'\t' read -r _saved_node _saved_idx < "$ROTATION_STATE" 2>/dev/null || true
+	if [ -n "$_saved_node" ] && [ -n "$_saved_idx" ]; then
+		_valid=0
+		for _i in "${!NODE_CANDIDATES[@]}"; do
+			if [ "${NODE_CANDIDATES[$_i]}" = "$_saved_node" ]; then
+				_valid=1
+				break
+			fi
+		done
+		if [ "$_valid" -eq 1 ]; then
+			_active_node="$_saved_node"
+			_node_idx="$_saved_idx"
+			log "Restored rotation state: ${_active_node} ($((_node_idx + 1))/${#NODE_CANDIDATES[@]})"
+		else
+			log "Saved node '${_saved_node}' not in NODE_CANDIDATES, starting from ${NODE}"
+		fi
+	fi
+fi
+log "watchdog started: node=${_active_node} candidates=${#NODE_CANDIDATES[@]} interval=${CHECK_INTERVAL}s threshold=${FAIL_THRESHOLD} transient=${TRANSIENT_THRESHOLD}"
 
 while true; do
 	if recent_wifi_crash 120; then
