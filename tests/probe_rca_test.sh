@@ -44,6 +44,7 @@ cleanup() {
 }
 
 trap_cleanup() {
+    trap - EXIT INT TERM
     local rc=$?
     log "Signal caught (rc=${rc}), cleaning up..."
     cleanup
@@ -52,7 +53,7 @@ trap_cleanup() {
     log "Aborted. Output: $OUTDIR"
     exit "$rc"
 }
-trap trap_cleanup INT TERM
+trap trap_cleanup EXIT INT TERM
 
 snapshot_state() {
     local outfile="$1"
@@ -269,9 +270,9 @@ log "  5. Read T5 seoul_state_*s.txt -- what does surflare status say over time?
 log "  6. Read final_curl_verbose.txt -- connection refused vs timeout vs SSL?"
 log "============================================"
 log ""
-trap - INT TERM
 log "Restarting surflare-watchdog..."
 systemctl start surflare-watchdog
+trap - EXIT INT TERM
 log "Done."
 echo ""
 echo "Output: $OUTDIR"

@@ -929,7 +929,7 @@ if [ -f "$ROTATION_STATE" ]; then
 		done
 		if [ "$_valid" -eq 1 ]; then
 			_active_node="$_saved_node"
-			_node_idx="$_saved_idx"
+			_node_idx="$_i"
 			log "Restored rotation state: ${_active_node} ($((_node_idx + 1))/${#NODE_CANDIDATES[@]})"
 		else
 			log "Saved node '${_saved_node}' not in NODE_CANDIDATES, starting from ${NODE}"
@@ -1003,7 +1003,7 @@ while true; do
 		fail_count=$FAIL_THRESHOLD
 
 	elif [ "$health" = "OK" ] || \
-	     { [ "$health" != "CN" ] && [ "$health" != "LOCAL_FAIL" ] && [ -n "$health" ]; }; then
+	     { [ "$health" != "CN" ] && [ "$health" != "LOCAL_FAIL" ] && [ "$health" != "TCP_BLOCK" ] && [ -n "$health" ]; }; then
 		# VPN healthy -- Google 200/30x (tunnel working) OR country probe returned non-CN country
 		fail_count=0
 		reconnect_count=0
@@ -1067,7 +1067,7 @@ while true; do
 			new_health=$(check_vpn_health)
 			log "Post-reconnect health: ${new_health:-failed}"
 			if [ "$new_health" = "OK" ] || \
-			   { [ "$new_health" != "CN" ] && [ "$new_health" != "LOCAL_FAIL" ] && [ -n "$new_health" ]; }; then
+			   { [ "$new_health" != "CN" ] && [ "$new_health" != "LOCAL_FAIL" ] && [ "$new_health" != "TCP_BLOCK" ] && [ -n "$new_health" ]; }; then
 				stop_packet_trace >/dev/null 2>&1
 				fail_count=0
 				reconnect_count=0
