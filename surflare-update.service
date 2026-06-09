@@ -1,0 +1,8 @@
+[Unit]
+Description=Surflare auto-update check
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/surflare-update.sh
