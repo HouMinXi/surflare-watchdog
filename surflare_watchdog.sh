@@ -16,6 +16,7 @@
 # View logs    : sudo dmesg | grep surflare_watchdog
 
 NODE="Los Angeles"                    # Set to your node tag (run: surflare nodes)
+NODE_CANDIDATES=("Los Angeles" "Dallas" "Atlanta" "Chicago" "Miami" "New York")
 MODE="global"                         # Connection mode: global, rule, direct
 TRANSIT=""                            # Transit server for multi-hop: auto, or "" to disable
 TRANSIT_CANDIDATES="Tokyo Seoul"            # Ordered probe list; connect_vpn picks lowest-latency
@@ -155,6 +156,7 @@ _classify_timeout() {
 	awk -v d="$dns" -v t="$tcp" -v l="$tls" -v f="$ttfb" \
 	'BEGIN{exit !(f+0>0)}' && stuck="TTFB"
 	log "probe timeout ${label}: dns=${dns} tcp=${tcp} tls=${tls} ttfb=${ttfb} stuck=${stuck}"
+	echo "$stuck"  # return value: callers must use $() to capture
 }
 
 _crash_timestamps=""
@@ -397,14 +399,29 @@ check_vpn_health() {
 	# Diagnostic: classify timeout phase from embedded curl timing
 	if [ -z "$result" ]; then
 		local _t _label
+		local all_tcp_stuck=1  # assume TCP-stuck until proven otherwise
+		local has_timing=0
 		for _t in "$tmp_gt:google" "$tmp_cft:cf-domain" "$tmp_cf2t:cf-ip" \
 		          "$tmp_ifct:ifconfig" "$tmp_icht:icanhazip" "$tmp_myt:myip"; do
 			_label="${_t#*:}"
 			_t="${_t%%:*}"
 			local _timing
 			_timing=$(cat "$_t" 2>/dev/null)
-			[ -n "$_timing" ] && _classify_timeout "$_label" "$_timing"
+			if [ -n "$_timing" ]; then
+				has_timing=1
+				local _stuck
+				_stuck=$(_classify_timeout "$_label" "$_timing")
+				[ "$_stuck" != "TCP" ] && all_tcp_stuck=0
+			else
+				all_tcp_stuck=0
+			fi
 		done
+		# Known edge: local DNS cache + total WiFi loss can mimic TCP_BLOCK
+		# (dns>0 from cache, tcp=0 from no connectivity). Benign: reconnect
+		# fails fast, storm protection caps at STORM_MAX attempts.
+		if [ "$has_timing" -eq 1 ] && [ "$all_tcp_stuck" -eq 1 ]; then
+			result="TCP_BLOCK"
+		fi
 	fi
 
 	rm -f "$tmp_g" "$tmp_cf" "$tmp_cf2" "$tmp_ifc" "$tmp_ich" "$tmp_myip" \
@@ -533,7 +550,7 @@ probe_best_transit() {
 	for node in $TRANSIT_CANDIDATES; do
 		log "Probing transit candidate: ${node}"
 		if ! timeout "$TRANSIT_CONNECT_TIMEOUT" surflare connect \
-			--node "$NODE" --mode "${MODE:-global}" \
+			--node "${_active_node:-$NODE}" --mode "${MODE:-global}" \
 			--transit "$node" --daemon >/dev/null 2>&1; then
 			log "Probe ${node}: connect failed"
 			cleanup_probe_state
@@ -596,6 +613,17 @@ probe_best_transit() {
 	echo "$best_node"
 }
 
+_rotate_node() {
+	local n=${#NODE_CANDIDATES[@]}
+	if [ "$n" -le 1 ]; then
+		return
+	fi
+	local prev="${_active_node}"
+	_node_idx=$(( (_node_idx + 1) % n ))
+	_active_node="${NODE_CANDIDATES[$_node_idx]}"
+	log "Node rotation: ${prev} -> ${_active_node} ($((_node_idx + 1))/${n})"
+}
+
 connect_vpn() {
 	# flock prevents concurrent calls from watchdog loop and systemd-sleep post hook
 	(
@@ -648,8 +676,9 @@ connect_vpn() {
 			log "Using transit: ${effective_transit} (from cache or first candidate)"
 		fi
 
-		log "Connecting to ${NODE} mode=${MODE:-global} transit=${effective_transit:-off} (daemon mode)..."
-		if ! surflare connect --node "$NODE" \
+		local use_node="${_active_node:-$NODE}"
+		log "Connecting to ${use_node} mode=${MODE:-global} transit=${effective_transit:-off} (daemon mode)..."
+		if ! surflare connect --node "$use_node" \
 			${MODE:+--mode "$MODE"} \
 			${effective_transit:+--transit "$effective_transit"} \
 			--daemon 9>&-; then
@@ -802,8 +831,7 @@ _manage_trace() {
 		return 0
 	fi
 
-	# LOCAL_FAIL: VPN process dead, start trace directly
-	if [ "$health" = "LOCAL_FAIL" ]; then
+	if [ "$health" = "LOCAL_FAIL" ] || [ "$health" = "TCP_BLOCK" ]; then
 		[ "${_trace_active:-0}" -eq 0 ] && start_packet_trace
 	fi
 	# CN and "": caller handles fail_count logic, start on first failure
@@ -869,6 +897,7 @@ _hc_tmp=""
 cleanup() {
 	stop_packet_trace >/dev/null 2>&1
 	[ -n "$storm_sleep_pid" ] && kill "$storm_sleep_pid" 2>/dev/null
+	# shellcheck disable=SC2086
 	[ -n "$_hc_tmp" ] && rm -f $_hc_tmp
 	rm -f "$PIDFILE"
 }
@@ -885,7 +914,9 @@ reconnect_count=0
 transient_count=0
 last_refresh=$(date +%s)
 last_heartbeat=$(date +%s)
-log "watchdog started: node=${NODE} interval=${CHECK_INTERVAL}s threshold=${FAIL_THRESHOLD} transient=${TRANSIENT_THRESHOLD}"
+_active_node="$NODE"
+_node_idx=0
+log "watchdog started: node=${NODE} candidates=${#NODE_CANDIDATES[@]} interval=${CHECK_INTERVAL}s threshold=${FAIL_THRESHOLD} transient=${TRANSIENT_THRESHOLD}"
 
 while true; do
 	if recent_wifi_crash 120; then
@@ -939,6 +970,15 @@ while true; do
 		# Local VPN state lost (process/nftables/routing gone) -- definitive failure,
 		# no network uncertainty. Skip accumulation and force reconnect immediately.
 		log "Local VPN state lost (process/nftables/routing), triggering immediate reconnect"
+		transient_count=0
+		fail_count=$FAIL_THRESHOLD
+
+	elif [ "$health" = "TCP_BLOCK" ]; then
+		# All probes timed out at TCP or TLS-handshake phase -- DPI block detected.
+		# reconnect_count is intentionally not reset here so storm protection still applies
+		# if TCP_BLOCK fires repeatedly (matching LOCAL_FAIL behaviour).
+		_rotate_node
+		log "Health check TCP block (all probes stuck at TCP layer), triggering immediate reconnect"
 		transient_count=0
 		fail_count=$FAIL_THRESHOLD
 
