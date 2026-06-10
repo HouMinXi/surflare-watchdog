@@ -646,39 +646,34 @@ wait_for_exit() {
 	fi
 }
 
-# refresh_auth: refresh surflare auth token using stored credentials (TPM2-encrypted via systemd-creds).
+# refresh_auth: (optional) refresh surflare auth token using stored credentials
+# (TPM2-encrypted via systemd-creds). Surflare persists its own token in
+# /etc/surflare/auth.dat, so this is a defensive redundancy -- not required for
+# normal operation. To enable, run: sudo bash ./setup_auth.sh
 # Retries LOGIN_RETRIES times with LOGIN_RETRY_DELAY between attempts -- surflare API is
 # sometimes unreachable even with VPN up. Returns 0 if any attempt succeeds.
-# Security note: password is passed as a CLI argument (-p), visible in /proc/<pid>/cmdline
-# for the duration of each attempt (~15s). Risk is limited because the daemon runs as root
-# and Linux restricts /proc/<pid>/cmdline cross-process reads to same-UID by default.
-# If surflare ever adds --password-stdin or SURFLARE_PASSWORD env-var support, prefer those.
+# Password is piped via stdin to avoid /proc/<pid>/cmdline exposure.
 refresh_auth() {
 	local email="${SURFLARE_EMAIL:-}"
 	local password=""
 
-	# Read password from systemd credentials directory (TPM2-decrypted at runtime)
-	if [ -n "$CREDENTIALS_DIRECTORY" ]; then
-		if [ -f "$CREDENTIALS_DIRECTORY/surflare-password" ]; then
-			password=$(cat "$CREDENTIALS_DIRECTORY/surflare-password")
-		else
-			log "Auth credential file not found: ${CREDENTIALS_DIRECTORY}/surflare-password -- proactive refresh disabled"
-			return 2  # no credentials: caller should back off for a full interval
-		fi
-	fi
+	# Silently skip if credentials are not configured (optional feature)
+	[ -z "$email" ] && return 2
+	[ -z "${CREDENTIALS_DIRECTORY:-}" ] && return 2
 
-	if [ -z "$email" ]; then
-		log "Auth refresh skipped: SURFLARE_EMAIL not set"
-		return 2  # no credentials: caller should back off for a full interval
+	# Read password from systemd credentials directory (TPM2-decrypted at runtime)
+	if [ -f "$CREDENTIALS_DIRECTORY/surflare_password" ]; then
+		password=$(cat "$CREDENTIALS_DIRECTORY/surflare_password")
+	else
+		return 2  # credential file missing: silently back off
 	fi
-	if [ -z "$password" ]; then
-		log "Auth refresh skipped: no credentials configured (set CREDENTIALS_DIRECTORY or SURFLARE_EMAIL)"
-		return 2  # no credentials: caller should back off for a full interval
-	fi
+	[ -z "$password" ] && return 2
 
 	local i=0 rc=1
 	while [ "$i" -lt "$LOGIN_RETRIES" ]; do
-		if timeout 15 surflare login -u "$email" -p "$password" >/dev/null 2>&1; then
+		# stdin pipe avoids /proc/cmdline exposure; surflare prompts "Password:"
+		# and reads from stdin when -p is omitted (verified surflare v4.x)
+		if printf '%s\n' "$password" | timeout 15 surflare login -u "$email" >/dev/null 2>&1; then
 			log "Auth token refreshed successfully (attempt $((i + 1))/${LOGIN_RETRIES})"
 			rc=0
 			break

@@ -46,6 +46,9 @@ sudo ln -sf /usr/local/sbin/surflare_watchdog.sh \
 
 # (Note: NetworkManager dispatcher hooks for VPN resume are deprecated
 # as they trigger too frequently during normal interface roaming/flapping)
+
+# Secure authentication setup (optional but recommended)
+sudo bash ./setup_auth.sh
 ```
 
 ## Usage
@@ -69,6 +72,23 @@ TRANSIT_CANDIDATES="Tokyo Seoul"  # Transit probe list (lowest latency wins)
 CHECK_INTERVAL=30                 # Health check interval (seconds)
 FAIL_THRESHOLD=4                  # Consecutive failures before reconnect
 ```
+
+## Authentication Refresh (Optional)
+
+The watchdog can optionally refresh the Surflare auth token before it expires, as a defensive redundancy. **This is not required for normal operation** -- Surflare already persists its own token in `/etc/surflare/auth.dat` after you run `sudo surflare login` once. However, if the token expires during extended unattended operation, auto-refresh prevents reconnect failures.
+
+We use `systemd-creds` to bind your password to the system's TPM2 module instead of storing it as plaintext.
+
+To configure this automatically, run:
+```bash
+sudo bash ./setup_auth.sh
+```
+
+This script will:
+1. Ask for your email and password (the password will not be echoed or stored in bash history).
+2. Use `systemd-creds` to encrypt the password into `/etc/systemd/system/surflare-watchdog.service.d/surflare_password.cred`.
+3. Create a systemd override `11-auth-email.conf` that exports `SURFLARE_EMAIL` and sets up `LoadCredentialEncrypted`.
+4. Instruct you to manually restart the daemon (`sudo systemctl restart surflare-watchdog`).
 
 ## Reading the logs
 
