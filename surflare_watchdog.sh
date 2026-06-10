@@ -174,50 +174,78 @@ _setup_kernel_moat() {
 	if ! command -v nft >/dev/null 2>&1; then
 		return 0
 	fi
-	# TCP Injection Moat: Silently drop injected spoofed TCP FIN/RST packets (seq=0, ack=0)
-	# Use raw priority (-300) in prerouting to drop before connection tracking
+	# Upstream filter injects spoofed TCP FIN+ACK (seq=0, ack=0, win=78) and RST packets to
+	# tear down tunnelled connections. Priority -300 drops them before conntrack.
 	nft add table inet surflare_moat 2>/dev/null || true
 	nft flush table inet surflare_moat 2>/dev/null || true
-	nft add chain inet surflare_moat prerouting '{ type filter hook prerouting priority -300; policy accept; }' 2>/dev/null || true
-	nft add rule inet surflare_moat prerouting tcp flags == fin tcp sequence 0 tcp ack 0 tcp window 78 drop 2>/dev/null || true
-	nft add rule inet surflare_moat prerouting tcp flags == rst tcp sequence 0 tcp ack 0 drop 2>/dev/null || true
-	log "Kernel moat deployed: dropping spoofed FIN/RST packets via prerouting"
+	if ! nft add chain inet surflare_moat prerouting '{ type filter hook prerouting priority -300; policy accept; }' 2>/dev/null; then
+		log "WARN: Kernel moat chain creation failed"
+		return 1
+	fi
+	local moat_ok=1
+	# "flags & fin == fin" matches both pure FIN [F] and FIN+ACK [F.] -- upstream filter sends [F.]
+	nft add rule inet surflare_moat prerouting \
+		tcp flags \& fin == fin tcp sequence 0 tcp ackseq 0 tcp window 78 drop 2>/dev/null || moat_ok=0
+	# RST injection: RST bit set regardless of ACK bit, seq=0, ackseq=0
+	nft add rule inet surflare_moat prerouting \
+		tcp flags \& rst == rst tcp sequence 0 tcp ackseq 0 drop 2>/dev/null || moat_ok=0
+	if [ "$moat_ok" -eq 1 ]; then
+		log "Kernel moat deployed: dropping injected FIN/RST packets"
+	else
+		log "WARN: Kernel moat rules failed to load; moat may be incomplete"
+	fi
 }
 
 _setup_chnroute() {
 	if [ "$MODE" != "global" ]; then
-		return 0 # Only override if in global mode
+		return 0
 	fi
 	local cn_file="/etc/surflare/cn_ipv4.txt"
 	if [ ! -f "$cn_file" ] || [ -n "$(find "$cn_file" -mtime +7 2>/dev/null)" ]; then
 		log "Downloading/Updating Chnroute IPv4 list..."
 		mkdir -p /etc/surflare
-		if curl -sSL --connect-timeout 10 https://raw.githubusercontent.com/misakaio/chnroutes2/master/chnroutes.txt -o "${cn_file}.tmp"; then
+		if curl -sSL --connect-timeout 30 https://raw.githubusercontent.com/misakaio/chnroutes2/master/chnroutes.txt -o "${cn_file}.tmp"; then
 			mv "${cn_file}.tmp" "$cn_file"
 		else
-			log "WARN: Failed to download Chnroute list."
+			log "WARN: Chnroute download failed; using cached file if available"
 			rm -f "${cn_file}.tmp"
 		fi
 	fi
 
-	if [ -f "$cn_file" ] && nft list table inet surflare >/dev/null 2>&1; then
-		log "Applying Chnroute (Kernel-level Smart Routing)..."
-		nft add set inet surflare cn_ipv4 '{ type ipv4_addr; flags interval; }' 2>/dev/null || true
-		nft flush set inet surflare cn_ipv4 2>/dev/null || true
-		
-		local tmp_nft="/tmp/cn_ipv4_$$.nft"
-		echo "add element inet surflare cn_ipv4 { " > "$tmp_nft"
-		grep -v '^#' "$cn_file" | tr '\n' ',' >> "$tmp_nft"
-		echo " }" >> "$tmp_nft"
-		if nft -f "$tmp_nft" 2>/dev/null; then
-			nft insert rule inet surflare output ip daddr @cn_ipv4 accept 2>/dev/null || true
-			nft insert rule inet surflare prerouting ip daddr @cn_ipv4 accept 2>/dev/null || true
-			log "Chnroute applied: Domestic traffic will bypass the proxy natively."
-		else
-			log "WARN: Failed to load Chnroute into nftables."
-		fi
-		rm -f "$tmp_nft"
+	if [ ! -f "$cn_file" ]; then
+		log "WARN: No Chnroute file available, skipping CN bypass"
+		return 1
 	fi
+
+	if ! nft list table inet surflare >/dev/null 2>&1; then
+		log "WARN: inet surflare table not ready, skipping CN bypass"
+		return 1
+	fi
+
+	local cn_count cn_date
+	cn_count=$(grep -vc '^#' "$cn_file" 2>/dev/null || echo 0)
+	cn_date=$(stat -c '%y' "$cn_file" 2>/dev/null | cut -d' ' -f1)
+	log "Applying Chnroute: ${cn_count} prefixes (file date: ${cn_date})"
+
+	nft add set inet surflare cn_ipv4 '{ type ipv4_addr; flags interval; }' 2>/dev/null || true
+	nft flush set inet surflare cn_ipv4 2>/dev/null || true
+
+	local tmp_nft="/tmp/cn_ipv4_$$.nft"
+	# paste -sd, joins lines with comma WITHOUT trailing comma (unlike tr '\n' ',')
+	{
+		printf 'add element inet surflare cn_ipv4 { '
+		grep -v '^#' "$cn_file" | grep -v '^[[:space:]]*$' | paste -sd, -
+		printf ' }\n'
+	} > "$tmp_nft"
+	if nft -f "$tmp_nft" 2>/dev/null; then
+		# output chain only: on a laptop prerouting handles inbound traffic
+		# (dst = local IP), not outbound; the output chain is the correct hook.
+		nft insert rule inet surflare output ip daddr @cn_ipv4 accept 2>/dev/null || true
+		log "Chnroute applied: CN prefixes bypass proxy via output chain"
+	else
+		log "WARN: Failed to load Chnroute into nftables; CN bypass not active"
+	fi
+	rm -f "$tmp_nft"
 }
 
 CONTROL_PROBE_TARGETS="114.114.114.114:53 223.5.5.5:53"
@@ -1050,6 +1078,7 @@ cleanup() {
 	[ -n "$storm_sleep_pid" ] && kill "$storm_sleep_pid" 2>/dev/null
 	# shellcheck disable=SC2086
 	[ -n "$_hc_tmp" ] && rm -f $_hc_tmp
+	nft delete table inet surflare_moat 2>/dev/null || true
 	rm -f "$PIDFILE"
 }
 trap 'log "watchdog stopped"; cleanup; exit 0' INT TERM
