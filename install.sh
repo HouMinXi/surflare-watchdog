@@ -6,6 +6,8 @@ if [ "$(id -u)" -ne 0 ]; then
     exit 1
 fi
 
+cd "$(dirname "${BASH_SOURCE[0]}")"
+
 echo "Installing surflare-watchdog..."
 
 # Install scripts
