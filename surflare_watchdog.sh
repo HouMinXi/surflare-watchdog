@@ -203,11 +203,14 @@ _setup_chnroute() {
 	local cn_v4_file="/etc/surflare/cn_ipv4.txt"
 	local cn_v6_file="/etc/surflare/cn_ipv6.txt"
 	mkdir -p /etc/surflare 2>/dev/null || true
-	if [ ! -f "$cn_v4_file" ] && [ -f "$(dirname "$0")/routes/cn_ipv4.txt" ]; then
-		cp "$(dirname "$0")/routes/cn_ipv4.txt" "$cn_v4_file" 2>/dev/null || true
+	local baseline_dir="/usr/local/share/surflare/routes"
+	if [ ! -f "$cn_v4_file" ] && [ -f "$baseline_dir/cn_ipv4.txt" ]; then
+		log "WARN: /etc/surflare/cn_ipv4.txt missing, loading built-in baseline"
+		cp "$baseline_dir/cn_ipv4.txt" "$cn_v4_file" 2>/dev/null || true
 	fi
-	if [ ! -f "$cn_v6_file" ] && [ -f "$(dirname "$0")/routes/cn_ipv6.txt" ]; then
-		cp "$(dirname "$0")/routes/cn_ipv6.txt" "$cn_v6_file" 2>/dev/null || true
+	if [ ! -f "$cn_v6_file" ] && [ -f "$baseline_dir/cn_ipv6.txt" ]; then
+		log "WARN: /etc/surflare/cn_ipv6.txt missing, loading built-in baseline"
+		cp "$baseline_dir/cn_ipv6.txt" "$cn_v6_file" 2>/dev/null || true
 	fi
 
 	if ! nft list table inet surflare >/dev/null 2>&1; then
