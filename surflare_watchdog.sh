@@ -184,6 +184,42 @@ _setup_kernel_moat() {
 	log "Kernel moat deployed: dropping spoofed FIN/RST packets via prerouting"
 }
 
+_setup_chnroute() {
+	if [ "$MODE" != "global" ]; then
+		return 0 # Only override if in global mode
+	fi
+	local cn_file="/etc/surflare/cn_ipv4.txt"
+	if [ ! -f "$cn_file" ] || [ -n "$(find "$cn_file" -mtime +7 2>/dev/null)" ]; then
+		log "Downloading/Updating Chnroute IPv4 list..."
+		mkdir -p /etc/surflare
+		if curl -sSL --connect-timeout 10 https://raw.githubusercontent.com/misakaio/chnroutes2/master/chnroutes.txt -o "${cn_file}.tmp"; then
+			mv "${cn_file}.tmp" "$cn_file"
+		else
+			log "WARN: Failed to download Chnroute list."
+			rm -f "${cn_file}.tmp"
+		fi
+	fi
+
+	if [ -f "$cn_file" ] && nft list table inet surflare >/dev/null 2>&1; then
+		log "Applying Chnroute (Kernel-level Smart Routing)..."
+		nft add set inet surflare cn_ipv4 '{ type ipv4_addr; flags interval; }' 2>/dev/null || true
+		nft flush set inet surflare cn_ipv4 2>/dev/null || true
+		
+		local tmp_nft="/tmp/cn_ipv4_$$.nft"
+		echo "add element inet surflare cn_ipv4 { " > "$tmp_nft"
+		grep -v '^#' "$cn_file" | tr '\n' ',' >> "$tmp_nft"
+		echo " }" >> "$tmp_nft"
+		if nft -f "$tmp_nft" 2>/dev/null; then
+			nft insert rule inet surflare output ip daddr @cn_ipv4 accept 2>/dev/null || true
+			nft insert rule inet surflare prerouting ip daddr @cn_ipv4 accept 2>/dev/null || true
+			log "Chnroute applied: Domestic traffic will bypass the proxy natively."
+		else
+			log "WARN: Failed to load Chnroute into nftables."
+		fi
+		rm -f "$tmp_nft"
+	fi
+}
+
 CONTROL_PROBE_TARGETS="114.114.114.114:53 223.5.5.5:53"
 CONTROL_PROBE_TIMEOUT=3
 
@@ -824,6 +860,8 @@ connect_vpn() {
 			done
 			[ "$pinned" -gt 0 ] && log "Pinned ${pinned} iwlwifi IRQ(s) to CPUs ${DESKTOP_CPU_SET}"
 		fi
+
+		_setup_chnroute
 
 		exit 0
 	) 9>"$LOCK_FILE"
