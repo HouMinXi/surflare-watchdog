@@ -10,9 +10,6 @@
 #                 sudo chmod 755 /usr/local/sbin/surflare_watchdog.sh
 #                 sudo ln -sf /usr/local/sbin/surflare_watchdog.sh \
 #                     /etc/systemd/system-sleep/surflare-resume.sh
-#                 sudo cp 99-surflare-resume /etc/NetworkManager/dispatcher.d/
-#                 sudo chown root:root /etc/NetworkManager/dispatcher.d/99-surflare-resume
-#                 sudo chmod 755 /etc/NetworkManager/dispatcher.d/99-surflare-resume
 # View logs    : sudo dmesg | grep surflare_watchdog
 
 NODE="Los Angeles"                    # Set to your node tag (run: surflare nodes)

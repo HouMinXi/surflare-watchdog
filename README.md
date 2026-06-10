@@ -44,10 +44,8 @@ sudo chmod 755 /usr/local/sbin/surflare_watchdog.sh
 sudo ln -sf /usr/local/sbin/surflare_watchdog.sh \
     /etc/systemd/system-sleep/surflare-resume.sh
 
-# NetworkManager dispatcher hook
-sudo cp 99-surflare-resume /etc/NetworkManager/dispatcher.d/
-sudo chown root:root /etc/NetworkManager/dispatcher.d/99-surflare-resume
-sudo chmod 755 /etc/NetworkManager/dispatcher.d/99-surflare-resume
+# (Note: NetworkManager dispatcher hooks for VPN resume are deprecated
+# as they trigger too frequently during normal interface roaming/flapping)
 ```
 
 ## Usage
