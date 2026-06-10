@@ -186,7 +186,7 @@ _setup_kernel_moat() {
 	# "flags & fin == fin" matches both pure FIN [F] and FIN+ACK [F.] -- upstream filter sends [F.]
 	nft add rule inet surflare_moat prerouting \
 		tcp flags \& fin == fin tcp sequence 0 tcp ackseq 0 tcp window 78 drop 2>/dev/null || moat_ok=0
-	# RST injection: RST bit set regardless of ACK bit, seq=0, ackseq=0
+	# RST injection: seq=0, ackseq=0
 	nft add rule inet surflare_moat prerouting \
 		tcp flags \& rst == rst tcp sequence 0 tcp ackseq 0 drop 2>/dev/null || moat_ok=0
 	if [ "$moat_ok" -eq 1 ]; then
@@ -202,10 +202,10 @@ _setup_chnroute() {
 	fi
 	local cn_v4_file="/etc/surflare/cn_ipv4.txt"
 	local cn_v6_file="/etc/surflare/cn_ipv6.txt"
-	
+	mkdir -p /etc/surflare
+
 	if [ ! -f "$cn_v4_file" ] || [ -n "$(find "$cn_v4_file" -mtime +7 2>/dev/null)" ]; then
-		log "Downloading/Updating Chnroute IPv4 list..."
-		mkdir -p /etc/surflare
+		log "Updating chnroute v4 list..."
 		if curl -fsSL --connect-timeout 30 https://raw.githubusercontent.com/misakaio/chnroutes2/master/chnroutes.txt -o "${cn_v4_file}.tmp" && [ -s "${cn_v4_file}.tmp" ]; then
 			mv "${cn_v4_file}.tmp" "$cn_v4_file"
 		else
@@ -215,8 +215,7 @@ _setup_chnroute() {
 	fi
 
 	if [ ! -f "$cn_v6_file" ] || [ -n "$(find "$cn_v6_file" -mtime +7 2>/dev/null)" ]; then
-		log "Downloading/Updating Chnroute IPv6 list..."
-		mkdir -p /etc/surflare
+		log "Updating chnroute v6 list..."
 		if curl -fsSL --connect-timeout 30 https://ispip.clang.cn/all_cn_ipv6.txt -o "${cn_v6_file}.tmp" && [ -s "${cn_v6_file}.tmp" ]; then
 			mv "${cn_v6_file}.tmp" "$cn_v6_file"
 		else
@@ -229,6 +228,8 @@ _setup_chnroute() {
 		log "WARN: inet surflare table not ready, skipping CN bypass"
 		return 1
 	fi
+
+	local bypass_applied=0
 
 	if [ -f "$cn_v4_file" ]; then
 		local cn_count cn_date
@@ -248,6 +249,7 @@ _setup_chnroute() {
 		if nft -f "$tmp_nft" 2>/dev/null; then
 			nft insert rule inet surflare output ip daddr @cn_ipv4 accept 2>/dev/null || true
 			log "Chnroute v4 applied: CN prefixes bypass proxy via output chain"
+			bypass_applied=$((bypass_applied + 1))
 		else
 			log "WARN: Failed to load Chnroute v4 into nftables; CN bypass not active"
 		fi
@@ -272,10 +274,15 @@ _setup_chnroute() {
 		if nft -f "$tmp_nft_v6" 2>/dev/null; then
 			nft insert rule inet surflare output ip6 daddr @cn_ipv6 accept 2>/dev/null || true
 			log "Chnroute v6 applied: CN v6 prefixes bypass proxy via output chain"
+			bypass_applied=$((bypass_applied + 1))
 		else
 			log "WARN: Failed to load Chnroute v6 into nftables; CN bypass not active"
 		fi
 		rm -f "$tmp_nft_v6"
+	fi
+
+	if [ "$bypass_applied" -eq 0 ]; then
+		log "WARN: no chnroute files; CN bypass disabled"
 	fi
 }
 
