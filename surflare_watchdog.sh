@@ -174,7 +174,7 @@ _setup_kernel_moat() {
 	if ! command -v nft >/dev/null 2>&1; then
 		return 0
 	fi
-	# Upstream filter injects spoofed TCP FIN+ACK (seq=0, ack=0, win=78) and RST packets to
+	# Upstream filter injects spoofed TCP FIN+ACK (win=78) and RST packets to
 	# tear down tunnelled connections. Priority -300 drops them before conntrack.
 	nft add table inet surflare_moat 2>/dev/null || true
 	nft flush table inet surflare_moat 2>/dev/null || true
@@ -185,10 +185,10 @@ _setup_kernel_moat() {
 	local moat_ok=1
 	# "flags & fin == fin" matches both pure FIN [F] and FIN+ACK [F.] -- upstream filter sends [F.]
 	nft add rule inet surflare_moat prerouting \
-		tcp flags \& fin == fin tcp sequence 0 tcp ackseq 0 tcp window 78 drop 2>/dev/null || moat_ok=0
-	# RST injection: seq=0, ackseq=0
+		tcp flags \& fin == fin tcp window 78 drop 2>/dev/null || moat_ok=0
+	# RST injection
 	nft add rule inet surflare_moat prerouting \
-		tcp flags \& rst == rst tcp sequence 0 tcp ackseq 0 drop 2>/dev/null || moat_ok=0
+		tcp flags \& rst == rst tcp window 78 drop 2>/dev/null || moat_ok=0
 	if [ "$moat_ok" -eq 1 ]; then
 		log "Kernel moat deployed: dropping injected FIN/RST packets"
 	else
