@@ -76,7 +76,7 @@ if __name__ == '__main__':
 
     ratio = calculate_overlap(bgp_nets, apnic_nets)
     
-    # We require at least 95% of the BGP dumped IPs to be within APNIC's China delegation
+    # Fail if BGP coverage is below 95% of APNIC CN delegation
     if ratio >= 0.95:
         print(f"PASS: {version} BGP routes are {ratio*100:.2f}% covered by APNIC CN delegation")
         sys.exit(0)
