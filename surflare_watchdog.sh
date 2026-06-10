@@ -200,21 +200,29 @@ _setup_chnroute() {
 	if [ "$MODE" != "global" ]; then
 		return 0
 	fi
-	local cn_file="/etc/surflare/cn_ipv4.txt"
-	if [ ! -f "$cn_file" ] || [ -n "$(find "$cn_file" -mtime +7 2>/dev/null)" ]; then
+	local cn_v4_file="/etc/surflare/cn_ipv4.txt"
+	local cn_v6_file="/etc/surflare/cn_ipv6.txt"
+	
+	if [ ! -f "$cn_v4_file" ] || [ -n "$(find "$cn_v4_file" -mtime +7 2>/dev/null)" ]; then
 		log "Downloading/Updating Chnroute IPv4 list..."
 		mkdir -p /etc/surflare
-		if curl -sSL --connect-timeout 30 https://raw.githubusercontent.com/misakaio/chnroutes2/master/chnroutes.txt -o "${cn_file}.tmp"; then
-			mv "${cn_file}.tmp" "$cn_file"
+		if curl -fsSL --connect-timeout 30 https://raw.githubusercontent.com/misakaio/chnroutes2/master/chnroutes.txt -o "${cn_v4_file}.tmp" && [ -s "${cn_v4_file}.tmp" ]; then
+			mv "${cn_v4_file}.tmp" "$cn_v4_file"
 		else
-			log "WARN: Chnroute download failed; using cached file if available"
-			rm -f "${cn_file}.tmp"
+			log "WARN: Chnroute v4 download failed; using cached file if available"
+			rm -f "${cn_v4_file}.tmp"
 		fi
 	fi
 
-	if [ ! -f "$cn_file" ]; then
-		log "WARN: No Chnroute file available, skipping CN bypass"
-		return 1
+	if [ ! -f "$cn_v6_file" ] || [ -n "$(find "$cn_v6_file" -mtime +7 2>/dev/null)" ]; then
+		log "Downloading/Updating Chnroute IPv6 list..."
+		mkdir -p /etc/surflare
+		if curl -fsSL --connect-timeout 30 https://ispip.clang.cn/all_cn_ipv6.txt -o "${cn_v6_file}.tmp" && [ -s "${cn_v6_file}.tmp" ]; then
+			mv "${cn_v6_file}.tmp" "$cn_v6_file"
+		else
+			log "WARN: Chnroute v6 download failed; using cached file if available"
+			rm -f "${cn_v6_file}.tmp"
+		fi
 	fi
 
 	if ! nft list table inet surflare >/dev/null 2>&1; then
@@ -222,30 +230,53 @@ _setup_chnroute() {
 		return 1
 	fi
 
-	local cn_count cn_date
-	cn_count=$(grep -vc '^#' "$cn_file" 2>/dev/null || echo 0)
-	cn_date=$(stat -c '%y' "$cn_file" 2>/dev/null | cut -d' ' -f1)
-	log "Applying Chnroute: ${cn_count} prefixes (file date: ${cn_date})"
+	if [ -f "$cn_v4_file" ]; then
+		local cn_count cn_date
+		cn_count=$(grep -vc '^#' "$cn_v4_file" 2>/dev/null || echo 0)
+		cn_date=$(stat -c '%y' "$cn_v4_file" 2>/dev/null | cut -d' ' -f1)
+		log "Applying Chnroute v4: ${cn_count} prefixes (file date: ${cn_date})"
 
-	nft add set inet surflare cn_ipv4 '{ type ipv4_addr; flags interval; }' 2>/dev/null || true
-	nft flush set inet surflare cn_ipv4 2>/dev/null || true
+		nft add set inet surflare cn_ipv4 '{ type ipv4_addr; flags interval; }' 2>/dev/null || true
+		nft flush set inet surflare cn_ipv4 2>/dev/null || true
 
-	local tmp_nft="/tmp/cn_ipv4_$$.nft"
-	# paste -sd, joins lines with comma WITHOUT trailing comma (unlike tr '\n' ',')
-	{
-		printf 'add element inet surflare cn_ipv4 { '
-		grep -v '^#' "$cn_file" | grep -v '^[[:space:]]*$' | paste -sd, -
-		printf ' }\n'
-	} > "$tmp_nft"
-	if nft -f "$tmp_nft" 2>/dev/null; then
-		# output chain only: on a laptop prerouting handles inbound traffic
-		# (dst = local IP), not outbound; the output chain is the correct hook.
-		nft insert rule inet surflare output ip daddr @cn_ipv4 accept 2>/dev/null || true
-		log "Chnroute applied: CN prefixes bypass proxy via output chain"
-	else
-		log "WARN: Failed to load Chnroute into nftables; CN bypass not active"
+		local tmp_nft="/tmp/cn_ipv4_$$.nft"
+		{
+			printf 'add element inet surflare cn_ipv4 { '
+			grep -v '^#' "$cn_v4_file" | grep -v '^[[:space:]]*$' | paste -sd, -
+			printf ' }\n'
+		} > "$tmp_nft"
+		if nft -f "$tmp_nft" 2>/dev/null; then
+			nft insert rule inet surflare output ip daddr @cn_ipv4 accept 2>/dev/null || true
+			log "Chnroute v4 applied: CN prefixes bypass proxy via output chain"
+		else
+			log "WARN: Failed to load Chnroute v4 into nftables; CN bypass not active"
+		fi
+		rm -f "$tmp_nft"
 	fi
-	rm -f "$tmp_nft"
+
+	if [ -f "$cn_v6_file" ]; then
+		local cn_count_v6 cn_date_v6
+		cn_count_v6=$(grep -vc '^#' "$cn_v6_file" 2>/dev/null || echo 0)
+		cn_date_v6=$(stat -c '%y' "$cn_v6_file" 2>/dev/null | cut -d' ' -f1)
+		log "Applying Chnroute v6: ${cn_count_v6} prefixes (file date: ${cn_date_v6})"
+
+		nft add set inet surflare cn_ipv6 '{ type ipv6_addr; flags interval; }' 2>/dev/null || true
+		nft flush set inet surflare cn_ipv6 2>/dev/null || true
+
+		local tmp_nft_v6="/tmp/cn_ipv6_$$.nft"
+		{
+			printf 'add element inet surflare cn_ipv6 { '
+			grep -v '^#' "$cn_v6_file" | grep -v '^[[:space:]]*$' | paste -sd, -
+			printf ' }\n'
+		} > "$tmp_nft_v6"
+		if nft -f "$tmp_nft_v6" 2>/dev/null; then
+			nft insert rule inet surflare output ip6 daddr @cn_ipv6 accept 2>/dev/null || true
+			log "Chnroute v6 applied: CN v6 prefixes bypass proxy via output chain"
+		else
+			log "WARN: Failed to load Chnroute v6 into nftables; CN bypass not active"
+		fi
+		rm -f "$tmp_nft_v6"
+	fi
 }
 
 CONTROL_PROBE_TARGETS="114.114.114.114:53 223.5.5.5:53"
