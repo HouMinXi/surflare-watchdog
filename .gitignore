@@ -3,3 +3,7 @@
 .idea/
 .worktrees/
 __pycache__/
+REVIEW.md
+# Root-level route files are runtime copies from /etc/surflare/; baseline lives in routes/
+cn_ipv4.txt
+cn_ipv6.txt

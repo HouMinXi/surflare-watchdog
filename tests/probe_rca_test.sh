@@ -7,8 +7,8 @@
 
 set -u
 
-NODE="Los Angeles"
-MODE="global"
+NODE="${NODE:-Los Angeles}"
+MODE="${MODE:-global}"
 CONNECT_TIMEOUT=12
 ROUTE_POLL_MAX=15
 PROCESS_EXIT_TIMEOUT=20
