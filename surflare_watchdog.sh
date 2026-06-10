@@ -202,26 +202,12 @@ _setup_chnroute() {
 	fi
 	local cn_v4_file="/etc/surflare/cn_ipv4.txt"
 	local cn_v6_file="/etc/surflare/cn_ipv6.txt"
-	mkdir -p /etc/surflare
-
-	if [ ! -f "$cn_v4_file" ] || [ -n "$(find "$cn_v4_file" -mtime +7 2>/dev/null)" ]; then
-		log "Updating chnroute v4 list..."
-		if curl -fsSL --connect-timeout 30 https://raw.githubusercontent.com/misakaio/chnroutes2/master/chnroutes.txt -o "${cn_v4_file}.tmp" && [ -s "${cn_v4_file}.tmp" ]; then
-			mv "${cn_v4_file}.tmp" "$cn_v4_file"
-		else
-			log "WARN: Chnroute v4 download failed; using cached file if available"
-			rm -f "${cn_v4_file}.tmp"
-		fi
+	mkdir -p /etc/surflare 2>/dev/null || true
+	if [ ! -f "$cn_v4_file" ] && [ -f "$(dirname "$0")/routes/cn_ipv4.txt" ]; then
+		cp "$(dirname "$0")/routes/cn_ipv4.txt" "$cn_v4_file" 2>/dev/null || true
 	fi
-
-	if [ ! -f "$cn_v6_file" ] || [ -n "$(find "$cn_v6_file" -mtime +7 2>/dev/null)" ]; then
-		log "Updating chnroute v6 list..."
-		if curl -fsSL --connect-timeout 30 https://ispip.clang.cn/all_cn_ipv6.txt -o "${cn_v6_file}.tmp" && [ -s "${cn_v6_file}.tmp" ]; then
-			mv "${cn_v6_file}.tmp" "$cn_v6_file"
-		else
-			log "WARN: Chnroute v6 download failed; using cached file if available"
-			rm -f "${cn_v6_file}.tmp"
-		fi
+	if [ ! -f "$cn_v6_file" ] && [ -f "$(dirname "$0")/routes/cn_ipv6.txt" ]; then
+		cp "$(dirname "$0")/routes/cn_ipv6.txt" "$cn_v6_file" 2>/dev/null || true
 	fi
 
 	if ! nft list table inet surflare >/dev/null 2>&1; then
