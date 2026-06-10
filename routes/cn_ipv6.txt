@@ -1,3 +1,6 @@
+# baseline IPv6 prefixes
+# Extracted from major China ISP allocations (Telecom, Unicom, Mobile, Ali, Tencent)
+# Generated: 2026-06-10
 2400:3200::/32
 2400:8900::/32
 2400:a480::/32

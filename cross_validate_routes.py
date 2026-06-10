@@ -36,12 +36,35 @@ def parse_bgp(file_path, version='ipv4'):
                     pass
     return list(ipaddress.collapse_addresses(cidrs))
 
-def calculate_coverage(bgp_nets, apnic_nets):
-    bgp_total = sum(net.num_addresses for net in bgp_nets)
-    apnic_total = sum(net.num_addresses for net in apnic_nets)
-    if apnic_total == 0:
-        return 0
-    return bgp_total / apnic_total
+def calculate_overlap(bgp_nets, apnic_nets):
+    def get_intervals(nets):
+        return [(int(n.network_address), int(n.broadcast_address)) for n in nets]
+    
+    bgp_ivs = sorted(get_intervals(bgp_nets))
+    apnic_ivs = sorted(get_intervals(apnic_nets))
+    
+    overlap_ips = 0
+    bgp_total = 0
+    apnic_idx = 0
+    apnic_len = len(apnic_ivs)
+    
+    for bgp_start, bgp_end in bgp_ivs:
+        bgp_total += (bgp_end - bgp_start + 1)
+        while apnic_idx < apnic_len and apnic_ivs[apnic_idx][1] < bgp_start:
+            apnic_idx += 1
+            
+        temp_idx = apnic_idx
+        while temp_idx < apnic_len and apnic_ivs[temp_idx][0] <= bgp_end:
+            a_start, a_end = apnic_ivs[temp_idx]
+            intersect_start = max(bgp_start, a_start)
+            intersect_end = min(bgp_end, a_end)
+            if intersect_start <= intersect_end:
+                overlap_ips += (intersect_end - intersect_start + 1)
+            temp_idx += 1
+            
+    if bgp_total == 0:
+        return 0.0
+    return overlap_ips / bgp_total
 
 if __name__ == '__main__':
     version = sys.argv[1] # "ipv4" or "ipv6"
@@ -51,13 +74,12 @@ if __name__ == '__main__':
     bgp_nets = parse_bgp(bgp_path, version)
     apnic_nets = parse_apnic(apnic_path, version)
 
-    ratio = calculate_coverage(bgp_nets, apnic_nets)
+    ratio = calculate_overlap(bgp_nets, apnic_nets)
     
-    # 0.7 to 1.3 is a reasonable threshold since BGP reflects actual routing which may slightly differ
-    # from pure administrative APNIC assignments, but won't be 10x smaller or larger.
-    if 0.7 <= ratio <= 1.3:
-        print(f"PASS: {version} BGP coverage ratio {ratio:.3f}")
+    # We require at least 95% of the BGP dumped IPs to be within APNIC's China delegation
+    if ratio >= 0.95:
+        print(f"PASS: {version} BGP routes are {ratio*100:.2f}% covered by APNIC CN delegation")
         sys.exit(0)
     else:
-        print(f"FAIL: {version} BGP coverage ratio {ratio:.3f}")
+        print(f"FAIL: {version} BGP routes are only {ratio*100:.2f}% covered by APNIC CN delegation (threshold: 95%)")
         sys.exit(1)

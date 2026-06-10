@@ -39,7 +39,12 @@ update_v6=false
 
 # Cross validation: IPv4
 if [ -s "$TMP_DIR/v4_bgp.txt" ] && [ -s "$TMP_DIR/apnic.txt" ]; then
-    if python3 "$VALIDATOR" ipv4 "$TMP_DIR/v4_bgp.txt" "$TMP_DIR/apnic.txt" 2>&1 | logger -t surflare-route-updater; then
+    output=$(python3 "$VALIDATOR" ipv4 "$TMP_DIR/v4_bgp.txt" "$TMP_DIR/apnic.txt" 2>&1)
+    rc=$?
+    if [ -n "$output" ]; then
+        echo "$output" | logger -t surflare-route-updater
+    fi
+    if [ "$rc" -eq 0 ]; then
         log "IPv4 cross-validation passed."
         cp "$TMP_DIR/v4_bgp.txt" "$OUT_DIR/cn_ipv4.txt"
         update_v4=true
@@ -47,10 +52,6 @@ if [ -s "$TMP_DIR/v4_bgp.txt" ] && [ -s "$TMP_DIR/apnic.txt" ]; then
         log "ERR: IPv4 cross-validation failed! BGP data rejected."
     fi
 elif [ -s "$TMP_DIR/v4_bgp.txt" ]; then
-    # APNIC unreachable but BGP is downloaded. Do we trust BGP blindly?
-    # H-3: If attacker blocks APNIC and poisons BGP, this bypasses validation.
-    # To fix H-3, we REFUSE to update if APNIC is unreachable and we have an existing local copy.
-    # Only if we don't have a local copy at all do we accept BGP as a last resort, but we should probably just fail.
     if [ -s "$OUT_DIR/cn_ipv4.txt" ]; then
         log "ERR: APNIC download failed, existing cache found. Rejecting unvalidated BGP update."
     else
@@ -67,7 +68,12 @@ fi
 
 # Cross validation: IPv6
 if [ -s "$TMP_DIR/v6_bgp.txt" ] && [ -s "$TMP_DIR/apnic.txt" ]; then
-    if python3 "$VALIDATOR" ipv6 "$TMP_DIR/v6_bgp.txt" "$TMP_DIR/apnic.txt" 2>&1 | logger -t surflare-route-updater; then
+    output=$(python3 "$VALIDATOR" ipv6 "$TMP_DIR/v6_bgp.txt" "$TMP_DIR/apnic.txt" 2>&1)
+    rc=$?
+    if [ -n "$output" ]; then
+        echo "$output" | logger -t surflare-route-updater
+    fi
+    if [ "$rc" -eq 0 ]; then
         log "IPv6 cross-validation passed."
         cp "$TMP_DIR/v6_bgp.txt" "$OUT_DIR/cn_ipv6.txt"
         update_v6=true

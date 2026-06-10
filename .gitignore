@@ -2,3 +2,4 @@
 *.lock
 .idea/
 .worktrees/
+__pycache__/
