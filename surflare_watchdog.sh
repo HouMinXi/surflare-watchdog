@@ -170,6 +170,20 @@ _startup_cleanup_dns_fallback() {
 	rm -f "$DNS_STUCK_FILE"
 }
 
+_setup_kernel_moat() {
+	if ! command -v nft >/dev/null 2>&1; then
+		return 0
+	fi
+	# TCP Injection Moat: Silently drop injected spoofed TCP FIN/RST packets (seq=0, ack=0)
+	# Use raw priority (-300) in prerouting to drop before connection tracking
+	nft add table inet surflare_moat 2>/dev/null || true
+	nft flush table inet surflare_moat 2>/dev/null || true
+	nft add chain inet surflare_moat prerouting '{ type filter hook prerouting priority -300; policy accept; }' 2>/dev/null || true
+	nft add rule inet surflare_moat prerouting tcp flags == fin tcp sequence 0 tcp ack 0 tcp window 78 drop 2>/dev/null || true
+	nft add rule inet surflare_moat prerouting tcp flags == rst tcp sequence 0 tcp ack 0 drop 2>/dev/null || true
+	log "Kernel moat deployed: dropping spoofed FIN/RST packets via prerouting"
+}
+
 CONTROL_PROBE_TARGETS="114.114.114.114:53 223.5.5.5:53"
 CONTROL_PROBE_TIMEOUT=3
 
@@ -1036,6 +1050,7 @@ if [ -f "$ROTATION_STATE" ]; then
 	fi
 fi
 log "watchdog started: node=${_active_node} candidates=${#NODE_CANDIDATES[@]} interval=${CHECK_INTERVAL}s threshold=${FAIL_THRESHOLD} transient=${TRANSIENT_THRESHOLD}"
+_setup_kernel_moat
 
 while true; do
 	if recent_wifi_crash 120; then
