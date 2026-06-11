@@ -745,14 +745,20 @@ _diagnose_tunnel_failure() {
 
 	first_ip="${_diag_server_ips%% *}"
 
-	# Detect physical interface from routing table (server IP always routed direct)
-	phys_if=$(ip route get "$first_ip" 2>/dev/null \
-		| awk '/dev/{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1);exit}}')
+	# ip route get output: "X.X.X.X via GW dev IF src LOCAL_IP uid UID"
+	# Extract both phys_if and local_ip from one call -- handles any private
+	# network range (10.x, 172.16-31.x, 192.168.x) without hardcoded subnets.
+	local route_info
+	route_info=$(ip route get "$first_ip" 2>/dev/null)
+	phys_if=$(echo "$route_info" | awk '/dev/{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1);exit}}')
+	local_ip=$(echo "$route_info" | awk '/src/{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1);exit}}')
 	[ -z "$phys_if" ] && phys_if="$WIFI_INTERFACE"
-	local_ip=$(ip addr show "$phys_if" 2>/dev/null \
-		| awk '/inet /{split($2,a,"/");print a[1];exit}')
+	if [ -z "$local_ip" ]; then
+		log "Diag: cannot determine local IP for ${phys_if:-unknown}, skipping probes"
+		return
+	fi
 
-	log "Diag: lifetime=${lifetime}s servers=${_diag_server_ips} if=${phys_if}"
+	log "Diag: lifetime=${lifetime}s servers=${_diag_server_ips} if=${phys_if} local=${local_ip}"
 
 	# Build tcpdump filter covering all server IPs: "host IP1 or host IP2 ..."
 	filter=$(echo "$_diag_server_ips" | tr ' ' '\n' | grep -v '^$' \
@@ -769,8 +775,8 @@ _diagnose_tunnel_failure() {
 
 	local out_pkts=0 in_pkts=0
 	if [ -f "$pcap" ]; then
-		out_pkts=$(tcpdump -r "$pcap" -nn "src ${local_ip:-192.168.0.0/16} and (${filter})" 2>/dev/null | wc -l)
-		in_pkts=$(tcpdump -r "$pcap" -nn "(${filter}) and dst ${local_ip:-192.168.100.0/24}" 2>/dev/null | wc -l)
+		out_pkts=$(tcpdump -r "$pcap" -nn "src $local_ip and (${filter})" 2>/dev/null | wc -l)
+		in_pkts=$(tcpdump -r "$pcap" -nn "(${filter}) and dst $local_ip" 2>/dev/null | wc -l)
 	fi
 	log "Diag: phys_capture out=${out_pkts} in=${in_pkts} pcap=${pcap}"
 
