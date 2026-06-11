@@ -15,7 +15,7 @@
 NODE="Los Angeles"                    # Set to your node tag (run: surflare nodes)
 NODE_CANDIDATES=("Los Angeles" "Dallas" "Atlanta" "Seoul" "Chicago" "Miami" "New York")
 MODE="global"                         # Connection mode: global, rule, direct
-TRANSIT="auto"                            # Transit server for multi-hop: auto, or "" to disable
+TRANSIT=""                                # Transit server: "" = use TRANSIT_CANDIDATES (logged), "auto" = surflare picks (opaque)
 TRANSIT_CANDIDATES="Tokyo Seoul"            # Ordered probe list; connect_vpn picks lowest-latency
 TRANSIT_CONNECT_TIMEOUT=12             # max seconds for surflare connect per candidate
 TRANSIT_ROUTE_READY_TIMEOUT=15        # max seconds to poll for routing readiness after connect
@@ -39,6 +39,16 @@ HEARTBEAT_INTERVAL=600                # seconds between periodic "VPN healthy" l
 TRANSIENT_THRESHOLD=6                 # consecutive external timeouts (local state OK) before escalating to fail_count
 _diag_server_ips=""                   # space-separated VPN server IPs captured after each successful connect
 _diag_connect_time=0                  # epoch seconds of last successful connect
+_sess_node=""                         # exit node of current VPN session
+_sess_transit=""                      # transit node of current session
+_sess_exit=""                         # exit country code of current session
+_sess_connect_s=0                     # epoch of current session start
+_sess_prev_node=""                    # previous session's exit node
+_sess_prev_s=0                        # previous session's lifetime in seconds
+_diag_conclusion=""                   # set by _diagnose_tunnel_failure for _record_disconnect
+_diag_out=0                           # physical capture outbound packet count
+_diag_in=0                            # physical capture inbound packet count
+EVENT_LOG="/var/log/surflare_events.jsonl"
 # Auto-detect WiFi interface; fallback to wlp9s0f0 if iw is unavailable
 WIFI_INTERFACE=$(iw dev 2>/dev/null | awk '/Interface/{print $2; exit}')
 [ -z "$WIFI_INTERFACE" ] && WIFI_INTERFACE="wlp9s0f0"
@@ -788,7 +798,49 @@ _diagnose_tunnel_failure() {
 	else
 		conclusion="SERVER_APP_FAILURE -- physical bidirectional OK, server not forwarding inner traffic"
 	fi
+	_diag_conclusion="${conclusion%% --*}"  # store short key (before " --")
+	_diag_out="$out_pkts"
+	_diag_in="$in_pkts"
 	log "Diag: CONCLUSION=${conclusion}"
+}
+
+# _record_connect: call after every confirmed-healthy reconnect.
+# Captures the transit node that was actually used, updates session state.
+_record_connect() {
+	local node="$1" exit_country="$2" now
+	now=$(date +%s)
+	_sess_prev_node="$_sess_node"
+	_sess_prev_s=$(( _sess_connect_s > 0 ? now - _sess_connect_s : 0 ))
+	_sess_node="$node"
+	_sess_exit="$exit_country"
+	_sess_connect_s="$now"
+	_diag_conclusion=""
+	_diag_out=0
+	_diag_in=0
+	# Read the transit that connect_vpn selected (logged by connect_vpn as "Using transit: X")
+	_sess_transit=$(cat "$TRANSIT_CACHE_FILE" 2>/dev/null || echo "unknown")
+	log "Session: node=${_sess_node} transit=${_sess_transit} exit=${_sess_exit} prev=${_sess_prev_node:-none}(${_sess_prev_s}s)"
+}
+
+# _record_disconnect: call after _diagnose_tunnel_failure when TCP_BLOCK fires.
+# Appends one JSON line to EVENT_LOG for pattern analysis.
+_record_disconnect() {
+	[ "$_sess_connect_s" -eq 0 ] && return
+	local now lifetime
+	now=$(date +%s)
+	lifetime=$(( now - _sess_connect_s ))
+	[ ! -f "$EVENT_LOG" ] && install -m 644 /dev/null "$EVENT_LOG" 2>/dev/null || true
+	printf '{"ts":"%s","node":"%s","lifetime_s":%d,"transit":"%s","exit":"%s","prev_node":"%s","prev_s":%d,"hour":%d,"diag":"%s","out":%d,"in":%d}\n' \
+		"$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+		"$_sess_node" "$lifetime" \
+		"${_sess_transit:-unknown}" \
+		"${_sess_exit:-?}" \
+		"${_sess_prev_node:-none}" "$_sess_prev_s" \
+		"$(date +%-H)" \
+		"${_diag_conclusion:-no_diag}" \
+		"$_diag_out" "$_diag_in" \
+		>> "$EVENT_LOG" 2>/dev/null || true
+	log "Event recorded: node=${_sess_node} lifetime=${lifetime}s transit=${_sess_transit:-?}"
 }
 
 TRANSIT_CACHE_FILE="/run/surflare_transit_cache"
@@ -1311,6 +1363,7 @@ while true; do
 	elif [ "$health" = "TCP_BLOCK" ]; then
 		if _control_probe; then
 			_diagnose_tunnel_failure
+			_record_disconnect
 			_rotate_node
 			log "Health check TCP block (tunnel confirmed, local network OK), triggering reconnect"
 			transient_count=0
@@ -1396,6 +1449,7 @@ while true; do
 				_transit_fail_count=0
 				_remove_dns_fallback
 				_update_server_endpoint
+				_record_connect "${_active_node}" "${new_health}"
 			else
 				reconnect_count=$((reconnect_count + 1))
 				log "Post-reconnect health check anomalous (reconnect_count=${reconnect_count})"
