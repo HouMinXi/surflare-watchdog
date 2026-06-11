@@ -71,7 +71,7 @@ umask 0177
 #   flock         -> util-linux   (all major distros)
 #   surflare/surflare-proxy -> from surflare installation
 # Note: nm-online is optional (NetworkManager package); falls back to sleep 15s.
-for cmd in curl killall pgrep flock surflare surflare-proxy python3; do
+for cmd in curl killall pgrep flock surflare surflare-proxy python3 expect; do
 	if ! command -v "$cmd" >/dev/null 2>&1; then
 		printf '<3>surflare_watchdog: missing dependency: %s, exiting\n' "$cmd" >/dev/kmsg
 		exit 1
@@ -646,34 +646,42 @@ wait_for_exit() {
 	fi
 }
 
-# refresh_auth: (optional) refresh surflare auth token using stored credentials
-# (TPM2-encrypted via systemd-creds). Surflare persists its own token in
-# /etc/surflare/auth.dat, so this is a defensive redundancy -- not required for
-# normal operation. To enable, run: sudo bash ./setup_auth.sh
-# Retries LOGIN_RETRIES times with LOGIN_RETRY_DELAY between attempts -- surflare API is
-# sometimes unreachable even with VPN up. Returns 0 if any attempt succeeds.
-# Password is piped via stdin to avoid /proc/<pid>/cmdline exposure.
+# refresh_auth: refresh surflare auth token using stored credentials
+# (TPM2-encrypted via systemd-creds). Uses expect(1) to deliver password
+# via PTY -- surflare reads from /dev/tty, not stdin. Heredoc avoids
+# leaking the password in /proc/<pid>/cmdline.
 refresh_auth() {
 	local email="${SURFLARE_EMAIL:-}"
 	local password=""
 
-	# Silently skip if credentials are not configured (optional feature)
 	[ -z "$email" ] && return 2
 	[ -z "${CREDENTIALS_DIRECTORY:-}" ] && return 2
 
-	# Read password from systemd credentials directory (TPM2-decrypted at runtime)
 	if [ -f "$CREDENTIALS_DIRECTORY/surflare_password" ]; then
 		password=$(cat "$CREDENTIALS_DIRECTORY/surflare_password")
 	else
-		return 2  # credential file missing: silently back off
+		return 2
 	fi
 	[ -z "$password" ] && return 2
 
 	local i=0 rc=1
 	while [ "$i" -lt "$LOGIN_RETRIES" ]; do
-		# stdin pipe avoids /proc/cmdline exposure; surflare prompts "Password:"
-		# and reads from stdin when -p is omitted (verified surflare v4.x)
-		if printf '%s\n' "$password" | timeout 15 surflare login -u "$email" >/dev/null 2>&1; then
+		if timeout 30 expect <<EXPECT_EOF >/dev/null 2>&1
+set timeout 15
+log_user 0
+spawn surflare login -u {${email}}
+expect {
+    {Password:} {}
+    timeout {exit 1}
+    eof {exit 1}
+}
+send -- {${password}}
+send "\r"
+expect eof
+lassign [wait] pid spawnid os_error value
+exit \$value
+EXPECT_EOF
+		then
 			log "Auth token refreshed successfully (attempt $((i + 1))/${LOGIN_RETRIES})"
 			rc=0
 			break
@@ -681,7 +689,6 @@ refresh_auth() {
 		i=$((i + 1))
 		[ "$i" -lt "$LOGIN_RETRIES" ] && sleep "$LOGIN_RETRY_DELAY"
 	done
-	# Clear password from shell memory immediately after use
 	unset password
 	if [ "$rc" -ne 0 ]; then
 		log "Auth token refresh failed after ${LOGIN_RETRIES} attempts"
@@ -1230,12 +1237,7 @@ while true; do
 		now=$(date +%s)
 		if [ $((now - last_refresh)) -ge "$TOKEN_REFRESH_INTERVAL" ]; then
 			refresh_auth
-			refresh_rc=$?
-			if [ "$refresh_rc" -eq 0 ] || [ "$refresh_rc" -eq 2 ]; then
-				# rc=0: success; rc=2: no credentials -- both back off a full interval.
-				# rc=1 (login failure) leaves last_refresh unchanged for prompt retry.
-				last_refresh=$(date +%s)
-			fi
+			last_refresh=$(date +%s)
 		fi
 
 		# Periodic heartbeat -- confirms watchdog is alive during long healthy stretches
