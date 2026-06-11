@@ -37,7 +37,7 @@ LOGIN_RETRIES=5                       # max login attempts per refresh cycle
 LOGIN_RETRY_DELAY=3                   # seconds between login retries
 HEARTBEAT_INTERVAL=600                # seconds between periodic "VPN healthy" log entries (0=off)
 TRANSIENT_THRESHOLD=6                 # consecutive external timeouts (local state OK) before escalating to fail_count
-_diag_server_ip=""                    # VPN server IP captured after each successful connect
+_diag_server_ips=""                   # space-separated VPN server IPs captured after each successful connect
 _diag_connect_time=0                  # epoch seconds of last successful connect
 # Auto-detect WiFi interface; fallback to wlp9s0f0 if iw is unavailable
 WIFI_INTERFACE=$(iw dev 2>/dev/null | awk '/Interface/{print $2; exit}')
@@ -698,92 +698,90 @@ EXPECT_EOF
 	return "$rc"
 }
 
-# _update_server_endpoint: capture the VPN server's public IP from the active
-# surflare-proxy socket. Called after every confirmed-healthy reconnect so that
-# _diagnose_tunnel_failure has a valid target to probe.
+# _update_server_endpoint: capture ALL public VPN server IPs from active
+# surflare-proxy sockets. Stores space-separated list in _diag_server_ips.
+# Called after every confirmed-healthy reconnect.
 _update_server_endpoint() {
-	local ep ip
-	# Try UDP first (WireGuard-style), then TCP (TLS tunnel)
-	ep=$(ss -unp 2>/dev/null | awk '/surflare/{print $5; exit}')
-	[ -z "$ep" ] && ep=$(ss -tnp state established 2>/dev/null | awk '/surflare/{print $5; exit}')
-	# Strip port -- handle both addr:port and [ipv6]:port
-	if [[ "$ep" =~ ^\[(.+)\]:[0-9]+$ ]]; then
-		ip="${BASH_REMATCH[1]}"
-	elif [[ "$ep" =~ ^([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+):[0-9]+$ ]]; then
-		ip="${BASH_REMATCH[1]}"
+	local ips
+	# ss -tnp format: Recv-Q Send-Q Local($3) Peer($4) Process
+	# Exclude RFC1918 (10.x, 172.16-31.x, 192.168.x) to get only public server IPs.
+	ips=$(ss -tnp state established 2>/dev/null \
+		| awk '/surflare/{split($4,a,":");ip=a[1];
+		        if (ip ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ &&
+		            ip !~ /^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.|127\.)/) print ip}' \
+		| sort -u | tr '\n' ' ' | sed 's/[[:space:]]*$//')
+	# UDP fallback: Netid State Recv-Q Send-Q Local($5) Peer($6) Process
+	if [ -z "$ips" ]; then
+		ips=$(ss -unp 2>/dev/null \
+			| awk '/surflare/{split($6,a,":");ip=a[1];
+			        if (ip ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ &&
+			            ip !~ /^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.|127\.)/) print ip}' \
+			| sort -u | tr '\n' ' ' | sed 's/[[:space:]]*$//')
 	fi
-	# Fallback: gateway of the VPN routing table
-	if [ -z "$ip" ]; then
-		ip=$(ip route show table 100 2>/dev/null | awk '/^default via/{print $3; exit}')
-	fi
-	_diag_server_ip="$ip"
+	_diag_server_ips="$ips"
 	_diag_connect_time=$(date +%s)
-	[ -n "$ip" ] && log "Diag: server endpoint=${ip} (connect_time=$(date -d @"$_diag_connect_time" '+%H:%M:%S' 2>/dev/null || date +%H:%M:%S))"
+	[ -n "$ips" ] && log "Diag: server endpoints=${ips}"
 }
 
 # _diagnose_tunnel_failure: called when TCP_BLOCK is detected.
-# Runs two probes on the PHYSICAL interface (bypassing the tunnel) and logs a
-# clear verdict so pcap analysis can distinguish upstream blackhole from server down.
+# Captures 3s of traffic on the PHYSICAL interface for ALL surflare server IPs
+# and logs a verdict distinguishing three root causes:
 #
-# Probe A -- physical NIC capture (3s):
-#   out>0 in=0  -> one-way: packets leave but nothing returns  (routing anomaly)
-#   out=0       -> proxy silent: surflare-proxy not sending    (local process issue)
-#   out>0 in>0  -> bidirectional: tunnel layer is alive        (app-level failure)
+#   bidirectional -> SERVER_APP_FAILURE  (physical layer OK, server not forwarding)
+#   one_way       -> UPSTREAM_UNREACHABLE  (outbound sent, nothing returned at all)
+#   proxy_silent  -> LOCAL_PROXY_DEAD    (surflare-proxy not generating traffic)
 #
-# Probe B -- ICMP ping direct to server (via physical IF, bypasses fwmark routing):
-#   ok          -> server alive; combined with one-way -> port block confirmed
-#   timeout     -> server unreachable; cannot distinguish IP block from server down
+# ICMP ping is intentionally omitted: surflare servers block ICMP, so ping
+# always times out regardless of server health, making it useless as a probe.
 _diagnose_tunnel_failure() {
-	local now lifetime
+	local now lifetime first_ip phys_if local_ip filter
 	now=$(date +%s)
 	lifetime=$(( now - _diag_connect_time ))
-	log "Diag: lifetime=${lifetime}s server=${_diag_server_ip:-unknown} if=${WIFI_INTERFACE}"
 
-	[ -z "$_diag_server_ip" ] && { log "Diag: no server IP captured, skipping probes"; return; }
+	if [ -z "$_diag_server_ips" ]; then
+		log "Diag: no server IPs captured, skipping probes"
+		return
+	fi
 
-	# Probe A: 3s physical NIC capture
+	first_ip="${_diag_server_ips%% *}"
+
+	# Detect physical interface from routing table (server IP always routed direct)
+	phys_if=$(ip route get "$first_ip" 2>/dev/null \
+		| awk '/dev/{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1);exit}}')
+	[ -z "$phys_if" ] && phys_if="$WIFI_INTERFACE"
+	local_ip=$(ip addr show "$phys_if" 2>/dev/null \
+		| awk '/inet /{split($2,a,"/");print a[1];exit}')
+
+	log "Diag: lifetime=${lifetime}s servers=${_diag_server_ips} if=${phys_if}"
+
+	# Build tcpdump filter covering all server IPs: "host IP1 or host IP2 ..."
+	filter=$(echo "$_diag_server_ips" | tr ' ' '\n' | grep -v '^$' \
+		| awk '{printf "%shost %s",(NR>1?" or ":""),$0}')
+
+	# Probe: 3s physical NIC capture filtered to all surflare server IPs
 	find /tmp -name 'surflare_phys_*.pcap' -mmin +30 -delete 2>/dev/null || true
 	local pcap
 	pcap="/tmp/surflare_phys_$(date +%Y%m%d_%H%M%S).pcap"
-	local local_ip
-	local_ip=$(ip addr show "$WIFI_INTERFACE" 2>/dev/null | awk '/inet /{split($2,a,"/"); print a[1]; exit}')
-	tcpdump -i "$WIFI_INTERFACE" -nn -w "$pcap" "host $_diag_server_ip" 2>/dev/null &
+	tcpdump -i "$phys_if" -nn -w "$pcap" "$filter" 2>/dev/null &
 	local td_pid=$!
 	sleep 3
 	kill "$td_pid" 2>/dev/null; wait "$td_pid" 2>/dev/null
 
 	local out_pkts=0 in_pkts=0
 	if [ -f "$pcap" ]; then
-		out_pkts=$(tcpdump -r "$pcap" -nn "src ${local_ip:-192.168.0.0/16} and dst $_diag_server_ip" 2>/dev/null | wc -l)
-		in_pkts=$(tcpdump -r "$pcap" -nn "src $_diag_server_ip" 2>/dev/null | wc -l)
+		out_pkts=$(tcpdump -r "$pcap" -nn "src ${local_ip:-192.168.0.0/16} and (${filter})" 2>/dev/null | wc -l)
+		in_pkts=$(tcpdump -r "$pcap" -nn "(${filter}) and dst ${local_ip:-192.168.100.0/24}" 2>/dev/null | wc -l)
 	fi
 	log "Diag: phys_capture out=${out_pkts} in=${in_pkts} pcap=${pcap}"
 
-	local verdict_a
-	if [ "$out_pkts" -gt 0 ] && [ "$in_pkts" -eq 0 ]; then
-		verdict_a="one_way"
-	elif [ "$out_pkts" -eq 0 ]; then
-		verdict_a="proxy_silent"
-	else
-		verdict_a="bidirectional"
-	fi
-
-	# Probe B: ICMP direct to server via physical IF (bypasses fwmark/table-100 routing)
-	local verdict_b="timeout"
-	if ping -c2 -W3 -I "$WIFI_INTERFACE" "$_diag_server_ip" >/dev/null 2>&1; then
-		verdict_b="ok"
-	fi
-	log "Diag: phys_ping=${verdict_b}"
-
-	# Combined verdict
 	local conclusion
-	case "${verdict_a}/${verdict_b}" in
-		one_way/ok)      conclusion="PORT_BLOCK -- server alive (ICMP ok), tunnel UDP silently dropped" ;;
-		one_way/timeout) conclusion="IP_UNREACHABLE -- no return AND no ICMP" ;;
-		proxy_silent/*)  conclusion="PROXY_DEAD -- surflare-proxy not sending tunnel traffic" ;;
-		bidirectional/*) conclusion="TUNNEL_APP_FAILURE -- physical layer bidirectional, issue above UDP" ;;
-		*)               conclusion="UNKNOWN" ;;
-	esac
+	if [ "$out_pkts" -gt 0 ] && [ "$in_pkts" -eq 0 ]; then
+		conclusion="UPSTREAM_UNREACHABLE -- outbound sent, nothing returned at physical layer"
+	elif [ "$out_pkts" -eq 0 ]; then
+		conclusion="LOCAL_PROXY_DEAD -- surflare-proxy not generating tunnel traffic"
+	else
+		conclusion="SERVER_APP_FAILURE -- physical bidirectional OK, server not forwarding inner traffic"
+	fi
 	log "Diag: CONCLUSION=${conclusion}"
 }
 
