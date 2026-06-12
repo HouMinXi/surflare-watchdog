@@ -1168,11 +1168,11 @@ table $_trace_table {
     chain output {
         type filter hook output priority mangle;
         ip daddr { $ip_set } tcp dport { 80, 443 } mark set mark | 0xface ct mark set ct mark | 0xface
-        mark 0xface log prefix "WD_TRACE_OUT" group $_trace_group
+        mark & 0xface == 0xface log prefix "WD_TRACE_OUT" group $_trace_group
     }
     chain input {
         type filter hook input priority mangle;
-        ct mark 0xface log prefix "WD_TRACE_IN" group $_trace_group
+        ct mark & 0xface == 0xface log prefix "WD_TRACE_IN" group $_trace_group
     }
 }
 EOF
