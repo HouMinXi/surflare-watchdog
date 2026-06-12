@@ -25,6 +25,7 @@ FAIL_THRESHOLD=4                      # Consecutive failures before reconnect
 LOCK_FILE=/run/surflare_watchdog.lock # Mutex lock to prevent concurrent reconnects
 PIDFILE=/run/surflare_watchdog.pid    # PID file for reliable daemon shutdown
 ROTATION_STATE=/var/tmp/surflare_rotation  # Persists active node across restarts
+DIAG_SACK_THRESHOLD=20                # % of packets with SACK blocks to flag transit degradation
 DISCONNECT_SETTLE=2                   # seconds after surflare disconnect before killing processes
 CONNECT_SETTLE=10                     # seconds after surflare connect --daemon for VPN to establish
 NETWORK_WAIT_FALLBACK=15              # seconds to wait for network when nm-online is unavailable
@@ -48,6 +49,10 @@ _sess_prev_s=0                        # previous session's lifetime in seconds
 _diag_conclusion=""                   # set by _diagnose_tunnel_failure for _record_disconnect
 _diag_out=0                           # physical capture outbound packet count
 _diag_in=0                            # physical capture inbound packet count
+_diag_syn_out=0                       # SYN packets sent (new connection attempts)
+_diag_syn_ack=0                       # SYN-ACK received (successful handshakes)
+_diag_sack_pct=0                      # % of packets with SACK blocks
+_diag_rst_in=0                        # RST packets received from server
 EVENT_LOG="/var/log/surflare_events.jsonl"
 # Auto-detect WiFi interface; fallback to wlp9s0f0 if iw is unavailable
 WIFI_INTERFACE=$(iw dev 2>/dev/null | awk '/Interface/{print $2; exit}')
@@ -791,16 +796,48 @@ _diagnose_tunnel_failure() {
 	log "Diag: phys_capture out=${out_pkts} in=${in_pkts} pcap=${pcap}"
 
 	local conclusion
+	local syn_out=0 syn_ack=0 sack_total=0 rst_in=0 sack_pct=0
 	if [ "$out_pkts" -gt 0 ] && [ "$in_pkts" -eq 0 ]; then
 		conclusion="UPSTREAM_UNREACHABLE -- outbound sent, nothing returned at physical layer"
 	elif [ "$out_pkts" -eq 0 ]; then
 		conclusion="LOCAL_PROXY_DEAD -- surflare-proxy not generating tunnel traffic"
 	else
-		conclusion="SERVER_APP_FAILURE -- physical bidirectional OK, server not forwarding inner traffic"
+		syn_out=$(tcpdump -r "$pcap" -nn \
+			"src $local_ip and tcp[tcpflags] & (tcp-syn|tcp-ack) == tcp-syn" \
+			2>/dev/null | wc -l)
+		syn_ack=$(tcpdump -r "$pcap" -nn \
+			"dst $local_ip and tcp[tcpflags] & (tcp-syn|tcp-ack) == (tcp-syn|tcp-ack)" \
+			2>/dev/null | wc -l)
+		sack_total=$(tcpdump -r "$pcap" -nn 2>/dev/null \
+			| grep -cE 'sack [0-9]' || true)
+		rst_in=$(tcpdump -r "$pcap" -nn \
+			"dst $local_ip and tcp[tcpflags] & tcp-rst != 0" \
+			2>/dev/null | wc -l)
+		local total_pkts=$(( out_pkts + in_pkts ))
+		[ "$total_pkts" -gt 0 ] && sack_pct=$(( sack_total * 100 / total_pkts ))
+		log "Diag: syn_out=${syn_out} syn_ack=${syn_ack} sack=${sack_total}/${total_pkts}(${sack_pct}%) rst=${rst_in}"
+
+		if [ "$syn_out" -gt 0 ] && [ $(( syn_ack * 2 )) -lt "$syn_out" ]; then
+			if [ "$rst_in" -gt 0 ]; then
+				conclusion="SERVER_REFUSED -- syn=${syn_ack}/${syn_out} rst=${rst_in} server responding with RST"
+			elif [ "$sack_pct" -gt "$DIAG_SACK_THRESHOLD" ]; then
+				conclusion="TRANSIT_DEGRADATION -- syn=${syn_ack}/${syn_out} sack=${sack_pct}% link quality collapse"
+			else
+				conclusion="TARGETED_SYN_BLOCK -- syn=${syn_ack}/${syn_out} sack=${sack_pct}% targeted SYN blocking"
+			fi
+		elif [ "$sack_pct" -gt "$DIAG_SACK_THRESHOLD" ]; then
+			conclusion="TRANSIT_DEGRADATION -- syn=${syn_ack}/${syn_out} sack=${sack_pct}% high packet loss on active streams"
+		else
+			conclusion="SERVER_APP_FAILURE -- syn=${syn_ack}/${syn_out} sack=${sack_pct}% server not forwarding"
+		fi
 	fi
-	_diag_conclusion="${conclusion%% --*}"  # store short key (before " --")
+	_diag_conclusion="${conclusion%% --*}"
 	_diag_out="$out_pkts"
 	_diag_in="$in_pkts"
+	_diag_syn_out="$syn_out"
+	_diag_syn_ack="$syn_ack"
+	_diag_sack_pct="$sack_pct"
+	_diag_rst_in="$rst_in"
 	log "Diag: CONCLUSION=${conclusion}"
 }
 
@@ -821,6 +858,10 @@ _record_connect() {
 	_diag_conclusion=""
 	_diag_out=0
 	_diag_in=0
+	_diag_syn_out=0
+	_diag_syn_ack=0
+	_diag_sack_pct=0
+	_diag_rst_in=0
 	# Read the transit written by connect_vpn for every connection (not just after reprobe)
 	_sess_transit=$(cat /run/surflare_last_transit 2>/dev/null || echo "unknown")
 	log "Session: node=${_sess_node} transit=${_sess_transit} exit=${_sess_exit} prev=${_sess_prev_node:-none}(${_sess_prev_s}s)"
@@ -834,7 +875,7 @@ _record_disconnect() {
 	now=$(date +%s)
 	lifetime=$(( now - _sess_connect_s ))
 	[ ! -f "$EVENT_LOG" ] && install -m 644 /dev/null "$EVENT_LOG" 2>/dev/null || true
-	printf '{"ts":"%s","node":"%s","lifetime_s":%d,"transit":"%s","exit":"%s","prev_node":"%s","prev_s":%d,"hour":%d,"diag":"%s","out":%d,"in":%d}\n' \
+	printf '{"ts":"%s","node":"%s","lifetime_s":%d,"transit":"%s","exit":"%s","prev_node":"%s","prev_s":%d,"hour":%d,"diag":"%s","out":%d,"in":%d,"syn_out":%d,"syn_ack":%d,"sack_pct":%d,"rst_in":%d}\n' \
 		"$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
 		"$_sess_node" "$lifetime" \
 		"${_sess_transit:-unknown}" \
@@ -843,6 +884,8 @@ _record_disconnect() {
 		"$(date +%-H)" \
 		"${_diag_conclusion:-no_diag}" \
 		"$_diag_out" "$_diag_in" \
+		"$_diag_syn_out" "$_diag_syn_ack" \
+		"$_diag_sack_pct" "$_diag_rst_in" \
 		>> "$EVENT_LOG" 2>/dev/null || true
 	log "Event recorded: node=${_sess_node} lifetime=${lifetime}s transit=${_sess_transit:-?}"
 }
