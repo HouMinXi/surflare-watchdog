@@ -16,7 +16,7 @@ NODE="Los Angeles"                    # Set to your node tag (run: surflare node
 NODE_CANDIDATES=("Los Angeles" "Dallas" "Atlanta" "Seoul" "Chicago" "Miami" "New York")
 MODE="global"                         # Connection mode: global, rule, direct
 TRANSIT=""                                # Transit server: "" = use TRANSIT_CANDIDATES (logged), "auto" = surflare picks (opaque)
-TRANSIT_CANDIDATES="Seoul Hong Kong"        # Ordered probe list; connect_vpn picks lowest-latency
+TRANSIT_CANDIDATES=("Seoul" "Hong Kong")    # Ordered probe list; connect_vpn picks lowest-latency
 TRANSIT_CONNECT_TIMEOUT=12             # max seconds for surflare connect per candidate
 TRANSIT_ROUTE_READY_TIMEOUT=15        # max seconds to poll for routing readiness after connect
 TRANSIT_PROBE_SETTLE=20              # seconds of quiet time for tunnel handshake after routing ready
@@ -898,12 +898,12 @@ cleanup_probe_state() {
 }
 
 probe_best_transit() {
-	if [ -z "$TRANSIT_CANDIDATES" ]; then
+	if [ ${#TRANSIT_CANDIDATES[@]} -eq 0 ]; then
 		echo ""
 		return
 	fi
 	local node best_node="" best_ms=999999
-	for node in $TRANSIT_CANDIDATES; do
+	for node in "${TRANSIT_CANDIDATES[@]}"; do
 		log "Probing transit candidate: ${node}"
 		if ! timeout "$TRANSIT_CONNECT_TIMEOUT" surflare connect \
 			--node "${_active_node:-$NODE}" --mode "${MODE:-global}" \
@@ -1027,9 +1027,9 @@ connect_vpn() {
 		fi
 
 		local effective_transit="$TRANSIT"
-		if [ -n "$TRANSIT_CANDIDATES" ] && [ -z "$TRANSIT" ]; then
+		if [ ${#TRANSIT_CANDIDATES[@]} -gt 0 ] && [ -z "$TRANSIT" ]; then
 			effective_transit=$(get_cached_transit)
-			[ -z "$effective_transit" ] && effective_transit="${TRANSIT_CANDIDATES%% *}"
+			[ -z "$effective_transit" ] && effective_transit="${TRANSIT_CANDIDATES[0]}"
 			log "Using transit: ${effective_transit} (from cache or first candidate)"
 		fi
 		# Persist effective transit so _record_connect can read it regardless
