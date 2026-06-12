@@ -16,7 +16,7 @@ NODE="Los Angeles"                    # Set to your node tag (run: surflare node
 NODE_CANDIDATES=("Los Angeles" "Dallas" "Atlanta" "Seoul" "Chicago" "Miami" "New York")
 MODE="global"                         # Connection mode: global, rule, direct
 TRANSIT=""                                # Transit server: "" = use TRANSIT_CANDIDATES (logged), "auto" = surflare picks (opaque)
-TRANSIT_CANDIDATES=("Seoul" "Hong Kong")    # Ordered probe list; connect_vpn picks lowest-latency
+TRANSIT_CANDIDATES=("Los Angeles" "Taipei" "Seoul" "Hong Kong")  # Ordered probe list; connect_vpn picks lowest-latency
 TRANSIT_CONNECT_TIMEOUT=12             # max seconds for surflare connect per candidate
 TRANSIT_ROUTE_READY_TIMEOUT=15        # max seconds to poll for routing readiness after connect
 TRANSIT_PROBE_SETTLE=20              # seconds of quiet time for tunnel handshake after routing ready
