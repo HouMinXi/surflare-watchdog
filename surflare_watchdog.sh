@@ -808,6 +808,10 @@ _diagnose_tunnel_failure() {
 # Captures the transit node that was actually used, updates session state.
 _record_connect() {
 	local node="$1" exit_country="$2" now
+	# Normalize health-check codes that are not ISO country codes
+	case "$exit_country" in
+		OK|TUNNEL_OK) exit_country="?" ;;
+	esac
 	now=$(date +%s)
 	_sess_prev_node="$_sess_node"
 	_sess_prev_s=$(( _sess_connect_s > 0 ? now - _sess_connect_s : 0 ))
@@ -817,8 +821,8 @@ _record_connect() {
 	_diag_conclusion=""
 	_diag_out=0
 	_diag_in=0
-	# Read the transit that connect_vpn selected (logged by connect_vpn as "Using transit: X")
-	_sess_transit=$(cat "$TRANSIT_CACHE_FILE" 2>/dev/null || echo "unknown")
+	# Read the transit written by connect_vpn for every connection (not just after reprobe)
+	_sess_transit=$(cat /run/surflare_last_transit 2>/dev/null || echo "unknown")
 	log "Session: node=${_sess_node} transit=${_sess_transit} exit=${_sess_exit} prev=${_sess_prev_node:-none}(${_sess_prev_s}s)"
 }
 
@@ -1028,6 +1032,9 @@ connect_vpn() {
 			[ -z "$effective_transit" ] && effective_transit="${TRANSIT_CANDIDATES%% *}"
 			log "Using transit: ${effective_transit} (from cache or first candidate)"
 		fi
+		# Persist effective transit so _record_connect can read it regardless
+		# of whether the probe cache has been populated yet.
+		printf '%s\n' "${effective_transit:-off}" > /run/surflare_last_transit 2>/dev/null || true
 
 		local use_node="${_active_node:-$NODE}"
 		log "Connecting to ${use_node} mode=${MODE:-global} transit=${effective_transit:-off} (daemon mode)..."
