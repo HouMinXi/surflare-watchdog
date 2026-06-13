@@ -292,6 +292,94 @@ _setup_chnroute() {
 	fi
 }
 
+_install_killswitch() {
+	nft delete table inet killswitch 2>/dev/null || true
+
+	local _ks_tmp="/tmp/ks_install_$$.nft"
+	cat > "$_ks_tmp" << 'NFTEOF'
+table inet killswitch {
+	set server_ips  { type ipv4_addr; }
+	set server_ips6 { type ipv6_addr; }
+	set bypass_ipv4 { type ipv4_addr; flags interval; }
+	set bypass_ipv6 { type ipv6_addr; flags interval; }
+	set lan_ranges {
+		type ipv4_addr
+		flags interval
+		elements = {
+			10.0.0.0/8, 100.64.0.0/10, 169.254.0.0/16,
+			172.16.0.0/12, 192.168.0.0/16
+		}
+	}
+	set lan6_ranges {
+		type ipv6_addr
+		flags interval
+		elements = { ::1/128, fe80::/10, fc00::/7 }
+	}
+	chain output {
+		type filter hook output priority filter + 20; policy drop;
+		ct state invalid drop
+		oif "lo" accept
+		ip daddr @server_ips accept
+		ip6 daddr @server_ips6 accept
+		meta mark == 0xff accept
+		ip daddr @bypass_ipv4 accept
+		ip6 daddr @bypass_ipv6 accept
+		ip daddr @lan_ranges accept
+		ip6 daddr @lan6_ranges accept
+		ip daddr 255.255.255.255 accept
+		ip daddr 224.0.0.0/4 accept
+		ip6 daddr ff00::/8 accept
+		udp sport 68 udp dport 67 accept
+		udp sport 546 udp dport 547 accept
+		meta skuid chrony udp dport 123 accept
+		limit rate 5/second burst 10 packets log prefix "ks-drop: "
+		counter drop
+	}
+}
+NFTEOF
+	if nft -f "$_ks_tmp"; then
+		log "Kill switch installed (inet killswitch, policy drop)"
+	else
+		log "ERROR: kill switch install failed"
+		rm -f "$_ks_tmp"
+		return 1
+	fi
+	rm -f "$_ks_tmp"
+
+	local cn_v4_file="/etc/surflare/cn_ipv4.txt"
+	local cn_v6_file="/etc/surflare/cn_ipv6.txt"
+	if [ -f "$cn_v4_file" ]; then
+		local bypass_v4
+		bypass_v4=$(grep -v '^#' "$cn_v4_file" | grep -v '^[[:space:]]*$' | paste -sd, -)
+		if [ -n "$bypass_v4" ]; then
+			nft add element inet killswitch bypass_ipv4 "{ $bypass_v4 }" 2>/dev/null || \
+				log "WARN: failed to load bypass_ipv4"
+		fi
+	fi
+	if [ -f "$cn_v6_file" ]; then
+		local bypass_v6
+		bypass_v6=$(grep -v '^#' "$cn_v6_file" | grep -v '^[[:space:]]*$' | paste -sd, -)
+		if [ -n "$bypass_v6" ]; then
+			nft add element inet killswitch bypass_ipv6 "{ $bypass_v6 }" 2>/dev/null || \
+				log "WARN: failed to load bypass_ipv6"
+		fi
+	fi
+}
+
+_update_killswitch_server_ips() {
+	[ -z "$_diag_server_ips" ] && return
+	nft list table inet killswitch >/dev/null 2>&1 || return
+	local ip_csv
+	ip_csv=$(echo "$_diag_server_ips" | tr ' ' ',')
+	nft flush set inet killswitch server_ips 2>/dev/null || true
+	nft add element inet killswitch server_ips "{ $ip_csv }" 2>/dev/null || true
+	log "Kill switch: server_ips updated (${_diag_server_ips})"
+}
+
+_remove_killswitch() {
+	nft delete table inet killswitch 2>/dev/null || true
+}
+
 CONTROL_PROBE_TARGETS="114.114.114.114:53 223.5.5.5:53"
 CONTROL_PROBE_TIMEOUT=3
 
@@ -1308,6 +1396,7 @@ cleanup() {
 	# shellcheck disable=SC2086
 	[ -n "$_hc_tmp" ] && rm -f $_hc_tmp
 	nft delete table inet surflare_moat 2>/dev/null || true
+	_remove_killswitch
 	rm -f "$PIDFILE"
 }
 trap 'log "watchdog stopped"; cleanup; exit 0' INT TERM
@@ -1346,6 +1435,9 @@ if [ -f "$ROTATION_STATE" ]; then
 	fi
 fi
 log "watchdog started: node=${_active_node} candidates=${#NODE_CANDIDATES[@]} interval=${CHECK_INTERVAL}s threshold=${FAIL_THRESHOLD} transient=${TRANSIENT_THRESHOLD}"
+if ! _install_killswitch; then
+	log "WARN: Kill switch failed to install -- IP leak protection inactive"
+fi
 _setup_kernel_moat
 
 while true; do
@@ -1502,6 +1594,7 @@ while true; do
 				_transit_fail_count=0
 				_remove_dns_fallback
 				_update_server_endpoint
+				_update_killswitch_server_ips
 				_record_connect "${_active_node}" "${new_health}"
 			else
 				reconnect_count=$((reconnect_count + 1))
