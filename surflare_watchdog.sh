@@ -694,9 +694,13 @@ expect {
 }
 send -- {${password}}
 send "\r"
-expect eof
-lassign [wait] pid spawnid os_error value
-exit \$value
+expect {
+    eof {
+        lassign [wait] pid spawnid os_error value
+        exit \$value
+    }
+    timeout { exit 1 }
+}
 EXPECT_EOF
 		then
 			log "Auth token refreshed successfully (attempt $((i + 1))/${LOGIN_RETRIES})"
@@ -1167,8 +1171,7 @@ start_packet_trace() {
 table $_trace_table {
     chain output {
         type filter hook output priority mangle;
-        ip daddr { $ip_set } tcp dport { 80, 443 } mark set mark | 0xface ct mark set ct mark | 0xface
-        mark & 0xface == 0xface log prefix "WD_TRACE_OUT" group $_trace_group
+        ip daddr { $ip_set } tcp dport { 80, 443 } ct mark set ct mark | 0xface log prefix "WD_TRACE_OUT" group $_trace_group
     }
     chain input {
         type filter hook input priority mangle;
