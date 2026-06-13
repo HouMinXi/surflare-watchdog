@@ -256,6 +256,18 @@ _setup_chnroute() {
 			nft insert rule inet surflare output ip daddr @cn_ipv4 accept 2>/dev/null || true
 			log "Chnroute v4 applied: CN prefixes bypass proxy via output chain"
 			bypass_applied=$((bypass_applied + 1))
+			if nft list table inet killswitch >/dev/null 2>&1; then
+				local tmp_ks_v4="/tmp/ks_bypass_v4_$$.nft"
+				{
+					printf 'flush set inet killswitch bypass_ipv4\n'
+					printf 'add element inet killswitch bypass_ipv4 { '
+					grep -v '^#' "$cn_v4_file" | grep -v '^[[:space:]]*$' | paste -sd, -
+					printf ' }\n'
+				} > "$tmp_ks_v4"
+				nft -f "$tmp_ks_v4" 2>/dev/null || \
+					log "WARN: kill switch bypass_ipv4 sync failed"
+				rm -f "$tmp_ks_v4"
+			fi
 		else
 			log "WARN: Failed to load Chnroute v4 into nftables; CN bypass not active"
 		fi
@@ -281,6 +293,18 @@ _setup_chnroute() {
 			nft insert rule inet surflare output ip6 daddr @cn_ipv6 accept 2>/dev/null || true
 			log "Chnroute v6 applied: CN v6 prefixes bypass proxy via output chain"
 			bypass_applied=$((bypass_applied + 1))
+			if nft list table inet killswitch >/dev/null 2>&1; then
+				local tmp_ks_v6="/tmp/ks_bypass_v6_$$.nft"
+				{
+					printf 'flush set inet killswitch bypass_ipv6\n'
+					printf 'add element inet killswitch bypass_ipv6 { '
+					grep -v '^#' "$cn_v6_file" | grep -v '^[[:space:]]*$' | paste -sd, -
+					printf ' }\n'
+				} > "$tmp_ks_v6"
+				nft -f "$tmp_ks_v6" 2>/dev/null || \
+					log "WARN: kill switch bypass_ipv6 sync failed"
+				rm -f "$tmp_ks_v6"
+			fi
 		else
 			log "WARN: Failed to load Chnroute v6 into nftables; CN bypass not active"
 		fi
