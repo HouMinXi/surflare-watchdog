@@ -346,6 +346,7 @@ table inet killswitch {
 		ip daddr @server_ips accept
 		ip6 daddr @server_ips6 accept
 		meta mark == 0xff accept
+		meta mark == 0x1 accept
 		ip daddr @bypass_ipv4 accept
 		ip6 daddr @bypass_ipv6 accept
 		ip daddr @lan_ranges accept
@@ -1089,6 +1090,8 @@ probe_best_transit() {
 			continue
 		fi
 		sleep "$TRANSIT_PROBE_SETTLE"
+		_update_server_endpoint
+		[ "$_killswitch_armed" -eq 1 ] && _update_killswitch_server_ips
 		# Require 200/30x from Google -- local proxy errors (502/503) return
 		# instantly and would otherwise produce a falsely-low latency reading.
 		local probe_result http_code ms
