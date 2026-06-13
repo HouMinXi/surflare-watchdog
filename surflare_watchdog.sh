@@ -1063,6 +1063,10 @@ probe_best_transit() {
 	fi
 	local node best_node="" best_ms=999999
 	for node in "${TRANSIT_CANDIDATES[@]}"; do
+		if [ "${_active_node:-$NODE}" = "$node" ]; then
+			log "Probing transit candidate: ${node} -- skipped (same as node)"
+			continue
+		fi
 		log "Probing transit candidate: ${node}"
 		if ! timeout "$TRANSIT_CONNECT_TIMEOUT" surflare connect \
 			--node "${_active_node:-$NODE}" --mode "${MODE:-global}" \
@@ -1134,7 +1138,18 @@ _rotate_node() {
 		return
 	fi
 	local prev="${_active_node}"
-	_node_idx=$(( (_node_idx + 1) % n ))
+	local effective_transit
+	effective_transit=$(cat "$TRANSIT_CACHE_FILE" 2>/dev/null) || true
+	local tried=0
+	while [ "$tried" -lt "$n" ]; do
+		_node_idx=$(( (_node_idx + 1) % n ))
+		tried=$((tried + 1))
+		if [ -n "$effective_transit" ] && \
+		   [ "${NODE_CANDIDATES[$_node_idx]}" = "$effective_transit" ]; then
+			continue
+		fi
+		break
+	done
 	_active_node="${NODE_CANDIDATES[$_node_idx]}"
 	log "Node rotation: ${prev} -> ${_active_node} ($((_node_idx + 1))/${n})"
 	printf '%s\t%d\n' "$_active_node" "$_node_idx" > "$ROTATION_STATE" 2>/dev/null || true
@@ -1191,11 +1206,12 @@ connect_vpn() {
 			[ -z "$effective_transit" ] && effective_transit="${TRANSIT_CANDIDATES[0]}"
 			log "Using transit: ${effective_transit} (from cache or first candidate)"
 		fi
-		# Persist effective transit so _record_connect can read it regardless
-		# of whether the probe cache has been populated yet.
-		printf '%s\n' "${effective_transit:-off}" > /run/surflare_last_transit 2>/dev/null || true
-
 		local use_node="${_active_node:-$NODE}"
+		if [ -n "$effective_transit" ] && [ "$use_node" = "$effective_transit" ]; then
+			log "Skipping transit ${effective_transit} (same as node), using direct"
+			effective_transit=""
+		fi
+		printf '%s\n' "${effective_transit:-off}" > /run/surflare_last_transit 2>/dev/null || true
 		log "Connecting to ${use_node} mode=${MODE:-global} transit=${effective_transit:-off} (daemon mode)..."
 		if ! surflare connect --node "$use_node" \
 			${MODE:+--mode "$MODE"} \
@@ -1459,9 +1475,7 @@ if [ -f "$ROTATION_STATE" ]; then
 	fi
 fi
 log "watchdog started: node=${_active_node} candidates=${#NODE_CANDIDATES[@]} interval=${CHECK_INTERVAL}s threshold=${FAIL_THRESHOLD} transient=${TRANSIENT_THRESHOLD}"
-if ! _install_killswitch; then
-	log "WARN: Kill switch failed to install -- IP leak protection inactive"
-fi
+_killswitch_armed=0
 _setup_kernel_moat
 
 while true; do
@@ -1500,6 +1514,7 @@ while true; do
 				stop_packet_trace >/dev/null 2>&1
 				_remove_dns_fallback
 				log "Storm protection triggered (post-crash): cooling for ${STORM_COOLING}s"
+				_remove_killswitch; _killswitch_armed=0
 				sleep "$STORM_COOLING" &
 				storm_sleep_pid=$!; wait "$storm_sleep_pid"; storm_sleep_pid=""
 				reconnect_count=0
@@ -1618,6 +1633,13 @@ while true; do
 				_transit_fail_count=0
 				_remove_dns_fallback
 				_update_server_endpoint
+				if [ "$_killswitch_armed" -eq 0 ]; then
+					if _install_killswitch; then
+						_killswitch_armed=1
+					else
+						log "WARN: Kill switch failed to install -- IP leak protection inactive"
+					fi
+				fi
 				_update_killswitch_server_ips
 				_record_connect "${_active_node}" "${new_health}"
 			else
@@ -1628,6 +1650,7 @@ while true; do
 					stop_packet_trace >/dev/null 2>&1
 					_remove_dns_fallback
 					log "Storm protection triggered: cooling for ${STORM_COOLING}s"
+					_remove_killswitch; _killswitch_armed=0
 					sleep "$STORM_COOLING" & storm_sleep_pid=$!; wait "$storm_sleep_pid"; storm_sleep_pid=""
 					reconnect_count=0
 					fail_count=0
@@ -1642,6 +1665,7 @@ while true; do
 				stop_packet_trace >/dev/null 2>&1
 				_remove_dns_fallback
 				log "Storm protection triggered (connect failure): cooling for ${STORM_COOLING}s"
+				_remove_killswitch; _killswitch_armed=0
 				sleep "$STORM_COOLING" & storm_sleep_pid=$!; wait "$storm_sleep_pid"; storm_sleep_pid=""
 				reconnect_count=0
 				fail_count=0
