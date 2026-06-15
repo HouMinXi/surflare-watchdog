@@ -104,13 +104,11 @@ esac
 # ---------------------------------------------------------------------------
 # Node probe: 4am daily (L7 full-probe; accepts ~5min VPN disruption)
 # ---------------------------------------------------------------------------
-# 4am: L7 full probe (connects to each node; ~5 min VPN disruption)
-PROBE_CRON="17 4 * * * /usr/local/sbin/surflare_node_probe.sh >> /var/log/surflare_probe.log 2>&1"
-# Every 3 min: parse proxy log for real-time node health (zero disruption, CN perspective)
+# Every 3 min: parse surflare-proxy log for real-time node health (zero VPN disruption)
 LOG_HEALTH_CRON="*/3 * * * * /usr/local/sbin/surflare_log_health.sh >> /dev/null 2>&1"
 ( crontab -l 2>/dev/null | grep -v surflare_node_probe | grep -v surflare_l4_probe | grep -v surflare_log_health
-  echo "$PROBE_CRON"
   echo "$LOG_HEALTH_CRON" ) | crontab -
+# Note: surflare_node_probe.sh is available as a manual diagnostic tool only.
 
 echo ""
 echo "Installation complete."
