@@ -50,14 +50,17 @@ SVC="$REPO/services"
 case "$INIT" in
 systemd)
     SD=/etc/systemd/system
-    # Symlink: repo is authoritative; git pull + systemctl daemon-reload = update
+    # Copy unit files (systemd does not reliably follow symlinks to home dirs).
+    # To update after git pull: re-run install.sh or:
+    #   sudo cp services/systemd/*.service services/systemd/*.timer /etc/systemd/system/
+    #   sudo systemctl daemon-reload && sudo systemctl restart surflare-watchdog
     for unit in surflare-watchdog.service \
                 surflare-early-detector.service \
                 surflare-route-updater.service \
                 surflare-route-updater.timer \
                 surflare-update.service \
                 surflare-update.timer; do
-        ln -sf "$SVC/systemd/$unit" "$SD/$unit"
+        cp "$SVC/systemd/$unit" "$SD/$unit"
     done
     # Sleep resume hook
     ln -sf /usr/local/sbin/surflare_watchdog.sh /etc/systemd/system-sleep/surflare-resume.sh
@@ -105,4 +108,4 @@ PROBE_CRON="17 4 * * * /usr/local/sbin/surflare_node_probe.sh >> /var/log/surfla
 echo ""
 echo "Installation complete."
 echo "  Start watchdog : systemctl start surflare-watchdog  (or service equivalent)"
-echo "  Update workflow: git pull && systemctl daemon-reload && systemctl restart surflare-watchdog"
+echo "  Update workflow: git pull && sudo cp services/systemd/*.{service,timer} /etc/systemd/system/ && sudo systemctl daemon-reload && sudo systemctl restart surflare-watchdog"
