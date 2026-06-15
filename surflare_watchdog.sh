@@ -323,6 +323,12 @@ _setup_chnroute() {
 _install_killswitch() {
 	nft delete table inet killswitch 2>/dev/null || true
 
+	# Detect the NTP daemon user at runtime (iStoreOS uses 'ntp', Fedora/RHEL use 'chrony').
+	# nft resolves skuid names at rule-load time; wrong user causes nft -f to fail.
+	local _ntp_user=""
+	id ntp    >/dev/null 2>&1 && _ntp_user="ntp"
+	id chrony >/dev/null 2>&1 && [ -z "$_ntp_user" ] && _ntp_user="chrony"
+
 	local _ks_tmp="/tmp/ks_install_$$.nft"
 	cat > "$_ks_tmp" << 'NFTEOF'
 table inet killswitch {
@@ -366,6 +372,12 @@ table inet killswitch {
 	}
 }
 NFTEOF
+	# Patch skuid to match the actual NTP user on this host.
+	if [ -n "$_ntp_user" ] && [ "$_ntp_user" != "ntp" ]; then
+		sed -i "s/meta skuid ntp /meta skuid ${_ntp_user} /" "$_ks_tmp"
+	elif [ -z "$_ntp_user" ]; then
+		sed -i '/meta skuid ntp/d' "$_ks_tmp"
+	fi
 	if nft -f "$_ks_tmp"; then
 		log "Kill switch installed (inet killswitch, policy drop)"
 	else
