@@ -1157,7 +1157,8 @@ _node_is_log_healthy() {
 	err_count=$(python3 - "$health_file" "$log_key" << 'PYEOF2'
 import json, sys
 try:
-    d = json.load(open(sys.argv[1]))
+    with open(sys.argv[1]) as _f:
+        d = json.load(_f)
     print(d.get("nodes", {}).get(sys.argv[2], {}).get("error_count", 0))
 except Exception:
     print(0)
@@ -1178,6 +1179,10 @@ _rotate_node() {
 	local prev="${_active_node}"
 	local effective_transit
 	effective_transit=$(cat "$TRANSIT_CACHE_FILE" 2>/dev/null) || true
+	# Mirror connect_vpn fallback: if cache absent, use first transit candidate
+	if [ -z "$effective_transit" ] && [ ${#TRANSIT_CANDIDATES[@]} -gt 0 ]; then
+		effective_transit="${TRANSIT_CANDIDATES[0]}"
+	fi
 	local tried=0
 	while [ "$tried" -lt "$n" ]; do
 		_node_idx=$(( (_node_idx + 1) % n ))

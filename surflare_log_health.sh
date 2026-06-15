@@ -22,8 +22,12 @@ OUT_FILE=$DEFAULT_OUT
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --window-minutes) WINDOW_MINUTES="$2"; shift 2 ;;
-        --out)            OUT_FILE="$2";        shift 2 ;;
+        --window-minutes)
+            [[ -n "${2:-}" ]] || { echo "Missing value for --window-minutes"; exit 1; }
+            WINDOW_MINUTES="$2"; shift 2 ;;
+        --out)
+            [[ -n "${2:-}" ]] || { echo "Missing value for --out"; exit 1; }
+            OUT_FILE="$2"; shift 2 ;;
         *) echo "Unknown arg: $1"; exit 1 ;;
     esac
 done
