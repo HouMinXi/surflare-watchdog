@@ -7,3 +7,8 @@ REVIEW.md
 # Root-level route files are runtime copies from /etc/surflare/; baseline lives in routes/
 cn_ipv4.txt
 cn_ipv6.txt
+
+# Local-only files (not for version control)
+CLAUDE.md
+*.plan
+.claude/
