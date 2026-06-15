@@ -323,3 +323,40 @@ connect, so the rule is automatically re-applied on reconnect or restart.
 | `pgrep -f "/usr/bin/surflare"` in `wait_for_exit` | Plain `pgrep surflare` also matches watchdog bash (comm=`surflare_watchd`) |
 | `tr '\n' ','` not `paste -sd, -` | `paste` not installed on iStoreOS |
 | NTP skuid detected at runtime | iStoreOS uses user `ntp`; Fedora/RHEL use `chrony` |
+
+---
+
+## Service Management (systemd)
+
+### Stop and disable all services
+
+```bash
+for svc in surflare-watchdog.service surflare-early-detector.service \
+            surflare-route-updater.timer surflare-update.timer; do
+  sudo systemctl stop    "$svc"
+  sudo systemctl disable "$svc"
+done
+# Clean up any remaining processes and nft tables
+sudo killall surflare surflare-proxy 2>/dev/null || true
+sudo nft delete table inet surflare      2>/dev/null || true
+sudo nft delete table inet surflare_moat 2>/dev/null || true
+sudo nft delete table inet killswitch    2>/dev/null || true
+```
+
+### Re-enable and start
+
+```bash
+sudo systemctl enable --now surflare-watchdog.service
+sudo systemctl enable --now surflare-early-detector.service
+sudo systemctl enable --now surflare-route-updater.timer
+sudo systemctl enable --now surflare-update.timer
+```
+
+### Check status
+
+```bash
+systemctl list-units | grep surflare          # active units
+systemctl list-unit-files | grep surflare     # enabled/disabled state
+sudo nft list tables | grep surflare          # nft tables (should exist when VPN connected)
+pgrep -af surflare                            # running processes
+```
