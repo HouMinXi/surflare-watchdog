@@ -9,6 +9,7 @@ cn_ipv4.txt
 cn_ipv6.txt
 
 # Local-only files (not for version control)
+docs/
 CLAUDE.md
 *.plan
 .claude/
