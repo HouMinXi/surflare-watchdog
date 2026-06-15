@@ -87,6 +87,14 @@ procd)
         chmod 755 "/etc/init.d/$svc"
         /etc/init.d/"$svc" enable || true
     done
+
+    # LAN transparent proxy: install nft rule file used by _install_lan_tproxy().
+    # The watchdog loads this after VPN connects so all br-lan devices are
+    # transparently proxied through surflare-proxy without per-device config.
+    # Requires kmod-nft-tproxy: opkg install kmod-nft-tproxy
+    cp "$REPO/surflare-lan-tproxy.nft" /etc/surflare-lan-tproxy.nft
+    chmod 644 /etc/surflare-lan-tproxy.nft
+    echo "  LAN tproxy rule installed -> /etc/surflare-lan-tproxy.nft"
     ;;
 
 runit)
