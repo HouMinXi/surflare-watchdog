@@ -273,3 +273,53 @@ sudo python3 -m json.tool /run/surflare_probe_results.json
 | OpenRC | Alpine, Gentoo |
 | procd | OpenWrt, iStoreOS (N100 router) |
 | runit | Void Linux |
+
+---
+
+## N100 Router Deployment (iStoreOS / OpenWrt)
+
+When deployed on an iStoreOS/OpenWrt router (procd init), `install.sh`
+additionally installs a transparent proxy rule that routes **all LAN
+devices** through the VPN without any per-device configuration.
+
+### How it works
+
+```
+LAN device (any IP on br-lan)
+  --> PREROUTING priority mangle-10
+      --> tproxy ip to 127.0.0.1:10800  (surflare-proxy)
+          --> VPN tunnel    (non-CN traffic)
+          --> direct WAN    (CN traffic, per chnroute list)
+```
+
+All TCP traffic from `br-lan` that is NOT destined for private addresses
+(`10/8`, `172.16/12`, `192.168/16`) is intercepted and transparently
+proxied through `surflare-proxy` on port 10800. surflare-proxy applies
+CN bypass and node routing before forwarding.
+
+### Extra dependency
+
+```bash
+opkg install kmod-nft-tproxy
+```
+
+Required for the `tproxy` nft action on OpenWrt kernel modules.
+Not needed on standard Linux (compiled in by default).
+
+### What install.sh does on procd
+
+In addition to the standard binary/service installation, `install.sh`
+copies `surflare-lan-tproxy.nft` to `/etc/surflare-lan-tproxy.nft`.
+The watchdog loads this file via `_install_lan_tproxy()` after every VPN
+connect, so the rule is automatically re-applied on reconnect or restart.
+
+### Known iStoreOS / busybox constraints
+
+| Constraint | Reason |
+|---|---|
+| `table ip` not `table inet` | `inet` + `ip saddr` in tproxy causes "conflicting protocols" error |
+| `tproxy ip to 127.0.0.1:10800` | Bare `tproxy to :10800` silently fails for LAN forwarded packets |
+| `pgrep surflare-proxy` (no `-x`) | busybox `pgrep -x` always returns 1 (known busybox bug) |
+| `pgrep -f "/usr/bin/surflare"` in `wait_for_exit` | Plain `pgrep surflare` also matches watchdog bash (comm=`surflare_watchd`) |
+| `tr '\n' ','` not `paste -sd, -` | `paste` not installed on iStoreOS |
+| NTP skuid detected at runtime | iStoreOS uses user `ntp`; Fedora/RHEL use `chrony` |
