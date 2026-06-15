@@ -1,0 +1,13 @@
+[Unit]
+Description=Surflare Early TCP Degradation Detector
+After=surflare-watchdog.service
+BindsTo=surflare-watchdog.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/surflare_early_detector.sh
+Restart=on-failure
+RestartSec=15
+
+[Install]
+WantedBy=multi-user.target

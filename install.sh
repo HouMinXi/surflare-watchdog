@@ -1,49 +1,108 @@
 #!/bin/bash
+# surflare-watchdog installer
+# Supports: systemd, OpenRC, procd (OpenWrt/iStoreOS), runit
+# Service files live in services/<init>/ and are symlinked (systemd) or
+# copied (others) so that `git pull` + daemon reload is the only update step.
+# NOTE: never use `systemctl disable` on symlinked units; use systemctl stop
+# then rm /etc/systemd/system/<unit> manually if uninstalling.
+
 set -eo pipefail
 
-if [ "$(id -u)" -ne 0 ]; then
-    echo "Please run as root"
-    exit 1
-fi
+[ "$(id -u)" -ne 0 ] && { echo "Run as root"; exit 1; }
 
-cd "$(dirname "${BASH_SOURCE[0]}")"
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-echo "Installing surflare-watchdog..."
+# ---------------------------------------------------------------------------
+# Init system detection
+# ---------------------------------------------------------------------------
+detect_init() {
+    [ -d /run/systemd/system ]   && { echo systemd; return; }
+    [ -f /etc/openwrt_release ]  && { echo procd;   return; }
+    [ -x /sbin/openrc ]          && { echo openrc;  return; }
+    [ -d /etc/runit ]            && { echo runit;   return; }
+    # Container / unknown: attempt systemd if systemctl exists
+    command -v systemctl &>/dev/null && { echo systemd; return; }
+    echo unknown
+}
+INIT="$(detect_init)"
+echo "Detected init system: $INIT"
 
-# Install scripts
-cp surflare_watchdog.sh /usr/local/sbin/
-chmod 755 /usr/local/sbin/surflare_watchdog.sh
+# ---------------------------------------------------------------------------
+# Install binaries (always copied so they work without repo present)
+# ---------------------------------------------------------------------------
+install -m 755 "$REPO/surflare_watchdog.sh"       /usr/local/sbin/surflare_watchdog.sh
+install -m 755 "$REPO/surflare_early_detector.sh" /usr/local/sbin/surflare_early_detector.sh
+install -m 755 "$REPO/surflare_node_probe.sh"     /usr/local/sbin/surflare_node_probe.sh
+install -m 755 "$REPO/surflare_route_updater.sh"  /usr/local/sbin/surflare_route_updater.sh
+install -m 755 "$REPO/surflare-update.sh"         /usr/local/sbin/surflare-update.sh
+install -m 755 "$REPO/cross_validate_routes.py"   /usr/local/sbin/cross_validate_routes.py
+install -m 755 "$REPO/setup_auth.sh"              /usr/local/sbin/setup_auth.sh
 
-cp surflare_route_updater.sh /usr/local/sbin/
-chmod 755 /usr/local/sbin/surflare_route_updater.sh
-
-cp cross_validate_routes.py /usr/local/sbin/
-chmod 755 /usr/local/sbin/cross_validate_routes.py
-
-cp setup_auth.sh /usr/local/sbin/
-chmod 755 /usr/local/sbin/setup_auth.sh
-
-# Install baseline routes
 mkdir -p /usr/local/share/surflare/routes
-cp routes/cn_ipv4.txt /usr/local/share/surflare/routes/
-cp routes/cn_ipv6.txt /usr/local/share/surflare/routes/
+cp "$REPO/routes/cn_ipv4.txt" /usr/local/share/surflare/routes/
+cp "$REPO/routes/cn_ipv6.txt" /usr/local/share/surflare/routes/
 
-# Install systemd services and timers
-cp surflare-watchdog.service /etc/systemd/system/
-cp surflare-route-updater.service /etc/systemd/system/
-cp surflare-route-updater.timer /etc/systemd/system/
+# ---------------------------------------------------------------------------
+# Service installation (symlink for systemd; cp+chmod for others)
+# ---------------------------------------------------------------------------
+SVC="$REPO/services"
 
-cp surflare-update.sh /usr/local/sbin/
-chmod 755 /usr/local/sbin/surflare-update.sh
-cp surflare-update.service /etc/systemd/system/
-cp surflare-update.timer /etc/systemd/system/
+case "$INIT" in
+systemd)
+    SD=/etc/systemd/system
+    # Symlink: repo is authoritative; git pull + systemctl daemon-reload = update
+    for unit in surflare-watchdog.service \
+                surflare-early-detector.service \
+                surflare-route-updater.service \
+                surflare-route-updater.timer \
+                surflare-update.service \
+                surflare-update.timer; do
+        ln -sf "$SVC/systemd/$unit" "$SD/$unit"
+    done
+    # Sleep resume hook
+    ln -sf /usr/local/sbin/surflare_watchdog.sh /etc/systemd/system-sleep/surflare-resume.sh
+    systemctl daemon-reload
+    systemctl enable surflare-watchdog.service
+    systemctl enable surflare-early-detector.service
+    systemctl enable --now surflare-route-updater.timer
+    systemctl enable --now surflare-update.timer
+    ;;
 
-# Resume hook
-ln -sf /usr/local/sbin/surflare_watchdog.sh /etc/systemd/system-sleep/surflare-resume.sh
+openrc)
+    for svc in surflare-watchdog surflare-early-detector; do
+        cp "$SVC/openrc/$svc" /etc/init.d/
+        chmod 755 "/etc/init.d/$svc"
+        rc-update add "$svc" default || true
+    done
+    ;;
 
-systemctl daemon-reload
-systemctl enable surflare-watchdog.service || true
-systemctl enable --now surflare-route-updater.timer || true
-systemctl enable --now surflare-update.timer || true
+procd)
+    for svc in surflare-watchdog surflare-early-detector; do
+        cp "$SVC/procd/$svc" /etc/init.d/
+        chmod 755 "/etc/init.d/$svc"
+        /etc/init.d/"$svc" enable || true
+    done
+    ;;
 
-echo "Installation complete. You can start watchdog via: systemctl start surflare-watchdog"
+runit)
+    for svc in surflare-watchdog surflare-early-detector; do
+        cp -r "$SVC/runit/$svc" /etc/sv/
+        ln -sf "/etc/sv/$svc" /service/ || true
+    done
+    ;;
+
+*)
+    echo "WARN: unknown init system; copy service files from services/ manually"
+    ;;
+esac
+
+# ---------------------------------------------------------------------------
+# Node probe: 4am daily (L7 full-probe; accepts ~5min VPN disruption)
+# ---------------------------------------------------------------------------
+PROBE_CRON="17 4 * * * /usr/local/sbin/surflare_node_probe.sh >> /var/log/surflare_probe.log 2>&1"
+( crontab -l 2>/dev/null | grep -v surflare_node_probe; echo "$PROBE_CRON" ) | crontab -
+
+echo ""
+echo "Installation complete."
+echo "  Start watchdog : systemctl start surflare-watchdog  (or service equivalent)"
+echo "  Update workflow: git pull && systemctl daemon-reload && systemctl restart surflare-watchdog"
