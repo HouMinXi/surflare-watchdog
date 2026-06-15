@@ -625,7 +625,7 @@ TRANSIT_JSON=$(IFS=,; echo "[${TRANSIT_RESULTS[*]}]")
 
 python3 - "$RESULTS_FILE" "$TS" "$CURRENT_NODE" "$CURRENT_TRANSIT" \
     "$EXIT_JSON" "$TRANSIT_JSON" << 'PYEOF' || wrn "JSON write failed; watchdog will see stale results"
-import json, sys
+import json, os, sys
 out_file, ts, cur_node, cur_transit, exit_raw, transit_raw = sys.argv[1:]
 data = {
     "timestamp": ts,
@@ -634,9 +634,45 @@ data = {
     "exit_nodes": json.loads(exit_raw),
     "transit_nodes": json.loads(transit_raw),
 }
+
+# Enrich with server IPs (from cache built during this probe run)
+ip_cache = {}
+try:
+    with open("/var/lib/surflare/node_ips.json") as _f:
+        ip_cache = json.load(_f)
+except Exception:
+    pass
+
+# Enrich with urltest monitoring status (from surflare-proxy log)
+urltest = {}
+try:
+    with open("/run/surflare_node_health.json") as _f:
+        h = json.load(_f)
+    urltest = h.get("nodes", {})
+except Exception:
+    pass
+
+def _enrich(node_list, is_transit=False):
+    for n in node_list:
+        name = n.get("name", "")
+        n["server_ips"] = ip_cache.get(name, [])
+        # urltest key: "mh_via_TRANSIT_to_NAME" for transit nodes,
+        # or just "NAME" for single-hop exit probes
+        if is_transit:
+            # transit nodes appear as single outbound in urltest
+            ut_key = name
+        else:
+            ut_key = f"mh_via_{cur_transit}_to_{name}" if cur_transit else name
+        ut = urltest.get(ut_key, {})
+        n["urltest_errors_15min"] = ut.get("error_count", 0)
+        n["urltest_healthy"] = ut.get("error_count", 0) <= 10
+
+_enrich(data["exit_nodes"],   is_transit=False)
+_enrich(data["transit_nodes"], is_transit=True)
+
 data["exit_nodes"].sort(key=lambda x: x.get("score", 0), reverse=True)
 data["transit_nodes"].sort(key=lambda x: x.get("score", 0), reverse=True)
-import os
+
 tmp = out_file + ".tmp"
 with open(tmp, "w") as f:
     json.dump(data, f, indent=2)
