@@ -320,6 +320,21 @@ _setup_chnroute() {
 	fi
 }
 
+_install_lan_tproxy() {
+	# Install transparent proxy rule for ALL LAN devices (iifname br-lan).
+	# Uses ip-family tproxy to 127.0.0.1:10800 (surflare-proxy port).
+	# Requires: PLATFORM=router, /etc/surflare-lan-tproxy.nft present.
+	[ "$PLATFORM" = "router" ] || return 0
+	local _nft_file="/etc/surflare-lan-tproxy.nft"
+	[ -f "$_nft_file" ] || return 0
+	nft delete table ip sw_lan_tproxy 2>/dev/null || true
+	if nft -f "$_nft_file" 2>/dev/null; then
+		log "LAN tproxy: installed (all br-lan TCP via surflare-proxy)"
+	else
+		log "WARN: LAN tproxy: nft load failed"
+	fi
+}
+
 _install_killswitch() {
 	nft delete table inet killswitch 2>/dev/null || true
 
@@ -1705,6 +1720,7 @@ while true; do
 			if _install_killswitch; then
 				_killswitch_armed=1
 				_update_killswitch_server_ips
+				_install_lan_tproxy
 				log "Kill switch armed on healthy startup"
 			else
 				log "WARN: Kill switch failed to install on healthy startup"
@@ -1782,6 +1798,7 @@ while true; do
 				if [ "$_killswitch_armed" -eq 0 ]; then
 					if _install_killswitch; then
 						_killswitch_armed=1
+						_install_lan_tproxy
 					else
 						log "WARN: Kill switch failed to install -- IP leak protection inactive"
 					fi
