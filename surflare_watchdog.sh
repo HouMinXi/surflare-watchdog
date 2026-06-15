@@ -1135,6 +1135,41 @@ probe_best_transit() {
 	echo "$best_node"
 }
 
+# _node_is_log_healthy: return 0 if no recent urltest errors for this node/transit combo.
+# Reads /run/surflare_node_health.json written by surflare_log_health.sh (3-min cron).
+# Returns 1 (skip) if node has >10 errors in the log window, or if health data unavailable.
+_node_is_log_healthy() {
+	local node="$1" transit="${2:-}"
+	local health_file="/run/surflare_node_health.json"
+	[ -f "$health_file" ] || return 0  # no data: assume healthy, let cascade decide
+	# Skip if health file is stale (>20 min)
+	local age
+	age=$(( $(date +%s) - $(stat -c %Y "$health_file" 2>/dev/null || echo 0) ))
+	[ "$age" -gt 1200 ] && return 0  # stale: assume healthy
+	# Construct log key: "mh_via_TRANSIT_to_NODE" or just "NODE"
+	local log_key
+	if [ -n "$transit" ]; then
+		log_key="mh_via_${transit}_to_${node}"
+	else
+		log_key="$node"
+	fi
+	local err_count
+	err_count=$(python3 - "$health_file" "$log_key" << 'PYEOF2'
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+    print(d.get("nodes", {}).get(sys.argv[2], {}).get("error_count", 0))
+except Exception:
+    print(0)
+PYEOF2
+) 2>/dev/null || err_count=0
+	if [ "${err_count:-0}" -gt 10 ]; then
+		log "LOG_HEALTH: skipping ${node} via ${transit:-direct} (${err_count} recent errors)"
+		return 1  # unhealthy, skip
+	fi
+	return 0  # healthy
+}
+
 _rotate_node() {
 	local n=${#NODE_CANDIDATES[@]}
 	if [ "$n" -le 1 ]; then
@@ -1149,6 +1184,10 @@ _rotate_node() {
 		tried=$((tried + 1))
 		if [ -n "$effective_transit" ] && \
 		   [ "${NODE_CANDIDATES[$_node_idx]}" = "$effective_transit" ]; then
+			continue
+		fi
+		# Skip nodes with recent urltest errors (log-based real-time health)
+		if ! _node_is_log_healthy "${NODE_CANDIDATES[$_node_idx]}" "$effective_transit"; then
 			continue
 		fi
 		break
