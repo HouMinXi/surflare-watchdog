@@ -84,6 +84,33 @@ get_current_session() {
 
 # -- SO_MARK=0xff direct TCP probe (bypasses tproxy + killswitch) ------------
 # Returns RTT in ms, or -1 on failure.
+# cache_node_ips: $1=node_name  $2..N=server IPs (space-separated ok via caller unquoted)
+cache_node_ips() {
+    local node="$1"
+    shift
+    [ $# -eq 0 ] && return  # no IPs
+    local cache="/var/lib/surflare/node_ips.json"
+    mkdir -p "$(dirname "$cache")"
+    python3 - "$cache" "$node" "$@" << 'IPEOF'
+import json, os, sys
+cache, node = sys.argv[1], sys.argv[2]
+ips = sys.argv[3:]
+data = {}
+if os.path.exists(cache):
+    try:
+        with open(cache) as _f:
+            data = json.load(_f)
+    except Exception:
+        data = {}
+data[node] = ips
+tmp = cache + ".tmp"
+with open(tmp, "w") as _f:
+    json.dump(data, _f, indent=2)
+os.chmod(tmp, 0o600)
+os.replace(tmp, cache)
+IPEOF
+}
+
 l4_direct_probe() {
     local ip="$1" port="${2:-443}" timeout="${3:-3}"
     python3 - "$ip" "$port" "$timeout" << 'PYEOF'
@@ -434,6 +461,8 @@ trap 'probe_cleanup; exit 130' INT TERM
 get_current_session
 
 [ -z "$CURRENT_NODE" ] && { bad "VPN not connected; aborting"; exit 2; }
+# Seed IP cache with current session (known without probing)
+[ -n "$CURRENT_SERVER_IPS" ] && cache_node_ips "$CURRENT_NODE" $CURRENT_SERVER_IPS
 
 # --- Coordinate with surflare_watchdog before disturbing the shared session.
 # 1. Wait <=30s for any in-flight connect_vpn (holds WATCHDOG_LOCK on fd 9).
@@ -504,6 +533,7 @@ for node in "${NODE_CANDIDATES[@]}"; do
     # eval-contract: all fields are regex-validated before echoing;
     # single-quotes protect server_ips/exit_country; never add unvalidated fields.
     eval "$result"
+    [ "${connect_ok:-0}" -eq 1 ] && [ -n "${server_ips:-}" ] && cache_node_ips "$node" ${server_ips}
 
     if [ "${connect_ok:-0}" -eq 1 ] && [ "${curl_ms:--1}" -gt 0 ]; then
         status="${GRN}GOOD${RST_C}"
@@ -552,6 +582,7 @@ for transit in "${TRANSIT_CANDIDATES[@]}"; do
     result=$(probe_transit_node "$transit" "$PROBE_EXIT")
     # eval-contract: see note above
     eval "$result"
+    [ "${connect_ok:-0}" -eq 1 ] && [ -n "${server_ips:-}" ] && cache_node_ips "$transit" ${server_ips}
 
     path_display="$verdict"
     case "${verdict:-CLEAN}" in

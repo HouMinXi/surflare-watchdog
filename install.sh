@@ -33,6 +33,7 @@ echo "Detected init system: $INIT"
 install -m 755 "$REPO/surflare_watchdog.sh"       /usr/local/sbin/surflare_watchdog.sh
 install -m 755 "$REPO/surflare_early_detector.sh" /usr/local/sbin/surflare_early_detector.sh
 install -m 755 "$REPO/surflare_node_probe.sh"     /usr/local/sbin/surflare_node_probe.sh
+install -m 755 "$REPO/surflare_l4_probe.sh"      /usr/local/sbin/surflare_l4_probe.sh
 install -m 755 "$REPO/surflare_route_updater.sh"  /usr/local/sbin/surflare_route_updater.sh
 install -m 755 "$REPO/surflare-update.sh"         /usr/local/sbin/surflare-update.sh
 install -m 755 "$REPO/cross_validate_routes.py"   /usr/local/sbin/cross_validate_routes.py
@@ -102,8 +103,13 @@ esac
 # ---------------------------------------------------------------------------
 # Node probe: 4am daily (L7 full-probe; accepts ~5min VPN disruption)
 # ---------------------------------------------------------------------------
+# 4am: L7 full probe (connects to each node; ~5 min VPN disruption)
 PROBE_CRON="17 4 * * * /usr/local/sbin/surflare_node_probe.sh >> /var/log/surflare_probe.log 2>&1"
-( crontab -l 2>/dev/null | grep -v surflare_node_probe; echo "$PROBE_CRON" ) | crontab -
+# Every 30 min: L4 non-intrusive probe (SO_MARK=0xff, no VPN disconnect)
+L4_CRON="7,37 * * * * /usr/local/sbin/surflare_l4_probe.sh >> /var/log/surflare_l4_probe.log 2>&1"
+( crontab -l 2>/dev/null | grep -v surflare_node_probe | grep -v surflare_l4_probe
+  echo "$PROBE_CRON"
+  echo "$L4_CRON" ) | crontab -
 
 echo ""
 echo "Installation complete."
