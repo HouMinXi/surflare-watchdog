@@ -1441,9 +1441,56 @@ cleanup() {
 	nft delete table inet surflare_moat 2>/dev/null || true
 	_remove_killswitch
 	rm -f "$PIDFILE"
+	rm -f "$WATCHDOG_ACK_FILE" 2>/dev/null || true
 }
 trap 'log "watchdog stopped"; cleanup; exit 0' INT TERM
 trap 'cleanup' EXIT
+
+readonly DETECTOR_ALIVE_FILE="/run/surflare_detector.alive"
+readonly WATCHDOG_ACK_FILE="/run/surflare_watchdog.early_ack"
+
+readonly PROBE_ACTIVE_FILE="/run/surflare_probe.active"
+PROBE_FRESH_SECONDS=75    # marker older than this => probe dead/hung; reclaim
+PROBE_HARD_MAX=360        # absolute cap on deferring to a probe run
+_probe_defer_start=0      # epoch of current defer streak (0 = not deferring)
+
+# _probe_active: returns 0 if a legitimate node_probe is running (defer this cycle).
+# Returns 1 if no probe, or marker is stale/over-long (watchdog reclaims session).
+_probe_active() {
+    [ -f "$PROBE_ACTIVE_FILE" ] || { _probe_defer_start=0; return 1; }
+    local now mtime age
+    now=$(date +%s)
+    mtime=$(stat -c %Y "$PROBE_ACTIVE_FILE" 2>/dev/null || echo 0)
+    age=$(( now - mtime ))
+    if [ "$age" -gt "$PROBE_FRESH_SECONDS" ]; then
+        log "node_probe marker stale (age=${age}s); reclaiming session"
+        pkill -f 'surflare_node_probe' 2>/dev/null || true
+        rm -f "$PROBE_ACTIVE_FILE"
+        _probe_defer_start=0
+        return 1
+    fi
+    [ "$_probe_defer_start" -eq 0 ] && _probe_defer_start="$now"
+    if [ $(( now - _probe_defer_start )) -gt "$PROBE_HARD_MAX" ]; then
+        log "node_probe held session > ${PROBE_HARD_MAX}s; force-reclaiming"
+        pkill -f 'surflare_node_probe' 2>/dev/null || true
+        rm -f "$PROBE_ACTIVE_FILE"
+        _probe_defer_start=0
+        return 1
+    fi
+    return 0
+}
+
+run_health_check_now=0
+
+# Register USR1 trap BEFORE writing the PID file so the detector cannot
+# read the PID and signal us before the trap is in place.
+trap '
+    run_health_check_now=1
+    [[ -n "${storm_sleep_pid:-}" ]] && { kill "$storm_sleep_pid" 2>/dev/null || true; }
+    touch "$WATCHDOG_ACK_FILE" 2>/dev/null || true
+    log "EARLY_WARN_TRIGGERED: detector requested immediate health check"
+' USR1
+
 echo $$ >"$PIDFILE"
 taskset -pc 0 $$ >/dev/null 2>&1 || true
 
@@ -1482,6 +1529,20 @@ _killswitch_armed=0
 _setup_kernel_moat
 
 while true; do
+	# Change 6: probe defer guard -- skip entire cycle when node_probe holds the session
+	if _probe_active; then
+		log "node_probe active; deferring health check + reactions this cycle"
+		sleep "$CHECK_INTERVAL" & storm_sleep_pid=$!
+		wait "$storm_sleep_pid" || true
+		storm_sleep_pid=""
+		continue
+	fi
+	# Change 2: detector liveness -- warn if heartbeat file is stale
+	_det_age=$(( $(date +%s) - $(stat -c %Y "$DETECTOR_ALIVE_FILE" 2>/dev/null || echo 0) ))
+	if [[ -f "$DETECTOR_ALIVE_FILE" ]] && (( _det_age > 75 )); then
+		log "WARN: early_detector_stale age=${_det_age}s -- P0 coverage degraded"
+	fi
+	unset _det_age
 	if recent_wifi_crash 120; then
 		record_crash
 		if crash_rate_exceeded; then
@@ -1677,5 +1738,12 @@ while true; do
 		fi
 	fi
 
-	sleep "$CHECK_INTERVAL" & storm_sleep_pid=$!; wait "$storm_sleep_pid"; storm_sleep_pid=""
+	# Change 3: always sleep first, check flag after wait -- no USR1 race
+	sleep "$CHECK_INTERVAL" & storm_sleep_pid=$!
+	wait "$storm_sleep_pid" || true
+	storm_sleep_pid=""
+	if (( run_health_check_now )); then
+		run_health_check_now=0
+		log "EARLY_WARN: running immediate health check (detector USR1)"
+	fi
 done
