@@ -16,8 +16,8 @@ trap '[[ -n "$_sleep_pid" ]] && kill "$_sleep_pid" 2>/dev/null; exit 0' INT TERM
 readonly WATCHDOG_PID_FILE="/run/surflare_watchdog.pid"
 readonly DETECTOR_ALIVE_FILE="/run/surflare_detector.alive"
 readonly MONITOR_INTERVAL=30     # seconds between ss samples
-readonly DEGRADATION_THRESHOLD=8 # min score to fire USR1 (2 conns x 2 dims x 2pts = 8)
-readonly COOLDOWN=120            # min seconds between USR1 signals; monitoring continues
+readonly DEGRADATION_THRESHOLD=16 # min score to fire USR1 (threshold raised from 8 to reduce false positives on high-latency nodes)
+readonly COOLDOWN=300            # min seconds between USR1 signals; monitoring continues
 
 # -- Dependency check -------------------------------------------------
 for _cmd in ss nft logger kill timeout; do
@@ -39,7 +39,7 @@ get_server_ips() {
 #
 # Three independent indicators (2 pts each):
 #   cwnd <= 1  : window at minimum (not normal slow-start; cwnd=2 is a valid recovery)
-#   rto > 4000 : RTO above 4 s (ss prints rto in ms; iproute2 divides tcpi_rto by 1000)
+#   rto > 8000 : RTO above 8 s (ss prints rto in ms; iproute2 divides tcpi_rto by 1000)
 #   backoff >= 3: exponential backoff counter signals persistent loss
 #
 # A connection counts as degraded only when it scores >= 4 (at least 2 indicators hit).
@@ -84,7 +84,7 @@ score_tunnel() {
         local -i conn_score=0
 
         [[ $cwnd    -le 1    ]] && (( conn_score += 2 ))
-        [[ $rto     -gt 4000 ]] && (( conn_score += 2 ))
+        [[ $rto     -gt 8000 ]] && (( conn_score += 2 ))
         [[ $backoff -ge 3    ]] && (( conn_score += 2 ))
 
         if (( conn_score >= 4 )); then

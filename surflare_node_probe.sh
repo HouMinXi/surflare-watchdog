@@ -659,8 +659,9 @@ def _enrich(node_list, is_transit=False):
         # urltest key: "mh_via_TRANSIT_to_NAME" for transit nodes,
         # or just "NAME" for single-hop exit probes
         if is_transit:
-            # transit nodes appear as single outbound in urltest
-            ut_key = name
+            # Transit was probed as: --transit NAME --node cur_node
+            # urltest key for this path is mh_via_NAME_to_cur_node
+            ut_key = f"mh_via_{name}_to_{cur_node}" if cur_node else name
         else:
             ut_key = f"mh_via_{cur_transit}_to_{name}" if cur_transit else name
         ut = urltest.get(ut_key, {})
