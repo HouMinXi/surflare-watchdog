@@ -1838,9 +1838,11 @@ while true; do
 				_lan_tproxy_nft="/etc/surflare-lan-tproxy.nft"
 				if [ -f "$_lan_tproxy_nft" ] && \
 				   ! nft list table ip sw_lan_tproxy >/dev/null 2>&1; then
-					nft -f "$_lan_tproxy_nft" 2>/dev/null && \
-						log "LAN tproxy restored" || \
+					if nft -f "$_lan_tproxy_nft" 2>/dev/null; then
+						log "LAN tproxy restored"
+					else
 						log "WARN: LAN tproxy restore failed"
+					fi
 					_update_bypass_devices
 				fi
 				_record_connect "${_active_node}" "${new_health}"
