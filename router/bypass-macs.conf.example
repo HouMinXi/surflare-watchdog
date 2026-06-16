@@ -1,0 +1,21 @@
+# bypass-macs.conf -- devices that bypass tproxy (use CN ISP IP directly)
+# Location: /etc/surflare/bypass-macs.conf
+# Permissions: chmod 600 (contains device identifiers)
+#
+# One MAC address per line. Lines starting with # are comments.
+# IPs are auto-resolved from /tmp/dhcp.leases on every VPN connect,
+# so devices work regardless of DHCP reassignment.
+#
+# Use cases:
+#   - Corporate VPN (AnyConnect etc.): device uses own VPN, not surflare
+#   - CN-gated apps (e.g. Thunder/Xunlei): need CN source IP to pass geo-check
+#
+# Note: On N100/iStoreOS, auto-bypass via DTLS detection (auto_bypass set)
+# handles AnyConnect automatically -- no need to add AnyConnect devices here
+# unless you want static pre-bypass before DTLS detection fires.
+#
+# Format: <MAC>   # optional comment
+#
+# Examples:
+# aa:bb:cc:dd:ee:ff   # work laptop (AnyConnect)
+# 11:22:33:44:55:66   # windows-pc (Thunder CN bypass)
