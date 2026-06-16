@@ -39,10 +39,13 @@ install -m 755 "$REPO/cross_validate_routes.py"   /usr/local/sbin/cross_validate
 install -m 755 "$REPO/setup_auth.sh"              /usr/local/sbin/setup_auth.sh
 
 if [ "$INIT" = "procd" ]; then
-    # Router (N100/iStoreOS) -- LAN tproxy nft rule
+    # Router (N100/iStoreOS) -- LAN tproxy nft rule + required packages
     install -m 644 "$REPO/router/surflare-lan-tproxy.nft" /etc/surflare-lan-tproxy.nft
     echo "  LAN tproxy rule installed -> /etc/surflare-lan-tproxy.nft"
-    echo "  Requires: opkg install kmod-nft-tproxy"
+    echo "  Installing required router packages..."
+    opkg update -q 2>/dev/null || true
+    opkg install coreutils-paste ss coreutils-timeout conntrack kmod-nft-tproxy 2>/dev/null || true
+    echo "  opkg: coreutils-paste ss coreutils-timeout conntrack kmod-nft-tproxy"
 else
     # Laptop (Fedora/RHEL/systemd) -- additional diagnostic tools
     install -m 755 "$REPO/laptop/surflare_early_detector.sh" /usr/local/sbin/surflare_early_detector.sh
