@@ -38,6 +38,9 @@ LOGIN_RETRIES=5                       # max login attempts per refresh cycle
 LOGIN_RETRY_DELAY=3                   # seconds between login retries
 HEARTBEAT_INTERVAL=600                # seconds between periodic "VPN healthy" log entries (0=off)
 TRANSIENT_THRESHOLD=6                 # consecutive external timeouts (local state OK) before escalating to fail_count
+BYPASS_LAN_DEVICES=""                 # space-separated LAN IPs that skip tproxy (e.g. "192.168.100.147 192.168.100.148")
+FORCE_VPN_IPS_FILE="/usr/local/share/surflare/routes/force_vpn_ips.txt"
+FORCE_VPN_RULE_PRIO=90                # ip rule priority for destination-forced VPN routes
 _diag_server_ips=""                   # space-separated VPN server IPs captured after each successful connect
 _diag_connect_time=0                  # epoch seconds of last successful connect
 _sess_node=""                         # exit node of current VPN session
@@ -421,6 +424,54 @@ _update_killswitch_server_ips() {
 
 _remove_killswitch() {
 	nft delete table inet killswitch 2>/dev/null || true
+}
+
+# Populate the bypass_devices set in the sw_lan_tproxy table so that devices
+# listed in BYPASS_LAN_DEVICES skip tproxy (use their own VPN, e.g. AnyConnect).
+_update_bypass_devices() {
+	nft list table ip sw_lan_tproxy >/dev/null 2>&1 || return 0
+	nft flush set ip sw_lan_tproxy bypass_devices 2>/dev/null || true
+	[ -z "$BYPASS_LAN_DEVICES" ] && return 0
+	local ip_csv
+	# xargs normalises multi-space / leading-trailing whitespace before converting
+	ip_csv=$(echo "$BYPASS_LAN_DEVICES" | xargs | tr ' ' ',')
+	[ -z "$ip_csv" ] && return 0
+	nft add element ip sw_lan_tproxy bypass_devices "{ $ip_csv }" 2>/dev/null || \
+		log "WARN: bypass_devices update failed (${ip_csv})"
+}
+
+# Add destination-based ip rules that force specific IP ranges through the VPN
+# routing table (table 100) regardless of surflare's CN bypass decision.
+# Call after VPN is confirmed up.  Reads FORCE_VPN_IPS_FILE (one CIDR per line).
+_inject_force_vpn_routes() {
+	[ -f "$FORCE_VPN_IPS_FILE" ] || return 0
+	ip rule show | grep -q 'fwmark 0x1 lookup 100' || return 0
+	local added=0 range
+	while IFS= read -r range; do
+		case "$range" in '#'*|'') continue ;; esac
+		ip rule show | grep -qF "to $range lookup 100" && continue
+		ip rule add to "$range" table 100 priority "$FORCE_VPN_RULE_PRIO" 2>/dev/null && \
+			added=$((added + 1)) || \
+			log "WARN: force_vpn_route add failed: $range"
+	done < "$FORCE_VPN_IPS_FILE"
+	[ "$added" -gt 0 ] && \
+		log "Force-VPN routes: ${added} range(s) added (priority ${FORCE_VPN_RULE_PRIO})"
+	return 0
+}
+
+# Remove ip rules previously injected by _inject_force_vpn_routes.
+# Call before flushing the VPN routing table on disconnect.
+_cleanup_force_vpn_routes() {
+	[ -f "$FORCE_VPN_IPS_FILE" ] || return 0
+	local removed=0 range
+	while IFS= read -r range; do
+		case "$range" in '#'*|'') continue ;; esac
+		while ip rule del to "$range" table 100 priority "$FORCE_VPN_RULE_PRIO" 2>/dev/null; do
+			removed=$((removed + 1))
+		done
+	done < "$FORCE_VPN_IPS_FILE"
+	[ "$removed" -gt 0 ] && log "Force-VPN routes: ${removed} rule(s) removed"
+	return 0
 }
 
 CONTROL_PROBE_TARGETS="114.114.114.114:53 223.5.5.5:53"
@@ -1253,6 +1304,8 @@ connect_vpn() {
 			nft delete table inet surflare 2>/dev/null &&
 				log "Removed residual nftables table inet surflare" || true
 		fi
+		# Clean up force-VPN destination ip rules before flushing routing table
+		_cleanup_force_vpn_routes
 		# Loop: ip rule del only removes one entry at a time; drain all matching rules
 		local rule_count=0
 		while ip rule del fwmark 0x1 lookup 100 2>/dev/null; do
@@ -1783,6 +1836,8 @@ while true; do
 					fi
 				fi
 				_update_killswitch_server_ips
+				_update_bypass_devices
+				_inject_force_vpn_routes
 				_record_connect "${_active_node}" "${new_health}"
 			else
 				reconnect_count=$((reconnect_count + 1))
