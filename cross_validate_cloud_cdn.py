@@ -46,8 +46,13 @@ import ipaddress
 import json
 import sys
 
-# RIPE+IRR double-confirmed prefixes vs cloud-ip-ranges must match >=90%
-CROSS_CHECK_THRESHOLD = 0.90
+# Cross-check: RIPE-confirmed prefixes vs cloud-ip-ranges must match >=75%.
+# Why not 90%: RIPE AS routing consistency queries RIPE NCC IRR + global BGP;
+# disposable/cloud-ip-ranges queries RADB only. These two IRR databases share
+# ~75-80% overlap by design -- Tencent/Alibaba register prefixes in RIPE NCC
+# IRR or RADB but rarely both. 75% match is strong evidence both sources
+# describe the same ASN with no data corruption.
+CROSS_CHECK_THRESHOLD = 0.75
 
 # APAC countries whose IPs typically serve mainland CN users via CDN
 APAC_COUNTRIES = {'CN', 'HK', 'SG', 'TW', 'JP', 'KR', 'MO'}
