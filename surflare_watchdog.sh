@@ -109,7 +109,7 @@ log() {
 # Indicators: surflare-proxy process + nftables table + fwmark policy routing rule.
 # A LOCAL_FAIL means the VPN is definitively down (not a transient network timeout).
 check_vpn_local_state() {
-	pgrep -x surflare-proxy >/dev/null 2>&1 || return 1
+	pgrep -f 'surflare-proxy' >/dev/null 2>&1 || return 1
 	nft list table inet surflare >/dev/null 2>&1 || return 1
 	ip rule show | grep -q 'fwmark 0x1 lookup 100' || return 1
 	return 0
@@ -127,7 +127,7 @@ _cleanup_dns_fallback_rules() {
 	[ -z "$gw" ] && return 0
 	local h removed=0
 	for h in $(nft -a list chain inet surflare output 2>/dev/null \
-		| grep -E "ip daddr ${gw//./\\.} (tcp|udp) dport 53 accept" | grep -oP 'handle \K[0-9]+'); do
+		| grep -E "ip daddr ${gw//./\\.} (tcp|udp) dport 53 accept" | awk '/handle /{print $NF}'); do
 		if ! nft delete rule inet surflare output handle "$h" 2>/dev/null; then
 			log "DNS fallback: WARN: failed to delete handle ${h}"
 		fi
@@ -150,7 +150,7 @@ _insert_dns_fallback() {
 	fi
 	_cleanup_dns_fallback_rules "$gw"
 	handle=$(nft -a list chain inet surflare output 2>/dev/null \
-		| grep 'dport 53 meta mark set' | head -1 | grep -oP 'handle \K[0-9]+')
+		| grep 'dport 53 meta mark set' | head -1 | awk '/handle /{print $NF}')
 	if [ -z "$handle" ]; then
 		log "DNS fallback: WARN: no dport 53 mark rule found in inet surflare"
 		return 0
@@ -252,7 +252,12 @@ _setup_chnroute() {
 			grep -v '^#' "$cn_v4_file" | grep -v '^[[:space:]]*$' | paste -sd, -
 			printf ' }\n'
 		} > "$tmp_nft"
-		if nft -f "$tmp_nft" 2>/dev/null; then
+		local _v4_ok=0 _v4_try=0
+		while [ "$_v4_try" -lt 3 ] && [ "$_v4_ok" -eq 0 ]; do
+			if nft -f "$tmp_nft" 2>/dev/null; then _v4_ok=1
+			else _v4_try=$((_v4_try+1)); [ "$_v4_try" -lt 3 ] && sleep 2; fi
+		done
+		if [ "$_v4_ok" -eq 1 ]; then
 			nft insert rule inet surflare output ip daddr @cn_ipv4 accept 2>/dev/null || true
 			log "Chnroute v4 applied: CN prefixes bypass proxy via output chain"
 			bypass_applied=$((bypass_applied + 1))
@@ -269,7 +274,7 @@ _setup_chnroute() {
 				rm -f "$tmp_ks_v4"
 			fi
 		else
-			log "WARN: Failed to load Chnroute v4 into nftables; CN bypass not active"
+			log "WARN: Failed to load Chnroute v4 into nftables after 3 attempts; CN bypass not active"
 		fi
 		rm -f "$tmp_nft"
 	fi
@@ -289,7 +294,12 @@ _setup_chnroute() {
 			grep -v '^#' "$cn_v6_file" | grep -v '^[[:space:]]*$' | paste -sd, -
 			printf ' }\n'
 		} > "$tmp_nft_v6"
-		if nft -f "$tmp_nft_v6" 2>/dev/null; then
+		local _v6_ok=0 _v6_try=0
+		while [ "$_v6_try" -lt 3 ] && [ "$_v6_ok" -eq 0 ]; do
+			if nft -f "$tmp_nft_v6" 2>/dev/null; then _v6_ok=1
+			else _v6_try=$((_v6_try+1)); [ "$_v6_try" -lt 3 ] && sleep 2; fi
+		done
+		if [ "$_v6_ok" -eq 1 ]; then
 			nft insert rule inet surflare output ip6 daddr @cn_ipv6 accept 2>/dev/null || true
 			log "Chnroute v6 applied: CN v6 prefixes bypass proxy via output chain"
 			bypass_applied=$((bypass_applied + 1))
@@ -306,7 +316,7 @@ _setup_chnroute() {
 				rm -f "$tmp_ks_v6"
 			fi
 		else
-			log "WARN: Failed to load Chnroute v6 into nftables; CN bypass not active"
+			log "WARN: Failed to load Chnroute v6 into nftables after 3 attempts; CN bypass not active"
 		fi
 		rm -f "$tmp_nft_v6"
 	fi
@@ -435,7 +445,7 @@ raise SystemExit(rc)
 
 compute_proxy_affinity() {
 	local total proxy_count first_proxy
-	total=$(nproc --all)
+	total=$(grep -c '^processor' /proc/cpuinfo)
 	if [ "$total" -le 2 ]; then
 		PROXY_CPU_SET=""
 		DESKTOP_CPU_SET=""
@@ -766,11 +776,11 @@ check_vpn_health() {
 
 wait_for_exit() {
 	local name="$1" i=0
-	while pgrep -x "$name" >/dev/null 2>&1 && [ "$i" -lt "$PROCESS_EXIT_TIMEOUT" ]; do
+	while pgrep -f "/usr/bin/$name" >/dev/null 2>&1 && [ "$i" -lt "$PROCESS_EXIT_TIMEOUT" ]; do
 		sleep 1
 		i=$((i + 1))
 	done
-	if pgrep -x "$name" >/dev/null 2>&1; then
+	if pgrep -f "/usr/bin/$name" >/dev/null 2>&1; then
 		log "Process ${name} did not exit after SIGTERM, sending SIGKILL (nftables rules may be orphaned if this is surflare)"
 		killall -KILL "$name" 2>/dev/null
 	fi
@@ -998,7 +1008,7 @@ _record_disconnect() {
 		"${_sess_transit:-unknown}" \
 		"${_sess_exit:-?}" \
 		"${_sess_prev_node:-none}" "$_sess_prev_s" \
-		"$(date +%-H)" \
+		"$((10#$(date +%H)))" \
 		"${_diag_conclusion:-no_diag}" \
 		"$_diag_out" "$_diag_in" \
 		"$_diag_syn_out" "$_diag_syn_ack" \
@@ -1078,7 +1088,7 @@ probe_best_transit() {
 		fi
 		local wait_sec=0
 		while [ "$wait_sec" -lt "$TRANSIT_ROUTE_READY_TIMEOUT" ]; do
-			pgrep -x surflare-proxy >/dev/null 2>&1 && \
+			pgrep -f 'surflare-proxy' >/dev/null 2>&1 && \
 			nft list table inet surflare >/dev/null 2>&1 && \
 			ip rule show | grep -q 'fwmark 0x1 lookup 100' && break
 			sleep 1
@@ -1269,7 +1279,7 @@ connect_vpn() {
 		fi
 		sleep "$CONNECT_SETTLE"
 		# Process-level sanity check: verify surflare-proxy is running
-		if ! pgrep -x surflare-proxy >/dev/null 2>&1; then
+		if ! pgrep -f 'surflare-proxy' >/dev/null 2>&1; then
 			log "VPN establishment timed out: surflare-proxy not running after ${CONNECT_SETTLE}s"
 			exit 1
 		fi
@@ -1277,7 +1287,7 @@ connect_vpn() {
 		compute_proxy_affinity
 		_remove_dns_fallback
 		local proxy_pid
-		proxy_pid=$(pgrep -x surflare-proxy | head -1)
+		proxy_pid=$(pgrep -f 'surflare-proxy' | head -1)
 		if [ -n "$proxy_pid" ] && [ -n "$PROXY_CPU_SET" ]; then
 			taskset -apc "$PROXY_CPU_SET" "$proxy_pid" >/dev/null 2>&1 &&
 				log "Pinned surflare-proxy (PID ${proxy_pid}) to CPUs ${PROXY_CPU_SET}" || true
@@ -1286,7 +1296,7 @@ connect_vpn() {
 		if [ -n "$DESKTOP_CPU_SET" ]; then
 			local irq pinned=0
 			# shellcheck disable=SC2013  # word-split intentional: iterating over IRQ numbers
-			for irq in $(grep iwlwifi /proc/interrupts | grep -oP '^\s*\K[0-9]+(?=:)'); do
+			for irq in $(grep iwlwifi /proc/interrupts | awk -F: '{gsub(/^[[:space:]]+/,"",$1); print $1}'); do
 				if echo "$DESKTOP_CPU_SET" > "/proc/irq/${irq}/smp_affinity_list" 2>/dev/null; then
 					pinned=$((pinned + 1))
 				fi
@@ -1326,8 +1336,7 @@ start_packet_trace() {
 	local probe_ips="" ip ips ip_set=""
 	for host in google.com www.google.com 1.1.1.1 1.0.0.1 \
 	            ifconfig.co icanhazip.com myip.wtf; do
-		ips=$(getent ahosts "$host" 2>/dev/null | \
-		      awk '{print $1}' | sort -u || true)
+		ips=$(nslookup "$host" 2>/dev/null | awk '/^Address:/{if ($2 !~ /#/) print $2}' | sort -u || true)
 		[ -n "$ips" ] && probe_ips="$probe_ips $ips"
 	done
 	probe_ips=$(echo "$probe_ips" | tr ' ' '\n' | sort -u | tr '\n' ' ')
@@ -1363,12 +1372,13 @@ EOF
 		2>"${_trace_pcap}.err" &
 	_trace_tcpdump_pid=$!
 
-	local ready=0
-	for _ in $(seq 1 20); do
+	local ready=0 _si=0
+	while [ "$_si" -lt 20 ]; do
 		if kill -0 "$_trace_tcpdump_pid" 2>/dev/null; then
 			ready=1; break
 		fi
-		sleep 0.1
+		sleep 1
+		_si=$((_si + 1))
 	done
 
 	if [ "$ready" -eq 1 ]; then
@@ -1387,8 +1397,8 @@ stop_packet_trace() {
 	if [ -n "${_trace_tcpdump_pid:-}" ]; then
 		kill "$_trace_tcpdump_pid" 2>/dev/null || true
 		local waited=0
-		while kill -0 "$_trace_tcpdump_pid" 2>/dev/null && [ $waited -lt 20 ]; do
-			sleep 0.1; waited=$((waited + 1))
+		while kill -0 "$_trace_tcpdump_pid" 2>/dev/null && [ $waited -lt 10 ]; do
+			sleep 1; waited=$((waited + 1))
 		done
 		kill -0 "$_trace_tcpdump_pid" 2>/dev/null && \
 			kill -9 "$_trace_tcpdump_pid" 2>/dev/null || true
@@ -1467,9 +1477,20 @@ fi
 # === Daemon mode (started manually with no arguments) ===
 
 # Prevent duplicate daemon instances
-if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
-	echo "watchdog already running (PID $(cat "$PIDFILE"))" >&2
-	exit 1
+# kill -0 alone is insufficient: kernel PID recycling can make a stale PID
+# appear live if an unrelated process reused it (observed: orphan subshell
+# held PID after SIGKILL storm, causing false "already running" exit).
+# Double-check: the live process must be a surflare_watchdog.sh process.
+if [ -f "$PIDFILE" ]; then
+	_old_pid=$(cat "$PIDFILE" 2>/dev/null)
+	if [ -n "$_old_pid" ] && kill -0 "$_old_pid" 2>/dev/null; then
+		if pgrep -f 'surflare_watchdog.sh' 2>/dev/null | grep -qw "$_old_pid"; then
+			echo "watchdog already running (PID $_old_pid)" >&2
+			exit 1
+		fi
+		log "WARN: stale PID file ($PIDFILE) references non-watchdog PID $_old_pid; clearing"
+	fi
+	rm -f "$PIDFILE"
 fi
 
 # Set trap before writing PID to minimise stale-file window on early kill
@@ -1508,7 +1529,7 @@ _probe_active() {
     age=$(( now - mtime ))
     if [ "$age" -gt "$PROBE_FRESH_SECONDS" ]; then
         log "node_probe marker stale (age=${age}s); reclaiming session"
-        pkill -f 'surflare_node_probe' 2>/dev/null || true
+        pgrep -f 'surflare_node_probe' 2>/dev/null | while read -r _spid; do kill "$_spid" 2>/dev/null; done; true
         rm -f "$PROBE_ACTIVE_FILE"
         _probe_defer_start=0
         return 1
@@ -1516,7 +1537,7 @@ _probe_active() {
     [ "$_probe_defer_start" -eq 0 ] && _probe_defer_start="$now"
     if [ $(( now - _probe_defer_start )) -gt "$PROBE_HARD_MAX" ]; then
         log "node_probe held session > ${PROBE_HARD_MAX}s; force-reclaiming"
-        pkill -f 'surflare_node_probe' 2>/dev/null || true
+        pgrep -f 'surflare_node_probe' 2>/dev/null | while read -r _spid; do kill "$_spid" 2>/dev/null; done; true
         rm -f "$PROBE_ACTIVE_FILE"
         _probe_defer_start=0
         return 1
