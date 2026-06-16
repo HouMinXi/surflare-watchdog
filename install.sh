@@ -44,8 +44,22 @@ if [ "$INIT" = "procd" ]; then
     echo "  LAN tproxy rule installed -> /etc/surflare-lan-tproxy.nft"
     echo "  Installing required router packages..."
     opkg update -q 2>/dev/null || true
-    opkg install coreutils-paste ss coreutils-timeout conntrack kmod-nft-tproxy 2>/dev/null || true
-    echo "  opkg: coreutils-paste ss coreutils-timeout conntrack kmod-nft-tproxy"
+    # Required: fill busybox gaps used by the watchdog script.
+    # Without these, the listed features silently fail or produce wrong output:
+    #   coreutils-paste   -- paste -sd, -  (CN bypass CIDR list join)
+    #   coreutils-grep    -- grep -oP      (nft handle extraction, IRQ parsing)
+    #   coreutils-sleep   -- sleep 0.1     (tcpdump readiness poll)
+    #   coreutils-date    -- date +%-H     (session event log hour field)
+    #   coreutils-nproc   -- nproc --all   (CPU affinity calculation)
+    #   procps-ng-pkill   -- pkill -f      (node probe session cleanup)
+    #   ss                -- ss -tnp       (VPN server IP extraction)
+    #   coreutils-timeout -- timeout N cmd (auth / connect timeouts)
+    #   conntrack         -- conntrack -F  (flush stale connections after killswitch)
+    #   kmod-nft-tproxy   -- LAN tproxy kernel module
+    opkg install \
+        coreutils-paste coreutils-grep coreutils-sleep coreutils-date \
+        coreutils-nproc procps-ng-pkill \
+        ss coreutils-timeout conntrack kmod-nft-tproxy 2>/dev/null || true
 else
     # Laptop (Fedora/RHEL/systemd) -- additional diagnostic tools
     install -m 755 "$REPO/laptop/surflare_early_detector.sh" /usr/local/sbin/surflare_early_detector.sh
