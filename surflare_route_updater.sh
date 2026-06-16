@@ -3,7 +3,7 @@
 # Fetches BGP and APNIC lists, cross-validates via python, and updates /etc/surflare/.
 # Also updates cn_ipv4_extra.txt (cloud CDN APAC bypass), three-source:
 #   Source A: RIPE AS routing consistency (IRR+BGP, gold standard)
-#   Source B: cloud-ip-ranges.com (RADB AS-SET, >=90% cross-check)
+#   Source B: cloud-ip-ranges.com (RADB AS-SET, >=75% corruption-detection gate)
 #   Source C: APNIC delegated stats (APAC geographic filter: HK/SG/TW/JP/KR/MO)
 
 V4_BGP_URL="https://raw.githubusercontent.com/misakaio/chnroutes2/master/chnroutes.txt"
