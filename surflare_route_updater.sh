@@ -138,7 +138,7 @@ else
                 "alibabacdn:$RIPE_CONSIST_ALICDN"; do
         name="${pair%%:*}"
         url="${pair#*:}"
-        if ! curl -fsSL --connect-timeout 30 --max-time 90 "$url" \
+        if ! curl -fsSL --connect-timeout 30 --max-time 300 "$url" \
                 -o "$TMP_DIR/consist_${name}.json"; then
             log "WARN: Failed to download RIPE consistency for ${name}"
             ripe_ok=false
