@@ -1,0 +1,58 @@
+# Disable IPv6 (N100 VPN is IPv4 only)
+force-AAAA-SOA yes
+speed-check-mode ping,tcp:80,tcp:443
+
+# SmartDNS - Trusted CN/Foreign DNS Split
+# Design:
+#   domestic group: CN DoT + plain UDP fallback, -exclude-default-group
+#   default group:  foreign DNS via VPN (1.1.1.1/8.8.8.8)
+#   Cross-validation: SmartDNS queries ALL servers in a group concurrently
+#   Hot backup: multiple servers per group, fastest valid result wins
+
+# Listen port (used by dnsmasq as upstream)
+bind :6053
+
+# Cache: serve stale during refresh, 4K entries
+cache-size 4096
+serve-expired yes
+serve-expired-ttl 3600
+
+# -- Bootstrap DNS --------------------------------------------------------
+# Used ONLY to resolve DoT/DoH server hostnames (e.g., dns.alidns.com)
+# Must be plain UDP, no group assignment
+server 223.5.5.5 -bootstrap-dns -exclude-default-group
+server 114.114.114.114 -bootstrap-dns -exclude-default-group
+
+# -- Domestic DNS (CN, encrypted, hot-backup 3-way) ----------------------
+# DoT (TLS encrypted) - primary, prevents ISP injection
+server-tls 223.5.5.5 -group domestic -exclude-default-group
+server-tls 223.6.6.6 -group domestic -exclude-default-group
+server-tls 120.53.53.53 -group domestic -exclude-default-group
+
+# DoH (HTTPS encrypted) - secondary cross-validation source
+server-https https://doh.pub/dns-query -group domestic -exclude-default-group
+server-https https://dns.alidns.com/dns-query -group domestic -exclude-default-group
+
+# Plain UDP - fallback (fastest response when TLS handshake is slow)
+server 223.5.5.5 -group domestic -exclude-default-group
+server 119.29.29.29 -group domestic -exclude-default-group
+
+# -- Foreign DNS (default group, via VPN) --------------------------------
+# These packets are marked 0x1 by surflare OUTPUT chain -> go through VPN
+# When VPN is down: timeout -> foreign domains fail gracefully (CN still works)
+server 1.1.1.1 -group foreign
+server 8.8.8.8 -group foreign
+server 1.0.0.1 -group foreign
+
+# -- CN domain list -> domestic group ------------------------------------
+conf-file /etc/smartdns/domain-set/cn_domains.conf
+
+
+
+# -- Force-foreign overrides (domains with CN-IP duality, must use VPN DNS) -
+conf-file /etc/smartdns/force-foreign.conf
+
+
+# -- Bing: force CN IP DIRECT path (VPN exit IPs trigger redirect loop) --
+domain-rules /bing.com/ -address 202.89.233.101 -speed-check-mode none
+domain-rules /cn.bing.com/ -address 202.89.233.101 -speed-check-mode none

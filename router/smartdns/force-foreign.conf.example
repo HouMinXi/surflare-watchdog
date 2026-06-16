@@ -1,0 +1,20 @@
+# SmartDNS force-foreign.conf
+# Purpose: Fix domains where VPN exit IP triggers server-side redirect loops.
+#
+# DIAGNOSIS METHOD (Playwright redirect capture):
+#   1. Capture redirect chain in browser
+#   2. Identify the loop pattern
+#   3. Check if CN IP direct access serves content (no redirect back)
+#   4. Add address override if CN IP is in bypass_ipv4 AND serves content directly
+#
+# Microsoft Bing: ERR_TOO_MANY_REDIRECTS
+#   Root cause (confirmed by Exa research + Playwright capture):
+#   - Microsoft detects commercial VPN exit IPs as "China VPN users"
+#   - www.bing.com (VPN IP) -> 302 -> cn.bing.com
+#   - cn.bing.com (VPN IP, global edge) -> 301 -> www.bing.com?mkt=zh-CN -> loop
+#   Fix: force BOTH to 202.89.233.101 (CN bypass IP, DIRECT path).
+#   With CN ISP IP: www.bing.com -> cn.bing.com (1 redirect) -> serves content.
+#   TLS verified: cert at 202.89.233.101 has SAN *.bing.com + www.bing.com.
+#   Reference: Clash Verge #1702, SearxNG #2193, V2EX t/927161
+address /bing.com/202.89.233.101
+address /cn.bing.com/202.89.233.101

@@ -27,7 +27,7 @@ PIDFILE=/run/surflare_watchdog.pid    # PID file for reliable daemon shutdown
 ROTATION_STATE=/var/tmp/surflare_rotation  # Persists active node across restarts
 DIAG_SACK_THRESHOLD=20                # % of packets with SACK blocks to flag transit degradation
 DISCONNECT_SETTLE=2                   # seconds after surflare disconnect before killing processes
-CONNECT_SETTLE=10                     # seconds after surflare connect --daemon for VPN to establish
+CONNECT_SETTLE=20                     # seconds after surflare connect --daemon for VPN to establish
 NETWORK_WAIT_FALLBACK=15              # seconds to wait for network when nm-online is unavailable
 NETWORK_WAIT_TIMEOUT=30               # nm-online timeout in seconds
 PROCESS_EXIT_TIMEOUT=20               # seconds to wait for SIGTERM before escalating to SIGKILL
@@ -88,17 +88,13 @@ umask 0177
 #   flock         -> util-linux   (all major distros)
 #   surflare/surflare-proxy -> from surflare installation
 # Note: nm-online is optional (NetworkManager package); falls back to sleep 15s.
-for cmd in curl killall pgrep flock surflare surflare-proxy python3; do
+for cmd in curl killall pgrep flock surflare surflare-proxy python3 expect; do
 	if ! command -v "$cmd" >/dev/null 2>&1; then
 		printf '<3>surflare_watchdog: missing dependency: %s, exiting\n' "$cmd" >/dev/kmsg
 		exit 1
 	fi
+
 done
-# expect only required for initial interactive login (not needed when auth.dat exists)
-if ! [ -f /etc/surflare/auth.dat ] && ! command -v expect >/dev/null 2>&1; then
-	printf '<3>surflare_watchdog: missing dependency: expect (needed for initial login)\n' >/dev/kmsg
-	exit 1
-fi
 
 if ! command -v nm-online >/dev/null 2>&1; then
 	printf '<4>surflare_watchdog: nm-online not found, will use fixed sleep on resume\n' >/dev/kmsg
@@ -113,7 +109,7 @@ log() {
 # Indicators: surflare-proxy process + nftables table + fwmark policy routing rule.
 # A LOCAL_FAIL means the VPN is definitively down (not a transient network timeout).
 check_vpn_local_state() {
-	pgrep surflare-proxy >/dev/null 2>&1 || return 1
+	pgrep -x surflare-proxy >/dev/null 2>&1 || return 1
 	nft list table inet surflare >/dev/null 2>&1 || return 1
 	ip rule show | grep -q 'fwmark 0x1 lookup 100' || return 1
 	return 0
@@ -253,7 +249,7 @@ _setup_chnroute() {
 		local tmp_nft="/tmp/cn_ipv4_$$.nft"
 		{
 			printf 'add element inet surflare cn_ipv4 { '
-			grep -v '^#' "$cn_v4_file" | grep -v '^[[:space:]]*$' | tr '\n' ',' | sed 's/,$//'
+			grep -v '^#' "$cn_v4_file" | grep -v '^[[:space:]]*$' | paste -sd, -
 			printf ' }\n'
 		} > "$tmp_nft"
 		if nft -f "$tmp_nft" 2>/dev/null; then
@@ -265,7 +261,7 @@ _setup_chnroute() {
 				{
 					printf 'flush set inet killswitch bypass_ipv4\n'
 					printf 'add element inet killswitch bypass_ipv4 { '
-					grep -v '^#' "$cn_v4_file" | grep -v '^[[:space:]]*$' | tr '\n' ',' | sed 's/,$//'
+					grep -v '^#' "$cn_v4_file" | grep -v '^[[:space:]]*$' | paste -sd, -
 					printf ' }\n'
 				} > "$tmp_ks_v4"
 				nft -f "$tmp_ks_v4" 2>/dev/null || \
@@ -290,7 +286,7 @@ _setup_chnroute() {
 		local tmp_nft_v6="/tmp/cn_ipv6_$$.nft"
 		{
 			printf 'add element inet surflare cn_ipv6 { '
-			grep -v '^#' "$cn_v6_file" | grep -v '^[[:space:]]*$' | tr '\n' ',' | sed 's/,$//'
+			grep -v '^#' "$cn_v6_file" | grep -v '^[[:space:]]*$' | paste -sd, -
 			printf ' }\n'
 		} > "$tmp_nft_v6"
 		if nft -f "$tmp_nft_v6" 2>/dev/null; then
@@ -302,7 +298,7 @@ _setup_chnroute() {
 				{
 					printf 'flush set inet killswitch bypass_ipv6\n'
 					printf 'add element inet killswitch bypass_ipv6 { '
-					grep -v '^#' "$cn_v6_file" | grep -v '^[[:space:]]*$' | tr '\n' ',' | sed 's/,$//'
+					grep -v '^#' "$cn_v6_file" | grep -v '^[[:space:]]*$' | paste -sd, -
 					printf ' }\n'
 				} > "$tmp_ks_v6"
 				nft -f "$tmp_ks_v6" 2>/dev/null || \
@@ -320,29 +316,8 @@ _setup_chnroute() {
 	fi
 }
 
-_install_lan_tproxy() {
-	# Install transparent proxy rule for ALL LAN devices (iifname br-lan).
-	# Uses ip-family tproxy to 127.0.0.1:10800 (surflare-proxy port).
-	# Requires: PLATFORM=router, /etc/surflare-lan-tproxy.nft present.
-	[ "$PLATFORM" = "router" ] || return 0
-	local _nft_file="/etc/surflare-lan-tproxy.nft"
-	[ -f "$_nft_file" ] || return 0
-	nft delete table ip sw_lan_tproxy 2>/dev/null || true
-	if nft -f "$_nft_file" 2>/dev/null; then
-		log "LAN tproxy: installed (all br-lan TCP via surflare-proxy)"
-	else
-		log "WARN: LAN tproxy: nft load failed"
-	fi
-}
-
 _install_killswitch() {
 	nft delete table inet killswitch 2>/dev/null || true
-
-	# Detect the NTP daemon user at runtime (iStoreOS uses 'ntp', Fedora/RHEL use 'chrony').
-	# nft resolves skuid names at rule-load time; wrong user causes nft -f to fail.
-	local _ntp_user=""
-	id ntp    >/dev/null 2>&1 && _ntp_user="ntp"
-	id chrony >/dev/null 2>&1 && [ -z "$_ntp_user" ] && _ntp_user="chrony"
 
 	local _ks_tmp="/tmp/ks_install_$$.nft"
 	cat > "$_ks_tmp" << 'NFTEOF'
@@ -381,18 +356,12 @@ table inet killswitch {
 		ip6 daddr ff00::/8 accept
 		udp sport 68 udp dport 67 accept
 		udp sport 546 udp dport 547 accept
-		meta skuid ntp udp dport 123 accept
+		meta skuid chrony udp dport 123 accept
 		limit rate 5/second burst 10 packets log prefix "ks-drop: "
 		counter drop
 	}
 }
 NFTEOF
-	# Patch skuid to match the actual NTP user on this host.
-	if [ -n "$_ntp_user" ] && [ "$_ntp_user" != "ntp" ]; then
-		sed -i "s/meta skuid ntp /meta skuid ${_ntp_user} /" "$_ks_tmp"
-	elif [ -z "$_ntp_user" ]; then
-		sed -i '/meta skuid ntp/d' "$_ks_tmp"
-	fi
 	if nft -f "$_ks_tmp"; then
 		log "Kill switch installed (inet killswitch, policy drop)"
 	else
@@ -406,7 +375,7 @@ NFTEOF
 	local cn_v6_file="/etc/surflare/cn_ipv6.txt"
 	if [ -f "$cn_v4_file" ]; then
 		local bypass_v4
-		bypass_v4=$(grep -v '^#' "$cn_v4_file" | grep -v '^[[:space:]]*$' | tr '\n' ',' | sed 's/,$//')
+		bypass_v4=$(grep -v '^#' "$cn_v4_file" | grep -v '^[[:space:]]*$' | paste -sd, -)
 		if [ -n "$bypass_v4" ]; then
 			nft add element inet killswitch bypass_ipv4 "{ $bypass_v4 }" 2>/dev/null || \
 				log "WARN: failed to load bypass_ipv4"
@@ -414,7 +383,7 @@ NFTEOF
 	fi
 	if [ -f "$cn_v6_file" ]; then
 		local bypass_v6
-		bypass_v6=$(grep -v '^#' "$cn_v6_file" | grep -v '^[[:space:]]*$' | tr '\n' ',' | sed 's/,$//')
+		bypass_v6=$(grep -v '^#' "$cn_v6_file" | grep -v '^[[:space:]]*$' | paste -sd, -)
 		if [ -n "$bypass_v6" ]; then
 			nft add element inet killswitch bypass_ipv6 "{ $bypass_v6 }" 2>/dev/null || \
 				log "WARN: failed to load bypass_ipv6"
@@ -797,14 +766,11 @@ check_vpn_health() {
 
 wait_for_exit() {
 	local name="$1" i=0
-	# pgrep -x broken on busybox. Plain 'pgrep surflare' also matches the watchdog bash
-	# process (comm="surflare_watchd"). Use pgrep -f with /usr/bin/ path so only the actual
-	# binary is matched, not the watchdog script at /usr/local/sbin/surflare_watchdog.sh.
-	while pgrep -f "/usr/bin/${name}" >/dev/null 2>&1 && [ "$i" -lt "$PROCESS_EXIT_TIMEOUT" ]; do
+	while pgrep -x "$name" >/dev/null 2>&1 && [ "$i" -lt "$PROCESS_EXIT_TIMEOUT" ]; do
 		sleep 1
 		i=$((i + 1))
 	done
-	if pgrep -f "/usr/bin/${name}" >/dev/null 2>&1; then
+	if pgrep -x "$name" >/dev/null 2>&1; then
 		log "Process ${name} did not exit after SIGTERM, sending SIGKILL (nftables rules may be orphaned if this is surflare)"
 		killall -KILL "$name" 2>/dev/null
 	fi
@@ -1112,7 +1078,7 @@ probe_best_transit() {
 		fi
 		local wait_sec=0
 		while [ "$wait_sec" -lt "$TRANSIT_ROUTE_READY_TIMEOUT" ]; do
-			pgrep surflare-proxy >/dev/null 2>&1 && \
+			pgrep -x surflare-proxy >/dev/null 2>&1 && \
 			nft list table inet surflare >/dev/null 2>&1 && \
 			ip rule show | grep -q 'fwmark 0x1 lookup 100' && break
 			sleep 1
@@ -1303,7 +1269,7 @@ connect_vpn() {
 		fi
 		sleep "$CONNECT_SETTLE"
 		# Process-level sanity check: verify surflare-proxy is running
-		if ! pgrep surflare-proxy >/dev/null 2>&1; then
+		if ! pgrep -x surflare-proxy >/dev/null 2>&1; then
 			log "VPN establishment timed out: surflare-proxy not running after ${CONNECT_SETTLE}s"
 			exit 1
 		fi
@@ -1311,7 +1277,7 @@ connect_vpn() {
 		compute_proxy_affinity
 		_remove_dns_fallback
 		local proxy_pid
-		proxy_pid=$(pgrep surflare-proxy | head -1)
+		proxy_pid=$(pgrep -x surflare-proxy | head -1)
 		if [ -n "$proxy_pid" ] && [ -n "$PROXY_CPU_SET" ]; then
 			taskset -apc "$PROXY_CPU_SET" "$proxy_pid" >/dev/null 2>&1 &&
 				log "Pinned surflare-proxy (PID ${proxy_pid}) to CPUs ${PROXY_CPU_SET}" || true
@@ -1366,10 +1332,7 @@ start_packet_trace() {
 	done
 	probe_ips=$(echo "$probe_ips" | tr ' ' '\n' | sort -u | tr '\n' ' ')
 
-	# Trim whitespace before empty check (busybox: tr '\n' ' ' leaves trailing space)
-	local probe_ips_trimmed
-	probe_ips_trimmed=$(echo "$probe_ips" | tr -d '[:space:]')
-	if [ -z "$probe_ips_trimmed" ]; then
+	if [ -z "$probe_ips" ]; then
 		log "Packet trace: cannot resolve any probe IPs, skipping"
 		return 1
 	fi
@@ -1377,9 +1340,6 @@ start_packet_trace() {
 	for ip in $probe_ips; do
 		ip_set="${ip_set:+$ip_set, }$ip"
 	done
-
-	# Guard: ip_set still empty after loop (shouldn't happen but prevents nft syntax error)
-	[ -z "$ip_set" ] && { log "Packet trace: ip_set empty after loop, skipping"; return 1; }
 
 	# Bitwise OR preserves surflare's fwmark 0x1 for VPN routing
 	if ! nft -f - <<EOF
@@ -1713,20 +1673,6 @@ while true; do
 		transient_count=0
 		_remove_dns_fallback
 
-		# First healthy check: install killswitch if not yet armed (handles startup with
-		# pre-existing VPN connection, where connect_vpn is never called).
-		if [ "$_killswitch_armed" -eq 0 ]; then
-			_update_server_endpoint  # populate _diag_server_ips from running proxy
-			if _install_killswitch; then
-				_killswitch_armed=1
-				_update_killswitch_server_ips
-				_install_lan_tproxy
-				log "Kill switch armed on healthy startup"
-			else
-				log "WARN: Kill switch failed to install on healthy startup"
-			fi
-		fi
-
 		# Proactive token refresh -- runs whenever VPN is confirmed healthy so tokens stay
 		# fresh for reconnects. Covers both Google-OK and country-probe-fallback paths.
 		now=$(date +%s)
@@ -1798,7 +1744,6 @@ while true; do
 				if [ "$_killswitch_armed" -eq 0 ]; then
 					if _install_killswitch; then
 						_killswitch_armed=1
-						_install_lan_tproxy
 					else
 						log "WARN: Kill switch failed to install -- IP leak protection inactive"
 					fi

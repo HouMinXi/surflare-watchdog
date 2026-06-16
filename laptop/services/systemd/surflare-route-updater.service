@@ -1,0 +1,8 @@
+[Unit]
+Description=Surflare Chnroute Updater
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/surflare_route_updater.sh
