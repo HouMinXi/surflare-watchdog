@@ -68,7 +68,8 @@ else
 fi
 
 mkdir -p /usr/local/share/surflare/routes
-cp "$REPO/routes/"*.txt /usr/local/share/surflare/routes/
+cp "$REPO/routes/cn_ipv4.txt" /usr/local/share/surflare/routes/
+cp "$REPO/routes/cn_ipv6.txt" /usr/local/share/surflare/routes/
 
 # ---------------------------------------------------------------------------
 # Service installation (symlink for systemd; cp+chmod for others)
