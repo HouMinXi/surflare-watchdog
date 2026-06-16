@@ -1299,6 +1299,16 @@ connect_vpn() {
 		[ "$rule_count" -gt 0 ] && log "Removed ${rule_count} residual ip rule(s) fwmark 0x1 lookup 100"
 		ip route flush table 100 2>/dev/null || true
 
+		# Remove LAN tproxy to prevent black-holing LAN traffic while the proxy
+		# is down. Without this, sw_lan_tproxy continues routing all LAN TCP to
+		# :10800 which has no listener, silently dropping all packets for the
+		# ~24s reconnect window. LAN devices fall through to direct fw4 routing
+		# so CN ISP pages remain accessible during reconnect.
+		if nft list table ip sw_lan_tproxy >/dev/null 2>&1; then
+			nft delete table ip sw_lan_tproxy 2>/dev/null || true
+			log "LAN tproxy removed: direct routing active during reconnect"
+		fi
+
 		# Attempt auth refresh before connecting -- surflare API may still be
 		# reachable briefly after nftables flush restores direct network access
 		refresh_auth || true
@@ -1555,6 +1565,7 @@ cleanup() {
 	# shellcheck disable=SC2086
 	[ -n "$_hc_tmp" ] && rm -f $_hc_tmp
 	nft delete table inet surflare_moat 2>/dev/null || true
+	nft delete table ip sw_lan_tproxy 2>/dev/null || true
 	_remove_killswitch
 	rm -f "$PIDFILE"
 	rm -f "$WATCHDOG_ACK_FILE" 2>/dev/null || true
@@ -1822,6 +1833,16 @@ while true; do
 				fi
 				_update_killswitch_server_ips
 				_update_bypass_devices
+				# Restore LAN tproxy now that the new proxy is ready on :10800.
+				# Only restore if it was removed during this reconnect cycle.
+				_lan_tproxy_nft="/etc/surflare-lan-tproxy.nft"
+				if [ -f "$_lan_tproxy_nft" ] && \
+				   ! nft list table ip sw_lan_tproxy >/dev/null 2>&1; then
+					nft -f "$_lan_tproxy_nft" 2>/dev/null && \
+						log "LAN tproxy restored" || \
+						log "WARN: LAN tproxy restore failed"
+					_update_bypass_devices
+				fi
 				_record_connect "${_active_node}" "${new_health}"
 			else
 				reconnect_count=$((reconnect_count + 1))
