@@ -17,10 +17,15 @@ RIPE_CONSIST_ALIBABA="https://stat.ripe.net/data/as-routing-consistency/data.jso
 RIPE_CONSIST_ALICDN="https://stat.ripe.net/data/as-routing-consistency/data.json?resource=AS24429"
 
 # Cloud CDN -- Source B: disposable/cloud-ip-ranges (RADB AS-SET, independent)
-# GitHub raw -- daily auto-updated by cloud-ip-ranges-crawler CI
-_CIDR_BASE="https://raw.githubusercontent.com/disposable/cloud-ip-ranges/master/txt"
-CLOUD_TENCENT_URL="${_CIDR_BASE}/tencent.txt"
-CLOUD_ALIBABA_URL="${_CIDR_BASE}/alibaba.txt"
+# Primary: GitHub raw (daily-updated CI). Fallback: jsDelivr CDN (caches GitHub,
+# independent CDN path). Both serve identical content; fallback covers GitHub
+# outages and rate limits.
+_CIDR_GH="https://raw.githubusercontent.com/disposable/cloud-ip-ranges/master/txt"
+_CIDR_JSD="https://cdn.jsdelivr.net/gh/disposable/cloud-ip-ranges@master/txt"
+CLOUD_TENCENT_URL="${_CIDR_GH}/tencent.txt"
+CLOUD_ALIBABA_URL="${_CIDR_GH}/alibaba.txt"
+CLOUD_TENCENT_FB="${_CIDR_JSD}/tencent.txt"
+CLOUD_ALIBABA_FB="${_CIDR_JSD}/alibaba.txt"
 
 OUT_DIR="/etc/surflare"
 mkdir -p "$OUT_DIR"
@@ -147,12 +152,20 @@ else
 
     log "Cloud CDN extra: downloading Source B (cloud-ip-ranges RADB AS-SET)..."
     cloud_ok=true
-    for pair in "tencent:$CLOUD_TENCENT_URL" "alibaba:$CLOUD_ALIBABA_URL"; do
+    for pair in "tencent:$CLOUD_TENCENT_URL:$CLOUD_TENCENT_FB" \
+                "alibaba:$CLOUD_ALIBABA_URL:$CLOUD_ALIBABA_FB"; do
         name="${pair%%:*}"
-        url="${pair#*:}"
-        if ! curl -fsSL --connect-timeout 30 "$url" \
-                -o "$TMP_DIR/cloud_${name}.txt"; then
-            log "WARN: Failed to download cloud-ip-ranges for ${name}"
+        rest="${pair#*:}"
+        primary="${rest%%:*}"
+        fallback="${rest#*:}"
+        if curl -fsSL --connect-timeout 30 "$primary" \
+                -o "$TMP_DIR/cloud_${name}.txt" 2>/dev/null; then
+            log "Source B ${name}: downloaded from primary"
+        elif curl -fsSL --connect-timeout 30 "$fallback" \
+                -o "$TMP_DIR/cloud_${name}.txt" 2>/dev/null; then
+            log "WARN: Source B ${name}: primary failed, used jsDelivr fallback"
+        else
+            log "WARN: Source B ${name}: both primary and fallback failed"
             cloud_ok=false
         fi
     done

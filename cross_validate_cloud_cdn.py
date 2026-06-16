@@ -1,32 +1,37 @@
 #!/usr/bin/env python3
 """Three-source cross-validation for cloud CDN extra bypass CIDRs.
 
-Methodology (achieves >=90% accuracy):
+Output quality: each CIDR in the output is confirmed by RIPE NCC IRR
+registration AND live BGP observation (>=10 full-table peers) AND APNIC APAC
+geographic allocation. This triple confirmation makes individual output CIDRs
+high-confidence. Data integrity (is the input trustworthy?) is handled
+separately via CROSS_CHECK_THRESHOLD (see below).
 
-  Source A -- RIPE AS Routing Consistency (gold standard)
+  Source A -- RIPE AS Routing Consistency (primary, gold standard)
     Endpoint: stat.ripe.net/data/as-routing-consistency/data.json
     What it provides: prefixes with two independent flags:
       in_bgp=True  -> observed by RIS BGP (>=10 full-table peers, globally visible)
       in_whois=True -> registered in IRR (official routing registry)
-    A prefix with BOTH flags is the gold standard; IRR alone or BGP alone is weaker.
+    Only prefixes with BOTH flags are kept; either flag alone is weaker.
 
-  Source B -- cloud-ip-ranges.com (RADB AS-SET, daily updated)
-    What it provides: CIDR list derived from RADB AS-SET declarations.
-    Independent data path from RIPE; validates Source A is consistent across
-    two different registry query methods.
+  Source B -- disposable/cloud-ip-ranges (RADB AS-SET, corruption detection)
+    URL: github.com/disposable/cloud-ip-ranges/txt/{tencent,alibaba}.txt
+    Purpose: CORRUPTION DETECTION gate only -- not accuracy measure.
+    RIPE uses RIPE NCC IRR; cloud-ip-ranges uses RADB. These two IRR databases
+    have ~75-80% structural overlap by design; see CROSS_CHECK_THRESHOLD.
 
   Source C -- APNIC delegated-apnic-latest (geographic filter)
-    What it provides: official APNIC regional IP allocation by country.
-    Countries: CN, HK, SG, TW, JP, KR, MO (all primary CN-serving CDN regions).
+    Countries: CN, HK, SG, TW, JP, KR, MO (primary CN-serving CDN regions).
     Eliminates US/EU cloud IPs that would never serve CN users.
 
 Validation logic:
   1. Parse Source A: keep only prefixes with in_bgp=True AND in_whois=True
-     -> "IRR+BGP confirmed" set -- these are the gold standard IPs
-  2. Cross-check Source B coverage: >=90% of gold-standard prefixes must
-     overlap with cloud-ip-ranges Source B (consistency gate)
-  3. Apply Source C APAC filter: keep only IPs allocated to APAC countries
-     -> eliminates US/EU false positives
+     -> "IRR+BGP confirmed" set -- the primary candidate pool
+  2. Corruption gate (Source B): >=CROSS_CHECK_THRESHOLD of Source A confirmed
+     prefixes must overlap cloud-ip-ranges. Threshold is 0.75 (not 0.90) --
+     RIPE NCC IRR and RADB have ~75-80% structural overlap by design; see the
+     CROSS_CHECK_THRESHOLD constant comment for the full reasoning.
+  3. Apply Source C APAC filter: keep only IPs in APAC-allocated blocks
   4. Dedup against existing cn_ipv4.txt (no redundant entries)
   5. Collapse and write output
 
