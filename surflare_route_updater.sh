@@ -16,9 +16,11 @@ RIPE_CONSIST_TENCENT="https://stat.ripe.net/data/as-routing-consistency/data.jso
 RIPE_CONSIST_ALIBABA="https://stat.ripe.net/data/as-routing-consistency/data.json?resource=AS45102"
 RIPE_CONSIST_ALICDN="https://stat.ripe.net/data/as-routing-consistency/data.json?resource=AS24429"
 
-# Cloud CDN -- Source B: cloud-ip-ranges.com (RADB AS-SET, independent of RIPE)
-CLOUD_TENCENT_URL="https://cloud-ip-ranges.com/download/tencent.txt"
-CLOUD_ALIBABA_URL="https://cloud-ip-ranges.com/download/alibaba.txt"
+# Cloud CDN -- Source B: disposable/cloud-ip-ranges (RADB AS-SET, independent)
+# GitHub raw -- daily auto-updated by cloud-ip-ranges-crawler CI
+_CIDR_BASE="https://raw.githubusercontent.com/disposable/cloud-ip-ranges/master/txt"
+CLOUD_TENCENT_URL="${_CIDR_BASE}/tencent.txt"
+CLOUD_ALIBABA_URL="${_CIDR_BASE}/alibaba.txt"
 
 OUT_DIR="/etc/surflare"
 mkdir -p "$OUT_DIR"
