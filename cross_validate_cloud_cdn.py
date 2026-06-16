@@ -1,11 +1,26 @@
 #!/usr/bin/env python3
 """Three-source cross-validation for cloud CDN extra bypass CIDRs.
 
-Output quality: each CIDR in the output is confirmed by RIPE NCC IRR
-registration AND live BGP observation (>=10 full-table peers) AND APNIC APAC
-geographic allocation. This triple confirmation makes individual output CIDRs
-high-confidence. Data integrity (is the input trustworthy?) is handled
-separately via CROSS_CHECK_THRESHOLD (see below).
+Two validation groups cover different providers:
+
+  Main group (Source A + Source B cross-check + Source C geo-filter):
+    Tencent Cloud Intl (AS132203, AS139341) -- Source B: tencent.txt
+    Alibaba Cloud Intl (AS45102, AS24429)   -- Source B: alibaba.txt
+    Huawei Cloud APAC  (AS136907)           -- Source B: huawei-cloud.txt
+    Empirical cross-check ratio: ~80-100% for each provider.
+
+  Supplement group (Source A + Source C geo-filter only, no Source B):
+    Alibaba Cloud Hangzhou (AS37963)        -- cloud-ip-ranges has no file
+    Alibaba Cloud Singapore (AS134963)      -- cloud-ip-ranges has no file
+    ByteDance / TikTok (AS396986)           -- cloud-ip-ranges has no file
+    These pass RIPE IRR+BGP dual confirmation (same quality as main group)
+    but no independent third-party cross-check is available.
+
+Output quality: each CIDR in the main group output is confirmed by RIPE NCC
+IRR registration AND live BGP observation (>=10 full-table peers) AND the
+provider's cloud-ip-ranges entry AND APNIC APAC geographic allocation.
+Supplement CIDRs skip the cloud-ip-ranges cross-check but retain the RIPE
+IRR+BGP dual confirmation and APAC geo-filter.
 
   Source A -- RIPE AS Routing Consistency (primary, gold standard)
     Endpoint: stat.ripe.net/data/as-routing-consistency/data.json
@@ -14,17 +29,17 @@ separately via CROSS_CHECK_THRESHOLD (see below).
       in_whois=True -> registered in IRR (official routing registry)
     Only prefixes with BOTH flags are kept; either flag alone is weaker.
 
-  Source B -- disposable/cloud-ip-ranges (RADB AS-SET, corruption detection)
-    URL: github.com/disposable/cloud-ip-ranges/txt/{tencent,alibaba}.txt
+  Source B -- disposable/cloud-ip-ranges (corruption detection, main group only)
+    URL: github.com/disposable/cloud-ip-ranges/txt/{tencent,alibaba,huawei-cloud}.txt
     Purpose: CORRUPTION DETECTION gate only -- not accuracy measure.
     RIPE uses RIPE NCC IRR; cloud-ip-ranges uses RADB. These two IRR databases
     have ~75-80% structural overlap by design; see CROSS_CHECK_THRESHOLD.
 
-  Source C -- APNIC delegated-apnic-latest (geographic filter)
+  Source C -- APNIC delegated-apnic-latest (geographic filter, both groups)
     Countries: CN, HK, SG, TW, JP, KR, MO (primary CN-serving CDN regions).
     Eliminates US/EU cloud IPs that would never serve CN users.
 
-Validation logic:
+Validation logic (main group):
   1. Parse Source A: keep only prefixes with in_bgp=True AND in_whois=True
      -> "IRR+BGP confirmed" set -- the primary candidate pool
   2. Corruption gate (Source B): >=CROSS_CHECK_THRESHOLD of Source A confirmed
@@ -35,11 +50,19 @@ Validation logic:
   4. Dedup against existing cn_ipv4.txt (no redundant entries)
   5. Collapse and write output
 
+Validation logic (supplement group, no cross-check):
+  Same as steps 1, 3, 4 above -- Source B cross-check skipped.
+  Supplement results are merged with main results before dedup.
+
 Usage:
   python3 cross_validate_cloud_cdn.py \\
       <ripe_consistency_json> <cloud_ranges_txt> \\
       <apnic_delegated_txt> <existing_cn_v4_txt> \\
-      <output_extra_txt>
+      <output_extra_txt> \\
+      [supplement_ripe_json ...]
+
+  supplement_ripe_json: zero or more additional RIPE consistency JSON files
+      validated without cloud-ip-ranges cross-check (RIPE+APAC only).
 
 Exit codes:
   0 - validation passed, output written
@@ -101,7 +124,7 @@ def parse_ripe_consistency(path):
 
 
 def parse_cloud_ranges(path):
-    """Parse cloud-ip-ranges.com CIDR list (one CIDR per line)."""
+    """Parse cloud-ip-ranges CIDR list (one CIDR per line)."""
     nets = []
     with open(path) as f:
         for line in f:
@@ -204,17 +227,18 @@ def overlaps_any(net, index):
 # ---------------------------------------------------------------------------
 
 def main():
-    if len(sys.argv) != 6:
+    if len(sys.argv) < 6:
         print(
             "Usage: cross_validate_cloud_cdn.py "
             "<ripe_consistency_json> <cloud_ranges_txt> "
             "<apnic_delegated_txt> <existing_cn_v4_txt> "
-            "<output_extra_txt>",
+            "<output_extra_txt> [supplement_ripe_json ...]",
             file=sys.stderr,
         )
         sys.exit(2)
 
-    ripe_json, cloud_txt, apnic_txt, existing_txt, output_txt = sys.argv[1:]
+    ripe_json, cloud_txt, apnic_txt, existing_txt, output_txt = sys.argv[1:6]
+    supplement_jsons = sys.argv[6:]  # RIPE-only paths, no cross-check
 
     # Load all sources
     try:
@@ -251,7 +275,7 @@ def main():
     existing_index = build_index(existing_cidrs)
 
     # --- Cross-check: Source A (RIPE confirmed) vs Source B (cloud-ip-ranges) ---
-    # Require >=90% of RIPE-confirmed prefixes to also appear in cloud-ip-ranges.
+    # Require >=75% of RIPE-confirmed prefixes to also appear in cloud-ip-ranges.
     # This guards against RIPE API returning stale/wrong data for an ASN.
     matched_in_cloud = sum(
         1 for net in confirmed if overlaps_any(net, cloud_index)
@@ -278,14 +302,39 @@ def main():
         )
         sys.exit(1)
 
-    # --- Apply APAC geographic filter ---
+    # --- Apply APAC geographic filter (main group) ---
     # Keep only RIPE-confirmed prefixes that are APAC-allocated.
     # This eliminates US/EU cloud IPs from the bypass list.
     apac_confirmed = [net for net in confirmed if overlaps_any(net, apac_index)]
 
-    # --- Dedup against existing cn_ipv4.txt ---
+    # --- Supplement group: RIPE + APAC only (no cloud-ip-ranges cross-check) ---
+    # Used for providers not covered by cloud-ip-ranges (Alibaba HZ/SG, ByteDance).
+    # Still requires RIPE IRR+BGP dual confirmation; APAC geo-filter applies.
+    supp_confirmed_total = 0
+    supp_apac = []
+    for supp_path in supplement_jsons:
+        try:
+            supp_confirmed, _ = parse_ripe_consistency(supp_path)
+            supp_confirmed_total += len(supp_confirmed)
+            supp_apac.extend(
+                net for net in supp_confirmed if overlaps_any(net, apac_index)
+            )
+        except Exception as e:  # noqa: BLE001 -- supplement failures are non-fatal
+            print(
+                f"WARN: supplement {supp_path} skipped: {e}",
+                file=sys.stderr,
+            )
+
+    if supplement_jsons:
+        print(
+            f"Supplement (RIPE+APAC only): {supp_confirmed_total} confirmed  "
+            f"APAC-filtered: {len(supp_apac)}"
+        )
+
+    # --- Merge main + supplement, dedup against existing cn_ipv4.txt ---
+    all_apac = apac_confirmed + supp_apac
     new_cidrs = [
-        net for net in apac_confirmed
+        net for net in all_apac
         if not overlaps_any(net, existing_index)
     ]
 
@@ -293,7 +342,8 @@ def main():
     collapsed = list(ipaddress.collapse_addresses(new_cidrs))
 
     print(
-        f"After APAC filter: {len(apac_confirmed)}  "
+        f"After APAC filter: {len(apac_confirmed)} main + {len(supp_apac)} supplement"
+        f" = {len(all_apac)} total  "
         f"After dedup with cn_ipv4: {len(new_cidrs)}  "
         f"Collapsed output: {len(collapsed)}"
     )
@@ -313,9 +363,10 @@ def main():
                 "# Cloud CDN APAC bypass -- auto-generated by cross_validate_cloud_cdn.py\n"
                 "# Sources: RIPE AS routing consistency (IRR+BGP) "
                 "x cloud-ip-ranges (RADB) x APNIC APAC allocation\n"
-                "# Covers: Tencent Cloud Intl + Alibaba Cloud Intl "
-                "(HK/SG/TW/JP/KR/MO nodes only)\n"
-                "# Cross-check threshold: >=90% RIPE-confirmed vs cloud-ip-ranges\n"
+                "# Covers: Tencent (AS132203+AS139341) + Alibaba (AS45102+AS24429) "
+                "+ Huawei (AS136907) + supplement (AS37963+AS134963+AS396986)\n"
+                "# Cross-check threshold: >=75% corruption-detection gate "
+                "(main group only; supplement is RIPE+APAC)\n"
             )
             for net in collapsed:
                 f.write(str(net) + '\n')

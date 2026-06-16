@@ -11,10 +11,25 @@ V6_BGP_URL="https://ispip.clang.cn/all_cn_ipv6.txt"
 APNIC_URL="https://ftp.apnic.net/stats/apnic/delegated-apnic-latest"
 
 # Cloud CDN -- Source A: RIPE AS routing consistency (IRR+BGP, >=10 peers)
-# Returns per-prefix {in_bgp, in_whois} flags; gold standard for routing truth
-RIPE_CONSIST_TENCENT="https://stat.ripe.net/data/as-routing-consistency/data.json?resource=AS132203"
-RIPE_CONSIST_ALIBABA="https://stat.ripe.net/data/as-routing-consistency/data.json?resource=AS45102"
-RIPE_CONSIST_ALICDN="https://stat.ripe.net/data/as-routing-consistency/data.json?resource=AS24429"
+# Returns per-prefix {in_bgp, in_whois} flags; gold standard for routing truth.
+#
+# Main group (cross-checked vs Source B):
+#   Tencent Cloud Intl: AS132203 (cloud compute), AS139341 (ACE CDN edge)
+#   Alibaba Cloud Intl: AS45102 (primary), AS24429 (CDN peering)
+#   Huawei Cloud APAC:  AS136907 (HK-reg, SG-managed)
+#
+# Supplement group (RIPE+APAC only; cloud-ip-ranges has no file for these):
+#   Alibaba Hangzhou: AS37963 | Alibaba Singapore: AS134963 | ByteDance: AS396986
+_RIPE="https://stat.ripe.net/data/as-routing-consistency/data.json?resource="
+RIPE_CONSIST_TENCENT="${_RIPE}AS132203"
+RIPE_CONSIST_TENCENT_ACE="${_RIPE}AS139341"
+RIPE_CONSIST_ALIBABA="${_RIPE}AS45102"
+RIPE_CONSIST_ALICDN="${_RIPE}AS24429"
+RIPE_CONSIST_HUAWEI="${_RIPE}AS136907"
+# Supplement (no cloud-ip-ranges cross-check available)
+RIPE_CONSIST_ALIBABA_HZ="${_RIPE}AS37963"
+RIPE_CONSIST_ALIBABA_SG="${_RIPE}AS134963"
+RIPE_CONSIST_BYTEDANCE="${_RIPE}AS396986"
 
 # Cloud CDN -- Source B: disposable/cloud-ip-ranges (RADB AS-SET, independent)
 # Primary: GitHub raw (daily-updated CI). Fallback: jsDelivr CDN (caches GitHub,
@@ -24,8 +39,10 @@ _CIDR_GH="https://raw.githubusercontent.com/disposable/cloud-ip-ranges/master/tx
 _CIDR_JSD="https://cdn.jsdelivr.net/gh/disposable/cloud-ip-ranges@master/txt"
 CLOUD_TENCENT_URL="${_CIDR_GH}/tencent.txt"
 CLOUD_ALIBABA_URL="${_CIDR_GH}/alibaba.txt"
+CLOUD_HUAWEI_URL="${_CIDR_GH}/huawei-cloud.txt"
 CLOUD_TENCENT_FB="${_CIDR_JSD}/tencent.txt"
 CLOUD_ALIBABA_FB="${_CIDR_JSD}/alibaba.txt"
+CLOUD_HUAWEI_FB="${_CIDR_JSD}/huawei-cloud.txt"
 
 OUT_DIR="/etc/surflare"
 mkdir -p "$OUT_DIR"
@@ -122,42 +139,71 @@ if ! $update_v4 && ! $update_v6; then
 fi
 
 # ---------------------------------------------------------------------------
-# Cloud CDN extra bypass (cn_ipv4_extra.txt) -- three-source validation
+# Cloud CDN extra bypass (cn_ipv4_extra.txt) -- multi-source validation
 #
 # Source A: RIPE AS routing consistency (IRR + BGP, gold standard, >=10 peers)
-#   Endpoint: stat.ripe.net/data/as-routing-consistency/data.json
-#   Provides per-prefix {in_bgp, in_whois} flags; only in_bgp AND in_whois kept.
-# Source B: cloud-ip-ranges.com (RADB AS-SET, daily) -- cross-check gate >=90%
+#   Main group ASNs: AS132203 AS139341 AS45102 AS24429 AS136907 (cross-checked)
+#   Supplement ASNs: AS37963 AS134963 AS396986 (RIPE+APAC only, no cross-check)
+# Source B: cloud-ip-ranges (RADB AS-SET) -- cross-check gate >=75% (main group)
 # Source C: APNIC delegated stats (APAC geographic filter) -- reuses apnic.txt
-#
-# Covers: Tencent Cloud Intl (AS132203) + Alibaba Cloud Intl (AS45102, AS24429)
 # ---------------------------------------------------------------------------
 CLOUD_VALIDATOR="$DIR/cross_validate_cloud_cdn.py"
 if [ ! -f "$CLOUD_VALIDATOR" ]; then
     log "WARN: cross_validate_cloud_cdn.py missing; skipping extra update"
 else
-    log "Cloud CDN extra: downloading Source A (RIPE AS routing consistency)..."
+    # -----------------------------------------------------------------
+    # Parallel RIPE downloads: main group (5 ASNs) + supplement (3 ASNs)
+    # All launched simultaneously; wait collects results.
+    # -----------------------------------------------------------------
+    log "Cloud CDN extra: parallel RIPE downloads (5 main + 3 supplement ASNs)..."
+    curl -fsSL --connect-timeout 30 --max-time 300 \
+        "$RIPE_CONSIST_TENCENT"     -o "$TMP_DIR/consist_tencent.json"     &
+    curl -fsSL --connect-timeout 30 --max-time 300 \
+        "$RIPE_CONSIST_TENCENT_ACE" -o "$TMP_DIR/consist_tencent_ace.json" &
+    curl -fsSL --connect-timeout 30 --max-time 300 \
+        "$RIPE_CONSIST_ALIBABA"     -o "$TMP_DIR/consist_alibaba.json"     &
+    curl -fsSL --connect-timeout 30 --max-time 300 \
+        "$RIPE_CONSIST_ALICDN"      -o "$TMP_DIR/consist_alibabacdn.json"  &
+    curl -fsSL --connect-timeout 30 --max-time 300 \
+        "$RIPE_CONSIST_HUAWEI"      -o "$TMP_DIR/consist_huawei.json"      &
+    curl -fsSL --connect-timeout 30 --max-time 300 \
+        "$RIPE_CONSIST_ALIBABA_HZ"  -o "$TMP_DIR/consist_alibaba_hz.json"  &
+    curl -fsSL --connect-timeout 30 --max-time 300 \
+        "$RIPE_CONSIST_ALIBABA_SG"  -o "$TMP_DIR/consist_alibaba_sg.json"  &
+    curl -fsSL --connect-timeout 30 --max-time 300 \
+        "$RIPE_CONSIST_BYTEDANCE"   -o "$TMP_DIR/consist_bytedance.json"   &
+    wait
+
+    # Check main group; warn on any missing but only skip if all fail
     ripe_ok=true
-    for pair in "tencent:$RIPE_CONSIST_TENCENT" \
-                "alibaba:$RIPE_CONSIST_ALIBABA" \
-                "alibabacdn:$RIPE_CONSIST_ALICDN"; do
-        name="${pair%%:*}"
-        url="${pair#*:}"
-        if ! curl -fsSL --connect-timeout 30 --max-time 300 "$url" \
-                -o "$TMP_DIR/consist_${name}.json"; then
-            log "WARN: Failed to download RIPE consistency for ${name}"
+    for name in tencent tencent_ace alibaba alibabacdn huawei; do
+        if [ ! -s "$TMP_DIR/consist_${name}.json" ]; then
+            log "WARN: RIPE download failed for main ASN: ${name}"
             ripe_ok=false
         fi
     done
+    # Supplement group: failures are non-fatal (logged, skipped individually)
+    for name in alibaba_hz alibaba_sg bytedance; do
+        if [ ! -s "$TMP_DIR/consist_${name}.json" ]; then
+            log "WARN: RIPE download failed for supplement ASN: ${name} (skipped)"
+        fi
+    done
 
+    # -----------------------------------------------------------------
+    # Source B downloads: tencent + alibaba + huawei-cloud (with fallback)
+    # -----------------------------------------------------------------
     log "Cloud CDN extra: downloading Source B (cloud-ip-ranges RADB AS-SET)..."
     cloud_ok=true
-    for pair in "tencent:$CLOUD_TENCENT_URL:$CLOUD_TENCENT_FB" \
-                "alibaba:$CLOUD_ALIBABA_URL:$CLOUD_ALIBABA_FB"; do
-        name="${pair%%:*}"
-        rest="${pair#*:}"
-        primary="${rest%%:*}"
-        fallback="${rest#*:}"
+    # Separator is '|' (not ':') -- URLs contain ':' in 'https://' so colon
+    # cannot be used as a field delimiter here.
+    for entry in \
+        "tencent|${CLOUD_TENCENT_URL}|${CLOUD_TENCENT_FB}" \
+        "alibaba|${CLOUD_ALIBABA_URL}|${CLOUD_ALIBABA_FB}" \
+        "huawei|${CLOUD_HUAWEI_URL}|${CLOUD_HUAWEI_FB}"; do
+        name="${entry%%|*}"
+        rest="${entry#*|}"
+        primary="${rest%%|*}"
+        fallback="${rest#*|}"
         if curl -fsSL --connect-timeout 30 "$primary" \
                 -o "$TMP_DIR/cloud_${name}.txt" 2>/dev/null; then
             log "Source B ${name}: downloaded from primary"
@@ -171,11 +217,14 @@ else
     done
 
     if $ripe_ok && $cloud_ok; then
-        # Merge three RIPE consistency JSONs into one (P3-2: single block)
-        python3 - "$TMP_DIR/consist_tencent.json" \
-                   "$TMP_DIR/consist_alibaba.json" \
-                   "$TMP_DIR/consist_alibabacdn.json" \
-                   "$TMP_DIR/consist_merged.json" << 'PYEOF'
+        # Merge 5 main-group RIPE JSONs into consist_merged.json
+        python3 - \
+                "$TMP_DIR/consist_tencent.json" \
+                "$TMP_DIR/consist_tencent_ace.json" \
+                "$TMP_DIR/consist_alibaba.json" \
+                "$TMP_DIR/consist_alibabacdn.json" \
+                "$TMP_DIR/consist_huawei.json" \
+                "$TMP_DIR/consist_merged.json" << 'PYEOF'
 import json, sys
 merged = {'data': {'prefixes': []}}
 for path in sys.argv[1:-1]:
@@ -191,8 +240,10 @@ with open(sys.argv[-1], 'w') as f:
 print(f"Merged {len(merged['data']['prefixes'])} consistency entries")
 PYEOF
 
-        # Merge cloud-ip-ranges files into one Source B file
-        cat "$TMP_DIR/cloud_tencent.txt" "$TMP_DIR/cloud_alibaba.txt" \
+        # Merge Source B files (tencent + alibaba + huawei-cloud)
+        cat "$TMP_DIR/cloud_tencent.txt" \
+            "$TMP_DIR/cloud_alibaba.txt" \
+            "$TMP_DIR/cloud_huawei.txt" \
             | grep -v '^#' | grep -v '^[[:space:]]*$' | sort -u \
             > "$TMP_DIR/cloud_combined.txt"
 
@@ -203,7 +254,7 @@ PYEOF
             ripe_ok=false
         fi
 
-        # P3-3: guard cn_v4_ref against empty/missing path
+        # Guard cn_v4_ref against empty/missing path
         cn_v4_ref="${OUT_DIR}/cn_ipv4.txt"
         if [ ! -f "$cn_v4_ref" ]; then
             cn_v4_ref="$TMP_DIR/v4_bgp.txt"
@@ -213,13 +264,22 @@ PYEOF
             cn_v4_ref="/dev/null"
         fi
 
+        # Build supplement args: only include files that exist and are non-empty
+        supplement_args=()
+        for name in alibaba_hz alibaba_sg bytedance; do
+            if [ -s "$TMP_DIR/consist_${name}.json" ]; then
+                supplement_args+=("$TMP_DIR/consist_${name}.json")
+            fi
+        done
+
         if $ripe_ok; then
             output=$(python3 "$CLOUD_VALIDATOR" \
                 "$TMP_DIR/consist_merged.json" \
                 "$TMP_DIR/cloud_combined.txt" \
                 "$apnic_ref" \
                 "$cn_v4_ref" \
-                "$TMP_DIR/cn_ipv4_extra.txt" 2>&1)
+                "$TMP_DIR/cn_ipv4_extra.txt" \
+                "${supplement_args[@]}" 2>&1)
             rc=$?
             echo "$output" | logger -t surflare-route-updater
             log "Cloud CDN validator: $output"
