@@ -63,6 +63,10 @@ if [ "$INIT" = "procd" ]; then
     #   coreutils-timeout -- timeout N cmd (auth / connect timeouts)
     #   conntrack         -- conntrack -F  (flush stale connections after killswitch)
     #   kmod-nft-tproxy   -- LAN tproxy kernel module
+    install -m 755 "$REPO/surflare_route_updater.sh" \
+        /usr/local/sbin/surflare_route_updater.sh
+    install -m 755 "$REPO/cross_validate_cloud_cdn.py" \
+        /usr/local/sbin/cross_validate_cloud_cdn.py
     opkg install \
         coreutils-paste coreutils-grep coreutils-sleep coreutils-date \
         coreutils-nproc procps-ng-pkill \
@@ -140,8 +144,16 @@ esac
 # ---------------------------------------------------------------------------
 # Every 3 min: parse surflare-proxy log for real-time node health (zero VPN disruption)
 LOG_HEALTH_CRON="*/3 * * * * /usr/local/sbin/surflare_log_health.sh >> /dev/null 2>&1"
-( crontab -l 2>/dev/null | grep -v surflare_node_probe | grep -v surflare_l4_probe | grep -v surflare_log_health
-  echo "$LOG_HEALTH_CRON" ) | crontab -
+# Daily 02:30: update CN IP routes (chnroutes2 BGP + cloud CDN APAC extra).
+# Source frequencies: chnroutes2=daily, cloud-ip-ranges=daily, RIPE=realtime.
+# Run at 02:30 to avoid collision with update-cn-domains at 03:00 Mon.
+_rucron="/usr/local/sbin/surflare_route_updater.sh"
+ROUTE_UPDATE_CRON="30 2 * * * $_rucron >> /dev/null 2>&1"
+( crontab -l 2>/dev/null \
+    | grep -v surflare_node_probe | grep -v surflare_l4_probe \
+    | grep -v surflare_log_health | grep -v surflare_route_updater
+  echo "$LOG_HEALTH_CRON"
+  echo "$ROUTE_UPDATE_CRON" ) | crontab -
 # Note: surflare_node_probe.sh is available as a manual diagnostic tool only.
 
 echo ""

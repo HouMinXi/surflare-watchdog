@@ -329,6 +329,46 @@ _setup_chnroute() {
 	if [ "$bypass_applied" -eq 0 ]; then
 		log "WARN: no chnroute files; CN bypass disabled"
 	fi
+
+	# Load cloud CDN extra bypass (Tencent/Alibaba international nodes).
+	# This file is maintained separately from cn_ipv4.txt and never overwritten
+	# by the main chnroute update -- it accumulates validated cloud CDN CIDRs.
+	local cn_v4_extra_file="/etc/surflare/cn_ipv4_extra.txt"
+	if [ -f "$cn_v4_extra_file" ] && \
+	   nft list table inet surflare >/dev/null 2>&1; then
+		local extra_count extra_date tmp_extra tmp_ks_extra
+		extra_count=$(grep -vc '^#' "$cn_v4_extra_file" 2>/dev/null || echo 0)
+		extra_date=$(stat -c '%y' "$cn_v4_extra_file" 2>/dev/null | cut -d' ' -f1)
+		log "Applying cloud CDN extra bypass: ${extra_count} CIDRs (${extra_date})"
+		tmp_extra="/tmp/cn_v4_extra_$$.nft"
+		{
+			printf 'add element inet surflare cn_ipv4 { '
+			grep -v '^#' "$cn_v4_extra_file" | \
+				grep -v '^[[:space:]]*$' | paste -sd, -
+			printf ' }\n'
+		} > "$tmp_extra"
+		if nft -f "$tmp_extra" 2>/dev/null; then
+			log "Cloud CDN extra bypass applied to surflare cn_ipv4"
+		else
+			log "WARN: cloud CDN extra bypass load failed (nft error)"
+		fi
+		rm -f "$tmp_extra"
+		if nft list table inet killswitch >/dev/null 2>&1; then
+			tmp_ks_extra="/tmp/ks_extra_$$.nft"
+			{
+				printf 'add element inet killswitch bypass_ipv4 { '
+				grep -v '^#' "$cn_v4_extra_file" | \
+					grep -v '^[[:space:]]*$' | paste -sd, -
+				printf ' }\n'
+			} > "$tmp_ks_extra"
+			if nft -f "$tmp_ks_extra" 2>/dev/null; then
+				log "Cloud CDN extra bypass applied to killswitch bypass_ipv4"
+			else
+				log "WARN: cloud CDN extra bypass killswitch sync failed"
+			fi
+			rm -f "$tmp_ks_extra"
+		fi
+	fi
 }
 
 _install_killswitch() {
@@ -408,6 +448,16 @@ NFTEOF
 		if [ -n "$bypass_v6" ]; then
 			nft add element inet killswitch bypass_ipv6 "{ $bypass_v6 }" 2>/dev/null || \
 				log "WARN: failed to load bypass_ipv6"
+		fi
+	fi
+	local _ks_extra="/etc/surflare/cn_ipv4_extra.txt"
+	if [ -f "$_ks_extra" ]; then
+		local extra_v4
+		extra_v4=$(grep -v '^#' "$_ks_extra" \
+			| grep -v '^[[:space:]]*$' | paste -sd, -)
+		if [ -n "$extra_v4" ]; then
+			nft add element inet killswitch bypass_ipv4 "{ $extra_v4 }" 2>/dev/null || \
+				log "WARN: failed to load cloud CDN extra bypass_ipv4"
 		fi
 	fi
 }
