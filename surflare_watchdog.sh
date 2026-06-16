@@ -374,9 +374,15 @@ table inet killswitch {
 	}
 }
 NFTEOF
+	# Adjust NTP skuid: chrony on systemd distros, root on OpenWrt (ntpd runs as root)
+	local _ntp_user
+	_ntp_user=$(id -u chrony >/dev/null 2>&1 && echo chrony || echo root)
+	sed -i "s/skuid chrony/skuid $_ntp_user/" "$_ks_tmp"
+
 	if nft -f "$_ks_tmp"; then
-		log "Kill switch installed (inet killswitch, policy drop)"
+		log "Kill switch installed (inet killswitch, policy drop, ntp-user=$_ntp_user)"
 	else
+		nft -f "$_ks_tmp" >&2  # log actual nft error to stderr/dmesg
 		log "ERROR: kill switch install failed"
 		rm -f "$_ks_tmp"
 		return 1
