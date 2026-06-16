@@ -39,6 +39,7 @@ LOGIN_RETRY_DELAY=3                   # seconds between login retries
 HEARTBEAT_INTERVAL=600                # seconds between periodic "VPN healthy" log entries (0=off)
 TRANSIENT_THRESHOLD=6                 # consecutive external timeouts (local state OK) before escalating to fail_count
 BYPASS_LAN_DEVICES=""                 # space-separated LAN IPs that skip tproxy (e.g. "192.168.100.147 192.168.100.148")
+BYPASS_LAN_MACS_FILE="/etc/surflare/bypass-macs.conf"  # MAC-to-IP bypass: IPs resolved from /tmp/dhcp.leases at runtime
 _diag_server_ips=""                   # space-separated VPN server IPs captured after each successful connect
 _diag_connect_time=0                  # epoch seconds of last successful connect
 _sess_node=""                         # exit node of current VPN session
@@ -424,18 +425,36 @@ _remove_killswitch() {
 	nft delete table inet killswitch 2>/dev/null || true
 }
 
-# Populate the bypass_devices set in the sw_lan_tproxy table so that devices
-# listed in BYPASS_LAN_DEVICES skip tproxy (use their own VPN, e.g. AnyConnect).
+# Populate the bypass_devices set in sw_lan_tproxy.
+# Sources (both are checked, results merged):
+#   1. BYPASS_LAN_DEVICES: explicit space-separated IPs
+#   2. BYPASS_LAN_MACS_FILE: one MAC per line; current IP resolved from dhcp.leases
+#
+# Configure MACs in /etc/surflare/bypass-macs.conf (see bypass-macs.conf.example).
+# The MAC-based path re-resolves IPs on every VPN connect, so devices work
+# regardless of DHCP reassignment.
 _update_bypass_devices() {
 	nft list table ip sw_lan_tproxy >/dev/null 2>&1 || return 0
 	nft flush set ip sw_lan_tproxy bypass_devices 2>/dev/null || true
-	[ -z "$BYPASS_LAN_DEVICES" ] && return 0
-	local ip_csv
-	# xargs normalises multi-space / leading-trailing whitespace before converting
-	ip_csv=$(echo "$BYPASS_LAN_DEVICES" | xargs | tr ' ' ',')
-	[ -z "$ip_csv" ] && return 0
-	nft add element ip sw_lan_tproxy bypass_devices "{ $ip_csv }" 2>/dev/null || \
-		log "WARN: bypass_devices update failed (${ip_csv})"
+
+	local all_ips="" ip_csv mac ip line
+	# Source 1: explicit IPs
+	if [ -n "$BYPASS_LAN_DEVICES" ]; then
+		ip_csv=$(echo "$BYPASS_LAN_DEVICES" | xargs | tr ' ' ',')
+		[ -n "$ip_csv" ] && all_ips="$ip_csv"
+	fi
+	# Source 2: MACs from file, resolved via dhcp.leases
+	if [ -f "$BYPASS_LAN_MACS_FILE" ] && [ -f /tmp/dhcp.leases ]; then
+		while IFS= read -r line; do
+			mac=$(echo "$line" | awk '{print tolower($1)}')
+			case "$mac" in '#'*|'') continue ;; esac
+			ip=$(awk -v m="$mac" 'tolower($2)==m{print $3;exit}' /tmp/dhcp.leases)
+			[ -n "$ip" ] && all_ips="${all_ips:+$all_ips,}$ip"
+		done < "$BYPASS_LAN_MACS_FILE"
+	fi
+	[ -z "$all_ips" ] && return 0
+	nft add element ip sw_lan_tproxy bypass_devices "{ $all_ips }" 2>/dev/null || \
+		log "WARN: bypass_devices update failed (${all_ips})"
 }
 
 
