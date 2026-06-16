@@ -1,0 +1,34 @@
+# surflare-bypass-macs.nft
+# Bridge-layer MAC bypass for devices that need direct internet access.
+#
+# Devices whose Ethernet addresses are in bypass_macs skip tproxy entirely
+# and route via the ISP WAN IP (no surflare interception).
+#
+# Use case: work laptops / phones running Cisco AnyConnect or another
+# corporate VPN.  They need to reach the company VPN gateway with the real
+# ISP IP, not via surflare's tunnel.
+#
+# Configuration:
+#   Set BYPASS_LAN_MACS in surflare_watchdog.sh (space-separated MACs).
+#   Watchdog loads this table at startup and repopulates bypass_macs after
+#   each VPN connect.
+#
+#   To add a device manually without watchdog restart:
+#     nft add element bridge sw_mac_bypass bypass_macs { aa:bb:cc:dd:ee:ff }
+#
+# How it works:
+#   This chain fires at bridge prerouting priority -200, before sw_lan_tproxy
+#   (priority mangle-10).  Frames from bypass MACs get meta mark 0x100.
+#   sw_lan_tproxy checks for this mark and returns early, skipping tproxy.
+
+table bridge sw_mac_bypass {
+    set bypass_macs {
+        type ether_addr;
+    }
+
+    chain prerouting {
+        type filter hook prerouting priority -200; policy accept;
+        # Set mark 0x100 on frames from bypass devices; sw_lan_tproxy checks this
+        iifname "br-lan" ether saddr @bypass_macs meta mark set 0x00000100
+    }
+}

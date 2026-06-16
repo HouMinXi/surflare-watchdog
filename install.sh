@@ -42,6 +42,9 @@ if [ "$INIT" = "procd" ]; then
     # Router (N100/iStoreOS) -- LAN tproxy nft rule + required packages
     install -m 644 "$REPO/router/surflare-lan-tproxy.nft" /etc/surflare-lan-tproxy.nft
     echo "  LAN tproxy rule installed -> /etc/surflare-lan-tproxy.nft"
+    install -m 644 "$REPO/router/surflare-bypass-macs.nft" /etc/surflare-bypass-macs.nft
+    echo "  MAC bypass table installed -> /etc/surflare-bypass-macs.nft"
+    nft -f /etc/surflare-bypass-macs.nft 2>/dev/null || true
     echo "  Installing required router packages..."
     opkg update -q 2>/dev/null || true
     # Required: fill busybox gaps used by the watchdog script.

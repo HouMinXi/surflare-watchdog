@@ -21,13 +21,6 @@
 #   - Priority mangle - 10 fires before surflare's own PREROUTING chain
 
 table ip sw_lan_tproxy {
-    # LAN source IPs that bypass tproxy (use their own routing/VPN, e.g. Cisco AnyConnect).
-    # Populated at runtime by the watchdog via BYPASS_LAN_DEVICES config.
-    # To add manually: nft add element ip sw_lan_tproxy bypass_devices { 192.168.x.x }
-    set bypass_devices {
-        type ipv4_addr;
-    }
-
     chain prerouting {
         type filter hook prerouting priority mangle - 10; policy accept;
 
@@ -39,8 +32,10 @@ table ip sw_lan_tproxy {
             127.0.0.0/8
         } return
 
-        # Bypass tproxy for specific devices (set BYPASS_LAN_DEVICES in watchdog config)
-        iifname "br-lan" ip saddr @bypass_devices return
+        # Bypass tproxy for devices marked by bridge MAC table sw_mac_bypass.
+        # bridge prerouting (priority -200) sets mark 0x100 on listed MAC frames
+        # before this chain fires.  See router/surflare-bypass-macs.nft.
+        iifname "br-lan" meta mark 0x00000100 return
 
         # Redirect all remaining LAN TCP to surflare-proxy (transparent)
         iifname "br-lan" meta l4proto tcp \

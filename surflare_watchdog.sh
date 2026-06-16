@@ -38,7 +38,7 @@ LOGIN_RETRIES=5                       # max login attempts per refresh cycle
 LOGIN_RETRY_DELAY=3                   # seconds between login retries
 HEARTBEAT_INTERVAL=600                # seconds between periodic "VPN healthy" log entries (0=off)
 TRANSIENT_THRESHOLD=6                 # consecutive external timeouts (local state OK) before escalating to fail_count
-BYPASS_LAN_DEVICES=""                 # space-separated LAN IPs that skip tproxy (e.g. "192.168.100.147 192.168.100.148")
+BYPASS_LAN_MACS=""                    # space-separated MAC addresses of devices that skip tproxy (e.g. "00:66:77:88:99:aa aa:bb:cc:dd:ee:ff")
 _diag_server_ips=""                   # space-separated VPN server IPs captured after each successful connect
 _diag_connect_time=0                  # epoch seconds of last successful connect
 _sess_node=""                         # exit node of current VPN session
@@ -424,18 +424,29 @@ _remove_killswitch() {
 	nft delete table inet killswitch 2>/dev/null || true
 }
 
-# Populate the bypass_devices set in the sw_lan_tproxy table so that devices
-# listed in BYPASS_LAN_DEVICES skip tproxy (use their own VPN, e.g. AnyConnect).
-_update_bypass_devices() {
-	nft list table ip sw_lan_tproxy >/dev/null 2>&1 || return 0
-	nft flush set ip sw_lan_tproxy bypass_devices 2>/dev/null || true
-	[ -z "$BYPASS_LAN_DEVICES" ] && return 0
-	local ip_csv
-	# xargs normalises multi-space / leading-trailing whitespace before converting
-	ip_csv=$(echo "$BYPASS_LAN_DEVICES" | xargs | tr ' ' ',')
-	[ -z "$ip_csv" ] && return 0
-	nft add element ip sw_lan_tproxy bypass_devices "{ $ip_csv }" 2>/dev/null || \
-		log "WARN: bypass_devices update failed (${ip_csv})"
+# Load the bridge MAC bypass table from its nft file if not already present.
+# The table persists in the kernel independently of the watchdog; this is
+# idempotent and safe to call on every startup.
+_ensure_mac_bypass_table() {
+	nft list table bridge sw_mac_bypass >/dev/null 2>&1 && return 0
+	local f="/etc/surflare-bypass-macs.nft"
+	[ -f "$f" ] || return 0
+	nft -f "$f" 2>/dev/null && \
+		log "MAC bypass table loaded (bridge sw_mac_bypass)" || \
+		log "WARN: failed to load bridge sw_mac_bypass from $f"
+}
+
+# Populate bypass_macs in the bridge MAC bypass table.
+# Listed MACs bypass tproxy; any IP the device holds works automatically.
+_update_bypass_macs() {
+	nft list table bridge sw_mac_bypass >/dev/null 2>&1 || return 0
+	nft flush set bridge sw_mac_bypass bypass_macs 2>/dev/null || true
+	[ -z "$BYPASS_LAN_MACS" ] && return 0
+	local mac_csv
+	mac_csv=$(echo "$BYPASS_LAN_MACS" | xargs | tr ' ' ',')
+	[ -z "$mac_csv" ] && return 0
+	nft add element bridge sw_mac_bypass bypass_macs "{ $mac_csv }" 2>/dev/null || \
+		log "WARN: bypass_macs update failed (${mac_csv})"
 }
 
 
@@ -1799,7 +1810,8 @@ while true; do
 					fi
 				fi
 				_update_killswitch_server_ips
-				_update_bypass_devices
+				_ensure_mac_bypass_table
+				_update_bypass_macs
 				_record_connect "${_active_node}" "${new_health}"
 			else
 				reconnect_count=$((reconnect_count + 1))
