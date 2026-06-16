@@ -88,13 +88,15 @@ umask 0177
 #   flock         -> util-linux   (all major distros)
 #   surflare/surflare-proxy -> from surflare installation
 # Note: nm-online is optional (NetworkManager package); falls back to sleep 15s.
-for cmd in curl killall pgrep flock surflare surflare-proxy python3 expect; do
+for cmd in curl killall pgrep flock surflare surflare-proxy python3; do
 	if ! command -v "$cmd" >/dev/null 2>&1; then
 		printf '<3>surflare_watchdog: missing dependency: %s, exiting\n' "$cmd" >/dev/kmsg
 		exit 1
 	fi
-
 done
+# expect is only needed for interactive password auth (CREDENTIALS_DIRECTORY path).
+# Router deployments use token-based auth and rarely have expect installed.
+# refresh_auth() guards its own expect usage with command -v at call time.
 
 if ! command -v nm-online >/dev/null 2>&1; then
 	printf '<4>surflare_watchdog: nm-online not found, will use fixed sleep on resume\n' >/dev/kmsg
@@ -803,6 +805,11 @@ refresh_auth() {
 		return 2
 	fi
 	[ -z "$password" ] && return 2
+
+	if ! command -v expect >/dev/null 2>&1; then
+		log "WARN: expect not installed; skipping interactive auth"
+		return 2
+	fi
 
 	local i=0 rc=1
 	while [ "$i" -lt "$LOGIN_RETRIES" ]; do
