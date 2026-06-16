@@ -252,7 +252,12 @@ _setup_chnroute() {
 			grep -v '^#' "$cn_v4_file" | grep -v '^[[:space:]]*$' | paste -sd, -
 			printf ' }\n'
 		} > "$tmp_nft"
-		if nft -f "$tmp_nft" 2>/dev/null; then
+		local _v4_ok=0 _v4_try=0
+		while [ "$_v4_try" -lt 3 ] && [ "$_v4_ok" -eq 0 ]; do
+			if nft -f "$tmp_nft" 2>/dev/null; then _v4_ok=1
+			else _v4_try=$((_v4_try+1)); [ "$_v4_try" -lt 3 ] && sleep 2; fi
+		done
+		if [ "$_v4_ok" -eq 1 ]; then
 			nft insert rule inet surflare output ip daddr @cn_ipv4 accept 2>/dev/null || true
 			log "Chnroute v4 applied: CN prefixes bypass proxy via output chain"
 			bypass_applied=$((bypass_applied + 1))
@@ -269,7 +274,7 @@ _setup_chnroute() {
 				rm -f "$tmp_ks_v4"
 			fi
 		else
-			log "WARN: Failed to load Chnroute v4 into nftables; CN bypass not active"
+			log "WARN: Failed to load Chnroute v4 into nftables after 3 attempts; CN bypass not active"
 		fi
 		rm -f "$tmp_nft"
 	fi
@@ -289,7 +294,12 @@ _setup_chnroute() {
 			grep -v '^#' "$cn_v6_file" | grep -v '^[[:space:]]*$' | paste -sd, -
 			printf ' }\n'
 		} > "$tmp_nft_v6"
-		if nft -f "$tmp_nft_v6" 2>/dev/null; then
+		local _v6_ok=0 _v6_try=0
+		while [ "$_v6_try" -lt 3 ] && [ "$_v6_ok" -eq 0 ]; do
+			if nft -f "$tmp_nft_v6" 2>/dev/null; then _v6_ok=1
+			else _v6_try=$((_v6_try+1)); [ "$_v6_try" -lt 3 ] && sleep 2; fi
+		done
+		if [ "$_v6_ok" -eq 1 ]; then
 			nft insert rule inet surflare output ip6 daddr @cn_ipv6 accept 2>/dev/null || true
 			log "Chnroute v6 applied: CN v6 prefixes bypass proxy via output chain"
 			bypass_applied=$((bypass_applied + 1))
@@ -306,7 +316,7 @@ _setup_chnroute() {
 				rm -f "$tmp_ks_v6"
 			fi
 		else
-			log "WARN: Failed to load Chnroute v6 into nftables; CN bypass not active"
+			log "WARN: Failed to load Chnroute v6 into nftables after 3 attempts; CN bypass not active"
 		fi
 		rm -f "$tmp_nft_v6"
 	fi
@@ -1467,9 +1477,20 @@ fi
 # === Daemon mode (started manually with no arguments) ===
 
 # Prevent duplicate daemon instances
-if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
-	echo "watchdog already running (PID $(cat "$PIDFILE"))" >&2
-	exit 1
+# kill -0 alone is insufficient: kernel PID recycling can make a stale PID
+# appear live if an unrelated process reused it (observed: orphan subshell
+# held PID after SIGKILL storm, causing false "already running" exit).
+# Double-check: the live process must be a surflare_watchdog.sh process.
+if [ -f "$PIDFILE" ]; then
+	_old_pid=$(cat "$PIDFILE" 2>/dev/null)
+	if [ -n "$_old_pid" ] && kill -0 "$_old_pid" 2>/dev/null; then
+		if pgrep -f 'surflare_watchdog.sh' 2>/dev/null | grep -qw "$_old_pid"; then
+			echo "watchdog already running (PID $_old_pid)" >&2
+			exit 1
+		fi
+		log "WARN: stale PID file ($PIDFILE) references non-watchdog PID $_old_pid; clearing"
+	fi
+	rm -f "$PIDFILE"
 fi
 
 # Set trap before writing PID to minimise stale-file window on early kill
