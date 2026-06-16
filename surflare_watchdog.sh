@@ -39,7 +39,8 @@ LOGIN_RETRY_DELAY=3                   # seconds between login retries
 HEARTBEAT_INTERVAL=600                # seconds between periodic "VPN healthy" log entries (0=off)
 TRANSIENT_THRESHOLD=6                 # consecutive external timeouts (local state OK) before escalating to fail_count
 BYPASS_LAN_DEVICES=""                 # space-separated LAN IPs that skip tproxy (e.g. "192.168.100.147 192.168.100.148")
-BYPASS_LAN_MACS_FILE="/etc/surflare/bypass-macs.conf"  # MAC-to-IP bypass: IPs resolved from /tmp/dhcp.leases at runtime
+# One MAC per line; current IP resolved from /tmp/dhcp.leases at connect time
+BYPASS_LAN_MACS_FILE="/etc/surflare/bypass-macs.conf"
 _diag_server_ips=""                   # space-separated VPN server IPs captured after each successful connect
 _diag_connect_time=0                  # epoch seconds of last successful connect
 _sess_node=""                         # exit node of current VPN session
@@ -428,9 +429,9 @@ _remove_killswitch() {
 # Populate the bypass_devices set in sw_lan_tproxy.
 # Sources (both are checked, results merged):
 #   1. BYPASS_LAN_DEVICES: explicit space-separated IPs
-#   2. BYPASS_LAN_MACS_FILE: one MAC per line; current IP resolved from dhcp.leases
+#   2. BYPASS_LAN_MACS_FILE: one MAC per line; IP resolved from dhcp.leases
 #
-# Configure MACs in /etc/surflare/bypass-macs.conf (see bypass-macs.conf.example).
+# Configure MACs in /etc/surflare/bypass-macs.conf (bypass-macs.conf.example).
 # The MAC-based path re-resolves IPs on every VPN connect, so devices work
 # regardless of DHCP reassignment.
 _update_bypass_devices() {
@@ -446,13 +447,15 @@ _update_bypass_devices() {
 	# Source 2: MACs from file, resolved via dhcp.leases
 	if [ -f "$BYPASS_LAN_MACS_FILE" ] && [ -f /tmp/dhcp.leases ]; then
 		while IFS= read -r line; do
-			mac=$(echo "$line" | awk '{print tolower($1)}')
+			mac=$(echo "$line" | awk '{print tolower($1)}' | tr -d '\r')
 			case "$mac" in '#'*|'') continue ;; esac
 			ip=$(awk -v m="$mac" 'tolower($2)==m{print $3;exit}' /tmp/dhcp.leases)
 			[ -n "$ip" ] && all_ips="${all_ips:+$all_ips,}$ip"
 		done < "$BYPASS_LAN_MACS_FILE"
 	fi
 	[ -z "$all_ips" ] && return 0
+	# Deduplicate in case same IP appears in both BYPASS_LAN_DEVICES and MAC file
+	all_ips=$(echo "$all_ips" | tr ',' '\n' | sort -u | paste -sd,)
 	nft add element ip sw_lan_tproxy bypass_devices "{ $all_ips }" 2>/dev/null || \
 		log "WARN: bypass_devices update failed (${all_ips})"
 }
