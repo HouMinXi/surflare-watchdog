@@ -76,6 +76,9 @@ else
     install -m 755 "$REPO/laptop/surflare_early_detector.sh" /usr/local/sbin/surflare_early_detector.sh
     install -m 755 "$REPO/laptop/surflare_node_probe.sh"     /usr/local/sbin/surflare_node_probe.sh
     install -m 755 "$REPO/laptop/surflare_route_updater.sh"  /usr/local/sbin/surflare_route_updater.sh
+    # Cloud CDN validator: required by surflare_route_updater.sh for extra bypass CIDRs
+    install -m 755 "$REPO/cross_validate_cloud_cdn.py" \
+        /usr/local/sbin/cross_validate_cloud_cdn.py
 fi
 
 mkdir -p /usr/local/share/surflare/routes
