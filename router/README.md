@@ -42,17 +42,40 @@ cp router/smartdns/force-foreign.conf.example /etc/smartdns/force-foreign.conf
 | File | Source | Update |
 |------|--------|--------|
 | `cn_ipv4.txt` | chnroutes2 BGP × APNIC delegated (95% overlap gate) | Daily 02:30 cron |
-| `cn_ipv4_extra.txt` | Three-source cloud CDN: RIPE IRR+BGP × RADB × APNIC APAC geo-filter | Daily 02:30 cron |
+| `cn_ipv4_extra.txt` | Multi-source cloud CDN: RIPE IRR+BGP × RADB × APNIC APAC geo-filter | Daily 02:30 cron |
 
-**cn_ipv4_extra.txt** covers Tencent Cloud International + Alibaba Cloud International
-nodes in HK/SG/TW/JP/KR/MO that serve CN users but are not in chnroutes2 (registered
-outside mainland). Without this file, apps like MIUI app store and Thunder route
-through the VPN and experience high latency (4+ seconds).
+**cn_ipv4_extra.txt** covers major Chinese cloud and CDN providers with APAC nodes
+that serve CN users but are not in chnroutes2 (registered outside mainland). Without
+this file, apps like MIUI app store and Thunder route through the VPN and experience
+high latency (4+ seconds).
+
+The validator uses two groups to maximize coverage:
+
+**Main group** (RIPE IRR+BGP × cloud-ip-ranges cross-check ≥75% × APNIC APAC geo):
+
+| ASN | Provider | cloud-ip-ranges file | Overlap |
+|-----|----------|----------------------|---------|
+| AS132203 | Tencent Cloud Intl | tencent.txt | ~80% |
+| AS139341 | Tencent ACE CDN | tencent.txt | 100% |
+| AS45102 | Alibaba Cloud Intl | alibaba.txt | ~80% |
+| AS24429 | Alibaba CDN (Taobao) | alibaba.txt | ~80% |
+| AS136907 | Huawei Cloud APAC | huawei-cloud.txt | 100% |
+
+**Supplement group** (RIPE IRR+BGP × APNIC APAC geo only — no cloud-ip-ranges file):
+
+| ASN | Provider | Reason for supplement path |
+|-----|----------|---------------------------|
+| AS37963 | Alibaba Cloud Hangzhou | 1.3% overlap — cloud-ip-ranges doesn't track this entity |
+| AS134963 | Alibaba Cloud Singapore | 47% overlap — incomplete coverage |
+| AS396986 | ByteDance / TikTok | No cloud-ip-ranges file exists |
+
+Combined output: ~787 collapsed CIDRs (vs 325 before). RIPE downloads run in parallel
+(8 simultaneous connections); total update time ~5 min.
 
 Cross-validation methodology:
-1. **RIPE AS routing consistency** (AS132203/AS45102/AS24429): keeps only `in_bgp=True AND in_whois=True` — IRR registry AND live BGP confirmed by ≥10 full-table peers
-2. **disposable/cloud-ip-ranges** (RADB AS-SET, daily): ≥75% of RIPE-confirmed must match — guards against RIPE API data corruption
-3. **APNIC delegated** (APAC geo-filter: CN/HK/SG/TW/JP/KR/MO): eliminates US/EU nodes
+1. **RIPE AS routing consistency**: keeps only `in_bgp=True AND in_whois=True` — IRR registry AND live BGP confirmed by ≥10 full-table peers
+2. **disposable/cloud-ip-ranges** (main group only): ≥75% of RIPE-confirmed must match — corruption detection gate, not accuracy measure
+3. **APNIC delegated** (both groups, APAC geo-filter: CN/HK/SG/TW/JP/KR/MO): eliminates US/EU nodes
 
 ## N100 Platform Constraints
 
