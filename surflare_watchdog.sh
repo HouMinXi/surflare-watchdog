@@ -110,11 +110,16 @@ log() {
 }
 
 # check_vpn_local_state: fast local-only check -- no network calls.
-# Returns 0 if all three local VPN indicators are present, 1 if any is missing.
-# Indicators: surflare-proxy process + nftables table + fwmark policy routing rule.
-# A LOCAL_FAIL means the VPN is definitively down (not a transient network timeout).
+# Returns 0 if all local VPN indicators are present, 1 if any is missing.
+# Indicators: surflare-proxy process + listening socket on 10800 + nftables
+# table + fwmark policy routing rule.  A LOCAL_FAIL means the VPN is
+# definitively down (not a transient network timeout).
+# Listening socket check: with process + table + rule present but the
+# proxy not listening on :10800, LAN tproxy TCP black-holes for up to
+# CHECK_INTERVAL before LOCAL_FAIL fires.
 check_vpn_local_state() {
 	pgrep -f 'surflare-proxy' >/dev/null 2>&1 || return 1
+	ss -ltn 2>/dev/null | grep -q ':10800' || return 1
 	nft list table inet surflare >/dev/null 2>&1 || return 1
 	ip rule show | grep -q 'fwmark 0x1 lookup 100' || return 1
 	return 0
@@ -369,6 +374,26 @@ _setup_chnroute() {
 			rm -f "$tmp_ks_extra"
 		fi
 	fi
+}
+
+# _cleanup_on_startup: called once at the top of the main loop.
+# If surflare-proxy is NOT running, nuke any stale watchdog-managed
+# nftables state left over from a previous (crashed/killed) watchdog
+# run.  This prevents the next startup from observing ghost rules
+# and passing check_vpn_local_state with a dead proxy, or from
+# leaving the LAN transparent proxy in place (which would black-hole
+# all LAN TCP to 127.0.0.1:10800 with no listener).
+# The proxy's own `inet surflare` table is also deleted since the
+# process owning it is gone; the proxy will re-create it on next start.
+_cleanup_on_startup() {
+	if pgrep -f 'surflare-proxy' >/dev/null 2>&1; then
+		return 0
+	fi
+	log "Startup cleanup: surflare-proxy not running, flushing stale watchdog state"
+	nft delete table inet surflare 2>/dev/null || true
+	nft delete table ip sw_lan_tproxy 2>/dev/null || true
+	ip rule del fwmark 0x1 lookup 100 2>/dev/null || true
+	nft flush table inet surflare 2>/dev/null || true
 }
 
 _install_killswitch() {
@@ -1763,6 +1788,7 @@ fi
 log "watchdog started: node=${_active_node} candidates=${#NODE_CANDIDATES[@]} interval=${CHECK_INTERVAL}s threshold=${FAIL_THRESHOLD} transient=${TRANSIENT_THRESHOLD}"
 _killswitch_armed=0
 _setup_kernel_moat
+_cleanup_on_startup
 
 while true; do
 	# Change 6: probe defer guard -- skip entire cycle when node_probe holds the session
