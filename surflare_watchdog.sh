@@ -13,7 +13,7 @@
 # View logs    : sudo dmesg | grep surflare_watchdog
 
 NODE="Los Angeles"                    # Set to your node tag (run: surflare nodes)
-NODE_CANDIDATES=("Los Angeles" "Dallas" "Atlanta" "Chicago" "Miami" "New York")
+NODE_CANDIDATES=("Los Angeles" "Dallas" "Chicago" "New York")  # Atlanta/Miami excluded: Anthropic Cloudflare WAF hard-blocks their exit IPs (HTTP 403, not JS-challenge); verified 2026-06-17
 MODE="global"                         # Connection mode: global, rule, direct
 TRANSIT=""                                # Transit server: "" = use TRANSIT_CANDIDATES (logged), "auto" = surflare picks (opaque)
 TRANSIT_CANDIDATES=("Dallas" "Chicago" "Atlanta" "Miami" "New York")  # US-only; KR/HK/TW exits trigger Bing cn redirect
