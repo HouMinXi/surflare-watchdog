@@ -58,7 +58,14 @@ log() {
 
 TMP_DIR=$(mktemp -d /tmp/surflare_updater_XXXXXX)
 ROUTE_UPDATER_LOCK="/run/surflare_route_updater.lock"
-trap 'rm -rf "$TMP_DIR"; rm -f "$ROUTE_UPDATER_LOCK"' EXIT
+# FIX: also kill the heartbeat subshell in the EXIT trap. Without this,
+# the heartbeat loop outlives the parent and re-touches ROUTE_UPDATER_LOCK
+# for up to 60s after the script exits, leaving a stale lock that the
+# watchdog's _route_updater_active() would briefly see as live (mtime
+# fresh) before the heartbeat's own sleep cycle exits and the watchdog
+# would then need the full 1800s mtime-age window to recover.
+_HEARTBEAT_PID=""
+trap 'kill "$_HEARTBEAT_PID" 2>/dev/null || true; wait "$_HEARTBEAT_PID" 2>/dev/null || true; rm -rf "$TMP_DIR"; rm -f "$ROUTE_UPDATER_LOCK"' EXIT
 
 # 3.2: prevent two concurrent instances from clobbering the watchdog signal lock.
 # If a second instance exits first, its EXIT trap would delete ROUTE_UPDATER_LOCK
