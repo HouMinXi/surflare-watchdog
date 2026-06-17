@@ -436,6 +436,25 @@ _cleanup_on_startup() {
 	nft delete table ip sw_lan_tproxy 2>/dev/null || true
 	ip rule del fwmark 0x1 lookup 100 2>/dev/null || true
 	nft flush table inet surflare 2>/dev/null || true
+	# F13: respect an in-progress storm cool across a restart.  If the
+	# persisted cool-until timestamp is in the future, sleep the
+	# remaining window before re-entering the main loop.  This prevents
+	# a watchdog crash mid-storm from resetting the cool state and
+	# immediately re-triggering storm protection.
+	local _cool_file="/run/surflare_watchdog.storm_cool_until"
+	if [ -f "$_cool_file" ]; then
+		local _cool_target _now _remaining
+		_cool_target=$(cat "$_cool_file" 2>/dev/null)
+		_now=$(date +%s)
+		if [ -n "$_cool_target" ] && [ "$_cool_target" -gt "$_now" ] 2>/dev/null; then
+			_remaining=$((_cool_target - _now))
+			log "Storm cool in progress; sleeping ${_remaining}s before main loop"
+			sleep "$_remaining" &
+			storm_sleep_pid=$!; wait "$storm_sleep_pid" || true
+			storm_sleep_pid=""
+		fi
+		rm -f "$_cool_file"
+	fi
 }
 
 _install_killswitch() {
@@ -1970,6 +1989,10 @@ while true; do
 				# direct route) instead of a black hole.
 				nft delete table ip sw_lan_tproxy 2>/dev/null || true
 				_remove_killswitch; _killswitch_armed=0
+				# F13: persist cool-until so a watchdog restart mid-cool
+				# respects the remaining window.
+				_cool_target=$(( $(date +%s) + STORM_COOLING ))
+				echo "$_cool_target" > /run/surflare_watchdog.storm_cool_until
 				sleep "$STORM_COOLING" &
 				storm_sleep_pid=$!; wait "$storm_sleep_pid"; storm_sleep_pid=""
 				reconnect_count=0
@@ -2133,6 +2156,10 @@ while true; do
 					# direct route) instead of a black hole.
 					nft delete table ip sw_lan_tproxy 2>/dev/null || true
 					_remove_killswitch; _killswitch_armed=0
+					# F13: persist cool-until so a watchdog restart mid-cool
+					# respects the remaining window.
+					_cool_target=$(( $(date +%s) + STORM_COOLING ))
+					echo "$_cool_target" > /run/surflare_watchdog.storm_cool_until
 					sleep "$STORM_COOLING" & storm_sleep_pid=$!; wait "$storm_sleep_pid"; storm_sleep_pid=""
 					reconnect_count=0
 					fail_count=0
@@ -2156,6 +2183,10 @@ while true; do
 				# direct route) instead of a black hole.
 				nft delete table ip sw_lan_tproxy 2>/dev/null || true
 				_remove_killswitch; _killswitch_armed=0
+				# F13: persist cool-until so a watchdog restart mid-cool
+				# respects the remaining window.
+				_cool_target=$(( $(date +%s) + STORM_COOLING ))
+				echo "$_cool_target" > /run/surflare_watchdog.storm_cool_until
 				sleep "$STORM_COOLING" & storm_sleep_pid=$!; wait "$storm_sleep_pid"; storm_sleep_pid=""
 				reconnect_count=0
 				fail_count=0
