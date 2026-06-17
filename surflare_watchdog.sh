@@ -678,6 +678,34 @@ _remove_killswitch() {
 	nft delete table inet killswitch 2>/dev/null || true
 }
 
+# Enter storm-protection cooldown. Called from the three storm trigger
+# sites (post-crash, post-reconnect, connect failure) which previously
+# duplicated the same ~12 lines. The reason string is logged for forensic
+# clarity -- it identifies which storm path actually triggered.
+_enter_storm_cooldown() {
+	local _reason="$1"
+	stop_packet_trace >/dev/null 2>&1
+	_remove_dns_fallback
+	log "Storm protection triggered (${_reason}): cooling for ${STORM_COOLING}s"
+	# F6: drop LAN tproxy BEFORE removing killswitch. With proxy dead and
+	# tproxy present, LAN IPv4 TCP black-holes to 127.0.0.1:10800 (no
+	# listener); IPv6 leaks because the killswitch forward chain is the
+	# only thing blocking non-CN IPv6 from LAN devices. Tear down tproxy
+	# first so LAN traffic gets the standard policy-routing path (drop
+	# or direct route) instead of a black hole.
+	nft delete table ip sw_lan_tproxy 2>/dev/null || true
+	_remove_killswitch; _killswitch_armed=0
+	# F13: persist cool-until so a watchdog restart mid-cool respects
+	# the remaining window.
+	_cool_target=$(( $(date +%s) + STORM_COOLING ))
+	echo "$_cool_target" > /run/surflare_watchdog.storm_cool_until
+	sleep "$STORM_COOLING" &
+	storm_sleep_pid=$!; wait "$storm_sleep_pid"; storm_sleep_pid=""
+	reconnect_count=0
+	fail_count=0
+	transient_count=0
+}
+
 # Populate the bypass_devices set in sw_lan_tproxy.
 # Sources (both are checked, results merged):
 #   1. BYPASS_LAN_DEVICES: explicit space-separated IPs
@@ -1999,27 +2027,7 @@ while true; do
 			reconnect_count=$((reconnect_count + 1))
 			log "Post-crash reconnect failed (reconnect_count=${reconnect_count})"
 			if [ "$reconnect_count" -ge "$STORM_MAX" ]; then
-				stop_packet_trace >/dev/null 2>&1
-				_remove_dns_fallback
-				log "Storm protection triggered (post-crash): cooling for ${STORM_COOLING}s"
-				# F6: drop LAN tproxy BEFORE removing killswitch.
-				# With proxy dead and tproxy present, LAN IPv4 TCP black-holes
-				# to 127.0.0.1:10800 (no listener); IPv6 leaks because the
-				# killswitch forward chain is the only thing blocking non-CN
-				# IPv6 from LAN devices.  Tear down tproxy first so LAN
-				# traffic gets the standard policy-routing path (drop or
-				# direct route) instead of a black hole.
-				nft delete table ip sw_lan_tproxy 2>/dev/null || true
-				_remove_killswitch; _killswitch_armed=0
-				# F13: persist cool-until so a watchdog restart mid-cool
-				# respects the remaining window.
-				_cool_target=$(( $(date +%s) + STORM_COOLING ))
-				echo "$_cool_target" > /run/surflare_watchdog.storm_cool_until
-				sleep "$STORM_COOLING" &
-				storm_sleep_pid=$!; wait "$storm_sleep_pid"; storm_sleep_pid=""
-				reconnect_count=0
-				fail_count=0
-				transient_count=0
+				_enter_storm_cooldown "post-crash"
 			fi
 		fi
 		sleep "$CHECK_INTERVAL" & storm_sleep_pid=$!; wait "$storm_sleep_pid"; storm_sleep_pid=""
@@ -2166,25 +2174,7 @@ while true; do
 				log "Post-reconnect health check anomalous (reconnect_count=${reconnect_count})"
 				maybe_reprobe_transit
 				if [ "$reconnect_count" -ge "$STORM_MAX" ]; then
-					stop_packet_trace >/dev/null 2>&1
-					_remove_dns_fallback
-					log "Storm protection triggered: cooling for ${STORM_COOLING}s"
-					# F6: drop LAN tproxy BEFORE removing killswitch.
-					# With proxy dead and tproxy present, LAN IPv4 TCP black-holes
-					# to 127.0.0.1:10800 (no listener); IPv6 leaks because the
-					# killswitch forward chain is the only thing blocking non-CN
-					# IPv6 from LAN devices.  Tear down tproxy first so LAN
-					# traffic gets the standard policy-routing path (drop or
-					# direct route) instead of a black hole.
-					nft delete table ip sw_lan_tproxy 2>/dev/null || true
-					_remove_killswitch; _killswitch_armed=0
-					# F13: persist cool-until so a watchdog restart mid-cool
-					# respects the remaining window.
-					_cool_target=$(( $(date +%s) + STORM_COOLING ))
-					echo "$_cool_target" > /run/surflare_watchdog.storm_cool_until
-					sleep "$STORM_COOLING" & storm_sleep_pid=$!; wait "$storm_sleep_pid"; storm_sleep_pid=""
-					reconnect_count=0
-					fail_count=0
+					_enter_storm_cooldown "reconnect-health-anomalous"
 					transient_count=0
 				fi
 			fi
@@ -2193,25 +2183,7 @@ while true; do
 			log "Reconnect attempt failed (reconnect_count=${reconnect_count})"
 			maybe_reprobe_transit
 			if [ "$reconnect_count" -ge "$STORM_MAX" ]; then
-				stop_packet_trace >/dev/null 2>&1
-				_remove_dns_fallback
-				log "Storm protection triggered (connect failure): cooling for ${STORM_COOLING}s"
-				# F6: drop LAN tproxy BEFORE removing killswitch.
-				# With proxy dead and tproxy present, LAN IPv4 TCP black-holes
-				# to 127.0.0.1:10800 (no listener); IPv6 leaks because the
-				# killswitch forward chain is the only thing blocking non-CN
-				# IPv6 from LAN devices.  Tear down tproxy first so LAN
-				# traffic gets the standard policy-routing path (drop or
-				# direct route) instead of a black hole.
-				nft delete table ip sw_lan_tproxy 2>/dev/null || true
-				_remove_killswitch; _killswitch_armed=0
-				# F13: persist cool-until so a watchdog restart mid-cool
-				# respects the remaining window.
-				_cool_target=$(( $(date +%s) + STORM_COOLING ))
-				echo "$_cool_target" > /run/surflare_watchdog.storm_cool_until
-				sleep "$STORM_COOLING" & storm_sleep_pid=$!; wait "$storm_sleep_pid"; storm_sleep_pid=""
-				reconnect_count=0
-				fail_count=0
+				_enter_storm_cooldown "connect-failure"
 				transient_count=0
 			fi
 		fi
