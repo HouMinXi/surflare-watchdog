@@ -498,6 +498,24 @@ NFTEOF
 	fi
 	rm -f "$_ks_tmp"
 
+	# F8: repopulate server_ips from disk if available.  A watchdog restart
+	# (e.g. crash + procd respawn) loses the in-memory _diag_server_ips set,
+	# so the killswitch would be installed with an empty server_ips and
+	# drop ALL VPN server traffic until the next diagnostic run.  Reading
+	# from /etc/surflare/server_ips (last persisted by
+	# _update_killswitch_server_ips) bridges that gap.
+	local _persist_v4="/etc/surflare/server_ips"
+	if [ -z "$_diag_server_ips" ] && [ -f "$_persist_v4" ]; then
+		_diag_server_ips=$(tr -d '[:space:]' < "$_persist_v4" 2>/dev/null)
+		if [ -n "$_diag_server_ips" ]; then
+			local _persist_csv
+			_persist_csv=$(echo "$_diag_server_ips" | tr ' ' ',')
+			nft add element inet killswitch server_ips "{ ${_persist_csv} }" 2>/dev/null || \
+				log "WARN: failed to repopulate server_ips from $_persist_v4"
+			log "Kill switch: server_ips restored from disk (${_diag_server_ips})"
+		fi
+	fi
+
 	local cn_v4_file="/etc/surflare/cn_ipv4.txt"
 	local cn_v6_file="/etc/surflare/cn_ipv6.txt"
 	# 3.4: on first boot before route_updater ran, cn_ipv6.txt does not exist.
@@ -540,8 +558,36 @@ _update_killswitch_server_ips() {
 	nft list table inet killswitch >/dev/null 2>&1 || return
 	local ip_csv
 	ip_csv=$(echo "$_diag_server_ips" | tr ' ' ',')
-	nft flush set inet killswitch server_ips 2>/dev/null || true
-	nft add element inet killswitch server_ips "{ $ip_csv }" 2>/dev/null || true
+	# F7: build the new set in a scratch table, then atomically swap.
+	# If `nft add element` fails (e.g. invalid IP, ENOMEM), the previous
+	# server_ips set is preserved -- never leave the killswitch with an
+	# empty set, which would drop ALL VPN server traffic and prevent
+	# any future reconnect.
+	local _ks_tmp="/tmp/ks_swap_$$.nft"
+	cat > "$_ks_tmp" << NFTEOF
+table inet killswitch_swap {
+	set server_ips { type ipv4_addr; }
+}
+NFTEOF
+	if nft -f "$_ks_tmp" 2>/dev/null \
+		&& nft add element inet killswitch_swap server_ips "{ $ip_csv }" 2>/dev/null; then
+		nft flush set inet killswitch server_ips 2>/dev/null || true
+		nft add element inet killswitch server_ips "{ $ip_csv }" 2>/dev/null || \
+			log "WARN: killswitch server_ips swap-in failed; using previous set"
+		nft delete table inet killswitch_swap 2>/dev/null || true
+	else
+		log "WARN: killswitch server_ips scratch build failed; keeping previous set"
+	fi
+	rm -f "$_ks_tmp"
+	# F8: persist the current node's server IPs to disk so a watchdog
+	# restart (e.g. crash + procd respawn) can re-apply the killswitch
+	# with the correct allow-list even before the next diagnostic run
+	# refreshes _diag_server_ips.
+	local _persist_v4="/etc/surflare/server_ips"
+	if [ -n "$_diag_server_ips" ]; then
+		echo "$_diag_server_ips" > "$_persist_v4" 2>/dev/null || \
+			log "WARN: failed to persist server_ips to $_persist_v4"
+	fi
 	log "Kill switch: server_ips updated (${_diag_server_ips})"
 }
 
