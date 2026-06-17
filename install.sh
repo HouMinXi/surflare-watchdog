@@ -91,6 +91,14 @@ else
         /usr/local/sbin/cross_validate_cloud_cdn.py
 fi
 
+# F12: install logrotate config for EVENT_LOG (10MB rotate, keep 5, compress).
+# Without rotation, an unbounded JSONL event log fills the disk and
+# gets the watchdog OOM-killed by the kernel OOM killer.
+if [ -d /etc/logrotate.d ]; then
+    install -m 644 "$REPO/etc/logrotate.d/surflare-watchdog" \
+        /etc/logrotate.d/surflare-watchdog
+fi
+
 mkdir -p /usr/local/share/surflare/routes
 cp "$REPO/routes/cn_ipv4.txt" /usr/local/share/surflare/routes/
 cp "$REPO/routes/cn_ipv6.txt" /usr/local/share/surflare/routes/

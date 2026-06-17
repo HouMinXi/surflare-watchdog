@@ -1,0 +1,10 @@
+/var/log/surflare_events.jsonl {
+    size 10M
+    rotate 5
+    compress
+    delaycompress
+    notifempty
+    copytruncate
+    missingok
+    su root root
+}
