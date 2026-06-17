@@ -173,6 +173,21 @@ else
     # preventing cascade reconnects caused by proxy saturation during downloads.
     touch "$ROUTE_UPDATER_LOCK"
     log "Cloud CDN extra: download window open (${ROUTE_UPDATER_LOCK})"
+    # Heartbeat: refresh the lock mtime every 60s during long downloads so
+    # the watchdog's mtime-based _route_updater_active() sees fresh activity.
+    # A SIGKILLed updater leaves the lock stale; the watchdog also checks
+    # pgrep -f surflare_route_updater and treats dead PID as inactive.
+    (
+        while [ -f "$ROUTE_UPDATER_LOCK" ]; do
+            sleep 60
+            if [ -f "$ROUTE_UPDATER_LOCK" ]; then
+                touch "$ROUTE_UPDATER_LOCK" 2>/dev/null || break
+            else
+                break
+            fi
+        done
+    ) &
+    _HEARTBEAT_PID=$!
 
     # -----------------------------------------------------------------
     # Parallel RIPE downloads: main group (5 ASNs) + supplement (3 ASNs)

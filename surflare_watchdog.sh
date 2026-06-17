@@ -581,9 +581,13 @@ CONTROL_PROBE_TIMEOUT=3
 # from "proxy busy, VPN dead".  Worst case: a real VPN outage goes undetected
 # until the download window closes (< 30 min in practice).
 # Stale lock (SIGKILL): age > 1800 s check prevents permanent suppression.
+# Also check the updater PID is alive: a SIGKILLed updater leaves a stale
+# lock even with the heartbeat (heartbeat itself can be killed).  If the
+# process is gone, treat as inactive regardless of mtime.
 _route_updater_active() {
     local lock="/run/surflare_route_updater.lock"
     [ -f "$lock" ] || return 1
+    pgrep -f 'surflare_route_updater' >/dev/null 2>&1 || return 1
     local mtime age
     mtime=$(stat -c '%Y' "$lock" 2>/dev/null) || return 1
     age=$(( $(date +%s) - mtime ))
