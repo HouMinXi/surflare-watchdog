@@ -415,6 +415,26 @@ table inet killswitch {
 		limit rate 5/second burst 10 packets log prefix "ks-drop: "
 		counter drop
 	}
+
+	# chain forward: block non-CN IPv6 from LAN devices.
+	# surflare is IPv4-only tproxy; without this chain, LAN devices with IPv6
+	# (e.g. systemd-resolved bypassing dnsmasq force-AAAA-SOA) reach non-CN
+	# IPv6 destinations via CN ISP IPv6, bypassing the VPN entirely.
+	# Non-CN IPv4 TCP from regular LAN devices is NOT dropped here: it is
+	# intercepted by sw_lan_tproxy PREROUTING and delivered to INPUT (port 10800).
+	# bypass_devices traffic (Thunder CN bypass) is intentionally allowed.
+	chain forward {
+		type filter hook forward priority filter - 10; policy accept;
+		ct state established,related accept
+		ct state invalid drop
+		iifname "br-lan" oifname "br-lan" accept
+		ip daddr @server_ips accept
+		ip6 daddr @server_ips6 accept
+		iifname "br-lan" ip daddr @bypass_ipv4 accept
+		iifname "br-lan" ip6 daddr @bypass_ipv6 accept
+		iifname "br-lan" meta nfproto ipv6 drop
+		limit rate 5/second burst 10 packets log prefix "ks-fwd-drop: "
+	}
 }
 NFTEOF
 	# Adjust NTP skuid: chrony on systemd distros, root on OpenWrt (ntpd runs as root)
@@ -424,6 +444,9 @@ NFTEOF
 
 	if nft -f "$_ks_tmp"; then
 		log "Kill switch installed (inet killswitch, policy drop, ntp-user=$_ntp_user)"
+		# Flush conntrack to close connections that bypassed the killswitch before
+		# chain forward was in place (especially IPv6 leaks to non-CN destinations).
+		conntrack -F 2>/dev/null || true
 	else
 		nft -f "$_ks_tmp" >&2  # log actual nft error to stderr/dmesg
 		log "ERROR: kill switch install failed"
