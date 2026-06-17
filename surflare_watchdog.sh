@@ -1499,7 +1499,14 @@ start_packet_trace() {
 	local probe_ips="" ip ips ip_set=""
 	for host in google.com www.google.com 1.1.1.1 1.0.0.1 \
 	            ifconfig.co icanhazip.com myip.wtf; do
-		ips=$(nslookup "$host" 2>/dev/null | awk '/^Address:/{if ($2 !~ /#/) print $2}' | sort -u || true)
+		# Filter to bare IPv4 only: busybox nslookup prints "127.0.0.1:53" (colon
+		# format) while GNU nslookup uses "127.0.0.1#53" (hash format).  Both :#
+		# variants must be excluded; the original /#/ check missed the colon form,
+		# causing "127.0.0.1:53" to enter the nft ip daddr set, which nft parses
+		# as a mapping expression -> "mapping outside of map context" -> trace fail.
+		ips=$(nslookup "$host" 2>/dev/null \
+			| awk '/^Address:/{if ($2 ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/) print $2}' \
+			| sort -u || true)
 		[ -n "$ips" ] && probe_ips="$probe_ips $ips"
 	done
 	probe_ips=$(echo "$probe_ips" | tr ' ' '\n' | sort -u | tr '\n' ' ')
