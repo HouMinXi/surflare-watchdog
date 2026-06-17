@@ -47,6 +47,16 @@ server 1.0.0.1 -group foreign
 # -- CN domain list -> domestic group ------------------------------------
 conf-file /etc/smartdns/domain-set/cn_domains.conf
 
+# -- Akamai CDN: force CN DNS so GeoDNS returns APAC nodes not US nodes --------
+# Bilibili falls back to upos-hz-mirrorakam.akamaized.net (Akamai CDN) when
+# Alibaba/Tencent CDN is overloaded. Without this, foreign DNS (via VPN Atlanta
+# exit) causes Akamai GeoDNS to return US-region nodes (e.g. 184.27.177.177)
+# that are NOT in CN bypass -- video goes through VPN, QUIC drops, causing lag.
+# With CN DNS: Akamai GeoDNS sees CN ISP IP, returns APAC nodes (23.46.216.0/24)
+# that ARE added to cn_ipv4_extra.txt bypass by surflare_route_updater.sh.
+nameserver /akamaized.net/domestic
+nameserver /akamai.net/domestic
+
 
 
 # -- Force-foreign overrides (domains with CN-IP duality, must use VPN DNS) -
