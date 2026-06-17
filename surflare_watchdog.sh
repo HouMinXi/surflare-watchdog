@@ -214,7 +214,8 @@ _setup_kernel_moat() {
 		log "WARN: Kernel moat chain creation failed"
 		return 1
 	fi
-	local moat_ok=1
+	local moat_set_ok=1
+	local moat_rules_ok=1
 	local _moat_action='counter log prefix "moat: "'
 	# moat_strict presence switches from counter-only to hard drop.
 	if [ -f /run/surflare_watchdog.moat_strict ]; then
@@ -229,7 +230,9 @@ _setup_kernel_moat() {
 		# Older nft may not support nested set in element syntax; fall
 		# back to explicit per-window rules.  This is wider than the
 		# set-based version but still bounded to observed signatures.
-		moat_ok=0
+		# Set failure is NOT a hard failure -- the per-window fallback
+		# rules below still cover the observed signature set.
+		moat_set_ok=0
 	fi
 	# "flags & fin == fin" matches both pure FIN [F] and FIN+ACK [F.] --
 	# upstream filter sends [F.].
@@ -239,7 +242,7 @@ _setup_kernel_moat() {
 		nft add rule inet surflare_moat prerouting \
 			tcp flags \& fin == fin tcp window 78 ${_moat_action} 2>/dev/null || \
 		nft add rule inet surflare_moat prerouting \
-			tcp flags \& fin == fin ${_moat_action} 2>/dev/null || moat_ok=0
+			tcp flags \& fin == fin ${_moat_action} 2>/dev/null || moat_rules_ok=0
 	# RST injection
 	# shellcheck disable=SC2086
 	nft add rule inet surflare_moat prerouting \
@@ -247,21 +250,27 @@ _setup_kernel_moat() {
 		nft add rule inet surflare_moat prerouting \
 			tcp flags \& rst == rst tcp window 78 ${_moat_action} 2>/dev/null || \
 		nft add rule inet surflare_moat prerouting \
-			tcp flags \& rst == rst ${_moat_action} 2>/dev/null || moat_ok=0
+			tcp flags \& rst == rst ${_moat_action} 2>/dev/null || moat_rules_ok=0
 	# F9: explicitly allow ICMPv6 packet-too-big so PMTUD continues to
 	# work even when other ICMPv6 unreachables are being filtered.
 	# Without this, IPv6 connections that need to discover a smaller
 	# MTU hang indefinitely.
 	nft add rule inet surflare_moat prerouting \
-		ip6 nexthdr icmpv6 icmpv6 type packet-too-big accept 2>/dev/null || moat_ok=0
-	if [ "$moat_ok" -eq 1 ]; then
+		ip6 nexthdr icmpv6 icmpv6 type packet-too-big accept 2>/dev/null || moat_rules_ok=0
+	if [ "$moat_rules_ok" -eq 1 ]; then
+		local _mode_desc
 		if [ -f /run/surflare_watchdog.moat_strict ]; then
-			log "Kernel moat deployed: dropping injected FIN/RST packets (strict mode)"
+			_mode_desc="dropping injected FIN/RST (strict mode)"
 		else
-			log "Kernel moat deployed: counter+log only (strict mode disabled, touch /run/surflare_watchdog.moat_strict to enable)"
+			_mode_desc="counter+log only (touch /run/surflare_watchdog.moat_strict to enable drop)"
+		fi
+		if [ "$moat_set_ok" -eq 1 ]; then
+			log "Kernel moat deployed: interval-set rules (windows 32/64/78/128) -- ${_mode_desc}"
+		else
+			log "Kernel moat deployed: hardcoded fallback rules (window 78 only, set creation failed) -- ${_mode_desc}"
 		fi
 	else
-		log "WARN: Kernel moat rules failed to load; moat may be incomplete"
+		log "WARN: moat rules failed to load; moat is INACTIVE"
 	fi
 }
 
