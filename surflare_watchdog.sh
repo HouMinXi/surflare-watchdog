@@ -469,15 +469,30 @@ NFTEOF
 	_ntp_user=$(id -u chrony >/dev/null 2>&1 && echo chrony || echo root)
 	sed -i "s/skuid chrony/skuid $_ntp_user/" "$_ks_tmp"
 
+	# F5: Flush conntrack to drop stale connections that bypassed the killswitch
+	# before chain forward was in place (especially IPv6 leaks to non-CN
+	# destinations).  Prefer scoped flush (-D -m mark N) to only kill flows
+	# marked for tproxy routing, leaving unrelated connections (e.g. local
+	# LAN, monitoring) untouched.  Fall back to unscoped -F on older conntrack
+	# (<1.4.4) that lacks -m support.  Done BEFORE the table swap so the new
+	# nftables rules are the ones closing the door, not a follow-up flush
+	# racing the load.
+	conntrack -D -m mark 1 2>/dev/null || conntrack -F 2>/dev/null || \
+		log "WARN: conntrack flush failed; pre-existing IPv6 connections may persist"
+
 	if nft -f "$_ks_tmp"; then
 		log "Kill switch installed (inet killswitch, policy drop, ntp-user=$_ntp_user)"
-		# Flush conntrack to close connections that bypassed the killswitch before
-		# chain forward was in place (especially IPv6 leaks to non-CN destinations).
-		conntrack -F 2>/dev/null || \
-			log "WARN: conntrack flush failed; pre-existing IPv6 connections may persist"
 	else
 		nft -f "$_ks_tmp" >&2  # log actual nft error to stderr/dmesg
 		log "ERROR: kill switch install failed"
+		rm -f "$_ks_tmp"
+		return 1
+	fi
+	# Post-install verification: a silent nft -f failure would leave the
+	# watchdog believing killswitch is up while the kernel has no such
+	# table.  List the table back; if missing, treat as install failure.
+	if ! nft list table inet killswitch >/dev/null 2>&1; then
+		log "ERROR: kill switch post-install verification failed; table missing"
 		rm -f "$_ks_tmp"
 		return 1
 	fi
