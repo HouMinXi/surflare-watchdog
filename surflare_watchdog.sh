@@ -641,11 +641,12 @@ _update_killswitch_server_ips() {
 	nft list table inet killswitch >/dev/null 2>&1 || return
 	local ip_csv
 	ip_csv=$(echo "$_diag_server_ips" | tr ' ' ',')
-	# F7: build the new set in a scratch table, then atomically swap.
-	# If `nft add element` fails (e.g. invalid IP, ENOMEM), the previous
-	# server_ips set is preserved -- never leave the killswitch with an
-	# empty set, which would drop ALL VPN server traffic and prevent
-	# any future reconnect.
+	# F7: best-effort near-atomic swap of server_ips. True atomic rename
+	# is not available in nft (<1.1); the approach is: validate in a
+	# scratch table, then flush+add in the production table, then verify.
+	# If the add fails after flush (ENOMEM, transient nft error), re-try
+	# once from the validated scratch data. If that also fails, log a
+	# CRITICAL and leave the set empty (operator must intervene).
 	local _ks_tmp="/tmp/ks_swap_$$.nft"
 	cat > "$_ks_tmp" << NFTEOF
 table inet killswitch_swap {
@@ -655,8 +656,11 @@ NFTEOF
 	if nft -f "$_ks_tmp" 2>/dev/null \
 		&& nft add element inet killswitch_swap server_ips "{ $ip_csv }" 2>/dev/null; then
 		nft flush set inet killswitch server_ips 2>/dev/null || true
-		nft add element inet killswitch server_ips "{ $ip_csv }" 2>/dev/null || \
-			log "WARN: killswitch server_ips swap-in failed; using previous set"
+		if ! nft add element inet killswitch server_ips "{ $ip_csv }" 2>/dev/null; then
+			log "WARN: server_ips swap-in failed on first attempt; retrying"
+			nft add element inet killswitch server_ips "{ $ip_csv }" 2>/dev/null || \
+				log "CRITICAL: server_ips swap-in failed twice; killswitch server_ips is EMPTY -- VPN server traffic will be DROPPED"
+		fi
 		nft delete table inet killswitch_swap 2>/dev/null || true
 	else
 		log "WARN: killswitch server_ips scratch build failed; keeping previous set"
