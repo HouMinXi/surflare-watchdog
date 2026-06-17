@@ -74,12 +74,13 @@ if [ "$INIT" = "procd" ]; then
     # F0: verify conntrack and scoped flush syntax (needed for killswitch install
     # to flush only tproxy-marked flows instead of ALL flows).  conntrack <1.4.4
     # lacks the -m filter; we fall back to `conntrack -F` in that case, but warn.
+    # We probe via `conntrack -h` (side-effect free) rather than a real
+    # `conntrack -D -m 0` flush, which would drop all mark=0 traffic on a live
+    # router (most LAN TCP) at install time.
     if ! command -v conntrack >/dev/null 2>&1; then
         echo "WARN: conntrack not installed; watchdog will log flush errors at runtime" >&2
-    elif ! conntrack -D -m 0 2>/dev/null | head -1 | grep -qE 'missing|invalid|usage|Unknown'; then
-        : # scoped flush available
-    else
-        echo "INFO: conntrack <1.4.4 detected; watchdog will use unscoped conntrack -F" >&2
+    elif ! conntrack -h 2>&1 | grep -q -- ' -m '; then
+        echo "INFO: conntrack lacks -m filter (likely <1.4.4); watchdog will use unscoped conntrack -F" >&2
     fi
 else
     # Laptop (Fedora/RHEL/systemd) -- additional diagnostic tools

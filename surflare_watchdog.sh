@@ -564,9 +564,13 @@ NFTEOF
 	# drop ALL VPN server traffic until the next diagnostic run.  Reading
 	# from /etc/surflare/server_ips (last persisted by
 	# _update_killswitch_server_ips) bridges that gap.
+	# FIX #5: previously `tr -d '[:space:]'` stripped all whitespace, concatenating
+	# multi-IP payloads (e.g. "72.244.37.221 8.8.8.8" became "72.244.37.2218.8.8.8"
+	# which nft cannot parse as a set element). Collapse runs of whitespace to a
+	# single space, then convert to comma for nft.
 	local _persist_v4="/etc/surflare/server_ips"
 	if [ -z "$_diag_server_ips" ] && [ -f "$_persist_v4" ]; then
-		_diag_server_ips=$(tr -d '[:space:]' < "$_persist_v4" 2>/dev/null)
+		_diag_server_ips=$(tr -s '[:space:]' ' ' < "$_persist_v4" 2>/dev/null | sed 's/^ //; s/ $//')
 		if [ -n "$_diag_server_ips" ]; then
 			local _persist_csv
 			_persist_csv=$(echo "$_diag_server_ips" | tr ' ' ',')
