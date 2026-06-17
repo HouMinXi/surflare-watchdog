@@ -435,7 +435,6 @@ _cleanup_on_startup() {
 	nft delete table inet surflare 2>/dev/null || true
 	nft delete table ip sw_lan_tproxy 2>/dev/null || true
 	ip rule del fwmark 0x1 lookup 100 2>/dev/null || true
-	nft flush table inet surflare 2>/dev/null || true
 	# F13: respect an in-progress storm cool across a restart.  If the
 	# persisted cool-until timestamp is in the future, sleep the
 	# remaining window before re-entering the main loop.  This prevents
