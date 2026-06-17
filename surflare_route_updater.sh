@@ -286,9 +286,22 @@ PYEOF
 
             if [ "$rc" -eq 0 ] && [ -s "$TMP_DIR/cn_ipv4_extra.txt" ]; then
                 cp "$TMP_DIR/cn_ipv4_extra.txt" "$OUT_DIR/cn_ipv4_extra.txt"
+                # Append static Akamai APAC CIDRs (Bilibili CDN fallback nodes).
+                # Akamai AS20940 is a global CDN; dynamic RIPE validation would
+                # add all AS20940 prefixes worldwide. Only the APAC /24s returned
+                # by AliDNS (EDNS client subnet = CN ISP IP) for akamaized.net
+                # are appended. SmartDNS nameserver /akamaized.net/domestic
+                # ensures phones resolve to these nodes, not US-region nodes.
+                # Verified 2026-06-17: nslookup a1893.dscw10.akamai.net 223.5.5.5
+                # from N100 (CN ISP IP) consistently returns 23.46.216.0/24.
+                {
+                    printf '# Akamai APAC static (Bilibili CDN fallback; akamaized.net via CN DNS)\n'
+                    printf '23.46.216.0/24\n'
+                    printf '23.67.33.0/24\n'
+                } >> "$OUT_DIR/cn_ipv4_extra.txt"
                 extra_count=$(grep -vc '^#' "$OUT_DIR/cn_ipv4_extra.txt" \
                     2>/dev/null || echo 0)
-                log "Cloud CDN extra bypass updated: ${extra_count} APAC CIDRs"
+                log "Cloud CDN extra bypass updated: ${extra_count} APAC CIDRs (incl. Akamai static)"
             else
                 log "ERR: Cloud CDN validation failed; extra file unchanged"
             fi
