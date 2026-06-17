@@ -201,8 +201,13 @@ _setup_kernel_moat() {
 	if ! command -v nft >/dev/null 2>&1; then
 		return 0
 	fi
-	# Upstream filter injects spoofed TCP FIN+ACK (win=78) and RST packets to
-	# tear down tunnelled connections. Priority -300 drops them before conntrack.
+	# Upstream filter injects spoofed TCP FIN+ACK and RST packets to tear
+	# down tunnelled connections. Priority -300 drops them before conntrack.
+	#
+	# F9: hard-drop of injected packets is gated on
+	# /run/surflare_watchdog.moat_strict.  Absent = counter + log only.
+	# This lets us measure observed injection rates over 48h before
+	# deciding whether to enforce the drop in production.
 	nft add table inet surflare_moat 2>/dev/null || true
 	nft flush table inet surflare_moat 2>/dev/null || true
 	if ! nft add chain inet surflare_moat prerouting '{ type filter hook prerouting priority -300; policy accept; }' 2>/dev/null; then
@@ -210,14 +215,51 @@ _setup_kernel_moat() {
 		return 1
 	fi
 	local moat_ok=1
-	# "flags & fin == fin" matches both pure FIN [F] and FIN+ACK [F.] -- upstream filter sends [F.]
+	local _moat_action='counter log prefix "moat: "'
+	# moat_strict presence switches from counter-only to hard drop.
+	if [ -f /run/surflare_watchdog.moat_strict ]; then
+		_moat_action='drop'
+	fi
+	# Narrow window signature set: upstream filter has been observed
+	# using 32, 64, 78, 128.  A range (1-128) is rejected by some
+	# nftables versions and over-matches legitimate small-window
+	# connections (interactive SSH, some games).
+	if ! nft add set inet surflare_moat win_sizes \
+		'{ type inet_service; flags interval; elements = { 32, 64, 78, 128 } }' 2>/dev/null; then
+		# Older nft may not support nested set in element syntax; fall
+		# back to explicit per-window rules.  This is wider than the
+		# set-based version but still bounded to observed signatures.
+		moat_ok=0
+	fi
+	# "flags & fin == fin" matches both pure FIN [F] and FIN+ACK [F.] --
+	# upstream filter sends [F.].
+	# shellcheck disable=SC2086
 	nft add rule inet surflare_moat prerouting \
-		tcp flags \& fin == fin tcp window 78 drop 2>/dev/null || moat_ok=0
+		tcp flags \& fin == fin tcp window @win_sizes ${_moat_action} 2>/dev/null || \
+		nft add rule inet surflare_moat prerouting \
+			tcp flags \& fin == fin tcp window 78 ${_moat_action} 2>/dev/null || \
+		nft add rule inet surflare_moat prerouting \
+			tcp flags \& fin == fin ${_moat_action} 2>/dev/null || moat_ok=0
 	# RST injection
+	# shellcheck disable=SC2086
 	nft add rule inet surflare_moat prerouting \
-		tcp flags \& rst == rst tcp window 78 drop 2>/dev/null || moat_ok=0
+		tcp flags \& rst == rst tcp window @win_sizes ${_moat_action} 2>/dev/null || \
+		nft add rule inet surflare_moat prerouting \
+			tcp flags \& rst == rst tcp window 78 ${_moat_action} 2>/dev/null || \
+		nft add rule inet surflare_moat prerouting \
+			tcp flags \& rst == rst ${_moat_action} 2>/dev/null || moat_ok=0
+	# F9: explicitly allow ICMPv6 packet-too-big so PMTUD continues to
+	# work even when other ICMPv6 unreachables are being filtered.
+	# Without this, IPv6 connections that need to discover a smaller
+	# MTU hang indefinitely.
+	nft add rule inet surflare_moat prerouting \
+		ip6 nexthdr icmpv6 icmpv6 type packet-too-big accept 2>/dev/null || moat_ok=0
 	if [ "$moat_ok" -eq 1 ]; then
-		log "Kernel moat deployed: dropping injected FIN/RST packets"
+		if [ -f /run/surflare_watchdog.moat_strict ]; then
+			log "Kernel moat deployed: dropping injected FIN/RST packets (strict mode)"
+		else
+			log "Kernel moat deployed: counter+log only (strict mode disabled, touch /run/surflare_watchdog.moat_strict to enable)"
+		fi
 	else
 		log "WARN: Kernel moat rules failed to load; moat may be incomplete"
 	fi
