@@ -428,12 +428,12 @@ table inet killswitch {
 		ct state established,related accept
 		ct state invalid drop
 		iifname "br-lan" oifname "br-lan" accept
-		ip daddr @server_ips accept
-		ip6 daddr @server_ips6 accept
+		iifname "br-lan" ip daddr @server_ips accept
+		iifname "br-lan" ip6 daddr @server_ips6 accept
 		iifname "br-lan" ip daddr @bypass_ipv4 accept
 		iifname "br-lan" ip6 daddr @bypass_ipv6 accept
 		iifname "br-lan" meta nfproto ipv6 drop
-		limit rate 5/second burst 10 packets log prefix "ks-fwd-drop: "
+		limit rate 5/second burst 10 packets log prefix "ks-fwd-mon: "
 	}
 }
 NFTEOF
@@ -446,7 +446,8 @@ NFTEOF
 		log "Kill switch installed (inet killswitch, policy drop, ntp-user=$_ntp_user)"
 		# Flush conntrack to close connections that bypassed the killswitch before
 		# chain forward was in place (especially IPv6 leaks to non-CN destinations).
-		conntrack -F 2>/dev/null || true
+		conntrack -F 2>/dev/null || \
+			log "WARN: conntrack flush failed; pre-existing IPv6 connections may persist"
 	else
 		nft -f "$_ks_tmp" >&2  # log actual nft error to stderr/dmesg
 		log "ERROR: kill switch install failed"
@@ -539,16 +540,21 @@ CONTROL_PROBE_TIMEOUT=3
 
 # _route_updater_active: returns 0 (true) when surflare_route_updater.sh is
 # in its bulk-download phase (lock file present and < 30 min old).
-# Used to suppress transient-timeout escalation: the proxy is legitimately
-# saturated by 8+ parallel RIPE/CDN downloads, so health-check timeouts are
-# expected and must not trigger cascade reconnects.
+# Lock path must match ROUTE_UPDATER_LOCK in surflare_route_updater.sh.
+#
+# Suppression is unconditional during the window: _control_probe bypasses the
+# proxy (SO_MARK=0xff) and cannot distinguish "proxy saturated, VPN alive"
+# from "proxy busy, VPN dead".  Worst case: a real VPN outage goes undetected
+# until the download window closes (< 30 min in practice).
+# Stale lock (SIGKILL): age > 1800 s check prevents permanent suppression.
 _route_updater_active() {
     local lock="/run/surflare_route_updater.lock"
     [ -f "$lock" ] || return 1
     local mtime age
     mtime=$(stat -c '%Y' "$lock" 2>/dev/null) || return 1
     age=$(( $(date +%s) - mtime ))
-    [ "$age" -lt 1800 ]  # stale lock (>30 min) treated as inactive
+    # NTP clock step can make age negative; treat as inactive (not active) then.
+    [ "$age" -ge 0 ] && [ "$age" -lt 1800 ]
 }
 
 _control_probe() {
