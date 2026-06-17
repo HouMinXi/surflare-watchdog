@@ -298,6 +298,7 @@ PYEOF
                     printf '# Akamai APAC static (Bilibili CDN fallback; akamaized.net via CN DNS)\n'
                     printf '23.46.216.0/24\n'
                     printf '23.67.33.0/24\n'
+                    printf '23.214.95.0/24\n'
                 } >> "$OUT_DIR/cn_ipv4_extra.txt"
                 extra_count=$(grep -vc '^#' "$OUT_DIR/cn_ipv4_extra.txt" \
                     2>/dev/null || echo 0)
