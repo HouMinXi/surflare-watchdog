@@ -70,7 +70,8 @@ if [ "$INIT" = "procd" ]; then
     opkg install \
         coreutils-paste coreutils-grep coreutils-sleep coreutils-date \
         coreutils-nproc procps-ng-pkill \
-        ss coreutils-timeout conntrack kmod-nft-tproxy 2>/dev/null || true
+        ss coreutils-timeout conntrack kmod-nft-tproxy \
+        logrotate 2>/dev/null || true
     # F0: verify conntrack and scoped flush syntax (needed for killswitch install
     # to flush only tproxy-marked flows instead of ALL flows).  conntrack <1.4.4
     # lacks the -m filter; we fall back to `conntrack -F` in that case, but warn.
@@ -92,12 +93,18 @@ else
         /usr/local/sbin/cross_validate_cloud_cdn.py
 fi
 
-# F12: install logrotate config for EVENT_LOG (10MB rotate, keep 5, compress).
-# Without rotation, an unbounded JSONL event log fills the disk and
-# gets the watchdog OOM-killed by the kernel OOM killer.
-if [ -d /etc/logrotate.d ]; then
+# F12: install logrotate config. N100 iStoreOS bundles logrotate
+# (3.22.0-r1) but some OpenWrt variants use logd/logread only. Gate the
+# install on the binary being present to avoid orphan config files
+# (which logrotate would never read anyway). On N100 this branch
+# was not hit because watchdog died at 22:42:24 before install.sh
+# reached this line -- observed 2026-06-17.
+if [ -d /etc/logrotate.d ] && command -v logrotate >/dev/null 2>&1; then
     install -m 644 "$REPO/etc/logrotate.d/surflare-watchdog" \
         /etc/logrotate.d/surflare-watchdog
+    echo "OK: logrotate config installed (event log rotation 10M/5)"
+else
+    echo "WARN: logrotate not available; EVENT_LOG will grow unbounded unless rotated manually"
 fi
 
 mkdir -p /usr/local/share/surflare/routes
@@ -171,11 +178,19 @@ LOG_HEALTH_CRON="*/3 * * * * /usr/local/sbin/surflare_log_health.sh >> /dev/null
 # Run at 02:30 to avoid collision with update-cn-domains at 03:00 Mon.
 _rucron="/usr/local/sbin/surflare_route_updater.sh"
 ROUTE_UPDATE_CRON="30 2 * * * $_rucron >> /dev/null 2>&1"
+# Daily 04:30: run logrotate. /etc/logrotate.d/surflare-watchdog only fires
+# when logrotate is actually invoked -- on N100 the binary is present
+# (3.22.0-r1) but no cron trigger ran before this fix, so /var/log/surflare-proxy.log
+# grew to 14MB (observed 2026-06-18). 04:30 avoids the 02:30 and 03:00 windows
+# and runs before the 3-min health cron.
+LOGROTATE_CRON="30 4 * * * /usr/sbin/logrotate /etc/logrotate.conf >> /var/log/logrotate.log 2>&1"
 ( crontab -l 2>/dev/null \
     | grep -v surflare_node_probe | grep -v surflare_l4_probe \
-    | grep -v surflare_log_health | grep -v surflare_route_updater
+    | grep -v surflare_log_health | grep -v surflare_route_updater \
+    | grep -v 'logrotate /etc/logrotate.conf'
   echo "$LOG_HEALTH_CRON"
-  echo "$ROUTE_UPDATE_CRON" ) | crontab -
+  echo "$ROUTE_UPDATE_CRON"
+  echo "$LOGROTATE_CRON" ) | crontab -
 # Note: surflare_node_probe.sh is available as a manual diagnostic tool only.
 
 echo ""
