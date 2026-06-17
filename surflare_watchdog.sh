@@ -119,7 +119,7 @@ log() {
 # CHECK_INTERVAL before LOCAL_FAIL fires.
 check_vpn_local_state() {
 	pgrep -f 'surflare-proxy' >/dev/null 2>&1 || return 1
-	ss -ltn 2>/dev/null | grep -q ':10800' || return 1
+	ss -ltn 2>/dev/null | grep -qE ':10800(\s|$)' || return 1
 	nft list table inet surflare >/dev/null 2>&1 || return 1
 	ip rule show | grep -q 'fwmark 0x1 lookup 100' || return 1
 	return 0
