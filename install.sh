@@ -71,6 +71,16 @@ if [ "$INIT" = "procd" ]; then
         coreutils-paste coreutils-grep coreutils-sleep coreutils-date \
         coreutils-nproc procps-ng-pkill \
         ss coreutils-timeout conntrack kmod-nft-tproxy 2>/dev/null || true
+    # F0: verify conntrack and scoped flush syntax (needed for killswitch install
+    # to flush only tproxy-marked flows instead of ALL flows).  conntrack <1.4.4
+    # lacks the -m filter; we fall back to `conntrack -F` in that case, but warn.
+    if ! command -v conntrack >/dev/null 2>&1; then
+        echo "WARN: conntrack not installed; watchdog will log flush errors at runtime" >&2
+    elif ! conntrack -D -m 0 2>/dev/null | head -1 | grep -qE 'missing|invalid|usage|Unknown'; then
+        : # scoped flush available
+    else
+        echo "INFO: conntrack <1.4.4 detected; watchdog will use unscoped conntrack -F" >&2
+    fi
 else
     # Laptop (Fedora/RHEL/systemd) -- additional diagnostic tools
     install -m 755 "$REPO/laptop/surflare_early_detector.sh" /usr/local/sbin/surflare_early_detector.sh
