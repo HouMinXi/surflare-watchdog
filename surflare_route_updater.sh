@@ -60,6 +60,22 @@ TMP_DIR=$(mktemp -d /tmp/surflare_updater_XXXXXX)
 ROUTE_UPDATER_LOCK="/run/surflare_route_updater.lock"
 trap 'rm -rf "$TMP_DIR"; rm -f "$ROUTE_UPDATER_LOCK"' EXIT
 
+# 3.2: prevent two concurrent instances from clobbering the watchdog signal lock.
+# If a second instance exits first, its EXIT trap would delete ROUTE_UPDATER_LOCK
+# while the first is still downloading, causing the watchdog to resume escalation
+# during an active download window.
+# Use /run/ (tmpfs, always exists on OpenWrt) for the advisory flock, NOT /var/lock/
+# which may not exist (OpenWrt /var -> /tmp/var, /var/lock not guaranteed created).
+# Disable EXIT trap in the loser path: trap cleanup would delete the winner's
+# ROUTE_UPDATER_LOCK if the winner has already created it.
+exec 9>/run/surflare_route_updater_run.lock
+if ! flock -n 9; then
+    log "WARN: another surflare_route_updater instance is running; skipping"
+    rm -rf "$TMP_DIR"
+    trap - EXIT   # do NOT run EXIT trap: avoid deleting winner's ROUTE_UPDATER_LOCK
+    exit 0
+fi
+
 log "Downloading BGP route lists..."
 if ! curl -fsSL --connect-timeout 30 "$V4_BGP_URL" -o "$TMP_DIR/v4_bgp.txt"; then
     log "WARN: Failed to download IPv4 BGP routes"

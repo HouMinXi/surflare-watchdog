@@ -429,11 +429,13 @@ table inet killswitch {
 		ct state invalid drop
 		iifname "br-lan" oifname "br-lan" accept
 		iifname "br-lan" ip daddr @server_ips accept
+		# server_ips6 always empty: surflare is IPv4-only; _update_server_endpoint
+		# only extracts IPv4 addrs.  Kept as no-op for future IPv6 VPN support.
 		iifname "br-lan" ip6 daddr @server_ips6 accept
 		iifname "br-lan" ip daddr @bypass_ipv4 accept
 		iifname "br-lan" ip6 daddr @bypass_ipv6 accept
 		iifname "br-lan" meta nfproto ipv6 drop
-		limit rate 5/second burst 10 packets log prefix "ks-fwd-mon: "
+		iifname "br-lan" limit rate 5/second burst 10 packets log prefix "ks-fwd-mon: "
 	}
 }
 NFTEOF
@@ -458,6 +460,13 @@ NFTEOF
 
 	local cn_v4_file="/etc/surflare/cn_ipv4.txt"
 	local cn_v6_file="/etc/surflare/cn_ipv6.txt"
+	# 3.4: on first boot before route_updater ran, cn_ipv6.txt does not exist.
+	# Without a fallback, bypass_ipv6 stays empty and chain forward drops ALL
+	# LAN IPv6 (including CN destinations) until the nightly cron runs.
+	# Fall back to the bundled baseline installed by install.sh.
+	# install.sh copies routes/ to /usr/local/share/surflare/routes/.
+	local _bundled_cn_v6="/usr/local/share/surflare/routes/cn_ipv6.txt"
+	[ -f "$cn_v6_file" ] || { [ -f "$_bundled_cn_v6" ] && cn_v6_file="$_bundled_cn_v6"; }
 	if [ -f "$cn_v4_file" ]; then
 		local bypass_v4
 		bypass_v4=$(grep -v '^#' "$cn_v4_file" | grep -v '^[[:space:]]*$' | paste -sd, -)
