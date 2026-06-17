@@ -514,6 +514,20 @@ _update_bypass_devices() {
 CONTROL_PROBE_TARGETS="114.114.114.114:53 223.5.5.5:53"
 CONTROL_PROBE_TIMEOUT=3
 
+# _route_updater_active: returns 0 (true) when surflare_route_updater.sh is
+# in its bulk-download phase (lock file present and < 30 min old).
+# Used to suppress transient-timeout escalation: the proxy is legitimately
+# saturated by 8+ parallel RIPE/CDN downloads, so health-check timeouts are
+# expected and must not trigger cascade reconnects.
+_route_updater_active() {
+    local lock="/run/surflare_route_updater.lock"
+    [ -f "$lock" ] || return 1
+    local mtime age
+    mtime=$(stat -c '%Y' "$lock" 2>/dev/null) || return 1
+    age=$(( $(date +%s) - mtime ))
+    [ "$age" -lt 1800 ]  # stale lock (>30 min) treated as inactive
+}
+
 _control_probe() {
 	local target ip port
 	for target in $CONTROL_PROBE_TARGETS; do
@@ -1836,7 +1850,13 @@ while true; do
 			_insert_dns_fallback
 		fi
 		if [ "$transient_count" -ge "$TRANSIENT_THRESHOLD" ]; then
-			if _control_probe; then
+			if _route_updater_active; then
+				# Route updater download window: proxy saturation is expected.
+				# Reset transient_count without escalating to fail_count so the
+				# watchdog does not cascade-reconnect during bulk downloads.
+				transient_count=0
+				log "HEALTH_SUPPRESSED: route_updater download window active; transient timeout expected, not escalating"
+			elif _control_probe; then
 				fail_count=$((fail_count + 1))
 				transient_count=0
 				log "Transient threshold reached (local network OK), escalating to fail_count: ${fail_count}"

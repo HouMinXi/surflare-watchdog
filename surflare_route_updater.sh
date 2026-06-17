@@ -57,7 +57,8 @@ log() {
 }
 
 TMP_DIR=$(mktemp -d /tmp/surflare_updater_XXXXXX)
-trap 'rm -rf "$TMP_DIR"' EXIT
+ROUTE_UPDATER_LOCK="/run/surflare_route_updater.lock"
+trap 'rm -rf "$TMP_DIR"; rm -f "$ROUTE_UPDATER_LOCK"' EXIT
 
 log "Downloading BGP route lists..."
 if ! curl -fsSL --connect-timeout 30 "$V4_BGP_URL" -o "$TMP_DIR/v4_bgp.txt"; then
@@ -151,6 +152,12 @@ CLOUD_VALIDATOR="$DIR/cross_validate_cloud_cdn.py"
 if [ ! -f "$CLOUD_VALIDATOR" ]; then
     log "WARN: cross_validate_cloud_cdn.py missing; skipping extra update"
 else
+    # Signal watchdog that bulk downloads are starting.  The watchdog checks
+    # this lock before escalating transient health-check timeouts to fail_count,
+    # preventing cascade reconnects caused by proxy saturation during downloads.
+    touch "$ROUTE_UPDATER_LOCK"
+    log "Cloud CDN extra: download window open (${ROUTE_UPDATER_LOCK})"
+
     # -----------------------------------------------------------------
     # Parallel RIPE downloads: main group (5 ASNs) + supplement (3 ASNs)
     # All launched simultaneously; wait collects results.
