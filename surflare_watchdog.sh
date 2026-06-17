@@ -1858,6 +1858,14 @@ while true; do
 				stop_packet_trace >/dev/null 2>&1
 				_remove_dns_fallback
 				log "Storm protection triggered (post-crash): cooling for ${STORM_COOLING}s"
+				# F6: drop LAN tproxy BEFORE removing killswitch.
+				# With proxy dead and tproxy present, LAN IPv4 TCP black-holes
+				# to 127.0.0.1:10800 (no listener); IPv6 leaks because the
+				# killswitch forward chain is the only thing blocking non-CN
+				# IPv6 from LAN devices.  Tear down tproxy first so LAN
+				# traffic gets the standard policy-routing path (drop or
+				# direct route) instead of a black hole.
+				nft delete table ip sw_lan_tproxy 2>/dev/null || true
 				_remove_killswitch; _killswitch_armed=0
 				sleep "$STORM_COOLING" &
 				storm_sleep_pid=$!; wait "$storm_sleep_pid"; storm_sleep_pid=""
@@ -2013,6 +2021,14 @@ while true; do
 					stop_packet_trace >/dev/null 2>&1
 					_remove_dns_fallback
 					log "Storm protection triggered: cooling for ${STORM_COOLING}s"
+					# F6: drop LAN tproxy BEFORE removing killswitch.
+					# With proxy dead and tproxy present, LAN IPv4 TCP black-holes
+					# to 127.0.0.1:10800 (no listener); IPv6 leaks because the
+					# killswitch forward chain is the only thing blocking non-CN
+					# IPv6 from LAN devices.  Tear down tproxy first so LAN
+					# traffic gets the standard policy-routing path (drop or
+					# direct route) instead of a black hole.
+					nft delete table ip sw_lan_tproxy 2>/dev/null || true
 					_remove_killswitch; _killswitch_armed=0
 					sleep "$STORM_COOLING" & storm_sleep_pid=$!; wait "$storm_sleep_pid"; storm_sleep_pid=""
 					reconnect_count=0
@@ -2028,6 +2044,14 @@ while true; do
 				stop_packet_trace >/dev/null 2>&1
 				_remove_dns_fallback
 				log "Storm protection triggered (connect failure): cooling for ${STORM_COOLING}s"
+				# F6: drop LAN tproxy BEFORE removing killswitch.
+				# With proxy dead and tproxy present, LAN IPv4 TCP black-holes
+				# to 127.0.0.1:10800 (no listener); IPv6 leaks because the
+				# killswitch forward chain is the only thing blocking non-CN
+				# IPv6 from LAN devices.  Tear down tproxy first so LAN
+				# traffic gets the standard policy-routing path (drop or
+				# direct route) instead of a black hole.
+				nft delete table ip sw_lan_tproxy 2>/dev/null || true
 				_remove_killswitch; _killswitch_armed=0
 				sleep "$STORM_COOLING" & storm_sleep_pid=$!; wait "$storm_sleep_pid"; storm_sleep_pid=""
 				reconnect_count=0
