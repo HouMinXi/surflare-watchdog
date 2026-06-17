@@ -546,8 +546,18 @@ NFTEOF
 	# (<1.4.4) that lacks -m support.  Done BEFORE the table swap so the new
 	# nftables rules are the ones closing the door, not a follow-up flush
 	# racing the load.
-	conntrack -D -m mark 1 2>/dev/null || conntrack -F 2>/dev/null || \
+	#
+	# F5.fix: explicitly log when the unscoped -F fallback fires -- a silent
+	# flush of ALL tracked connections is destructive (kills SSH sessions,
+	# monitoring, LAN TCP) and operators need a clear breadcrumb in the
+	# log to correlate with downstream disruption reports.
+	if conntrack -D -m mark 1 2>/dev/null; then
+		: # scoped flush ok
+	elif conntrack -F 2>/dev/null; then
+		log "WARN: conntrack scoped flush unavailable or failed; ran unscoped -F (drops ALL tracked connections -- SSH, monitoring, LAN TCP)"
+	else
 		log "WARN: conntrack flush failed; pre-existing IPv6 connections may persist"
+	fi
 
 	if nft -f "$_ks_tmp"; then
 		log "Kill switch installed (inet killswitch, policy drop, ntp-user=$_ntp_user)"
