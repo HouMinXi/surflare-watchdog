@@ -118,7 +118,7 @@ log() {
 # proxy not listening on :10800, LAN tproxy TCP black-holes for up to
 # CHECK_INTERVAL before LOCAL_FAIL fires.
 check_vpn_local_state() {
-	pgrep -f 'surflare-proxy' >/dev/null 2>&1 || return 1
+	pgrep -f '/surflare-proxy(\s|$)' >/dev/null 2>&1 || return 1
 	ss -ltn 2>/dev/null | grep -qE ':10800(\s|$)' || return 1
 	nft list table inet surflare >/dev/null 2>&1 || return 1
 	ip rule show | grep -q 'fwmark 0x1 lookup 100' || return 1
@@ -428,7 +428,7 @@ _setup_chnroute() {
 # The proxy's own `inet surflare` table is also deleted since the
 # process owning it is gone; the proxy will re-create it on next start.
 _cleanup_on_startup() {
-	if pgrep -f 'surflare-proxy' >/dev/null 2>&1; then
+	if pgrep -f '/surflare-proxy(\s|$)' >/dev/null 2>&1; then
 		return 0
 	fi
 	log "Startup cleanup: surflare-proxy not running, flushing stale watchdog state"
@@ -1395,7 +1395,7 @@ probe_best_transit() {
 		fi
 		local wait_sec=0
 		while [ "$wait_sec" -lt "$TRANSIT_ROUTE_READY_TIMEOUT" ]; do
-			pgrep -f 'surflare-proxy' >/dev/null 2>&1 && \
+			pgrep -f '/surflare-proxy(\s|$)' >/dev/null 2>&1 && \
 			nft list table inet surflare >/dev/null 2>&1 && \
 			ip rule show | grep -q 'fwmark 0x1 lookup 100' && break
 			sleep 1
@@ -1596,7 +1596,7 @@ connect_vpn() {
 		fi
 		sleep "$CONNECT_SETTLE"
 		# Process-level sanity check: verify surflare-proxy is running
-		if ! pgrep -f 'surflare-proxy' >/dev/null 2>&1; then
+		if ! pgrep -f '/surflare-proxy(\s|$)' >/dev/null 2>&1; then
 			log "VPN establishment timed out: surflare-proxy not running after ${CONNECT_SETTLE}s"
 			exit 1
 		fi
@@ -1604,7 +1604,7 @@ connect_vpn() {
 		compute_proxy_affinity
 		_remove_dns_fallback
 		local proxy_pid
-		proxy_pid=$(pgrep -f 'surflare-proxy' | head -1)
+		proxy_pid=$(pgrep -f '/surflare-proxy(\s|$)' | head -1)
 		if [ -n "$proxy_pid" ] && [ -n "$PROXY_CPU_SET" ]; then
 			taskset -apc "$PROXY_CPU_SET" "$proxy_pid" >/dev/null 2>&1 &&
 				log "Pinned surflare-proxy (PID ${proxy_pid}) to CPUs ${PROXY_CPU_SET}" || true
@@ -1834,7 +1834,7 @@ cleanup() {
 	# only safe to delete if the proxy is gone (proxy owns the table
 	# exclusively); if proxy is still up, leave it alone and let the
 	# proxy manage its own cleanup on next exit.
-	if ! pgrep -f 'surflare-proxy' >/dev/null 2>&1; then
+	if ! pgrep -f '/surflare-proxy(\s|$)' >/dev/null 2>&1; then
 		nft delete table inet surflare 2>/dev/null || true
 	fi
 	# Drop run-state sentinels so a future restart does not inherit
