@@ -1705,6 +1705,20 @@ cleanup() {
 	nft delete table inet surflare_moat 2>/dev/null || true
 	nft delete table ip sw_lan_tproxy 2>/dev/null || true
 	_remove_killswitch
+	# F10: also tear down watchdog-managed state.  inet surflare is
+	# only safe to delete if the proxy is gone (proxy owns the table
+	# exclusively); if proxy is still up, leave it alone and let the
+	# proxy manage its own cleanup on next exit.
+	if ! pgrep -f 'surflare-proxy' >/dev/null 2>&1; then
+		nft delete table inet surflare 2>/dev/null || true
+	fi
+	# Drop run-state sentinels so a future restart does not inherit
+	# stale "ready" / "cool" / "strict moat" markers.
+	rm -f /run/surflare_watchdog.killswitch_ready
+	rm -f /run/surflare_watchdog.storm_cool_until
+	# Preserve /run/surflare_watchdog.moat_strict as a user opt-in:
+	# the user may want it to survive a watchdog restart, so we leave it
+	# alone here.
 	rm -f "$PIDFILE"
 	rm -f "$WATCHDOG_ACK_FILE" 2>/dev/null || true
 }
