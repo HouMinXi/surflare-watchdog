@@ -14,7 +14,7 @@ CLAUDE.md
 *.plan
 .claude/
 
-# forge backend config (local only: base_url + api_key_env refs, not for VCS)
+# Forge backend config -- exclude locally deployed .code-forge/ from VCS
 .code-forge/
 
 # N100 config snapshots (sensitive: MACs, DHCP leases, keys -- never commit)
