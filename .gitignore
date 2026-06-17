@@ -14,6 +14,9 @@ CLAUDE.md
 *.plan
 .claude/
 
+# Forge backend config -- exclude locally deployed .code-forge/ from VCS
+.code-forge/
+
 # N100 config snapshots (sensitive: MACs, DHCP leases, keys -- never commit)
 # Format: snapshots/n100-YYYYMMDD.tar.gz
 # Refresh: ssh root@192.168.100.1 "tar czf - /etc/config/ /etc/surflare/ ..."
