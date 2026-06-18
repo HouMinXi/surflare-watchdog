@@ -2087,7 +2087,6 @@ _startup_cleanup_dns_fallback
 fail_count=0
 reconnect_count=0
 transient_count=0
-last_refresh=$(date +%s)
 last_heartbeat=$(date +%s)
 _active_node="$NODE"
 _node_idx=0
