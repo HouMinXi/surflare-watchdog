@@ -169,7 +169,7 @@ procd)
     # Idempotent fallback ensures boot-time autostart on those images.
     test -L /etc/rc.d/S95surflare-watchdog || \
         ln -sf /etc/init.d/surflare-watchdog /etc/rc.d/S95surflare-watchdog
-    # BOOT-02: boot-time lockdown (S18, before S19firewall/S20network)
+    # Boot-time lockdown (S18, before S19firewall/S20network)
     cp "$SVC_ROUTER/procd/surflare-bootlock" /etc/init.d/surflare-bootlock
     chmod 755 /etc/init.d/surflare-bootlock
     /etc/init.d/surflare-bootlock enable || true

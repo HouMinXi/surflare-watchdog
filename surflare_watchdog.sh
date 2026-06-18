@@ -566,9 +566,9 @@ table inet killswitch {
 		udp sport 68 udp dport 67 accept
 		udp sport 546 udp dport 547 accept
 		meta skuid chrony udp dport 123 accept
-		# KS-01: REJECT non-whitelisted UDP (QUIC clients fall back to TCP <1ms)
+		# REJECT non-whitelisted UDP (QUIC clients fall back to TCP <1ms)
 		meta l4proto udp reject with icmp port-unreachable
-		# KS-02: REJECT non-whitelisted IPv6 (Happy Eyeballs falls back to IPv4 <250ms)
+		# REJECT non-whitelisted IPv6 (Happy Eyeballs falls back to IPv4 <250ms)
 		meta nfproto ipv6 reject with icmpv6 addr-unreachable
 		limit rate 5/second burst 10 packets log prefix "ks-drop: "
 		counter drop
@@ -641,7 +641,7 @@ NFTEOF
 	fi
 	rm -f "$_ks_tmp"
 
-	# BOOT-01: remove boot-time lockdown now that killswitch is armed.
+	# Remove boot-time lockdown now that killswitch is armed.
 	# surflare-bootlock (S18) blocks LAN overseas traffic during the boot
 	# window before this watchdog starts; no longer needed once the real
 	# killswitch is in place.
@@ -650,7 +650,7 @@ NFTEOF
 		log "Boot lock removed: killswitch now armed"
 	fi
 
-	# DNS-01: enforce LAN DNS through the router's dnsmasq/SmartDNS.
+	# Enforce LAN DNS through the router's dnsmasq/SmartDNS.
 	# Reject any br-lan DNS (port 53) not destined for the router itself.
 	# fib daddr type local covers all dnsmasq listen addresses (5+ IPv4,
 	# 8+ IPv6) without hardcoding IPs.  Router-originated DNS is unaffected
@@ -2468,7 +2468,7 @@ while true; do
 		fi
 	fi
 
-	# HC-02: adaptive interval -- shorter poll when degraded for faster recovery.
+	# Adaptive interval -- shorter poll when degraded for faster recovery.
 	# 15s floor (not lower): 7 probes x 12s max-time overlap at <14s interval.
 	_interval="$CHECK_INTERVAL"
 	if [ "${transient_count:-0}" -gt 0 ] || [ "${fail_count:-0}" -gt 0 ]; then
