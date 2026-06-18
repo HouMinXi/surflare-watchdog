@@ -21,6 +21,7 @@ TRANSIT_CONNECT_TIMEOUT=12             # max seconds for surflare connect per ca
 TRANSIT_ROUTE_READY_TIMEOUT=15        # max seconds to poll for routing readiness after connect
 TRANSIT_PROBE_SETTLE=20              # seconds of quiet time for tunnel handshake after routing ready
 CHECK_INTERVAL=30                     # Exit IP check interval in seconds
+DEGRADED_INTERVAL=15                  # Shortened interval when degraded (transient/fail > 0)
 FAIL_THRESHOLD=4                      # Consecutive failures before reconnect
 LOCK_FILE=/run/surflare_watchdog.lock # Mutex lock to prevent concurrent reconnects
 PIDFILE=/run/surflare_watchdog.pid    # PID file for reliable daemon shutdown
@@ -647,6 +648,29 @@ NFTEOF
 	if nft list table inet surflare_boot_lock >/dev/null 2>&1; then
 		nft destroy table inet surflare_boot_lock 2>/dev/null || true
 		log "Boot lock removed: killswitch now armed"
+	fi
+
+	# DNS-01: enforce LAN DNS through the router's dnsmasq/SmartDNS.
+	# Reject any br-lan DNS (port 53) not destined for the router itself.
+	# fib daddr type local covers all dnsmasq listen addresses (5+ IPv4,
+	# 8+ IPv6) without hardcoding IPs.  Router-originated DNS is unaffected
+	# (no iifname "br-lan" match on locally generated packets).
+	if [ "$PLATFORM" = "router" ] && \
+	   ! nft list table ip dns_enforce >/dev/null 2>&1; then
+		if nft -f - <<'DNS_EOF'
+table ip dns_enforce {
+	chain prerouting {
+		type filter hook prerouting priority mangle - 20; policy accept;
+		iifname "br-lan" meta l4proto { tcp, udp } th dport 53 fib daddr type local accept
+		iifname "br-lan" meta l4proto { tcp, udp } th dport 53 log prefix "dns-bypass: " reject with icmp port-unreachable
+	}
+}
+DNS_EOF
+		then
+			log "DNS enforcement armed: LAN bypass DNS rejected"
+		else
+			log "WARN: DNS enforcement table load failed"
+		fi
 	fi
 
 	# F8: repopulate server_ips from disk if available.  A watchdog restart
@@ -2122,6 +2146,7 @@ cleanup() {
 	[ -n "$_hc_tmp" ] && rm -f $_hc_tmp
 	nft delete table inet surflare_moat 2>/dev/null || true
 	nft delete table ip sw_lan_tproxy 2>/dev/null || true
+	nft delete table ip dns_enforce 2>/dev/null || true
 	_remove_killswitch
 	# F10: also tear down watchdog-managed state.  inet surflare is
 	# only safe to delete if the proxy is gone (proxy owns the table
@@ -2443,8 +2468,13 @@ while true; do
 		fi
 	fi
 
-	# Change 3: always sleep first, check flag after wait -- no USR1 race
-	sleep "$CHECK_INTERVAL" & storm_sleep_pid=$!
+	# HC-02: adaptive interval -- shorter poll when degraded for faster recovery.
+	# 15s floor (not lower): 7 probes x 12s max-time overlap at <14s interval.
+	_interval="$CHECK_INTERVAL"
+	if [ "${transient_count:-0}" -gt 0 ] || [ "${fail_count:-0}" -gt 0 ]; then
+		_interval="$DEGRADED_INTERVAL"
+	fi
+	sleep "$_interval" & storm_sleep_pid=$!
 	wait "$storm_sleep_pid" || true
 	storm_sleep_pid=""
 	if (( run_health_check_now )); then
