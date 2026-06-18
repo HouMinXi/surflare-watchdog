@@ -738,6 +738,14 @@ _enter_storm_cooldown() {
 	_cool_target=$(( $(date +%s) + STORM_COOLING ))
 	echo "$_cool_target" > /run/surflare_watchdog.storm_cool_until
 	sleep "$STORM_COOLING" &
+	# STORM_COOLING is a recovery bound, not a forced pause. The
+	# `wait` below returns early if the background sleep is killed
+	# (e.g. cleanup() on SIGTERM). For an operator override during
+	# a long cool window: `kill -USR1 <watchdog_pid>` will also kill
+	# this sleep (cleanup trap only fires on SIGTERM/SIGINT; SIGUSR1
+	# falls through to default action which is to terminate the
+	# process -- but a foreground trap is not required for the
+	# background sleep, which receives the signal directly).
 	storm_sleep_pid=$!; wait "$storm_sleep_pid"; storm_sleep_pid=""
 	reconnect_count=0
 	fail_count=0
