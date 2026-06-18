@@ -480,7 +480,7 @@ _setup_chnroute() {
 _cleanup_on_startup() {
 	if _proc_alive surflare-proxy >/dev/null 2>&1; then
 		# Check if proxy has active VPN connections (not just alive but stale)
-		if ss -tnp 2>/dev/null | grep -q 'surflare.*ESTAB.*:443'; then
+		if ss -tnp 2>/dev/null | grep -qE 'surflare.*ESTAB.*:443(\s|$)'; then
 			return 0  # Healthy: proxy alive + active VPN connection
 		fi
 		log "Startup: proxy alive but no VPN conn (stale), killing"
@@ -1250,12 +1250,15 @@ check_vpn_health() {
 	fi
 
 	# G1 blindspot detection: external probes succeeded (OK/TUNNEL_OK/country)
-	# but the SOCKS5 proxy probe failed -- tunnel is dead, external probes
-	# succeeded because both endpoints exit in the same country.
+	# but the SOCKS5 proxy probe COMPLETED with a non-OK result -- tunnel is
+	# dead, external probes succeeded because both exit in same country.
+	# Only override when proxy probe actually finished (non-empty output).
+	# An empty tmp_proxy means the probe was killed before completing (early
+	# exit from polling loop) -- not evidence of tunnel failure.
 	if [ -n "$result" ] && [ "$result" != "TCP_BLOCK" ] && [ "$result" != "LOCAL_FAIL" ]; then
 		local r_proxy
 		r_proxy=$(cat "$tmp_proxy" 2>/dev/null)
-		if [ "$r_proxy" != "OK" ]; then
+		if [ -n "$r_proxy" ] && [ "$r_proxy" != "OK" ]; then
 			result="TCP_BLOCK"
 		fi
 	fi
