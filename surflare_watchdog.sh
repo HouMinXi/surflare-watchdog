@@ -678,7 +678,20 @@ NFTEOF
 }
 
 _update_killswitch_server_ips() {
-	[ -z "$_diag_server_ips" ] && return
+	# Phase 2B: 3-level fallback -- socket IPs -> disk backup -> keep existing
+	if [ -z "$_diag_server_ips" ]; then
+		# Level 2: try disk backup when socket extraction failed
+		if [ -f /etc/surflare/server_ips ]; then
+			_diag_server_ips=$(cat /etc/surflare/server_ips 2>/dev/null | tr '\n' ' ')
+			[ -n "$_diag_server_ips" ] && \
+				log "server_ips: socket empty, using disk backup"
+		fi
+		# Level 3: keep existing set unchanged
+		[ -z "$_diag_server_ips" ] && {
+			log "CRITICAL: no server IPs from socket or disk; keeping existing set"
+			return
+		}
+	fi
 	nft list table inet killswitch >/dev/null 2>&1 || return
 	local ip_csv
 	ip_csv=$(echo "$_diag_server_ips" | tr ' ' ',')
@@ -699,8 +712,18 @@ NFTEOF
 		nft flush set inet killswitch server_ips 2>/dev/null || true
 		if ! nft add element inet killswitch server_ips "{ $ip_csv }" 2>/dev/null; then
 			log "WARN: server_ips swap-in failed on first attempt; retrying"
-			nft add element inet killswitch server_ips "{ $ip_csv }" 2>/dev/null || \
-				log "CRITICAL: server_ips swap-in failed twice; killswitch server_ips is EMPTY -- VPN server traffic will be DROPPED"
+			if ! nft add element inet killswitch server_ips "{ $ip_csv }" 2>/dev/null; then
+				# Phase 2B: emergency restore from disk (3rd fallback level)
+				local _disk_ips=""
+				[ -f /etc/surflare/server_ips ] && \
+					_disk_ips=$(tr -s ' \t\n' ',' < /etc/surflare/server_ips)
+				if [ -n "$_disk_ips" ] && \
+				   nft add element inet killswitch server_ips "{ $_disk_ips }" 2>/dev/null; then
+					log "WARN: server_ips swap-in failed; restored from disk backup"
+				else
+					log "CRITICAL: server_ips swap-in failed, disk restore failed; killswitch server_ips is EMPTY"
+				fi
+			fi
 		fi
 		nft delete table inet killswitch_swap 2>/dev/null || true
 	else
@@ -732,14 +755,31 @@ _enter_storm_cooldown() {
 	stop_packet_trace >/dev/null 2>&1
 	_remove_dns_fallback
 	log "Storm protection triggered (${_reason}): cooling for ${STORM_COOLING}s"
-	# F6: drop LAN tproxy BEFORE removing killswitch. With proxy dead and
-	# tproxy present, LAN IPv4 TCP black-holes to 127.0.0.1:10800 (no
-	# listener); IPv6 leaks because the killswitch forward chain is the
-	# only thing blocking non-CN IPv6 from LAN devices. Tear down tproxy
-	# first so LAN traffic gets the standard policy-routing path (drop
-	# or direct route) instead of a black hole.
-	nft delete table ip sw_lan_tproxy 2>/dev/null || true
-	_remove_killswitch; _killswitch_armed=0
+	# Phase 2A: Tombstone mode -- keep killswitch alive (CN bypass stays),
+	# replace tproxy with REJECT (no TCP black-hole, no IP leak), flush
+	# server_ips so VPN server traffic is also blocked.
+	#
+	# Before v64: deleted tproxy + killswitch -> 600s IP leak window.
+	# Tombstone: killswitch stays armed, overseas gets REJECT (fast fail).
+	local _handle
+	if nft list table ip sw_lan_tproxy >/dev/null 2>&1; then
+		_handle=$(nft -a list chain ip sw_lan_tproxy prerouting 2>/dev/null | \
+			awk '/tproxy.*10800/{print $NF}')
+		if [ -n "$_handle" ]; then
+			nft replace rule ip sw_lan_tproxy prerouting handle "$_handle" \
+				iifname "br-lan" meta l4proto tcp reject with icmp host-unreachable \
+				2>/dev/null && \
+				log "Tombstone: tproxy replaced with REJECT" || \
+				log "WARN: tombstone tproxy replace failed"
+		else
+			# No tproxy rule found (already removed?) -- delete table to avoid stale state
+			nft delete table ip sw_lan_tproxy 2>/dev/null || true
+		fi
+	fi
+	# Flush server_ips so VPN server traffic is also blocked by killswitch
+	nft flush set inet killswitch server_ips 2>/dev/null || true
+	nft flush set inet killswitch server_ips6 2>/dev/null || true
+	# Keep killswitch armed -- DO NOT call _remove_killswitch
 	# F13: persist cool-until so a watchdog restart mid-cool respects
 	# the remaining window.
 	_cool_target=$(( $(date +%s) + STORM_COOLING ))
