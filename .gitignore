@@ -21,3 +21,5 @@ CLAUDE.md
 # Format: snapshots/n100-YYYYMMDD.tar.gz
 # Refresh: ssh root@192.168.100.1 "tar czf - /etc/config/ /etc/surflare/ ..."
 snapshots/
+.planning/
+.worktrees
