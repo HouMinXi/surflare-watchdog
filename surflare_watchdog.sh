@@ -121,7 +121,7 @@ log() {
 # /proc/<pid>/comm is the kernel's authoritative executable name
 # (truncated to 15 chars), set by the kernel at exec time, and cannot
 # be spoofed by argv manipulation. Both busybox and GNU ps honor it.
-# Per Gemini review: avoid procps-ng-pgrep because it overwrites busybox
+# Avoid procps-ng-pgrep because it overwrites busybox
 # pgrep and may break native OpenWrt init scripts.
 _proc_alive() {
 	local _name="${1:0:15}"  # /proc/pid/comm truncates to 15 chars
@@ -1832,7 +1832,7 @@ connect_vpn() {
 		# O3 (v3.2): token refresh gated by file timestamp. Runs in
 		# direct-routing window (nft flushed, API reachable via ISP).
 		# File-based because this subshell's variable updates are lost on exit.
-		# Only writes timestamp on success (mimo R3: failure must not suppress retry).
+		# Only writes timestamp on success; failure must not suppress retry.
 		local _last_ref=0
 		[ -f "$LAST_REFRESH_FILE" ] && _last_ref=$(cat "$LAST_REFRESH_FILE" 2>/dev/null)
 		_last_ref=${_last_ref:-0}  # defense: empty/corrupt file -> 0
