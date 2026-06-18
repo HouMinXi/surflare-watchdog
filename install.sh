@@ -69,7 +69,7 @@ if [ "$INIT" = "procd" ]; then
         /usr/local/sbin/cross_validate_cloud_cdn.py
     opkg install \
         coreutils-paste coreutils-grep coreutils-sleep coreutils-date \
-        coreutils-nproc procps-ng-pkill \
+        coreutils-nproc procps-ng-pkill procps-ng-pgrep \
         ss coreutils-timeout conntrack kmod-nft-tproxy \
         logrotate 2>/dev/null || true
     # F0: verify conntrack and scoped flush syntax (needed for killswitch install
