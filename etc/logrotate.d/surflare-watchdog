@@ -8,3 +8,26 @@
     missingok
     su root root
 }
+# Forge finding #1: surflare-proxy.log grows unbounded (14MB observed
+# 2026-06-18). copytruncate matches the proxy's reopen-on-SIGHUP pattern
+# (or the postrotate below forces it). size 50M is bigger than the event
+# log because the proxy logs are chatty (per-connection debug); 5 rotations
+# keeps ~250M of history before oldest is dropped.
+/var/log/surflare-proxy.log {
+    size 50M
+    rotate 5
+    compress
+    delaycompress
+    notifempty
+    copytruncate
+    missingok
+    su root root
+    # surflare-proxy is not a logrotate-aware daemon; send SIGHUP to nudge
+    # it to reopen the log after copytruncate rotates the file out from
+    # under it. Without this, the proxy keeps writing to the rotated (now
+    # removed by copytruncate) file descriptor, which holds the disk space
+    # and silently loses subsequent log lines.
+    postrotate
+        killall -HUP surflare-proxy 2>/dev/null || true
+    endscript
+}
