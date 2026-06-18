@@ -26,8 +26,7 @@ LOCK_FILE=/run/surflare_watchdog.lock # Mutex lock to prevent concurrent reconne
 PIDFILE=/run/surflare_watchdog.pid    # PID file for reliable daemon shutdown
 ROTATION_STATE=/var/tmp/surflare_rotation  # Persists active node across restarts
 DIAG_SACK_THRESHOLD=20                # % of packets with SACK blocks to flag transit degradation
-# shellcheck disable=SC2034  # reserved: rollback reference + documentation
-DISCONNECT_SETTLE=2                   # seconds after surflare disconnect before killing processes
+DISCONNECT_SETTLE=1                   # seconds after surflare disconnect before killing processes
 CONNECT_SETTLE=20                     # seconds after surflare connect --daemon for VPN to establish
 POST_READY_SETTLE=2                   # seconds after local routing ready before declaring VPN up
 LAST_REFRESH_FILE="/run/surflare_last_refresh"  # cross-subshell token refresh timestamp
@@ -683,7 +682,7 @@ _update_killswitch_server_ips() {
 	if [ -z "$_diag_server_ips" ]; then
 		# Level 2: try disk backup when socket extraction failed
 		if [ -f /etc/surflare/server_ips ]; then
-			_diag_server_ips=$(cat /etc/surflare/server_ips 2>/dev/null | tr '\n' ' ')
+			_diag_server_ips=$(tr '\n' ' ' < /etc/surflare/server_ips 2>/dev/null)
 			[ -n "$_diag_server_ips" ] && \
 				log "server_ips: socket empty, using disk backup"
 		fi
@@ -1681,9 +1680,7 @@ connect_vpn() {
 		if ! surflare disconnect 2>/dev/null; then
 			log "disconnect returned non-zero (may not have been connected), continuing cleanup..."
 		fi
-		# O2: shortened settle (v3.2) -- 1s gives kernel enough time to
-		# reclaim process resources; original 2s was arbitrary buffer.
-		sleep 1
+		sleep "$DISCONNECT_SETTLE"
 
 		log "Killing remaining processes..."
 		killall surflare surflare-proxy 2>/dev/null
