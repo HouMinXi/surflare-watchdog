@@ -480,7 +480,7 @@ _setup_chnroute() {
 _cleanup_on_startup() {
 	if _proc_alive surflare-proxy >/dev/null 2>&1; then
 		# Check if proxy has active VPN connections (not just alive but stale)
-		if ss -tnp 2>/dev/null | grep -qE 'surflare.*ESTAB.*:443(\s|$)'; then
+		if ss -tnp 2>/dev/null | grep -qE 'ESTAB.*:443\s.*surflare'; then
 			return 0  # Healthy: proxy alive + active VPN connection
 		fi
 		log "Startup: proxy alive but no VPN conn (stale), killing"
