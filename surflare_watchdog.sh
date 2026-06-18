@@ -68,7 +68,7 @@ CRASH_DEDUP_INTERVAL=121              # minimum seconds between counting two cra
 
 # Validate NODE is configured (fail fast if placeholder is unchanged)
 if [ "$NODE" = "your_node_tag" ]; then
-	printf '<3>surflare_watchdog: NODE is not configured. Edit NODE= in the script first.\n' >/dev/kmsg
+	echo '<3>surflare_watchdog: NODE is not configured. Edit NODE= in the script first.' >/dev/kmsg
 	echo "NODE is not configured. Edit NODE= in the script first." >&2
 	exit 1
 fi
@@ -93,7 +93,7 @@ umask 0177
 # Note: nm-online is optional (NetworkManager package); falls back to sleep 15s.
 for cmd in curl killall pgrep flock surflare surflare-proxy python3; do
 	if ! command -v "$cmd" >/dev/null 2>&1; then
-		printf '<3>surflare_watchdog: missing dependency: %s, exiting\n' "$cmd" >/dev/kmsg
+		echo "<3>surflare_watchdog: missing dependency: ${cmd}, exiting" >/dev/kmsg
 		exit 1
 	fi
 done
@@ -102,11 +102,14 @@ done
 # refresh_auth() guards its own expect usage with command -v at call time.
 
 if ! command -v nm-online >/dev/null 2>&1; then
-	printf '<4>surflare_watchdog: nm-online not found, will use fixed sleep on resume\n' >/dev/kmsg
+	echo '<4>surflare_watchdog: nm-online not found, will use fixed sleep on resume' >/dev/kmsg
 fi
 
 log() {
-	printf '<6>surflare_watchdog: %s\n' "$*" >/dev/kmsg
+	# Use echo, not printf: bash 5.2.37 printf builtin writes char-by-char
+	# to /dev/kmsg under procd (OpenWrt), causing printk ratelimit floods.
+	# echo builtin does a single write() and works correctly.
+	echo "<6>surflare_watchdog: $*" >/dev/kmsg
 }
 
 # _proc_alive: returns 0 if any process has /proc/<pid>/comm == _name.
