@@ -26,6 +26,7 @@ LOCK_FILE=/run/surflare_watchdog.lock # Mutex lock to prevent concurrent reconne
 PIDFILE=/run/surflare_watchdog.pid    # PID file for reliable daemon shutdown
 ROTATION_STATE=/var/tmp/surflare_rotation  # Persists active node across restarts
 DIAG_SACK_THRESHOLD=20                # % of packets with SACK blocks to flag transit degradation
+# shellcheck disable=SC2034  # reserved: rollback reference + documentation
 DISCONNECT_SETTLE=2                   # seconds after surflare disconnect before killing processes
 CONNECT_SETTLE=20                     # seconds after surflare connect --daemon for VPN to establish
 POST_READY_SETTLE=2                   # seconds after local routing ready before declaring VPN up
@@ -764,13 +765,15 @@ _enter_storm_cooldown() {
 	local _handle
 	if nft list table ip sw_lan_tproxy >/dev/null 2>&1; then
 		_handle=$(nft -a list chain ip sw_lan_tproxy prerouting 2>/dev/null | \
-			awk '/tproxy.*10800/{print $NF}')
+			awk '/tproxy.*10800/{print $NF; exit}')
 		if [ -n "$_handle" ]; then
-			nft replace rule ip sw_lan_tproxy prerouting handle "$_handle" \
+			if nft replace rule ip sw_lan_tproxy prerouting handle "$_handle" \
 				iifname "br-lan" meta l4proto tcp reject with icmp host-unreachable \
-				2>/dev/null && \
-				log "Tombstone: tproxy replaced with REJECT" || \
+				2>/dev/null; then
+				log "Tombstone: tproxy replaced with REJECT"
+			else
 				log "WARN: tombstone tproxy replace failed"
+			fi
 		else
 			# No tproxy rule found (already removed?) -- delete table to avoid stale state
 			nft delete table ip sw_lan_tproxy 2>/dev/null || true
