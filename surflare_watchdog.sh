@@ -28,6 +28,8 @@ ROTATION_STATE=/var/tmp/surflare_rotation  # Persists active node across restart
 DIAG_SACK_THRESHOLD=20                # % of packets with SACK blocks to flag transit degradation
 DISCONNECT_SETTLE=2                   # seconds after surflare disconnect before killing processes
 CONNECT_SETTLE=20                     # seconds after surflare connect --daemon for VPN to establish
+POST_READY_SETTLE=2                   # seconds after local routing ready before declaring VPN up
+LAST_REFRESH_FILE="/run/surflare_last_refresh"  # cross-subshell token refresh timestamp
 NETWORK_WAIT_FALLBACK=15              # seconds to wait for network when nm-online is unavailable
 NETWORK_WAIT_TIMEOUT=30               # nm-online timeout in seconds
 PROCESS_EXIT_TIMEOUT=20               # seconds to wait for SIGTERM before escalating to SIGKILL
@@ -149,7 +151,9 @@ _pids_by_comm() {
 # check_vpn_local_state: fast local-only check -- no network calls.
 # Returns 0 if all local VPN indicators are present, 1 if any is missing.
 # Indicators: surflare-proxy process + listening socket on 10800 + nftables
-# table + fwmark policy routing rule.  A LOCAL_FAIL means the VPN is
+# table (inet surflare -- created by surflare binary, not watchdog's inet
+# killswitch; absent when VPN is down, appears after connect --daemon)
+# + fwmark policy routing rule.  A LOCAL_FAIL means the VPN is
 # definitively down (not a transient network timeout).
 # Listening socket check: with process + table + rule present but the
 # proxy not listening on :10800, LAN tproxy TCP black-holes for up to
@@ -1623,11 +1627,20 @@ connect_vpn() {
 			exit 2
 		}
 
+		# Rollback flag: use_legacy_settle reverts O1 to fixed sleep
+		if [ -f /etc/surflare/use_legacy_settle ]; then
+			_use_poll=0
+		else
+			_use_poll=1
+		fi
+
 		log "Disconnecting cleanly, flushing nftables tproxy rules and policy routing..."
 		if ! surflare disconnect 2>/dev/null; then
 			log "disconnect returned non-zero (may not have been connected), continuing cleanup..."
 		fi
-		sleep "$DISCONNECT_SETTLE"
+		# O2: shortened settle (v3.2) -- 1s gives kernel enough time to
+		# reclaim process resources; original 2s was arbitrary buffer.
+		sleep 1
 
 		log "Killing remaining processes..."
 		killall surflare surflare-proxy 2>/dev/null
@@ -1661,9 +1674,20 @@ connect_vpn() {
 			log "LAN tproxy removed: direct routing active during reconnect"
 		fi
 
-		# Attempt auth refresh before connecting -- surflare API may still be
-		# reachable briefly after nftables flush restores direct network access
-		refresh_auth || true
+		# O3 (v3.2): token refresh gated by file timestamp. Runs in
+		# direct-routing window (nft flushed, API reachable via ISP).
+		# File-based because this subshell's variable updates are lost on exit.
+		# Only writes timestamp on success (mimo R3: failure must not suppress retry).
+		local _last_ref=0
+		[ -f "$LAST_REFRESH_FILE" ] && _last_ref=$(cat "$LAST_REFRESH_FILE" 2>/dev/null)
+		_last_ref=${_last_ref:-0}  # defense: empty/corrupt file -> 0
+		if [ $(($(date +%s) - _last_ref)) -ge "$TOKEN_REFRESH_INTERVAL" ]; then
+			if refresh_auth; then
+				date +%s > "$LAST_REFRESH_FILE"
+			else
+				log "refresh_auth failed, will retry next cycle"
+			fi
+		fi
 
 		if [ -f "/sys/class/net/${WIFI_INTERFACE}/threaded" ] && \
 		   [ "$(cat "/sys/class/net/${WIFI_INTERFACE}/threaded" 2>/dev/null)" != "1" ]; then
@@ -1690,11 +1714,29 @@ connect_vpn() {
 			log "Connection failed, will retry on next check cycle"
 			exit 1
 		fi
-		sleep "$CONNECT_SETTLE"
-		# Process-level sanity check: verify surflare-proxy is running
-		if ! _proc_alive surflare-proxy >/dev/null 2>&1; then
-			log "VPN establishment timed out: surflare-proxy not running after ${CONNECT_SETTLE}s"
-			exit 1
+		# O1 (v3.2): poll-based readiness with handshake buffer.
+		# _use_poll=0 (rollback flag) reverts to original fixed sleep.
+		if [ "$_use_poll" -eq 1 ]; then
+			local _ready_wait=0
+			while [ "$_ready_wait" -lt "$CONNECT_SETTLE" ]; do
+				if check_vpn_local_state; then
+					sleep "$POST_READY_SETTLE"
+					log "VPN routing ready: polled ${_ready_wait}s + buffer ${POST_READY_SETTLE}s"
+					break
+				fi
+				sleep 1
+				_ready_wait=$((_ready_wait + 1))
+			done
+			if [ "$_ready_wait" -ge "$CONNECT_SETTLE" ]; then
+				log "VPN establishment timed out: not ready after ${CONNECT_SETTLE}s"
+				exit 1
+			fi
+		else
+			sleep "$CONNECT_SETTLE"
+			if ! _proc_alive surflare-proxy >/dev/null 2>&1; then
+				log "VPN establishment timed out: surflare-proxy not running after ${CONNECT_SETTLE}s"
+				exit 1
+			fi
 		fi
 
 		compute_proxy_affinity
@@ -2127,11 +2169,15 @@ while true; do
 		_remove_dns_fallback
 
 		# Proactive token refresh -- runs whenever VPN is confirmed healthy so tokens stay
-		# fresh for reconnects. Covers both Google-OK and country-probe-fallback paths.
+		# fresh for reconnects. Uses same file as connect_vpn O3 for cross-subshell sync.
 		now=$(date +%s)
-		if [ $((now - last_refresh)) -ge "$TOKEN_REFRESH_INTERVAL" ]; then
-			refresh_auth
-			last_refresh=$(date +%s)
+		_last_ref=0
+		[ -f "$LAST_REFRESH_FILE" ] && _last_ref=$(cat "$LAST_REFRESH_FILE" 2>/dev/null)
+		_last_ref=${_last_ref:-0}
+		if [ $((now - _last_ref)) -ge "$TOKEN_REFRESH_INTERVAL" ]; then
+			if refresh_auth; then
+				date +%s > "$LAST_REFRESH_FILE"
+			fi
 		fi
 
 		# Periodic heartbeat -- confirms watchdog is alive during long healthy stretches
