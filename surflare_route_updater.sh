@@ -184,16 +184,19 @@ else
     # the watchdog's mtime-based _route_updater_active() sees fresh activity.
     # A SIGKILLed updater leaves the lock stale; the watchdog also checks
     # pgrep -f surflare_route_updater and treats dead PID as inactive.
-    (
-        while [ -f "$ROUTE_UPDATER_LOCK" ]; do
+    # Forge finding #4: the bare subshell ( ... ) above still has the
+    # parent script's argv in /proc/<pid>/cmdline, so pgrep -f matches
+    # the heartbeat even after the main script is SIGKILLed -- masking
+    # the dead-updater state for up to 60s. Use `setsid` to put the
+    # heartbeat in a new session with /proc/<pid>/cmdline == "sh" (or
+    # whatever exec replaces it), so pgrep -f 'surflare_route_updater'
+    # does not match.
+    setsid sh -c '
+        while [ -f "$1" ]; do
             sleep 60
-            if [ -f "$ROUTE_UPDATER_LOCK" ]; then
-                touch "$ROUTE_UPDATER_LOCK" 2>/dev/null || break
-            else
-                break
-            fi
+            [ -f "$1" ] && touch "$1" 2>/dev/null || break
         done
-    ) &
+    ' sh "$ROUTE_UPDATER_LOCK" &
     _HEARTBEAT_PID=$!
 
     # -----------------------------------------------------------------
