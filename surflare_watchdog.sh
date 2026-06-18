@@ -1670,6 +1670,7 @@ connect_vpn() {
 		}
 
 		# Rollback flag: use_legacy_settle reverts O1 to fixed sleep
+		local _use_poll
 		if [ -f /etc/surflare/use_legacy_settle ]; then
 			_use_poll=0
 		else
