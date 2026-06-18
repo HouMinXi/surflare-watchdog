@@ -2178,8 +2178,9 @@ while true; do
 				log "Post-reconnect health check anomalous (reconnect_count=${reconnect_count})"
 				maybe_reprobe_transit
 				if [ "$reconnect_count" -ge "$STORM_MAX" ]; then
+					# _enter_storm_cooldown already resets all counters
+					# (reconnect_count, fail_count, transient_count).
 					_enter_storm_cooldown "reconnect-health-anomalous"
-					transient_count=0
 				fi
 			fi
 		else
