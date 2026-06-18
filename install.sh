@@ -154,6 +154,10 @@ procd)
     cp "$SVC_ROUTER/procd/surflare-watchdog" /etc/init.d/surflare-watchdog
     chmod 755 /etc/init.d/surflare-watchdog
     /etc/init.d/surflare-watchdog enable || true
+    # iStoreOS/OpenWrt: enable may not create /etc/rc.d symlink (tmpfs quirk).
+    # Idempotent fallback ensures boot-time autostart on those images.
+    test -L /etc/rc.d/S95surflare-watchdog || \
+        ln -sf /etc/init.d/surflare-watchdog /etc/rc.d/S95surflare-watchdog
     ;;
 
 runit)
