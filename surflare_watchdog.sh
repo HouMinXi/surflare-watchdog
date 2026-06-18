@@ -109,6 +109,40 @@ log() {
 	printf '<6>surflare_watchdog: %s\n' "$*" >/dev/kmsg
 }
 
+# _proc_alive: returns 0 if any process has /proc/<pid>/comm == _name.
+# Replaces pgrep -f / pgrep -x which are unreliable on busybox (known
+# -x bug) and pattern-based matching which false-positives on log files
+# and monitoring scripts (e.g. "tail -f /var/log/surflare-proxy.log").
+# /proc/<pid>/comm is the kernel's authoritative executable name
+# (truncated to 15 chars), set by the kernel at exec time, and cannot
+# be spoofed by argv manipulation. Both busybox and GNU ps honor it.
+# Per Gemini review: avoid procps-ng-pgrep because it overwrites busybox
+# pgrep and may break native OpenWrt init scripts.
+_proc_alive() {
+	local _name="$1"
+	local _pid _comm
+	for _pid in /proc/[0-9]*; do
+		[ -r "$_pid/comm" ] || continue
+		_comm=$(cat "$_pid/comm" 2>/dev/null) || continue
+		[ "$_comm" = "$_name" ] && return 0
+	done
+	return 1
+}
+
+# _pid_by_comm: returns PIDs of all processes with comm == _name,
+# one per line. Used where the caller needs a specific PID (e.g. signal
+# routing, /proc/<pid>/inspection). Same comm-based identity as
+# _proc_alive so behavior is consistent.
+_pids_by_comm() {
+	local _name="$1"
+	local _pid _comm
+	for _pid in /proc/[0-9]*; do
+		[ -r "$_pid/comm" ] || continue
+		_comm=$(cat "$_pid/comm" 2>/dev/null) || continue
+		[ "$_comm" = "$_name" ] && echo "${_pid##*/}"
+	done
+}
+
 # check_vpn_local_state: fast local-only check -- no network calls.
 # Returns 0 if all local VPN indicators are present, 1 if any is missing.
 # Indicators: surflare-proxy process + listening socket on 10800 + nftables
@@ -118,7 +152,7 @@ log() {
 # proxy not listening on :10800, LAN tproxy TCP black-holes for up to
 # CHECK_INTERVAL before LOCAL_FAIL fires.
 check_vpn_local_state() {
-	pgrep -f '/surflare-proxy(\s|$)' >/dev/null 2>&1 || return 1
+	_proc_alive surflare-proxy >/dev/null 2>&1 || return 1
 	ss -ltn 2>/dev/null | grep -qE ':10800(\s|$)' || return 1
 	nft list table inet surflare >/dev/null 2>&1 || return 1
 	ip rule show | grep -q 'fwmark 0x1 lookup 100' || return 1
@@ -437,7 +471,7 @@ _setup_chnroute() {
 # The proxy's own `inet surflare` table is also deleted since the
 # process owning it is gone; the proxy will re-create it on next start.
 _cleanup_on_startup() {
-	if pgrep -f '/surflare-proxy(\s|$)' >/dev/null 2>&1; then
+	if _proc_alive surflare-proxy >/dev/null 2>&1; then
 		return 0
 	fi
 	log "Startup cleanup: surflare-proxy not running, flushing stale watchdog state"
@@ -763,7 +797,7 @@ CONTROL_PROBE_TIMEOUT=3
 _route_updater_active() {
     local lock="/run/surflare_route_updater.lock"
     [ -f "$lock" ] || return 1
-    pgrep -f 'surflare_route_updater' >/dev/null 2>&1 || return 1
+    _proc_alive surflare_route_updater >/dev/null 2>&1 || return 1
     local mtime age
     mtime=$(stat -c '%Y' "$lock" 2>/dev/null) || return 1
     age=$(( $(date +%s) - mtime ))
@@ -1129,11 +1163,11 @@ check_vpn_health() {
 
 wait_for_exit() {
 	local name="$1" i=0
-	while pgrep -f "/usr/bin/$name" >/dev/null 2>&1 && [ "$i" -lt "$PROCESS_EXIT_TIMEOUT" ]; do
+	while _proc_alive "$name" >/dev/null 2>&1 && [ "$i" -lt "$PROCESS_EXIT_TIMEOUT" ]; do
 		sleep 1
 		i=$((i + 1))
 	done
-	if pgrep -f "/usr/bin/$name" >/dev/null 2>&1; then
+	if _proc_alive "$name" >/dev/null 2>&1; then
 		log "Process ${name} did not exit after SIGTERM, sending SIGKILL (nftables rules may be orphaned if this is surflare)"
 		killall -KILL "$name" 2>/dev/null
 	fi
@@ -1446,7 +1480,7 @@ probe_best_transit() {
 		fi
 		local wait_sec=0
 		while [ "$wait_sec" -lt "$TRANSIT_ROUTE_READY_TIMEOUT" ]; do
-			pgrep -f '/surflare-proxy(\s|$)' >/dev/null 2>&1 && \
+			_proc_alive surflare-proxy >/dev/null 2>&1 && \
 			nft list table inet surflare >/dev/null 2>&1 && \
 			ip rule show | grep -q 'fwmark 0x1 lookup 100' && break
 			sleep 1
@@ -1647,7 +1681,7 @@ connect_vpn() {
 		fi
 		sleep "$CONNECT_SETTLE"
 		# Process-level sanity check: verify surflare-proxy is running
-		if ! pgrep -f '/surflare-proxy(\s|$)' >/dev/null 2>&1; then
+		if ! _proc_alive surflare-proxy >/dev/null 2>&1; then
 			log "VPN establishment timed out: surflare-proxy not running after ${CONNECT_SETTLE}s"
 			exit 1
 		fi
@@ -1655,7 +1689,7 @@ connect_vpn() {
 		compute_proxy_affinity
 		_remove_dns_fallback
 		local proxy_pid
-		proxy_pid=$(pgrep -f '/surflare-proxy(\s|$)' | head -1)
+		proxy_pid=$(_pids_by_comm surflare-proxy | head -1)
 		if [ -n "$proxy_pid" ] && [ -n "$PROXY_CPU_SET" ]; then
 			taskset -apc "$PROXY_CPU_SET" "$proxy_pid" >/dev/null 2>&1 &&
 				log "Pinned surflare-proxy (PID ${proxy_pid}) to CPUs ${PROXY_CPU_SET}" || true
@@ -1859,7 +1893,7 @@ fi
 if [ -f "$PIDFILE" ]; then
 	_old_pid=$(cat "$PIDFILE" 2>/dev/null)
 	if [ -n "$_old_pid" ] && kill -0 "$_old_pid" 2>/dev/null; then
-		if pgrep -f 'surflare_watchdog.sh' 2>/dev/null | grep -qw "$_old_pid"; then
+		if _pids_by_comm surflare_watchdog.sh | grep -qw "$_old_pid"; then
 			echo "watchdog already running (PID $_old_pid)" >&2
 			exit 1
 		fi
@@ -1885,7 +1919,7 @@ cleanup() {
 	# only safe to delete if the proxy is gone (proxy owns the table
 	# exclusively); if proxy is still up, leave it alone and let the
 	# proxy manage its own cleanup on next exit.
-	if ! pgrep -f '/surflare-proxy(\s|$)' >/dev/null 2>&1; then
+	if ! _proc_alive surflare-proxy >/dev/null 2>&1; then
 		nft delete table inet surflare 2>/dev/null || true
 	fi
 	# Drop run-state sentinels so a future restart does not inherit
@@ -1923,7 +1957,7 @@ _probe_active() {
     age=$(( now - mtime ))
     if [ "$age" -gt "$PROBE_FRESH_SECONDS" ]; then
         log "node_probe marker stale (age=${age}s); reclaiming session"
-        pgrep -f 'surflare_node_probe' 2>/dev/null | while read -r _spid; do kill "$_spid" 2>/dev/null; done; true
+        _pids_by_comm surflare_node_probe | while read -r _spid; do kill "$_spid" 2>/dev/null; done; true
         rm -f "$PROBE_ACTIVE_FILE"
         _probe_defer_start=0
         return 1
@@ -1931,7 +1965,7 @@ _probe_active() {
     [ "$_probe_defer_start" -eq 0 ] && _probe_defer_start="$now"
     if [ $(( now - _probe_defer_start )) -gt "$PROBE_HARD_MAX" ]; then
         log "node_probe held session > ${PROBE_HARD_MAX}s; force-reclaiming"
-        pgrep -f 'surflare_node_probe' 2>/dev/null | while read -r _spid; do kill "$_spid" 2>/dev/null; done; true
+        _pids_by_comm surflare_node_probe | while read -r _spid; do kill "$_spid" 2>/dev/null; done; true
         rm -f "$PROBE_ACTIVE_FILE"
         _probe_defer_start=0
         return 1
