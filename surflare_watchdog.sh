@@ -479,7 +479,25 @@ _setup_chnroute() {
 # process owning it is gone; the proxy will re-create it on next start.
 _cleanup_on_startup() {
 	if _proc_alive surflare-proxy >/dev/null 2>&1; then
-		return 0
+		# Check if proxy has active VPN connections (not just alive but stale)
+		if ss -tnp 2>/dev/null | grep -q 'surflare.*ESTAB.*:443'; then
+			return 0  # Healthy: proxy alive + active VPN connection
+		fi
+		log "Startup: proxy alive but no VPN conn (stale), killing"
+		killall surflare-proxy 2>/dev/null
+		sleep 2
+	fi
+	# Port-based cleanup: ensure 10800 is free
+	if ss -ltn 2>/dev/null | grep -qE ':10800(\s|$)'; then
+		if command -v fuser >/dev/null 2>&1; then
+			fuser -k -9 10800/tcp 2>/dev/null || true
+		else
+			# ss fallback when fuser unavailable
+			local _pid
+			_pid=$(ss -lptn 2>/dev/null | grep ':10800' | sed -n 's/.*pid=\([0-9]*\).*/\1/p' | head -1)
+			[ -n "$_pid" ] && kill -9 "$_pid" 2>/dev/null || true
+		fi
+		sleep 1
 	fi
 	log "Startup cleanup: surflare-proxy not running, flushing stale watchdog state"
 	nft delete table inet surflare 2>/dev/null || true
