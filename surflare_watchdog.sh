@@ -122,7 +122,7 @@ log() {
 # Per Gemini review: avoid procps-ng-pgrep because it overwrites busybox
 # pgrep and may break native OpenWrt init scripts.
 _proc_alive() {
-	local _name="$1"
+	local _name="${1:0:15}"  # /proc/pid/comm truncates to 15 chars
 	local _pid _comm
 	for _pid in /proc/[0-9]*; do
 		[ -r "$_pid/comm" ] || continue
@@ -137,7 +137,7 @@ _proc_alive() {
 # routing, /proc/<pid>/inspection). Same comm-based identity as
 # _proc_alive so behavior is consistent.
 _pids_by_comm() {
-	local _name="$1"
+	local _name="${1:0:15}"  # /proc/pid/comm truncates to 15 chars
 	local _pid _comm
 	for _pid in /proc/[0-9]*; do
 		[ -r "$_pid/comm" ] || continue

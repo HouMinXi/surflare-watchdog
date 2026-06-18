@@ -33,6 +33,7 @@ with open('/tmp/raw.conf') as f:
 NEW_COUNT=$(wc -l < "$TMP")
 [ "$NEW_COUNT" -lt 50000 ] && { log "ERROR: only $NEW_COUNT converted"; exit 1; }
 
+mkdir -p "$(dirname "$DEST")"
 mv "$TMP" "$DEST"
 rm -f /tmp/raw.conf
 
@@ -42,3 +43,6 @@ rm -f /tmp/raw.conf
 log "updated: $NEW_COUNT domains"
 # Reload: restart SmartDNS (this version does not support graceful reload)
 /etc/init.d/smartdns restart
+# Flush dnsmasq cache so stale DNS records don't persist after SmartDNS
+# domain list change (dnsmasq forwards to SmartDNS but caches responses).
+killall -HUP dnsmasq 2>/dev/null || true
