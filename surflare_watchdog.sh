@@ -999,10 +999,10 @@ check_vpn_health() {
 		return
 	fi
 
-	# Layer 2: parallel external probes -- six run concurrently, first success wins
-	local tmp_g tmp_cf tmp_cf2 tmp_ifc tmp_ich tmp_myip
-	local tmp_gt tmp_cft tmp_cf2t tmp_ifct tmp_icht tmp_myt
-	local pid_g pid_cf pid_cf2 pid_ifc pid_ich pid_myip
+	# Layer 2: parallel external probes -- seven run concurrently, first success wins
+	local tmp_g tmp_cf tmp_cf2 tmp_ifc tmp_ich tmp_myip tmp_proxy
+	local tmp_gt tmp_cft tmp_cf2t tmp_ifct tmp_icht tmp_myt tmp_proxyt
+	local pid_g pid_cf pid_cf2 pid_ifc pid_ich pid_myip pid_proxy
 	tmp_g=$(mktemp /tmp/surflare_hc.XXXXXX)
 	tmp_cf=$(mktemp /tmp/surflare_hc.XXXXXX)
 	tmp_cf2=$(mktemp /tmp/surflare_hc.XXXXXX)
@@ -1015,9 +1015,11 @@ check_vpn_health() {
 	tmp_ifct=$(mktemp /tmp/surflare_hc.XXXXXX)
 	tmp_icht=$(mktemp /tmp/surflare_hc.XXXXXX)
 	tmp_myt=$(mktemp /tmp/surflare_hc.XXXXXX)
+	tmp_proxy=$(mktemp /tmp/surflare_hc.XXXXXX)
+	tmp_proxyt=$(mktemp /tmp/surflare_hc.XXXXXX)
 	# Ensure temp files are removed even if this function is interrupted mid-wait.
 	# Stored in a global so the main EXIT trap can also clean up on unclean exit.
-	_hc_tmp="$tmp_g $tmp_cf $tmp_cf2 $tmp_ifc $tmp_ich $tmp_myip $tmp_gt $tmp_cft $tmp_cf2t $tmp_ifct $tmp_icht $tmp_myt"
+	_hc_tmp="$tmp_g $tmp_cf $tmp_cf2 $tmp_ifc $tmp_ich $tmp_myip $tmp_proxy $tmp_gt $tmp_cft $tmp_cf2t $tmp_ifct $tmp_icht $tmp_myt $tmp_proxyt"
 
 	# Probe 1: Google -- blocked externally -> 200/30x means VPN is working
 	(
@@ -1098,10 +1100,27 @@ check_vpn_health() {
 	) >"$tmp_myip" 2>/dev/null &
 	pid_myip=$!
 
+	# Probe 7: SOCKS5 proxy path -- detects G1 blindspot (tunnel dead but external
+	# probes succeed because both endpoints exit in same country). Shorter timeout
+	# since this is local (127.0.0.1 SOCKS5 -> tunnel -> destination).
+	(
+		local _raw
+		_raw=$(curl -s --proxy socks5h://127.0.0.1:10800 \
+		       --connect-timeout 5 --max-time 10 \
+		       -o /dev/null \
+		       -w '%{http_code}\n%{time_namelookup}:%{time_connect}:%{time_appconnect}:%{time_starttransfer}:%{time_total}' \
+		       https://connectivitycheck.gstatic.com/generate_204 2>/dev/null)
+		echo "$_raw" | tail -1 >"$tmp_proxyt"
+		local code
+		code=$(echo "$_raw" | head -1)
+		case "$code" in 204|200) echo "OK" ;; esac
+	) >"$tmp_proxy" 2>/dev/null &
+	pid_proxy=$!
+
 	# --- Early-exit polling loop ---
 	# Poll results every 1s. Return as soon as any probe produces a usable result.
 	# Maximum wait = max-time (12s), but typically returns in 1-3s when tunnel is healthy.
-	local all_pids="$pid_g $pid_cf $pid_cf2 $pid_ifc $pid_ich $pid_myip"
+	local all_pids="$pid_g $pid_cf $pid_cf2 $pid_ifc $pid_ich $pid_myip $pid_proxy"
 	local deadline=$((SECONDS + 13))  # 13s absolute deadline (max-time + 1s margin)
 	local result=""
 
@@ -1187,7 +1206,8 @@ check_vpn_health() {
 		local all_tcp_stuck=1  # assume TCP-stuck until proven otherwise
 		local has_timing=0 unknown_count=0
 		for _t in "$tmp_gt:google" "$tmp_cft:cf-domain" "$tmp_cf2t:cf-ip" \
-		          "$tmp_ifct:ifconfig" "$tmp_icht:icanhazip" "$tmp_myt:myip"; do
+		          "$tmp_ifct:ifconfig" "$tmp_icht:icanhazip" "$tmp_myt:myip" \
+		          "$tmp_proxyt:proxy"; do
 			_label="${_t#*:}"
 			_t="${_t%%:*}"
 			local _timing
@@ -1211,8 +1231,19 @@ check_vpn_health() {
 		echo "$unknown_count" > "$DNS_STUCK_FILE" 2>/dev/null || true
 	fi
 
-	rm -f "$tmp_g" "$tmp_cf" "$tmp_cf2" "$tmp_ifc" "$tmp_ich" "$tmp_myip" \
-	      "$tmp_gt" "$tmp_cft" "$tmp_cf2t" "$tmp_ifct" "$tmp_icht" "$tmp_myt"
+	# G1 blindspot detection: external probes succeeded (OK/TUNNEL_OK/country)
+	# but the SOCKS5 proxy probe failed -- tunnel is dead, external probes
+	# succeeded because both endpoints exit in the same country.
+	if [ -n "$result" ] && [ "$result" != "TCP_BLOCK" ] && [ "$result" != "LOCAL_FAIL" ]; then
+		local r_proxy
+		r_proxy=$(cat "$tmp_proxy" 2>/dev/null)
+		if [ "$r_proxy" != "OK" ]; then
+			result="TCP_BLOCK"
+		fi
+	fi
+
+	rm -f "$tmp_g" "$tmp_cf" "$tmp_cf2" "$tmp_ifc" "$tmp_ich" "$tmp_myip" "$tmp_proxy" \
+	      "$tmp_gt" "$tmp_cft" "$tmp_cf2t" "$tmp_ifct" "$tmp_icht" "$tmp_myt" "$tmp_proxyt"
 	_hc_tmp=""
 
 	echo "$result"
