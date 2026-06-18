@@ -1,0 +1,59 @@
+#!/bin/sh /etc/rc.common
+
+# Boot-time lockdown: block LAN overseas traffic before surflare-watchdog
+# starts.  Loads a minimal nft table at S18 (before S19firewall/S20network)
+# that REJECTs non-RFC1918 forwarded traffic from br-lan.  The watchdog
+# removes this table once its own killswitch is armed; a 120s self-destruct
+# timer prevents permanent lockout if the watchdog never starts.
+
+USE_PROCD=1
+START=18
+STOP=99
+
+TABLE_NAME="surflare_boot_lock"
+
+start_service() {
+    # Skip if the real killswitch is already armed (fast restart)
+    if nft list table inet killswitch >/dev/null 2>&1; then
+        return 0
+    fi
+
+    nft -f - <<'NFTEOF'
+table inet surflare_boot_lock {
+    chain forward {
+        type filter hook forward priority -200; policy accept;
+        ct state established,related accept
+        iifname "br-lan" oifname "br-lan" accept
+        iifname "br-lan" ip daddr {
+            10.0.0.0/8, 100.64.0.0/10, 169.254.0.0/16,
+            172.16.0.0/12, 192.168.0.0/16
+        } accept
+        iifname "br-lan" ip6 daddr { ::1/128, fe80::/10, fc00::/7 } accept
+        iifname "br-lan" ip daddr 255.255.255.255 accept
+        iifname "br-lan" ip daddr 224.0.0.0/4 accept
+        iifname "br-lan" ip6 daddr ff00::/8 accept
+        iifname "br-lan" reject with icmp host-unreachable
+    }
+}
+NFTEOF
+
+    if [ $? -eq 0 ]; then
+        logger -t surflare-bootlock "Boot lock armed (S18, self-destruct 120s)"
+        # Self-destruct: prevent permanent lockout if watchdog never starts.
+        # nft destroy is idempotent (always RC=0), so check existence first.
+        (sleep 120
+         if nft list table inet "$TABLE_NAME" >/dev/null 2>&1; then
+             nft destroy table inet "$TABLE_NAME" 2>/dev/null || true
+             logger -t surflare-bootlock "Boot lock self-destructed (120s timeout)"
+         else
+             logger -t surflare-bootlock "Boot lock 120s timer: table already removed"
+         fi) &
+    else
+        logger -t surflare-bootlock "ERROR: failed to arm boot lock"
+    fi
+}
+
+stop_service() {
+    nft destroy table inet "$TABLE_NAME" 2>/dev/null || true
+    logger -t surflare-bootlock "Boot lock removed"
+}

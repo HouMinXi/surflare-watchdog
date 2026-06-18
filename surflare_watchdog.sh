@@ -565,6 +565,10 @@ table inet killswitch {
 		udp sport 68 udp dport 67 accept
 		udp sport 546 udp dport 547 accept
 		meta skuid chrony udp dport 123 accept
+		# KS-01: REJECT non-whitelisted UDP (QUIC clients fall back to TCP <1ms)
+		meta l4proto udp reject with icmp port-unreachable
+		# KS-02: REJECT non-whitelisted IPv6 (Happy Eyeballs falls back to IPv4 <250ms)
+		meta nfproto ipv6 reject with icmpv6 addr-unreachable
 		limit rate 5/second burst 10 packets log prefix "ks-drop: "
 		counter drop
 	}
@@ -587,7 +591,7 @@ table inet killswitch {
 		iifname "br-lan" ip6 daddr @server_ips6 accept
 		iifname "br-lan" ip daddr @bypass_ipv4 accept
 		iifname "br-lan" ip6 daddr @bypass_ipv6 accept
-		iifname "br-lan" meta nfproto ipv6 drop
+		iifname "br-lan" meta nfproto ipv6 reject with icmpv6 addr-unreachable
 		iifname "br-lan" limit rate 5/second burst 10 packets log prefix "ks-fwd-mon: "
 	}
 }
@@ -635,6 +639,15 @@ NFTEOF
 		return 1
 	fi
 	rm -f "$_ks_tmp"
+
+	# BOOT-01: remove boot-time lockdown now that killswitch is armed.
+	# surflare-bootlock (S18) blocks LAN overseas traffic during the boot
+	# window before this watchdog starts; no longer needed once the real
+	# killswitch is in place.
+	if nft list table inet surflare_boot_lock >/dev/null 2>&1; then
+		nft destroy table inet surflare_boot_lock 2>/dev/null || true
+		log "Boot lock removed: killswitch now armed"
+	fi
 
 	# F8: repopulate server_ips from disk if available.  A watchdog restart
 	# (e.g. crash + procd respawn) loses the in-memory _diag_server_ips set,

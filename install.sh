@@ -42,6 +42,14 @@ if [ "$INIT" = "procd" ]; then
     # Router (N100/iStoreOS) -- LAN tproxy nft rule + required packages
     install -m 644 "$REPO/router/surflare-lan-tproxy.nft" /etc/surflare-lan-tproxy.nft
     echo "  LAN tproxy rule installed -> /etc/surflare-lan-tproxy.nft"
+    # Guard: remove stale tproxy file from nftables.d if present.
+    # fw4 includes all files in /etc/nftables.d/ as fragments; a standalone
+    # table definition there breaks fw4 load and leaves the router without
+    # firewall after reboot.
+    if [ -f /etc/nftables.d/surflare-lan-tproxy.nft ]; then
+        rm -f /etc/nftables.d/surflare-lan-tproxy.nft
+        echo "  WARN: removed stale /etc/nftables.d/surflare-lan-tproxy.nft (breaks fw4)"
+    fi
     mkdir -p /etc/surflare
     if [ ! -f /etc/surflare/bypass-macs.conf ]; then
         install -m 600 "$REPO/router/bypass-macs.conf.example" /etc/surflare/bypass-macs.conf
@@ -158,6 +166,12 @@ procd)
     # Idempotent fallback ensures boot-time autostart on those images.
     test -L /etc/rc.d/S95surflare-watchdog || \
         ln -sf /etc/init.d/surflare-watchdog /etc/rc.d/S95surflare-watchdog
+    # BOOT-02: boot-time lockdown (S18, before S19firewall/S20network)
+    cp "$SVC_ROUTER/procd/surflare-bootlock" /etc/init.d/surflare-bootlock
+    chmod 755 /etc/init.d/surflare-bootlock
+    /etc/init.d/surflare-bootlock enable || true
+    test -L /etc/rc.d/S18surflare-bootlock || \
+        ln -sf /etc/init.d/surflare-bootlock /etc/rc.d/S18surflare-bootlock
     ;;
 
 runit)
