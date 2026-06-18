@@ -1889,9 +1889,13 @@ cleanup() {
 		nft delete table inet surflare 2>/dev/null || true
 	fi
 	# Drop run-state sentinels so a future restart does not inherit
-	# stale "ready" / "cool" / "strict moat" markers.
+	# stale "ready" markers.
+	# Forge finding #3: do NOT delete storm_cool_until here. On a graceful
+	# exit followed by an immediate procd respawn, _cleanup_on_startup
+	# reads storm_cool_until to sleep the remaining window. Deleting it
+	# here would lose the cool state and allow immediate storm re-trigger.
+	# _cleanup_on_startup deletes the file itself after consuming it.
 	rm -f /run/surflare_watchdog.killswitch_ready
-	rm -f /run/surflare_watchdog.storm_cool_until
 	# Preserve /run/surflare_watchdog.moat_strict as a user opt-in:
 	# the user may want it to survive a watchdog restart, so we leave it
 	# alone here.
