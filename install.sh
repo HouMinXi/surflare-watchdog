@@ -71,6 +71,8 @@ if [ "$INIT" = "procd" ]; then
     #   coreutils-timeout -- timeout N cmd (auth / connect timeouts)
     #   conntrack         -- conntrack -F  (flush stale connections after killswitch)
     #   kmod-nft-tproxy   -- LAN tproxy kernel module
+    #   kmod-nfnetlink-log -- nflog for packet trace (log ... group N)
+    #   sexpect           -- PTY-based login (password not in /proc cmdline)
     install -m 755 "$REPO/surflare_route_updater.sh" \
         /usr/local/sbin/surflare_route_updater.sh
     install -m 755 "$REPO/cross_validate_cloud_cdn.py" \
@@ -79,6 +81,7 @@ if [ "$INIT" = "procd" ]; then
         coreutils-paste coreutils-grep coreutils-sleep coreutils-date \
         coreutils-nproc procps-ng-pkill \
         ss coreutils-timeout conntrack kmod-nft-tproxy \
+        kmod-nfnetlink-log sexpect \
         logrotate 2>/dev/null || true
     # F0: verify conntrack and scoped flush syntax (needed for killswitch install
     # to flush only tproxy-marked flows instead of ALL flows).  conntrack <1.4.4

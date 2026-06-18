@@ -1295,32 +1295,53 @@ wait_for_exit() {
 	fi
 }
 
-# refresh_auth: refresh surflare auth token using stored credentials
-# (TPM2-encrypted via systemd-creds). Uses expect(1) to deliver password
-# via PTY -- surflare reads from /dev/tty, not stdin. Heredoc avoids
-# leaking the password in /proc/<pid>/cmdline.
+# refresh_auth: refresh surflare auth token using stored credentials.
+# Two credential paths, tried in order:
+#   1. systemd-creds (laptop): SURFLARE_EMAIL env + CREDENTIALS_DIRECTORY
+#      file.  Uses expect(1) heredoc (password via stdin, not argv).
+#   2. credential file (router/procd): /etc/surflare/credentials with
+#      email=... and password=... lines (chmod 600 enforced).  Uses
+#      sexpect(1) -env (password via env var, not argv).
+# Both paths deliver the password via PTY without exposing it in
+# /proc/<pid>/cmdline.  Never falls back to surflare login -p.
 refresh_auth() {
-	local email="${SURFLARE_EMAIL:-}"
-	local password=""
+	local email="" password="" _cred_source=""
 
-	[ -z "$email" ] && return 2
-	[ -z "${CREDENTIALS_DIRECTORY:-}" ] && return 2
-
-	if [ -f "$CREDENTIALS_DIRECTORY/surflare_password" ]; then
+	# Path 1: systemd-creds (laptop)
+	if [ -n "${SURFLARE_EMAIL:-}" ] && [ -n "${CREDENTIALS_DIRECTORY:-}" ] \
+	   && [ -f "${CREDENTIALS_DIRECTORY}/surflare_password" ]; then
+		email="$SURFLARE_EMAIL"
 		password=$(cat "$CREDENTIALS_DIRECTORY/surflare_password")
-	else
-		return 2
+		_cred_source="systemd-creds"
 	fi
-	[ -z "$password" ] && return 2
 
-	if ! command -v expect >/dev/null 2>&1; then
-		log "WARN: expect not installed; skipping interactive auth"
+	# Path 2: credential file (router/procd)
+	if [ -z "$password" ] && [ -f /etc/surflare/credentials ]; then
+		# Permission check: refuse world-readable credential files
+		local _perms
+		_perms=$(stat -c %a /etc/surflare/credentials 2>/dev/null) || true
+		if [ -n "$_perms" ] && [ "$_perms" != "600" ] && [ "$_perms" != "400" ]; then
+			log "WARN: /etc/surflare/credentials has mode $_perms (expected 600); refusing to read"
+			return 2
+		fi
+		# -m1: only first match (reject duplicates); tr -d '\r': strip CRLF
+		email=$(grep -m1 '^email=' /etc/surflare/credentials | cut -d= -f2- | tr -d '\r')
+		password=$(grep -m1 '^password=' /etc/surflare/credentials | cut -d= -f2- | tr -d '\r')
+		_cred_source="credential-file"
+	fi
+
+	# No credentials found on either path
+	if [ -z "$email" ] || [ -z "$password" ]; then
+		[ -f /etc/surflare/credentials ] && \
+			log "WARN: /etc/surflare/credentials exists but email= or password= is missing"
 		return 2
 	fi
 
 	local i=0 rc=1
 	while [ "$i" -lt "$LOGIN_RETRIES" ]; do
-		if timeout 30 expect <<EXPECT_EOF >/dev/null 2>&1
+		if command -v expect >/dev/null 2>&1; then
+			# expect (laptop): PTY-based login via Tcl heredoc
+			if timeout 30 expect <<EXPECT_EOF >/dev/null 2>&1
 set timeout 15
 log_user 0
 spawn surflare login -u {${email}}
@@ -1339,9 +1360,37 @@ expect {
     timeout { exit 1 }
 }
 EXPECT_EOF
-		then
-			log "Auth token refreshed successfully (attempt $((i + 1))/${LOGIN_RETRIES})"
-			rc=0
+			then
+				rc=0
+			fi
+		elif command -v sexpect >/dev/null 2>&1; then
+			# sexpect (router): PTY-based login.  Password delivered via
+			# -env (reads from env var, never in /proc cmdline).  Socket
+			# path via mktemp to avoid TOCTOU; trap ensures cleanup on
+			# SIGTERM during the auth window.
+			local _sock
+			_sock=$(mktemp /tmp/.surflare_auth.XXXXXX)
+			rm -f "$_sock"  # mktemp creates the file; sexpect needs the path free
+			trap "rm -f '$_sock'" EXIT
+			export _SURFLARE_AUTH_PW="$password"
+			if timeout 30 sh -c "
+				sexpect -s '$_sock' spawn -t 25 surflare login -u '$email' >/dev/null 2>&1
+				sexpect -s '$_sock' expect -t 15 'Password:' >/dev/null 2>&1 || exit 1
+				sexpect -s '$_sock' send -env _SURFLARE_AUTH_PW -enter >/dev/null 2>&1
+				sexpect -s '$_sock' wait -t 15 >/dev/null 2>&1
+			"; then
+				rc=0
+			fi
+			unset _SURFLARE_AUTH_PW
+			rm -f "$_sock"
+			trap - EXIT
+		else
+			log "WARN: neither expect nor sexpect installed; cannot refresh auth"
+			unset password
+			return 2
+		fi
+		if [ "$rc" -eq 0 ]; then
+			log "Auth token refreshed (attempt $((i + 1))/${LOGIN_RETRIES})"
 			break
 		fi
 		i=$((i + 1))
