@@ -580,7 +580,10 @@ table inet killswitch {
 		meta l4proto udp reject with icmp port-unreachable
 		# REJECT non-whitelisted IPv6 (Happy Eyeballs falls back to IPv4 <250ms)
 		meta nfproto ipv6 reject with icmpv6 addr-unreachable
-		limit rate 5/second burst 10 packets log prefix "ks-drop: "
+		# Only log new outbound connection attempts (SYN).  RST, ACK, FIN
+		# reaching here are kernel auto-responses to inbound probes or
+		# orphaned post-reconnect cleanup -- not bypass attempts.
+		tcp flags syn / fin,syn,rst,ack limit rate 5/second burst 10 packets log prefix "ks-drop: "
 		counter drop
 	}
 
@@ -624,6 +627,13 @@ NFTEOF
 		log "ERROR: kill switch install failed"
 		rm -f "$_ks_tmp"
 		return 1
+	fi
+
+	# Pre-populate bypass_src to close the startup race window.
+	# Without this, bypass device traffic hits ks-fwd-mon log during the
+	# brief gap between killswitch install and _update_bypass_devices call.
+	if [ -n "$BYPASS_LAN_DEVICES" ]; then
+		nft add element inet killswitch bypass_src "{ $BYPASS_LAN_DEVICES }" 2>/dev/null || true
 	fi
 
 	# Flush stale conntrack entries that predate the new killswitch rules.
