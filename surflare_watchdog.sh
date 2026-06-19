@@ -558,6 +558,9 @@ _cleanup_on_startup() {
 		log "Reusing existing killswitch (surviving from prior instance)"
 		_killswitch_armed=1
 	fi
+	# dns_enforce lives outside the killswitch table; ensure it exists
+	# even when the killswitch reuse path skips _install_killswitch.
+	_ensure_dns_enforce
 	ip rule del fwmark 0x1 lookup 100 2>/dev/null || true
 	# F13: respect an in-progress storm cool across a restart.  If the
 	# persisted cool-until timestamp is in the future, sleep the
@@ -577,6 +580,35 @@ _cleanup_on_startup() {
 			storm_sleep_pid=""
 		fi
 		rm -f "$_cool_file"
+	fi
+}
+
+# Ensure dns_enforce table exists.  Idempotent: skips if already present.
+# Extracted from _install_killswitch so it runs even when the killswitch
+# survives a restart (the reuse path skips _install_killswitch entirely).
+_ensure_dns_enforce() {
+	[ "$PLATFORM" = "router" ] || return 0
+	nft list table ip dns_enforce >/dev/null 2>&1 && return 0
+	# fib daddr type local covers all dnsmasq listen addresses without
+	# hardcoding IPs.  Router-originated DNS is unaffected (no iifname
+	# "br-lan" match on locally generated packets).  Log is rate-limited
+	# to prevent dmesg flooding from devices with hardcoded DNS servers.
+	if nft -f - <<'DNS_EOF'
+table ip dns_enforce {
+	set vpn_bypass { type ipv4_addr; }
+	chain prerouting {
+		type filter hook prerouting priority mangle - 20; policy accept;
+		iifname "br-lan" meta l4proto { tcp, udp } th dport 53 ip saddr @vpn_bypass accept
+		iifname "br-lan" meta l4proto { tcp, udp } th dport 53 fib daddr type local accept
+		iifname "br-lan" meta l4proto { tcp, udp } th dport 53 limit rate 3/second burst 5 packets log prefix "dns-bypass: "
+		iifname "br-lan" meta l4proto { tcp, udp } th dport 53 reject with icmp port-unreachable
+	}
+}
+DNS_EOF
+	then
+		log "DNS enforcement armed: LAN bypass DNS rejected"
+	else
+		log "WARN: DNS enforcement table load failed"
 	fi
 }
 
@@ -733,30 +765,7 @@ NFTEOF
 
 	# Enforce LAN DNS through the router's dnsmasq/SmartDNS.
 	# Reject any br-lan DNS (port 53) not destined for the router itself.
-	# fib daddr type local covers all dnsmasq listen addresses (5+ IPv4,
-	# 8+ IPv6) without hardcoding IPs.  Router-originated DNS is unaffected
-	# (no iifname "br-lan" match on locally generated packets).
-	# Devices in vpn_bypass (populated from auto_bypass + bypass_devices)
-	# are exempted: they run their own VPN and use non-router DNS.
-	if [ "$PLATFORM" = "router" ] && \
-	   ! nft list table ip dns_enforce >/dev/null 2>&1; then
-		if nft -f - <<'DNS_EOF'
-table ip dns_enforce {
-	set vpn_bypass { type ipv4_addr; }
-	chain prerouting {
-		type filter hook prerouting priority mangle - 20; policy accept;
-		iifname "br-lan" meta l4proto { tcp, udp } th dport 53 ip saddr @vpn_bypass accept
-		iifname "br-lan" meta l4proto { tcp, udp } th dport 53 fib daddr type local accept
-		iifname "br-lan" meta l4proto { tcp, udp } th dport 53 log prefix "dns-bypass: " reject with icmp port-unreachable
-	}
-}
-DNS_EOF
-		then
-			log "DNS enforcement armed: LAN bypass DNS rejected"
-		else
-			log "WARN: DNS enforcement table load failed"
-		fi
-	fi
+	_ensure_dns_enforce
 
 	# F8: repopulate server_ips from disk if available.  A watchdog restart
 	# (e.g. crash + procd respawn) loses the in-memory _diag_server_ips set,
@@ -896,17 +905,32 @@ _remove_killswitch() {
 # the DTLS detection rule intact so they survive across the tombstone window.
 _tombstone_tproxy() {
 	nft list table ip sw_lan_tproxy >/dev/null 2>&1 || return 0
-	# Replace ALL tproxy rules (TCP + QUIC) with reject.  Loop handles
-	# both single-rule (old nft) and dual-rule (TCP+QUIC) configurations.
-	local _handle _replaced=0
-	for _handle in $(nft -a list chain ip sw_lan_tproxy prerouting 2>/dev/null | \
-		awk '/tproxy.*10800/{print $NF}'); do
-		if nft replace rule ip sw_lan_tproxy prerouting handle "$_handle" \
-			iifname "br-lan" reject with icmp host-unreachable \
-			2>/dev/null; then
-			_replaced=$((_replaced + 1))
+	# Replace each tproxy rule with a protocol-matched reject so only
+	# the originally proxied protocols are blocked.  Without the qualifier
+	# the first reject catches ALL br-lan traffic and over-blocks
+	# non-TCP/non-QUIC flows (e.g. UDP game traffic to CN IPs).
+	local _line _handle _replaced=0
+	while IFS= read -r _line; do
+		[ -z "$_line" ] && continue
+		_handle=${_line##* }
+		if echo "$_line" | grep -q 'meta l4proto tcp'; then
+			nft replace rule ip sw_lan_tproxy prerouting handle "$_handle" \
+				iifname "br-lan" meta l4proto tcp \
+				reject with tcp reset 2>/dev/null && \
+				_replaced=$((_replaced + 1))
+		elif echo "$_line" | grep -q 'udp dport 443'; then
+			nft replace rule ip sw_lan_tproxy prerouting handle "$_handle" \
+				iifname "br-lan" udp dport 443 \
+				reject with icmp host-unreachable 2>/dev/null && \
+				_replaced=$((_replaced + 1))
+		else
+			nft replace rule ip sw_lan_tproxy prerouting handle "$_handle" \
+				iifname "br-lan" reject with icmp host-unreachable \
+				2>/dev/null && _replaced=$((_replaced + 1))
 		fi
-	done
+	done <<EOF
+$(nft -a list chain ip sw_lan_tproxy prerouting 2>/dev/null | grep 'tproxy.*10800')
+EOF
 	[ "$_replaced" -gt 0 ] && log "Tombstone: ${_replaced} tproxy rule(s) replaced with REJECT"
 	# No tproxy rule found means already tombstoned or manually removed;
 	# keep the table (bypass sets, DTLS detection) intact either way.
@@ -936,10 +960,12 @@ _restore_tproxy() {
 		printf 'destroy table ip sw_lan_tproxy\n'
 		cat "$_lan_tproxy_nft"
 	} > "$_restore_tmp"
-	if nft -f "$_restore_tmp" 2>/dev/null; then
+	local _nft_err
+	_nft_err=$(nft -f "$_restore_tmp" 2>&1)
+	if [ $? -eq 0 ]; then
 		log "LAN tproxy restored (fresh load from ${_lan_tproxy_nft})"
 	else
-		log "WARN: LAN tproxy restore failed"
+		log "WARN: LAN tproxy restore failed: ${_nft_err}"
 	fi
 	rm -f "$_restore_tmp"
 }
@@ -999,12 +1025,16 @@ _update_bypass_devices() {
 	# sync auto_bypass IPs to killswitch bypass_src (corporate VPN clients
 	# still need the forward chain exemption).
 	if [ "$MODE" != "global" ]; then
-		nft flush set inet killswitch bypass_src 2>/dev/null || true
 		local _auto_ips
 		_auto_ips=$(nft list set ip sw_lan_tproxy auto_bypass 2>/dev/null \
 			| grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | paste -sd,)
-		if [ -n "$_auto_ips" ] && nft list table inet killswitch >/dev/null 2>&1; then
-			nft add element inet killswitch bypass_src "{ $_auto_ips }" 2>/dev/null || true
+		# Atomic flush+add via nft -f so bypass_src is never empty mid-update.
+		if nft list table inet killswitch >/dev/null 2>&1; then
+			{
+				printf 'flush set inet killswitch bypass_src\n'
+				[ -n "$_auto_ips" ] && \
+					printf 'add element inet killswitch bypass_src { %s }\n' "$_auto_ips"
+			} | nft -f - 2>/dev/null || true
 		fi
 		_sync_dns_enforce_bypass
 		return 0
