@@ -59,6 +59,8 @@ _diag_syn_out=0                       # SYN packets sent (new connection attempt
 _diag_syn_ack=0                       # SYN-ACK received (successful handshakes)
 _diag_sack_pct=0                      # % of packets with SACK blocks
 _diag_rst_in=0                        # RST packets received from server
+_transit_grace_ts=0                   # epoch when SERVER_APP_FAILURE granted transit reprobe grace
+TRANSIT_GRACE_TTL=300                 # seconds to honor transit grace before expiry (5 min)
 EVENT_LOG="/var/log/surflare_events.jsonl"
 # Auto-detect WiFi interface; fallback to wlp9s0f0 if iw is unavailable
 WIFI_INTERFACE=$(iw dev 2>/dev/null | awk '/Interface/{print $2; exit}')
@@ -864,6 +866,7 @@ _enter_storm_cooldown() {
 	reconnect_count=0
 	fail_count=0
 	transient_count=0
+	_transit_grace_ts=0
 }
 
 # Populate the bypass_devices set in sw_lan_tproxy.
@@ -1599,6 +1602,14 @@ _diagnose_tunnel_failure() {
 	_diag_sack_pct="$sack_pct"
 	_diag_rst_in="$rst_in"
 	log "Diag: CONCLUSION=${conclusion}"
+	# Grant transit grace when diagnosis proves transit is healthy.
+	# SERVER_APP_FAILURE = bidirectional traffic with healthy SYN-ACK ratio,
+	# meaning physical layer and transit are working; only the server app is
+	# broken.  Reprobe (which tests transit candidates) is wasted in this case.
+	if [ "$_diag_conclusion" = "SERVER_APP_FAILURE" ]; then
+		_transit_grace_ts=$(date +%s)
+		log "Diag: transit grace granted (SERVER_APP_FAILURE confirms transit healthy)"
+	fi
 }
 
 # _record_connect: call after every confirmed-healthy reconnect.
@@ -1676,6 +1687,20 @@ save_transit_cache() {
 maybe_reprobe_transit() {
 	_transit_fail_count=$((_transit_fail_count + 1))
 	if [ "$_transit_fail_count" -ge "$TRANSIT_REPROBE_AFTER" ]; then
+		# Transit grace: skip one reprobe when a recent SERVER_APP_FAILURE
+		# proved transit is healthy.  Grace is one-time (consumed on use) and
+		# expires after TRANSIT_GRACE_TTL seconds to avoid acting on stale data.
+		if [ "${_transit_grace_ts:-0}" -gt 0 ]; then
+			local _grace_age=$(( $(date +%s) - _transit_grace_ts ))
+			if [ "$_grace_age" -lt "$TRANSIT_GRACE_TTL" ]; then
+				log "Transit fail threshold reached, skipping reprobe (SERVER_APP_FAILURE ${_grace_age}s ago)"
+				_transit_grace_ts=0
+				_transit_fail_count=0
+				return
+			fi
+			log "Transit grace expired (${_grace_age}s >= ${TRANSIT_GRACE_TTL}s), proceeding with reprobe"
+			_transit_grace_ts=0
+		fi
 		log "Transit fail threshold reached, reprobing..."
 		local new_transit
 		new_transit=$(probe_best_transit)
@@ -1706,12 +1731,14 @@ probe_best_transit() {
 		return
 	fi
 	local node best_node="" best_ms=999999
+	local _probe_idx=0 _probe_total=${#TRANSIT_CANDIDATES[@]}
 	for node in "${TRANSIT_CANDIDATES[@]}"; do
+		_probe_idx=$((_probe_idx + 1))
 		if [ "${_active_node:-$NODE}" = "$node" ]; then
-			log "Probing transit candidate: ${node} -- skipped (same as node)"
+			log "Probing transit candidate: ${node} (${_probe_idx}/${_probe_total}) -- skipped (same as node)"
 			continue
 		fi
-		log "Probing transit candidate: ${node}"
+		log "Probing transit candidate: ${node} (${_probe_idx}/${_probe_total})"
 		if ! timeout "$TRANSIT_CONNECT_TIMEOUT" surflare connect \
 			--node "${_active_node:-$NODE}" --mode "${MODE:-global}" \
 			--transit "$node" --daemon >/dev/null 2>&1; then
@@ -2400,6 +2427,7 @@ while true; do
 		fail_count=0
 		reconnect_count=0
 		transient_count=0
+		_transit_grace_ts=0
 		_remove_dns_fallback
 
 		# Proactive token refresh -- runs whenever VPN is confirmed healthy so tokens stay
@@ -2478,6 +2506,7 @@ while true; do
 				reconnect_count=0
 				transient_count=0
 				_transit_fail_count=0
+				_transit_grace_ts=0
 				_remove_dns_fallback
 				_update_server_endpoint
 				if [ "$_killswitch_armed" -eq 0 ]; then
