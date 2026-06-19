@@ -604,8 +604,8 @@ table inet killswitch {
 		iifname "br-lan" ip6 daddr @server_ips6 accept
 		iifname "br-lan" ip daddr @bypass_ipv4 accept
 		iifname "br-lan" ip6 daddr @bypass_ipv6 accept
-		iifname "br-lan" meta nfproto ipv6 reject with icmpv6 addr-unreachable
 		iifname "br-lan" ip saddr @bypass_src accept
+		iifname "br-lan" meta nfproto ipv6 reject with icmpv6 addr-unreachable
 		iifname "br-lan" limit rate 5/second burst 10 packets log prefix "ks-fwd-mon: "
 	}
 }
@@ -877,6 +877,9 @@ _enter_storm_cooldown() {
 _update_bypass_devices() {
 	nft list table ip sw_lan_tproxy >/dev/null 2>&1 || return 0
 	nft flush set ip sw_lan_tproxy bypass_devices 2>/dev/null || true
+	# Flush bypass_src unconditionally alongside bypass_devices so stale IPs
+	# are cleared even when all bypass devices are removed from config.
+	nft flush set inet killswitch bypass_src 2>/dev/null || true
 
 	local all_ips="" ip_csv mac ip line
 	# Source 1: explicit IPs
@@ -900,10 +903,10 @@ _update_bypass_devices() {
 		log "WARN: bypass_devices update failed (${all_ips})"
 	# Sync bypass device IPs into killswitch bypass_src so their non-CN traffic
 	# does not trigger ks-fwd-mon log noise (traffic is forwarded, just not logged).
+	# bypass_src was already flushed at function entry; only add elements here.
 	if nft list table inet killswitch >/dev/null 2>&1; then
-		nft flush set inet killswitch bypass_src 2>/dev/null
 		nft add element inet killswitch bypass_src "{ $all_ips }" 2>/dev/null || \
-			log "WARN: killswitch bypass_src sync failed"
+			log "WARN: kill switch bypass_src sync failed"
 	fi
 	_sync_dns_enforce_bypass
 }
