@@ -600,7 +600,7 @@ table ip dns_enforce {
 		type filter hook prerouting priority mangle - 20; policy accept;
 		iifname "br-lan" meta l4proto { tcp, udp } th dport 53 ip saddr @vpn_bypass accept
 		iifname "br-lan" meta l4proto { tcp, udp } th dport 53 fib daddr type local accept
-		iifname "br-lan" meta l4proto { tcp, udp } th dport 53 limit rate 3/second burst 5 packets log prefix "dns-bypass: "
+		iifname "br-lan" meta l4proto { tcp, udp } th dport 53 limit rate 5/minute burst 3 packets log prefix "dns-bypass: "
 		iifname "br-lan" meta l4proto { tcp, udp } th dport 53 reject with icmp port-unreachable
 	}
 }
