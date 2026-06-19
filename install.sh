@@ -40,8 +40,16 @@ install -m 755 "$REPO/setup_auth.sh"              /usr/local/sbin/setup_auth.sh
 
 if [ "$INIT" = "procd" ]; then
     # Router (N100/iStoreOS) -- LAN tproxy nft rule + required packages
-    install -m 644 "$REPO/router/surflare-lan-tproxy.nft" /etc/surflare-lan-tproxy.nft
-    echo "  LAN tproxy rule installed -> /etc/surflare-lan-tproxy.nft"
+    # Deploy mode-specific tproxy nft.  SURFLARE_MODE env overrides;
+    # default is "rule" (Smart Routing) which is the N100 production mode.
+    _deploy_mode="${SURFLARE_MODE:-rule}"
+    if [ ! -f "$REPO/router/${_deploy_mode}/surflare-lan-tproxy.nft" ]; then
+        echo "ERROR: $REPO/router/${_deploy_mode}/surflare-lan-tproxy.nft not found" >&2
+        echo "  Valid modes: rule, global" >&2
+        exit 1
+    fi
+    install -m 644 "$REPO/router/${_deploy_mode}/surflare-lan-tproxy.nft" /etc/surflare-lan-tproxy.nft
+    echo "  LAN tproxy rule installed (mode=${_deploy_mode}) -> /etc/surflare-lan-tproxy.nft"
     # Guard: remove stale tproxy file from nftables.d if present.
     # fw4 includes all files in /etc/nftables.d/ as fragments; a standalone
     # table definition there breaks fw4 load and leaves the router without

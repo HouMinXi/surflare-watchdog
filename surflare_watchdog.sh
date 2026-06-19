@@ -663,8 +663,17 @@ table inet killswitch {
 		iifname "br-lan" ip daddr @bypass_ipv4 accept
 		iifname "br-lan" ip6 daddr @bypass_ipv6 accept
 		iifname "br-lan" ip saddr @bypass_src accept
-		iifname "br-lan" meta nfproto ipv6 reject with icmpv6 addr-unreachable
+		# Private destinations from LAN (carrier IPs, app-internal VPNs)
+		# are not external leaks; accept like the output chain does.
+		iifname "br-lan" ip daddr @lan_ranges accept
+		iifname "br-lan" ip6 daddr @lan6_ranges accept
+		# NTP: basic utility, no privacy data, devices need accurate time
+		# for TLS certificate validation.
+		iifname "br-lan" udp dport 123 accept
+		# Log ALL remaining non-whitelisted traffic (IPv4 + IPv6) before
+		# rejecting.  The limit prevents dmesg flooding from QUIC bursts.
 		iifname "br-lan" limit rate 5/second burst 10 packets log prefix "ks-fwd-mon: "
+		iifname "br-lan" meta nfproto ipv6 reject with icmpv6 addr-unreachable
 		iifname "br-lan" reject with icmp host-unreachable
 	}
 }
@@ -887,51 +896,52 @@ _remove_killswitch() {
 # the DTLS detection rule intact so they survive across the tombstone window.
 _tombstone_tproxy() {
 	nft list table ip sw_lan_tproxy >/dev/null 2>&1 || return 0
-	local _handle
-	_handle=$(nft -a list chain ip sw_lan_tproxy prerouting 2>/dev/null | \
-		awk '/tproxy.*10800/{print $NF; exit}')
-	if [ -n "$_handle" ]; then
+	# Replace ALL tproxy rules (TCP + QUIC) with reject.  Loop handles
+	# both single-rule (old nft) and dual-rule (TCP+QUIC) configurations.
+	local _handle _replaced=0
+	for _handle in $(nft -a list chain ip sw_lan_tproxy prerouting 2>/dev/null | \
+		awk '/tproxy.*10800/{print $NF}'); do
 		if nft replace rule ip sw_lan_tproxy prerouting handle "$_handle" \
-			iifname "br-lan" meta l4proto tcp reject with icmp host-unreachable \
+			iifname "br-lan" reject with icmp host-unreachable \
 			2>/dev/null; then
-			log "Tombstone: tproxy replaced with REJECT"
-		else
-			log "WARN: tombstone tproxy replace failed"
+			_replaced=$((_replaced + 1))
 		fi
-	fi
+	done
+	[ "$_replaced" -gt 0 ] && log "Tombstone: ${_replaced} tproxy rule(s) replaced with REJECT"
 	# No tproxy rule found means already tombstoned or manually removed;
 	# keep the table (bypass sets, DTLS detection) intact either way.
 }
 
-# Restore tproxy redirect from a tombstoned or missing state.
-# Case (a): table exists with reject rule (tombstoned) -> replace back to tproxy.
-# Case (b): table missing entirely (first boot / manual delete) -> load nft file.
-# Case (c): table exists with tproxy already live -> no-op.
+# Restore tproxy from a tombstoned or missing state by reloading the
+# deployed nft file.  This is simpler and more robust than per-handle
+# replacement: tombstoned rules lose their original protocol/port
+# qualifiers, so a fresh load from the authoritative file is the only
+# way to guarantee correct rule content.
+# Case (a): table exists (tombstoned or partial) -> destroy + reload.
+# Case (b): table missing entirely (first boot) -> load.
+# Case (c): table exists with live tproxy -> reload is idempotent
+#           (destroy + recreate with same content).
 _restore_tproxy() {
 	local _lan_tproxy_nft="/etc/surflare-lan-tproxy.nft"
-	if nft list table ip sw_lan_tproxy >/dev/null 2>&1; then
-		local _restore_handle
-		_restore_handle=$(nft -a list chain ip sw_lan_tproxy prerouting 2>/dev/null | \
-			awk '/reject.*host-unreachable/{print $NF; exit}')
-		if [ -n "$_restore_handle" ]; then
-			if nft replace rule ip sw_lan_tproxy prerouting handle "$_restore_handle" \
-				iifname "br-lan" meta l4proto tcp \
-				tproxy ip to 127.0.0.1:10800 \
-				meta mark set 0x00000001 \
-				accept 2>/dev/null; then
-				log "LAN tproxy restored (tombstone revived)"
-			else
-				log "WARN: tproxy restore via replace failed"
-			fi
-		fi
-		# Already live tproxy (no reject found) = nothing to do
-	elif [ -f "$_lan_tproxy_nft" ]; then
-		if nft -f "$_lan_tproxy_nft" 2>/dev/null; then
-			log "LAN tproxy restored (fresh load)"
-		else
-			log "WARN: LAN tproxy restore failed"
-		fi
+	if [ ! -f "$_lan_tproxy_nft" ]; then
+		log "WARN: $_lan_tproxy_nft not found, cannot restore tproxy"
+		return 1
 	fi
+	# Prepend destroy so the load is atomic: old table removed and new
+	# table created in one nft -f transaction.  bypass_devices and
+	# auto_bypass sets are re-created empty; the connect flow repopulates
+	# them via _update_bypass_devices after restore.
+	local _restore_tmp="/tmp/tproxy_restore_$$.nft"
+	{
+		printf 'destroy table ip sw_lan_tproxy\n'
+		cat "$_lan_tproxy_nft"
+	} > "$_restore_tmp"
+	if nft -f "$_restore_tmp" 2>/dev/null; then
+		log "LAN tproxy restored (fresh load from ${_lan_tproxy_nft})"
+	else
+		log "WARN: LAN tproxy restore failed"
+	fi
+	rm -f "$_restore_tmp"
 }
 
 # Enter storm-protection cooldown. Called from the three storm trigger
@@ -984,6 +994,21 @@ _enter_storm_cooldown() {
 # regardless of DHCP reassignment.
 _update_bypass_devices() {
 	nft list table ip sw_lan_tproxy >/dev/null 2>&1 || return 0
+	# Rule mode: surflare-proxy Smart Routing handles CN/non-CN split at
+	# the application layer, so bypass_devices is not populated.  Only
+	# sync auto_bypass IPs to killswitch bypass_src (corporate VPN clients
+	# still need the forward chain exemption).
+	if [ "$MODE" != "global" ]; then
+		nft flush set inet killswitch bypass_src 2>/dev/null || true
+		local _auto_ips
+		_auto_ips=$(nft list set ip sw_lan_tproxy auto_bypass 2>/dev/null \
+			| grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | paste -sd,)
+		if [ -n "$_auto_ips" ] && nft list table inet killswitch >/dev/null 2>&1; then
+			nft add element inet killswitch bypass_src "{ $_auto_ips }" 2>/dev/null || true
+		fi
+		_sync_dns_enforce_bypass
+		return 0
+	fi
 	nft flush set ip sw_lan_tproxy bypass_devices 2>/dev/null || true
 	# Flush bypass_src unconditionally alongside bypass_devices so stale IPs
 	# are cleared even when all bypass devices are removed from config.
