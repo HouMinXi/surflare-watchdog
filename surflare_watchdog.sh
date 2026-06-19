@@ -14,7 +14,14 @@
 
 NODE="Los Angeles"                    # Set to your node tag (run: surflare nodes)
 NODE_CANDIDATES=("Los Angeles" "Dallas" "Chicago" "New York")  # Atlanta/Miami excluded: Anthropic Cloudflare WAF hard-blocks their exit IPs (HTTP 403, not JS-challenge); verified 2026-06-17
-MODE="global"                         # Connection mode: global, rule, direct
+# Connection mode: set after PLATFORM detection below.
+# router: "rule" (Smart Routing) -- surflare-proxy splits CN-direct vs
+#   non-CN-tunnel at the application layer.  Without this, all tproxy'd
+#   LAN traffic goes through VPN and CN apps see a foreign IP.
+# laptop: "global" -- all traffic through VPN for privacy.  The kernel
+#   output chain cn_ipv4 handles CN-direct at the nft layer, but
+#   there is no tproxy so the split is irrelevant.
+MODE=""  # resolved after PLATFORM detection
 TRANSIT=""                                # Transit server: "" = use TRANSIT_CANDIDATES (logged), "auto" = surflare picks (opaque)
 TRANSIT_CANDIDATES=("Dallas" "Chicago" "Atlanta" "Miami" "New York")  # US-only; KR/HK/TW exits trigger Bing cn redirect
 TRANSIT_CONNECT_TIMEOUT=12             # max seconds for surflare connect per candidate
@@ -76,6 +83,14 @@ if [ -f /etc/openwrt_release ]; then
 	PLATFORM="router"
 else
 	PLATFORM="laptop"
+fi
+
+# Resolve MODE from PLATFORM (can be overridden by setting MODE above)
+if [ -z "$MODE" ]; then
+	case "$PLATFORM" in
+		router) MODE="rule" ;;
+		*)      MODE="global" ;;
+	esac
 fi
 
 # Validate NODE is configured (fail fast if placeholder is unchanged)
