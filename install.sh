@@ -205,13 +205,23 @@ ROUTE_UPDATE_CRON="30 2 * * * $_rucron >> /dev/null 2>&1"
 # grew to 14MB (observed 2026-06-18). 04:30 avoids the 02:30 and 03:00 windows
 # and runs before the 3-min health cron.
 LOGROTATE_CRON="30 4 * * * /usr/sbin/logrotate /etc/logrotate.conf >> /var/log/logrotate.log 2>&1"
+# Dead-man's switch (procd only): remove orphan killswitch if watchdog is
+# not running.  Laptop/systemd does not use persistent killswitch and has
+# no /etc/init.d/surflare-watchdog, so skip the cron to avoid errors.
+if [ "$INIT" = "procd" ]; then
+    DEADMAN_CRON="* * * * * /etc/init.d/surflare-watchdog deadman"
+else
+    DEADMAN_CRON=""
+fi
 ( crontab -l 2>/dev/null \
     | grep -v surflare_node_probe | grep -v surflare_l4_probe \
     | grep -v surflare_log_health | grep -v surflare_route_updater \
-    | grep -v 'logrotate /etc/logrotate.conf'
+    | grep -v 'logrotate /etc/logrotate.conf' \
+    | grep -v 'surflare-watchdog deadman'
   echo "$LOG_HEALTH_CRON"
   echo "$ROUTE_UPDATE_CRON"
-  echo "$LOGROTATE_CRON" ) | crontab -
+  echo "$LOGROTATE_CRON"
+  if [ -n "$DEADMAN_CRON" ]; then echo "$DEADMAN_CRON"; fi ) | crontab -
 # Note: surflare_node_probe.sh is available as a manual diagnostic tool only.
 
 echo ""

@@ -507,7 +507,17 @@ _cleanup_on_startup() {
 	fi
 	log "Startup cleanup: surflare-proxy not running, flushing stale watchdog state"
 	nft delete table inet surflare 2>/dev/null || true
-	nft delete table ip sw_lan_tproxy 2>/dev/null || true
+	# Keep sw_lan_tproxy if it exists (tombstoned or live from a prior
+	# instance): bypass_devices/auto_bypass sets persist, and the connect
+	# flow will restore the tproxy rule via nft replace.
+	# Keep killswitch if it exists: CN traffic stays protected.
+	# The connect flow calls _install_killswitch only when
+	# _killswitch_armed is 0 (see main loop), so a surviving killswitch
+	# from the prior instance is reused.
+	if nft list table inet killswitch >/dev/null 2>&1; then
+		log "Reusing existing killswitch (surviving from prior instance)"
+		_killswitch_armed=1
+	fi
 	ip rule del fwmark 0x1 lookup 100 2>/dev/null || true
 	# F13: respect an in-progress storm cool across a restart.  If the
 	# persisted cool-until timestamp is in the future, sleep the
@@ -823,8 +833,65 @@ NFTEOF
 	log "Kill switch: server_ips updated (${_diag_server_ips})"
 }
 
+# Unused: cleanup() uses modular teardown (flush server_ips, keep table),
+# stop_service() uses _full_teardown (delete table).  Retained for manual
+# emergency use: source this file and call _remove_killswitch.
 _remove_killswitch() {
 	nft delete table inet killswitch 2>/dev/null || true
+}
+
+# Replace the tproxy redirect rule with a reject so LAN TCP gets fast ICMP
+# failure instead of black-holing into a dead proxy or leaking via direct
+# forwarding.  Idempotent: safe to call when tproxy is already tombstoned
+# or the table does not exist.  Leaves bypass_devices/auto_bypass sets and
+# the DTLS detection rule intact so they survive across the tombstone window.
+_tombstone_tproxy() {
+	nft list table ip sw_lan_tproxy >/dev/null 2>&1 || return 0
+	local _handle
+	_handle=$(nft -a list chain ip sw_lan_tproxy prerouting 2>/dev/null | \
+		awk '/tproxy.*10800/{print $NF; exit}')
+	if [ -n "$_handle" ]; then
+		if nft replace rule ip sw_lan_tproxy prerouting handle "$_handle" \
+			iifname "br-lan" meta l4proto tcp reject with icmp host-unreachable \
+			2>/dev/null; then
+			log "Tombstone: tproxy replaced with REJECT"
+		else
+			log "WARN: tombstone tproxy replace failed"
+		fi
+	fi
+	# No tproxy rule found means already tombstoned or manually removed;
+	# keep the table (bypass sets, DTLS detection) intact either way.
+}
+
+# Restore tproxy redirect from a tombstoned or missing state.
+# Case (a): table exists with reject rule (tombstoned) -> replace back to tproxy.
+# Case (b): table missing entirely (first boot / manual delete) -> load nft file.
+# Case (c): table exists with tproxy already live -> no-op.
+_restore_tproxy() {
+	local _lan_tproxy_nft="/etc/surflare-lan-tproxy.nft"
+	if nft list table ip sw_lan_tproxy >/dev/null 2>&1; then
+		local _restore_handle
+		_restore_handle=$(nft -a list chain ip sw_lan_tproxy prerouting 2>/dev/null | \
+			awk '/reject.*host-unreachable/{print $NF; exit}')
+		if [ -n "$_restore_handle" ]; then
+			if nft replace rule ip sw_lan_tproxy prerouting handle "$_restore_handle" \
+				iifname "br-lan" meta l4proto tcp \
+				tproxy ip to 127.0.0.1:10800 \
+				meta mark set 0x00000001 \
+				accept 2>/dev/null; then
+				log "LAN tproxy restored (tombstone revived)"
+			else
+				log "WARN: tproxy restore via replace failed"
+			fi
+		fi
+		# Already live tproxy (no reject found) = nothing to do
+	elif [ -f "$_lan_tproxy_nft" ]; then
+		if nft -f "$_lan_tproxy_nft" 2>/dev/null; then
+			log "LAN tproxy restored (fresh load)"
+		else
+			log "WARN: LAN tproxy restore failed"
+		fi
+	fi
 }
 
 # Enter storm-protection cooldown. Called from the three storm trigger
@@ -842,23 +909,7 @@ _enter_storm_cooldown() {
 	#
 	# Before v64: deleted tproxy + killswitch -> 600s IP leak window.
 	# Tombstone: killswitch stays armed, overseas gets REJECT (fast fail).
-	local _handle
-	if nft list table ip sw_lan_tproxy >/dev/null 2>&1; then
-		_handle=$(nft -a list chain ip sw_lan_tproxy prerouting 2>/dev/null | \
-			awk '/tproxy.*10800/{print $NF; exit}')
-		if [ -n "$_handle" ]; then
-			if nft replace rule ip sw_lan_tproxy prerouting handle "$_handle" \
-				iifname "br-lan" meta l4proto tcp reject with icmp host-unreachable \
-				2>/dev/null; then
-				log "Tombstone: tproxy replaced with REJECT"
-			else
-				log "WARN: tombstone tproxy replace failed"
-			fi
-		else
-			# No tproxy rule found (already removed?) -- delete table to avoid stale state
-			nft delete table ip sw_lan_tproxy 2>/dev/null || true
-		fi
-	fi
+	_tombstone_tproxy
 	# Flush server_ips so VPN server traffic is also blocked by killswitch
 	nft flush set inet killswitch server_ips 2>/dev/null || true
 	nft flush set inet killswitch server_ips6 2>/dev/null || true
@@ -1948,15 +1999,11 @@ connect_vpn() {
 		[ "$rule_count" -gt 0 ] && log "Removed ${rule_count} residual ip rule(s) fwmark 0x1 lookup 100"
 		ip route flush table 100 2>/dev/null || true
 
-		# Remove LAN tproxy to prevent black-holing LAN traffic while the proxy
-		# is down. Without this, sw_lan_tproxy continues routing all LAN TCP to
-		# :10800 which has no listener, silently dropping all packets for the
-		# ~24s reconnect window. LAN devices fall through to direct fw4 routing
-		# so CN ISP pages remain accessible during reconnect.
-		if nft list table ip sw_lan_tproxy >/dev/null 2>&1; then
-			nft delete table ip sw_lan_tproxy 2>/dev/null || true
-			log "LAN tproxy removed: direct routing active during reconnect"
-		fi
+		# Tombstone LAN tproxy: replace the tproxy redirect with reject so
+		# LAN TCP gets ICMP host-unreachable instead of black-holing into a
+		# dead proxy.  Keeps bypass_devices/auto_bypass sets and DTLS
+		# detection intact so bypass devices are not disrupted by reconnect.
+		_tombstone_tproxy
 
 		# O3 (v3.2): token refresh gated by file timestamp. Runs in
 		# direct-routing window (nft flushed, API reachable via ISP).
@@ -2261,9 +2308,18 @@ cleanup() {
 	# in the next instance handles any survivor.
 	killall surflare-proxy 2>/dev/null
 	nft delete table inet surflare_moat 2>/dev/null || true
-	nft delete table ip sw_lan_tproxy 2>/dev/null || true
-	nft delete table ip dns_enforce 2>/dev/null || true
-	_remove_killswitch
+	# Modular teardown: keep killswitch and dns_enforce alive across
+	# restart so CN traffic continues flowing and LAN DNS enforcement
+	# persists.  Only flush server_ips so VPN server traffic is blocked
+	# until the next instance reconnects.  Tombstone tproxy (replace
+	# tproxy rule with reject) so non-CN LAN TCP gets fast ICMP failure
+	# instead of black-holing into a dead proxy or leaking via direct
+	# forwarding.  The next instance's connect flow restores tproxy.
+	# stop_service() in the init script handles full teardown on
+	# explicit service stop (prevents self-lock).
+	_tombstone_tproxy
+	nft flush set inet killswitch server_ips 2>/dev/null || true
+	nft flush set inet killswitch server_ips6 2>/dev/null || true
 	nft delete table inet surflare 2>/dev/null || true
 	# Drop run-state sentinels so a future restart does not inherit
 	# stale "ready" markers.
@@ -2549,19 +2605,9 @@ while true; do
 					fi
 				fi
 				_update_killswitch_server_ips
-				_update_bypass_devices
 				# Restore LAN tproxy now that the new proxy is ready on :10800.
-				# Only restore if it was removed during this reconnect cycle.
-				_lan_tproxy_nft="/etc/surflare-lan-tproxy.nft"
-				if [ -f "$_lan_tproxy_nft" ] && \
-				   ! nft list table ip sw_lan_tproxy >/dev/null 2>&1; then
-					if nft -f "$_lan_tproxy_nft" 2>/dev/null; then
-						log "LAN tproxy restored"
-					else
-						log "WARN: LAN tproxy restore failed"
-					fi
-					_update_bypass_devices
-				fi
+				_restore_tproxy
+				_update_bypass_devices
 				_record_connect "${_active_node}" "${new_health}"
 			else
 				reconnect_count=$((reconnect_count + 1))
