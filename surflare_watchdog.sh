@@ -544,6 +544,9 @@ table inet killswitch {
 	set server_ips6 { type ipv6_addr; }
 	set bypass_ipv4 { type ipv4_addr; flags interval; }
 	set bypass_ipv6 { type ipv6_addr; flags interval; }
+	# bypass_src: LAN device source IPs that skip tproxy (bypass_devices).
+	# Their non-CN traffic is forwarded directly; no log noise needed.
+	set bypass_src  { type ipv4_addr; }
 	set lan_ranges {
 		type ipv4_addr
 		flags interval
@@ -602,6 +605,7 @@ table inet killswitch {
 		iifname "br-lan" ip daddr @bypass_ipv4 accept
 		iifname "br-lan" ip6 daddr @bypass_ipv6 accept
 		iifname "br-lan" meta nfproto ipv6 reject with icmpv6 addr-unreachable
+		iifname "br-lan" ip saddr @bypass_src accept
 		iifname "br-lan" limit rate 5/second burst 10 packets log prefix "ks-fwd-mon: "
 	}
 }
@@ -894,6 +898,13 @@ _update_bypass_devices() {
 	all_ips=$(echo "$all_ips" | tr ',' '\n' | sort -u | paste -sd,)
 	nft add element ip sw_lan_tproxy bypass_devices "{ $all_ips }" 2>/dev/null || \
 		log "WARN: bypass_devices update failed (${all_ips})"
+	# Sync bypass device IPs into killswitch bypass_src so their non-CN traffic
+	# does not trigger ks-fwd-mon log noise (traffic is forwarded, just not logged).
+	if nft list table inet killswitch >/dev/null 2>&1; then
+		nft flush set inet killswitch bypass_src 2>/dev/null
+		nft add element inet killswitch bypass_src "{ $all_ips }" 2>/dev/null || \
+			log "WARN: killswitch bypass_src sync failed"
+	fi
 	_sync_dns_enforce_bypass
 }
 
@@ -2300,12 +2311,16 @@ while true; do
 		storm_sleep_pid=""
 		continue
 	fi
-	# Change 2: detector liveness -- warn if heartbeat file is stale
-	_det_age=$(( $(date +%s) - $(stat -c %Y "$DETECTOR_ALIVE_FILE" 2>/dev/null || echo 0) ))
-	if [[ -f "$DETECTOR_ALIVE_FILE" ]] && (( _det_age > 75 )); then
-		log "WARN: early_detector_stale age=${_det_age}s -- P0 coverage degraded"
+	# Detector liveness: warn if heartbeat file is stale.
+	# Skip on router: early_detector requires nm-online (laptop only),
+	# so the heartbeat file never updates on procd/OpenWrt.
+	if [ "$PLATFORM" != "router" ]; then
+		_det_age=$(( $(date +%s) - $(stat -c %Y "$DETECTOR_ALIVE_FILE" 2>/dev/null || echo 0) ))
+		if [[ -f "$DETECTOR_ALIVE_FILE" ]] && (( _det_age > 75 )); then
+			log "WARN: early_detector_stale age=${_det_age}s -- P0 coverage degraded"
+		fi
+		unset _det_age
 	fi
-	unset _det_age
 	if recent_wifi_crash 120; then
 		record_crash
 		if crash_rate_exceeded; then
