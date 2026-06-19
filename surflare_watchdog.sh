@@ -562,6 +562,7 @@ _cleanup_on_startup() {
 	# even when the killswitch reuse path skips _install_killswitch.
 	_ensure_dns_enforce
 	ip rule del fwmark 0x1 lookup 100 2>/dev/null || true
+	ip -6 rule del fwmark 0x1 lookup 100 2>/dev/null || true
 	# F13: respect an in-progress storm cool across a restart.  If the
 	# persisted cool-until timestamp is in the future, sleep the
 	# remaining window before re-entering the main loop.  This prevents
@@ -904,7 +905,7 @@ _remove_killswitch() {
 # or the table does not exist.  Leaves bypass_devices/auto_bypass sets and
 # the DTLS detection rule intact so they survive across the tombstone window.
 _tombstone_tproxy() {
-	nft list table ip sw_lan_tproxy >/dev/null 2>&1 || return 0
+	nft list table inet sw_lan_tproxy >/dev/null 2>&1 || return 0
 	# Replace each tproxy rule with a protocol-matched reject so only
 	# the originally proxied protocols are blocked.  Without the qualifier
 	# the first reject catches ALL br-lan traffic and over-blocks
@@ -914,22 +915,22 @@ _tombstone_tproxy() {
 		[ -z "$_line" ] && continue
 		_handle=${_line##* }
 		if echo "$_line" | grep -q 'meta l4proto tcp'; then
-			nft replace rule ip sw_lan_tproxy prerouting handle "$_handle" \
+			nft replace rule inet sw_lan_tproxy prerouting handle "$_handle" \
 				iifname "br-lan" meta l4proto tcp \
 				reject with tcp reset 2>/dev/null && \
 				_replaced=$((_replaced + 1))
 		elif echo "$_line" | grep -q 'udp dport 443'; then
-			nft replace rule ip sw_lan_tproxy prerouting handle "$_handle" \
+			nft replace rule inet sw_lan_tproxy prerouting handle "$_handle" \
 				iifname "br-lan" udp dport 443 \
-				reject with icmp host-unreachable 2>/dev/null && \
+				reject 2>/dev/null && \
 				_replaced=$((_replaced + 1))
 		else
-			nft replace rule ip sw_lan_tproxy prerouting handle "$_handle" \
-				iifname "br-lan" reject with icmp host-unreachable \
+			nft replace rule inet sw_lan_tproxy prerouting handle "$_handle" \
+				iifname "br-lan" reject \
 				2>/dev/null && _replaced=$((_replaced + 1))
 		fi
 	done <<EOF
-$(nft -a list chain ip sw_lan_tproxy prerouting 2>/dev/null | grep 'tproxy.*10800')
+$(nft -a list chain inet sw_lan_tproxy prerouting 2>/dev/null | grep 'tproxy.*10800')
 EOF
 	[ "$_replaced" -gt 0 ] && log "Tombstone: ${_replaced} tproxy rule(s) replaced with REJECT"
 	# No tproxy rule found means already tombstoned or manually removed;
@@ -957,7 +958,7 @@ _restore_tproxy() {
 	# them via _update_bypass_devices after restore.
 	local _restore_tmp="/tmp/tproxy_restore_$$.nft"
 	{
-		printf 'destroy table ip sw_lan_tproxy\n'
+		printf 'destroy table inet sw_lan_tproxy\n'
 		cat "$_lan_tproxy_nft"
 	} > "$_restore_tmp"
 	local _nft_err
@@ -1019,14 +1020,14 @@ _enter_storm_cooldown() {
 # The MAC-based path re-resolves IPs on every VPN connect, so devices work
 # regardless of DHCP reassignment.
 _update_bypass_devices() {
-	nft list table ip sw_lan_tproxy >/dev/null 2>&1 || return 0
+	nft list table inet sw_lan_tproxy >/dev/null 2>&1 || return 0
 	# Rule mode: surflare-proxy Smart Routing handles CN/non-CN split at
 	# the application layer, so bypass_devices is not populated.  Only
 	# sync auto_bypass IPs to killswitch bypass_src (corporate VPN clients
 	# still need the forward chain exemption).
 	if [ "$MODE" != "global" ]; then
 		local _auto_ips
-		_auto_ips=$(nft list set ip sw_lan_tproxy auto_bypass 2>/dev/null \
+		_auto_ips=$(nft list set inet sw_lan_tproxy auto_bypass 2>/dev/null \
 			| grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | paste -sd,)
 		# Atomic flush+add via nft -f so bypass_src is never empty mid-update.
 		if nft list table inet killswitch >/dev/null 2>&1; then
@@ -1039,7 +1040,7 @@ _update_bypass_devices() {
 		_sync_dns_enforce_bypass
 		return 0
 	fi
-	nft flush set ip sw_lan_tproxy bypass_devices 2>/dev/null || true
+	nft flush set inet sw_lan_tproxy bypass_devices 2>/dev/null || true
 	# Flush bypass_src unconditionally alongside bypass_devices so stale IPs
 	# are cleared even when all bypass devices are removed from config.
 	nft flush set inet killswitch bypass_src 2>/dev/null || true
@@ -1062,7 +1063,7 @@ _update_bypass_devices() {
 	[ -z "$all_ips" ] && return 0
 	# Deduplicate in case same IP appears in both BYPASS_LAN_DEVICES and MAC file
 	all_ips=$(echo "$all_ips" | tr ',' '\n' | sort -u | paste -sd,)
-	nft add element ip sw_lan_tproxy bypass_devices "{ $all_ips }" 2>/dev/null || \
+	nft add element inet sw_lan_tproxy bypass_devices "{ $all_ips }" 2>/dev/null || \
 		log "WARN: bypass_devices update failed (${all_ips})"
 	# Sync bypass device IPs into killswitch bypass_src so their non-CN traffic
 	# does not trigger ks-fwd-mon log noise (traffic is forwarded, just not logged).
@@ -1074,7 +1075,7 @@ _update_bypass_devices() {
 		# return, so their non-CN traffic reaches the killswitch forward chain
 		# and must be accepted (not rejected).
 		local _auto_ips
-		_auto_ips=$(nft list set ip sw_lan_tproxy auto_bypass 2>/dev/null \
+		_auto_ips=$(nft list set inet sw_lan_tproxy auto_bypass 2>/dev/null \
 			| grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | paste -sd,)
 		if [ -n "$_auto_ips" ]; then
 			nft add element inet killswitch bypass_src "{ $_auto_ips }" 2>/dev/null || true
@@ -1091,10 +1092,10 @@ _update_bypass_devices() {
 # between reconnects).
 _sync_dns_enforce_bypass() {
 	local _dns_ips="" _static _auto
-	_static=$(nft list set ip sw_lan_tproxy bypass_devices 2>/dev/null \
+	_static=$(nft list set inet sw_lan_tproxy bypass_devices 2>/dev/null \
 		| grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | paste -sd,)
 	[ -n "$_static" ] && _dns_ips="$_static"
-	_auto=$(nft list set ip sw_lan_tproxy auto_bypass 2>/dev/null \
+	_auto=$(nft list set inet sw_lan_tproxy auto_bypass 2>/dev/null \
 		| grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | paste -sd,)
 	[ -n "$_auto" ] && _dns_ips="${_dns_ips:+$_dns_ips,}$_auto"
 	_dns_ips=$(echo "$_dns_ips" | tr ',' '\n' | sort -u | paste -sd,)
@@ -1900,6 +1901,7 @@ cleanup_probe_state() {
 		nft delete table inet surflare 2>/dev/null || true
 	fi
 	while ip rule del fwmark 0x1 lookup 100 2>/dev/null; do :; done
+	while ip -6 rule del fwmark 0x1 lookup 100 2>/dev/null; do :; done
 	ip route flush table 100 2>/dev/null || true
 }
 
@@ -2089,6 +2091,9 @@ connect_vpn() {
 		# Loop: ip rule del only removes one entry at a time; drain all matching rules
 		local rule_count=0
 		while ip rule del fwmark 0x1 lookup 100 2>/dev/null; do
+			rule_count=$((rule_count + 1))
+		done
+		while ip -6 rule del fwmark 0x1 lookup 100 2>/dev/null; do
 			rule_count=$((rule_count + 1))
 		done
 		[ "$rule_count" -gt 0 ] && log "Removed ${rule_count} residual ip rule(s) fwmark 0x1 lookup 100"
@@ -2585,6 +2590,7 @@ while true; do
 			nft delete table inet surflare 2>/dev/null || true
 			_stale=0
 			while ip rule del fwmark 0x1 lookup 100 2>/dev/null; do _stale=$((_stale+1)); done
+			while ip -6 rule del fwmark 0x1 lookup 100 2>/dev/null; do _stale=$((_stale+1)); done
 			ip route flush table 100 2>/dev/null || true
 			log "Flushed stale nftables/routing (${_stale} rule(s))"
 		fi

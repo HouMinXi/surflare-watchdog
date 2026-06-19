@@ -50,11 +50,12 @@ stop_service() {
 # Shared teardown logic for stop_service and the dead-man's switch cron.
 _full_teardown() {
     nft delete table inet killswitch 2>/dev/null
-    nft delete table ip sw_lan_tproxy 2>/dev/null
+    nft delete table inet sw_lan_tproxy 2>/dev/null
     nft delete table ip dns_enforce 2>/dev/null
     nft delete table inet surflare 2>/dev/null
     nft delete table inet surflare_moat 2>/dev/null
     ip rule del fwmark 0x1 lookup 100 2>/dev/null
+    ip -6 rule del fwmark 0x1 lookup 100 2>/dev/null
     rm -f /run/surflare_watchdog.killswitch_ready
     rm -f /run/surflare_watchdog.storm_cool_until
 }

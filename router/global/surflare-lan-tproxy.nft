@@ -3,7 +3,8 @@
 # bypass_devices: populated by watchdog from /etc/surflare/bypass-macs.conf
 #   for devices that need direct CN ISP (e.g. Thunder).
 # auto_bypass: DTLS 1.2 detection for corporate VPN clients (e.g. AnyConnect).
-table ip sw_lan_tproxy {
+# IPv6: tproxied alongside IPv4; auto_bypass is IPv4-only (no IPv6 DTLS use case).
+table inet sw_lan_tproxy {
     set bypass_devices {
         type ipv4_addr;
     }
@@ -18,9 +19,14 @@ table ip sw_lan_tproxy {
     chain prerouting {
         type filter hook prerouting priority mangle - 10; policy accept;
 
-        # Private destinations: direct, no proxy needed
+        # Private destinations: direct, no proxy needed (IPv4)
         iifname "br-lan" ip daddr {
             10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 127.0.0.0/8
+        } return
+
+        # Private destinations: direct, no proxy needed (IPv6)
+        iifname "br-lan" ip6 daddr {
+            ::1/128, fe80::/10, fc00::/7
         } return
 
         # Static bypass (bypass-macs.conf devices via watchdog)
@@ -33,19 +39,32 @@ table ip sw_lan_tproxy {
         # Adds source IP to auto_bypass with 5-min timeout, then returns
         # so the packet is NOT caught by the QUIC tproxy rule below.
         # Keepalives (~30s) renew the timeout; VPN closes -> expires -> resumes proxy.
-        iifname "br-lan" udp dport 443 @th,72,16 0xfefd \
+        # IPv4-only: auto_bypass set is type ipv4_addr.
+        iifname "br-lan" meta nfproto ipv4 udp dport 443 @th,72,16 0xfefd \
             add @auto_bypass { ip saddr timeout 5m } return
 
-        # TCP tproxy: all remaining LAN TCP to surflare-proxy
-        iifname "br-lan" meta l4proto tcp \
+        # TCP tproxy: all remaining LAN TCP to surflare-proxy (IPv4)
+        iifname "br-lan" meta nfproto ipv4 meta l4proto tcp \
             tproxy ip to 127.0.0.1:10800 \
+            meta mark set 0x00000001 \
+            accept
+
+        # TCP tproxy: IPv6
+        iifname "br-lan" meta nfproto ipv6 meta l4proto tcp \
+            tproxy ip6 to [::1]:10800 \
             meta mark set 0x00000001 \
             accept
 
         # QUIC tproxy: UDP/443 to surflare-proxy (eliminates 300ms TCP fallback).
         # Global mode: all QUIC exits via VPN like TCP.
-        iifname "br-lan" udp dport 443 \
+        iifname "br-lan" meta nfproto ipv4 udp dport 443 \
             tproxy ip to 127.0.0.1:10800 \
+            meta mark set 0x00000001 \
+            accept
+
+        # QUIC tproxy: IPv6 UDP/443
+        iifname "br-lan" meta nfproto ipv6 udp dport 443 \
+            tproxy ip6 to [::1]:10800 \
             meta mark set 0x00000001 \
             accept
     }
