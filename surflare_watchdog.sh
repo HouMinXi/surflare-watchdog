@@ -341,9 +341,9 @@ _setup_kernel_moat() {
 }
 
 _setup_chnroute() {
-	if [ "$MODE" != "global" ]; then
-		return 0
-	fi
+	# Populates CN bypass CIDRs into killswitch bypass_ipv4/bypass_ipv6
+	# (both modes) and surflare output chain cn_ipv4/cn_ipv6 accept rules
+	# (global mode only -- rule mode delegates CN split to surflare-proxy).
 	local cn_v4_file="/etc/surflare/cn_ipv4.txt"
 	local cn_v6_file="/etc/surflare/cn_ipv6.txt"
 	mkdir -p /etc/surflare 2>/dev/null || true
@@ -357,139 +357,164 @@ _setup_chnroute() {
 		cp "$baseline_dir/cn_ipv6.txt" "$cn_v6_file" 2>/dev/null || true
 	fi
 
-	if ! nft list table inet surflare >/dev/null 2>&1; then
-		log "WARN: inet surflare table not ready, skipping CN bypass"
+	# Global mode needs inet surflare table for the output chain cn_ipv4 rule.
+	# Rule mode skips the surflare output chain (app-layer handles CN split),
+	# but still needs killswitch bypass_ipv4 populated.
+	local _surflare_table_ready=0
+	if nft list table inet surflare >/dev/null 2>&1; then
+		_surflare_table_ready=1
+	fi
+	if [ "$MODE" = "global" ] && [ "$_surflare_table_ready" -eq 0 ]; then
+		log "WARN: inet surflare table not ready, skipping output-chain CN bypass"
+		# Do NOT return: killswitch bypass_ipv4 can still be populated
+		# even when surflare table is absent.  Fall through.
+	fi
+	# Either mode: killswitch table is required for bypass_ipv4 population.
+	if ! nft list table inet killswitch >/dev/null 2>&1; then
+		log "WARN: killswitch table not ready, skipping CN bypass"
 		return 1
 	fi
 
 	local bypass_applied=0
-
-	if [ -f "$cn_v4_file" ]; then
-		local cn_count cn_date
-		cn_count=$(grep -vc '^#' "$cn_v4_file" 2>/dev/null || echo 0)
-		cn_date=$(stat -c '%y' "$cn_v4_file" 2>/dev/null | cut -d' ' -f1)
-		log "Applying Chnroute v4: ${cn_count} prefixes (file date: ${cn_date})"
-
-		nft add set inet surflare cn_ipv4 '{ type ipv4_addr; flags interval; }' 2>/dev/null || true
-		nft flush set inet surflare cn_ipv4 2>/dev/null || true
-
-		local tmp_nft="/tmp/cn_ipv4_$$.nft"
-		{
-			printf 'add element inet surflare cn_ipv4 { '
-			grep -v '^#' "$cn_v4_file" | grep -v '^[[:space:]]*$' | paste -sd, -
-			printf ' }\n'
-		} > "$tmp_nft"
-		local _v4_ok=0 _v4_try=0
-		while [ "$_v4_try" -lt 3 ] && [ "$_v4_ok" -eq 0 ]; do
-			if nft -f "$tmp_nft" 2>/dev/null; then _v4_ok=1
-			else _v4_try=$((_v4_try+1)); [ "$_v4_try" -lt 3 ] && sleep 2; fi
-		done
-		if [ "$_v4_ok" -eq 1 ]; then
-			nft insert rule inet surflare output ip daddr @cn_ipv4 accept 2>/dev/null || true
-			log "Chnroute v4 applied: CN prefixes bypass proxy via output chain"
-			bypass_applied=$((bypass_applied + 1))
-			if nft list table inet killswitch >/dev/null 2>&1; then
-				local tmp_ks_v4="/tmp/ks_bypass_v4_$$.nft"
-				{
-					printf 'flush set inet killswitch bypass_ipv4\n'
-					printf 'add element inet killswitch bypass_ipv4 { '
-					grep -v '^#' "$cn_v4_file" | grep -v '^[[:space:]]*$' | paste -sd, -
-					printf ' }\n'
-				} > "$tmp_ks_v4"
-				nft -f "$tmp_ks_v4" 2>/dev/null || \
-					log "WARN: kill switch bypass_ipv4 sync failed"
-				rm -f "$tmp_ks_v4"
-			fi
-		else
-			log "WARN: Failed to load Chnroute v4 into nftables after 3 attempts; CN bypass not active"
-		fi
-		rm -f "$tmp_nft"
-	fi
-
-	if [ -f "$cn_v6_file" ]; then
-		local cn_count_v6 cn_date_v6
-		cn_count_v6=$(grep -vc '^#' "$cn_v6_file" 2>/dev/null || echo 0)
-		cn_date_v6=$(stat -c '%y' "$cn_v6_file" 2>/dev/null | cut -d' ' -f1)
-		log "Applying Chnroute v6: ${cn_count_v6} prefixes (file date: ${cn_date_v6})"
-
-		nft add set inet surflare cn_ipv6 '{ type ipv6_addr; flags interval; }' 2>/dev/null || true
-		nft flush set inet surflare cn_ipv6 2>/dev/null || true
-
-		local tmp_nft_v6="/tmp/cn_ipv6_$$.nft"
-		{
-			printf 'add element inet surflare cn_ipv6 { '
-			grep -v '^#' "$cn_v6_file" | grep -v '^[[:space:]]*$' | paste -sd, -
-			printf ' }\n'
-		} > "$tmp_nft_v6"
-		local _v6_ok=0 _v6_try=0
-		while [ "$_v6_try" -lt 3 ] && [ "$_v6_ok" -eq 0 ]; do
-			if nft -f "$tmp_nft_v6" 2>/dev/null; then _v6_ok=1
-			else _v6_try=$((_v6_try+1)); [ "$_v6_try" -lt 3 ] && sleep 2; fi
-		done
-		if [ "$_v6_ok" -eq 1 ]; then
-			nft insert rule inet surflare output ip6 daddr @cn_ipv6 accept 2>/dev/null || true
-			log "Chnroute v6 applied: CN v6 prefixes bypass proxy via output chain"
-			bypass_applied=$((bypass_applied + 1))
-			if nft list table inet killswitch >/dev/null 2>&1; then
-				local tmp_ks_v6="/tmp/ks_bypass_v6_$$.nft"
-				{
-					printf 'flush set inet killswitch bypass_ipv6\n'
-					printf 'add element inet killswitch bypass_ipv6 { '
-					grep -v '^#' "$cn_v6_file" | grep -v '^[[:space:]]*$' | paste -sd, -
-					printf ' }\n'
-				} > "$tmp_ks_v6"
-				nft -f "$tmp_ks_v6" 2>/dev/null || \
-					log "WARN: kill switch bypass_ipv6 sync failed"
-				rm -f "$tmp_ks_v6"
-			fi
-		else
-			log "WARN: Failed to load Chnroute v6 into nftables after 3 attempts; CN bypass not active"
-		fi
-		rm -f "$tmp_nft_v6"
-	fi
-
-	if [ "$bypass_applied" -eq 0 ]; then
-		log "WARN: no chnroute files; CN bypass disabled"
-	fi
-
-	# Load cloud CDN extra bypass (Tencent/Alibaba international nodes).
-	# This file is maintained separately from cn_ipv4.txt and never overwritten
-	# by the main chnroute update -- it accumulates validated cloud CDN CIDRs.
 	local cn_v4_extra_file="/etc/surflare/cn_ipv4_extra.txt"
-	if [ -f "$cn_v4_extra_file" ] && \
-	   nft list table inet surflare >/dev/null 2>&1; then
-		local extra_count extra_date tmp_extra tmp_ks_extra
-		extra_count=$(grep -vc '^#' "$cn_v4_extra_file" 2>/dev/null || echo 0)
-		extra_date=$(stat -c '%y' "$cn_v4_extra_file" 2>/dev/null | cut -d' ' -f1)
-		log "Applying cloud CDN extra bypass: ${extra_count} CIDRs (${extra_date})"
-		tmp_extra="/tmp/cn_v4_extra_$$.nft"
-		{
-			printf 'add element inet surflare cn_ipv4 { '
-			grep -v '^#' "$cn_v4_extra_file" | \
-				grep -v '^[[:space:]]*$' | paste -sd, -
-			printf ' }\n'
-		} > "$tmp_extra"
-		if nft -f "$tmp_extra" 2>/dev/null; then
-			log "Cloud CDN extra bypass applied to surflare cn_ipv4"
-		else
-			log "WARN: cloud CDN extra bypass load failed (nft error)"
-		fi
-		rm -f "$tmp_extra"
-		if nft list table inet killswitch >/dev/null 2>&1; then
-			tmp_ks_extra="/tmp/ks_extra_$$.nft"
+
+	# --- surflare output chain (global mode only) ---
+	# Kernel-level CN bypass for the router's own processes.  Each protocol
+	# has its own retry loop because the surflare table may still be loading.
+	if [ "$MODE" = "global" ] && [ "$_surflare_table_ready" -eq 1 ]; then
+		if [ -f "$cn_v4_file" ]; then
+			local cn_count cn_date
+			cn_count=$(grep -vc '^#' "$cn_v4_file" 2>/dev/null || echo 0)
+			cn_date=$(stat -c '%y' "$cn_v4_file" 2>/dev/null | cut -d' ' -f1)
+			log "Applying Chnroute v4 to surflare output: ${cn_count} prefixes (${cn_date})"
+
+			nft add set inet surflare cn_ipv4 '{ type ipv4_addr; flags interval; }' 2>/dev/null || true
+			nft flush set inet surflare cn_ipv4 2>/dev/null || true
+
+			local tmp_nft="/tmp/cn_ipv4_$$.nft"
 			{
-				printf 'add element inet killswitch bypass_ipv4 { '
+				printf 'add element inet surflare cn_ipv4 { '
+				grep -v '^#' "$cn_v4_file" | grep -v '^[[:space:]]*$' | paste -sd, -
+				printf ' }\n'
+			} > "$tmp_nft"
+			local _v4_ok=0 _v4_try=0
+			while [ "$_v4_try" -lt 3 ] && [ "$_v4_ok" -eq 0 ]; do
+				if nft -f "$tmp_nft" 2>/dev/null; then _v4_ok=1
+				else _v4_try=$((_v4_try+1)); [ "$_v4_try" -lt 3 ] && sleep 2; fi
+			done
+			if [ "$_v4_ok" -eq 1 ]; then
+				nft insert rule inet surflare output ip daddr @cn_ipv4 accept 2>/dev/null || true
+				log "Chnroute v4 applied: CN prefixes bypass proxy via output chain"
+				bypass_applied=$((bypass_applied + 1))
+			else
+				log "WARN: Failed to load Chnroute v4 into surflare output after 3 attempts"
+			fi
+			rm -f "$tmp_nft"
+		fi
+
+		if [ -f "$cn_v6_file" ]; then
+			local cn_count_v6 cn_date_v6
+			cn_count_v6=$(grep -vc '^#' "$cn_v6_file" 2>/dev/null || echo 0)
+			cn_date_v6=$(stat -c '%y' "$cn_v6_file" 2>/dev/null | cut -d' ' -f1)
+			log "Applying Chnroute v6 to surflare output: ${cn_count_v6} prefixes (${cn_date_v6})"
+
+			nft add set inet surflare cn_ipv6 '{ type ipv6_addr; flags interval; }' 2>/dev/null || true
+			nft flush set inet surflare cn_ipv6 2>/dev/null || true
+
+			local tmp_nft_v6="/tmp/cn_ipv6_$$.nft"
+			{
+				printf 'add element inet surflare cn_ipv6 { '
+				grep -v '^#' "$cn_v6_file" | grep -v '^[[:space:]]*$' | paste -sd, -
+				printf ' }\n'
+			} > "$tmp_nft_v6"
+			local _v6_ok=0 _v6_try=0
+			while [ "$_v6_try" -lt 3 ] && [ "$_v6_ok" -eq 0 ]; do
+				if nft -f "$tmp_nft_v6" 2>/dev/null; then _v6_ok=1
+				else _v6_try=$((_v6_try+1)); [ "$_v6_try" -lt 3 ] && sleep 2; fi
+			done
+			if [ "$_v6_ok" -eq 1 ]; then
+				nft insert rule inet surflare output ip6 daddr @cn_ipv6 accept 2>/dev/null || true
+				log "Chnroute v6 applied: CN v6 prefixes bypass proxy via output chain"
+				bypass_applied=$((bypass_applied + 1))
+			else
+				log "WARN: Failed to load Chnroute v6 into surflare output after 3 attempts"
+			fi
+			rm -f "$tmp_nft_v6"
+		fi
+
+		# Cloud CDN extra bypass additive to surflare cn_ipv4 (Tencent/Alibaba APAC).
+		if [ -f "$cn_v4_extra_file" ]; then
+			local extra_count extra_date
+			extra_count=$(grep -vc '^#' "$cn_v4_extra_file" 2>/dev/null || echo 0)
+			extra_date=$(stat -c '%y' "$cn_v4_extra_file" 2>/dev/null | cut -d' ' -f1)
+			log "Cloud CDN extra: ${extra_count} CIDRs (${extra_date}) -> surflare cn_ipv4"
+			local tmp_extra="/tmp/cn_v4_extra_$$.nft"
+			{
+				printf 'add element inet surflare cn_ipv4 { '
 				grep -v '^#' "$cn_v4_extra_file" | \
 					grep -v '^[[:space:]]*$' | paste -sd, -
 				printf ' }\n'
-			} > "$tmp_ks_extra"
-			if nft -f "$tmp_ks_extra" 2>/dev/null; then
-				log "Cloud CDN extra bypass applied to killswitch bypass_ipv4"
+			} > "$tmp_extra"
+			if nft -f "$tmp_extra" 2>/dev/null; then
+				log "Cloud CDN extra bypass applied to surflare cn_ipv4"
 			else
-				log "WARN: cloud CDN extra bypass killswitch sync failed"
+				log "WARN: cloud CDN extra bypass load failed (nft error)"
 			fi
-			rm -f "$tmp_ks_extra"
+			rm -f "$tmp_extra"
 		fi
+	fi
+
+	# --- killswitch bypass sets (both modes, one atomic batch) ---
+	# Build a single nft batch file containing flush+add for all sources
+	# (v4 + cloud CDN extra + v6).  One nft -f call = one netlink transaction.
+	# No race window between cn_ipv4.txt and cn_ipv4_extra.txt loading.
+	local _ks_batch="/tmp/ks_bypass_all_$$.nft"
+	local _ks_sources=0
+	: > "$_ks_batch"
+
+	if [ -f "$cn_v4_file" ]; then
+		local _cn_count _cn_date
+		_cn_count=$(grep -vc '^#' "$cn_v4_file" 2>/dev/null || echo 0)
+		_cn_date=$(stat -c '%y' "$cn_v4_file" 2>/dev/null | cut -d' ' -f1)
+		{
+			printf 'flush set inet killswitch bypass_ipv4\n'
+			printf 'add element inet killswitch bypass_ipv4 { '
+			grep -v '^#' "$cn_v4_file" | grep -v '^[[:space:]]*$' | paste -sd, -
+			printf ' }\n'
+		} >> "$_ks_batch"
+		_ks_sources=$((_ks_sources + 1))
+	fi
+	# Cloud CDN extra: additive to bypass_ipv4 (same batch, no separate flush).
+	if [ -f "$cn_v4_extra_file" ]; then
+		{
+			printf 'add element inet killswitch bypass_ipv4 { '
+			grep -v '^#' "$cn_v4_extra_file" | \
+				grep -v '^[[:space:]]*$' | paste -sd, -
+			printf ' }\n'
+		} >> "$_ks_batch"
+	fi
+	if [ -f "$cn_v6_file" ]; then
+		{
+			printf 'flush set inet killswitch bypass_ipv6\n'
+			printf 'add element inet killswitch bypass_ipv6 { '
+			grep -v '^#' "$cn_v6_file" | grep -v '^[[:space:]]*$' | paste -sd, -
+			printf ' }\n'
+		} >> "$_ks_batch"
+		_ks_sources=$((_ks_sources + 1))
+	fi
+
+	if [ "$_ks_sources" -gt 0 ]; then
+		if nft -f "$_ks_batch" 2>/dev/null; then
+			bypass_applied=$((bypass_applied + _ks_sources))
+			log "Killswitch bypass synced: v4+extra+v6 atomic, mode=${MODE}"
+		else
+			log "WARN: killswitch bypass atomic sync failed"
+		fi
+	fi
+	rm -f "$_ks_batch"
+
+	if [ "$bypass_applied" -eq 0 ]; then
+		log "WARN: no chnroute files; CN bypass disabled"
 	fi
 }
 
