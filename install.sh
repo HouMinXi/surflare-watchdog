@@ -73,7 +73,7 @@ if [ "$INIT" = "procd" ]; then
     #   kmod-nft-tproxy   -- LAN tproxy kernel module
     #   kmod-nfnetlink-log -- nflog for packet trace (log ... group N)
     #   sexpect           -- PTY-based login (password not in /proc cmdline)
-    install -m 755 "$REPO/surflare_route_updater.sh" \
+    install -m 755 "$REPO/router/surflare_route_updater.sh" \
         /usr/local/sbin/surflare_route_updater.sh
     install -m 755 "$REPO/cross_validate_cloud_cdn.py" \
         /usr/local/sbin/cross_validate_cloud_cdn.py
