@@ -591,9 +591,12 @@ table inet killswitch {
 	# surflare is IPv4-only tproxy; without this chain, LAN devices with IPv6
 	# (e.g. systemd-resolved bypassing dnsmasq force-AAAA-SOA) reach non-CN
 	# IPv6 destinations via CN ISP IPv6, bypassing the VPN entirely.
-	# Non-CN IPv4 TCP from regular LAN devices is NOT dropped here: it is
-	# intercepted by sw_lan_tproxy PREROUTING and delivered to INPUT (port 10800).
-	# bypass_devices traffic (Thunder CN bypass) is intentionally allowed.
+	# Reject unmatched LAN-originated traffic.  During normal operation,
+	# non-CN TCP from LAN goes through sw_lan_tproxy and never reaches this
+	# chain.  This reject is the safety net for the tproxy-down window
+	# (reconnect, restart, crash): without it, non-CN LAN TCP falls through
+	# to the accept policy and is forwarded directly, leaking the real IP.
+	# bypass_devices traffic (Thunder CN bypass) is accepted above.
 	chain forward {
 		type filter hook forward priority filter - 10; policy accept;
 		ct state established,related accept
@@ -612,6 +615,7 @@ table inet killswitch {
 		iifname "br-lan" ip saddr @bypass_src accept
 		iifname "br-lan" meta nfproto ipv6 reject with icmpv6 addr-unreachable
 		iifname "br-lan" limit rate 5/second burst 10 packets log prefix "ks-fwd-mon: "
+		iifname "br-lan" reject with icmp host-unreachable
 	}
 }
 NFTEOF
@@ -920,6 +924,15 @@ _update_bypass_devices() {
 	if nft list table inet killswitch >/dev/null 2>&1; then
 		nft add element inet killswitch bypass_src "{ $all_ips }" 2>/dev/null || \
 			log "WARN: kill switch bypass_src sync failed"
+		# Also sync auto_bypass IPs: these devices skip tproxy via PREROUTING
+		# return, so their non-CN traffic reaches the killswitch forward chain
+		# and must be accepted (not rejected).
+		local _auto_ips
+		_auto_ips=$(nft list set ip sw_lan_tproxy auto_bypass 2>/dev/null \
+			| grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | paste -sd,)
+		if [ -n "$_auto_ips" ]; then
+			nft add element inet killswitch bypass_src "{ $_auto_ips }" 2>/dev/null || true
+		fi
 	fi
 	_sync_dns_enforce_bypass
 }
@@ -931,21 +944,30 @@ _update_bypass_devices() {
 # (auto_bypass is kernel-managed with 5m timeout, new devices can appear
 # between reconnects).
 _sync_dns_enforce_bypass() {
-	nft list table ip dns_enforce >/dev/null 2>&1 || return 0
-	local _dns_ips=""
-	local _static
+	local _dns_ips="" _static _auto
 	_static=$(nft list set ip sw_lan_tproxy bypass_devices 2>/dev/null \
 		| grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | paste -sd,)
 	[ -n "$_static" ] && _dns_ips="$_static"
-	local _auto
 	_auto=$(nft list set ip sw_lan_tproxy auto_bypass 2>/dev/null \
 		| grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | paste -sd,)
 	[ -n "$_auto" ] && _dns_ips="${_dns_ips:+$_dns_ips,}$_auto"
 	_dns_ips=$(echo "$_dns_ips" | tr ',' '\n' | sort -u | paste -sd,)
-	nft flush set ip dns_enforce vpn_bypass 2>/dev/null
-	if [ -n "$_dns_ips" ]; then
-		nft add element ip dns_enforce vpn_bypass "{ $_dns_ips }" 2>/dev/null || \
-			log "WARN: dns_enforce vpn_bypass sync failed"
+
+	# Sync to dns_enforce vpn_bypass (DNS exemption for VPN devices)
+	if nft list table ip dns_enforce >/dev/null 2>&1; then
+		nft flush set ip dns_enforce vpn_bypass 2>/dev/null
+		if [ -n "$_dns_ips" ]; then
+			nft add element ip dns_enforce vpn_bypass "{ $_dns_ips }" 2>/dev/null || \
+				log "WARN: dns_enforce vpn_bypass sync failed"
+		fi
+	fi
+
+	# Sync auto_bypass IPs to killswitch bypass_src so the forward chain
+	# reject rule does not block their non-CN traffic.  bypass_devices are
+	# already in bypass_src via _update_bypass_devices; only auto_bypass
+	# needs periodic re-sync here (devices join/leave on 5-min timeout).
+	if [ -n "$_auto" ] && nft list table inet killswitch >/dev/null 2>&1; then
+		nft add element inet killswitch bypass_src "{ $_auto }" 2>/dev/null || true
 	fi
 }
 
