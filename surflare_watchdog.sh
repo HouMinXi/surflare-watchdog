@@ -592,8 +592,8 @@ _ensure_dns_enforce() {
 	nft list table ip dns_enforce >/dev/null 2>&1 && return 0
 	# fib daddr type local covers all dnsmasq listen addresses without
 	# hardcoding IPs.  Router-originated DNS is unaffected (no iifname
-	# "br-lan" match on locally generated packets).  Log is rate-limited
-	# to prevent dmesg flooding from devices with hardcoded DNS servers.
+	# "br-lan" match on locally generated packets).  Silent reject only;
+	# dns-bypass logging removed (it was DNS hygiene noise, not IP leak).
 	if nft -f - <<'DNS_EOF'
 table ip dns_enforce {
 	set vpn_bypass { type ipv4_addr; }
@@ -601,7 +601,6 @@ table ip dns_enforce {
 		type filter hook prerouting priority mangle - 20; policy accept;
 		iifname "br-lan" meta l4proto { tcp, udp } th dport 53 ip saddr @vpn_bypass accept
 		iifname "br-lan" meta l4proto { tcp, udp } th dport 53 fib daddr type local accept
-		iifname "br-lan" meta l4proto { tcp, udp } th dport 53 limit rate 5/minute burst 3 packets log prefix "dns-bypass: "
 		iifname "br-lan" meta l4proto { tcp, udp } th dport 53 reject with icmp port-unreachable
 	}
 }
