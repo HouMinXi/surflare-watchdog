@@ -21,15 +21,109 @@ destinations.
   killswitch `bypass_ipv4` set and routes directly via ISP.  Only TCP is
   affected by the foreign-IP limitation.
 
-## nftables Behavior
+## Network Topology
 
-| Table | Role | Populated? |
-|-------|------|-----------|
-| `inet killswitch` output | Router's own leak protection (policy drop) | Yes -- server_ips, bypass_ipv4 (chnroute), LAN ranges |
-| `inet killswitch` forward | LAN leak protection during tproxy-down | Yes -- bypass_ipv4 allows CN, rejects non-CN with `ks-fwd-mon` log |
-| `ip sw_lan_tproxy` | Redirect all br-lan TCP to surflare-proxy | Yes |
-| `inet surflare` output | CN bypass for router's own processes | Yes -- `cn_ipv4`/`cn_ipv6` accept rules |
-| `ip dns_enforce` | Force LAN DNS through dnsmasq/SmartDNS | Yes |
+```
+[ISP Modem 192.168.1.1] (PPPoE passthrough)
+      |
+      eth0 (WAN, 192.168.1.100 modem-access)
+      |
+[N100 iStoreOS]  pppoe-wan (100.65.x.x)
+      |
+      br-lan (192.168.100.1/24)
+      +-- eth1/eth2/eth3 (bridge)
+            |
+            LAN devices (.2 mesh, .10 x500, .11 admin-PC,
+                          .147 Mac/AnyConnect, .212 vivo, ...)
+```
+
+## nftables Architecture (Global Mode)
+
+### Packet Flow: LAN Device to Internet
+
+```
+LAN device
+  |
+  v
++-------------------------------------------------------+
+| sw_lan_tproxy prerouting (mangle-10)                  |
+|  1. private dest? ---------> return (direct)          |
+|  2. in bypass_devices? ----> return (Thunder/.11)     |
+|  3. in auto_bypass? -------> return (AnyConnect)      |
+|  4. DTLS UDP/443 0xFEFD? --> add auto_bypass, return  |
+|  5. TCP? ------------------> tproxy :10800 (mark 0x1) |
+|  6. UDP/443 (QUIC)? -------> tproxy :10800 (mark 0x1) |
+|  7. other UDP? ------------> fall through (accept)     |
++-------------------------------------------------------+
+  |                              |
+  | (non-tproxy'd / bypass)      | (tproxy'd TCP + QUIC)
+  v                              v
++-----------------------------+  surflare-proxy (:10800)
+| killswitch forward (-10)    |    |
+|  bypass_ipv4 (CN)? -> accept|    +-> ALL traffic: VPN tunnel
+|  bypass_src? --------> accept|       (no CN/non-CN split)
+|  lan_ranges? --------> accept|
+|  NTP UDP/123? -------> accept|
+|  log ks-fwd-mon             |
+|  IPv6: reject icmpv6        |
+|  IPv4: reject icmp          |
++-----------------------------+
+```
+
+### Packet Flow: Router to Internet
+
+```
+Router process (opkg, curl, SSH)
+  |
+  v
++-----------------------------------------------+
+| inet surflare output (mangle)                 |
+|  mark 0xff? -> accept (tunnel)                |
+|  server ports? -> accept                      |
+|  loopback? -> accept                          |
+|  DNS? -> mark 0x1                             |
+|  private? -> accept                           |
+|  cn_ipv4? -> accept (kernel CN bypass)        |  <-- global only
+|  TCP/UDP? -> mark 0x1 -> surflare-proxy       |
++-----------------------------------------------+
+  |
+  v
++-----------------------------------------------+
+| killswitch output (filter+20, policy DROP)    |
+|  server_ips? -> accept                        |
+|  mark 0xff/0x1? -> accept                     |
+|  bypass_ipv4 (CN)? -> accept                  |
+|  lan_ranges? -> accept                        |
+|  UDP -> reject                                |
+|  IPv6 -> reject                               |
+|  log ks-drop + DROP                           |
++-----------------------------------------------+
+```
+
+### nftables Tables Summary
+
+| Table | Chain | Priority | Role |
+|-------|-------|----------|------|
+| `ip sw_lan_tproxy` | prerouting | mangle-10 | LAN TCP + QUIC to surflare-proxy |
+| `ip dns_enforce` | prerouting | mangle-20 | Force LAN DNS through router |
+| `inet surflare` | output | mangle | Router traffic + **cn_ipv4 accept** |
+| `inet surflare` | prerouting | mangle | tproxy marked packets to :10800 |
+| `inet killswitch` | output | filter+20 | Router leak protection (policy drop) |
+| `inet killswitch` | forward | filter-10 | LAN leak protection + IP audit log |
+| `inet surflare_moat` | prerouting | raw | TCP fingerprint detection |
+| `inet fw4` | forward | filter | OpenWrt zone firewall (policy drop) |
+
+### Key difference from rule mode
+
+Global mode adds `ip daddr @cn_ipv4 accept` to the `inet surflare` output
+chain, giving the router's own processes a kernel-level CN bypass that does
+not go through surflare-proxy.  All LAN TCP/QUIC goes through surflare-proxy
+and exits via VPN regardless of destination -- no CN/non-CN split at the
+application layer.
+
+`bypass_devices` is populated from `/etc/surflare/bypass-macs.conf` so
+specific devices (e.g. admin-PC running Thunder) skip tproxy entirely and
+route via ISP for CN traffic.
 
 ## VPN Downtime Behavior
 
