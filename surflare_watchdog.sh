@@ -657,12 +657,16 @@ NFTEOF
 	# fib daddr type local covers all dnsmasq listen addresses (5+ IPv4,
 	# 8+ IPv6) without hardcoding IPs.  Router-originated DNS is unaffected
 	# (no iifname "br-lan" match on locally generated packets).
+	# Devices in vpn_bypass (populated from auto_bypass + bypass_devices)
+	# are exempted: they run their own VPN and use non-router DNS.
 	if [ "$PLATFORM" = "router" ] && \
 	   ! nft list table ip dns_enforce >/dev/null 2>&1; then
 		if nft -f - <<'DNS_EOF'
 table ip dns_enforce {
+	set vpn_bypass { type ipv4_addr; }
 	chain prerouting {
 		type filter hook prerouting priority mangle - 20; policy accept;
+		iifname "br-lan" meta l4proto { tcp, udp } th dport 53 ip saddr @vpn_bypass accept
 		iifname "br-lan" meta l4proto { tcp, udp } th dport 53 fib daddr type local accept
 		iifname "br-lan" meta l4proto { tcp, udp } th dport 53 log prefix "dns-bypass: " reject with icmp port-unreachable
 	}
@@ -890,6 +894,32 @@ _update_bypass_devices() {
 	all_ips=$(echo "$all_ips" | tr ',' '\n' | sort -u | paste -sd,)
 	nft add element ip sw_lan_tproxy bypass_devices "{ $all_ips }" 2>/dev/null || \
 		log "WARN: bypass_devices update failed (${all_ips})"
+	_sync_dns_enforce_bypass
+}
+
+# Sync auto_bypass + bypass_devices IPs to dns_enforce vpn_bypass set.
+# Devices running their own VPN use non-router DNS; without this exemption,
+# dns_enforce rejects their DNS queries and breaks their connectivity.
+# Called after _update_bypass_devices and periodically from the main loop
+# (auto_bypass is kernel-managed with 5m timeout, new devices can appear
+# between reconnects).
+_sync_dns_enforce_bypass() {
+	nft list table ip dns_enforce >/dev/null 2>&1 || return 0
+	local _dns_ips=""
+	local _static
+	_static=$(nft list set ip sw_lan_tproxy bypass_devices 2>/dev/null \
+		| grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | paste -sd,)
+	[ -n "$_static" ] && _dns_ips="$_static"
+	local _auto
+	_auto=$(nft list set ip sw_lan_tproxy auto_bypass 2>/dev/null \
+		| grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | paste -sd,)
+	[ -n "$_auto" ] && _dns_ips="${_dns_ips:+$_dns_ips,}$_auto"
+	_dns_ips=$(echo "$_dns_ips" | tr ',' '\n' | sort -u | paste -sd,)
+	nft flush set ip dns_enforce vpn_bypass 2>/dev/null
+	if [ -n "$_dns_ips" ]; then
+		nft add element ip dns_enforce vpn_bypass "{ $_dns_ips }" 2>/dev/null || \
+			log "WARN: dns_enforce vpn_bypass sync failed"
+	fi
 }
 
 
@@ -1957,6 +1987,11 @@ _trace_group=12346
 start_packet_trace() {
 	[ "${_trace_active:-0}" -eq 1 ] && return 0
 
+	# Ensure nfnetlink_log kernel module is loaded (nft log ... group N
+	# requires it; on early boot the module may not be auto-loaded yet,
+	# causing nft -f to fail with "No such file or directory").
+	modprobe nfnetlink_log 2>/dev/null || true
+
 	local ts
 	ts=$(date +%Y%m%d_%H%M%S)
 	_trace_pcap="/tmp/surflare_watchdog_${ts}.pcap"
@@ -1998,7 +2033,7 @@ start_packet_trace() {
 table $_trace_table {
     chain output {
         type filter hook output priority mangle;
-        ip daddr { $ip_set } tcp dport { 80, 443 } ct mark set ct mark | 0xface log prefix "WD_TRACE_OUT" group $_trace_group
+        meta nfproto ipv4 ip daddr { $ip_set } tcp dport { 80, 443 } ct mark set ct mark | 0xface log prefix "WD_TRACE_OUT" group $_trace_group
     }
     chain input {
         type filter hook input priority mangle;
@@ -2469,6 +2504,9 @@ while true; do
 			fi
 		fi
 	fi
+
+	# Sync auto_bypass IPs to dns_enforce (devices may appear/expire between reconnects)
+	_sync_dns_enforce_bypass
 
 	# Adaptive interval -- shorter poll when degraded for faster recovery.
 	# 15s floor (not lower): 7 probes x 12s max-time overlap at <14s interval.
