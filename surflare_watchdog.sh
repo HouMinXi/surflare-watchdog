@@ -526,10 +526,12 @@ _cleanup_on_startup() {
 }
 
 _install_killswitch() {
-	nft delete table inet killswitch 2>/dev/null || true
-
 	local _ks_tmp="/tmp/ks_install_$$.nft"
+	# Atomic table replacement: destroy + create in a single nft -f transaction.
+	# nft processes the batch file as one netlink message, so the kernel swaps
+	# the old table for the new one with no gap where traffic is unprotected.
 	cat > "$_ks_tmp" << 'NFTEOF'
+destroy table inet killswitch
 table inet killswitch {
 	set server_ips  { type ipv4_addr; }
 	set server_ips6 { type ipv6_addr; }
@@ -602,27 +604,6 @@ NFTEOF
 	_ntp_user=$(id -u chrony >/dev/null 2>&1 && echo chrony || echo root)
 	sed -i "s/skuid chrony/skuid $_ntp_user/" "$_ks_tmp"
 
-	# F5: Flush conntrack to drop stale connections that bypassed the killswitch
-	# before chain forward was in place (especially IPv6 leaks to non-CN
-	# destinations).  Prefer scoped flush (-D -m mark N) to only kill flows
-	# marked for tproxy routing, leaving unrelated connections (e.g. local
-	# LAN, monitoring) untouched.  Fall back to unscoped -F on older conntrack
-	# (<1.4.4) that lacks -m support.  Done BEFORE the table swap so the new
-	# nftables rules are the ones closing the door, not a follow-up flush
-	# racing the load.
-	#
-	# F5.fix: explicitly log when the unscoped -F fallback fires -- a silent
-	# flush of ALL tracked connections is destructive (kills SSH sessions,
-	# monitoring, LAN TCP) and operators need a clear breadcrumb in the
-	# log to correlate with downstream disruption reports.
-	if conntrack -D -m mark 1 2>/dev/null; then
-		: # scoped flush ok
-	elif conntrack -F 2>/dev/null; then
-		log "WARN: conntrack scoped flush unavailable or failed; ran unscoped -F (drops ALL tracked connections -- SSH, monitoring, LAN TCP)"
-	else
-		log "WARN: conntrack flush failed; pre-existing IPv6 connections may persist"
-	fi
-
 	if nft -f "$_ks_tmp"; then
 		log "Kill switch installed (inet killswitch, policy drop, ntp-user=$_ntp_user)"
 	else
@@ -630,6 +611,20 @@ NFTEOF
 		log "ERROR: kill switch install failed"
 		rm -f "$_ks_tmp"
 		return 1
+	fi
+
+	# Flush stale conntrack entries that predate the new killswitch rules.
+	# Done AFTER the atomic nft -f load so the new rules are already
+	# governing new connections while old entries are being flushed.
+	# Prefer scoped flush (-D -m mark N) to only kill tproxy-marked flows,
+	# leaving unrelated connections (LAN, monitoring) untouched.
+	# Fall back to unscoped -F on older conntrack (<1.4.4) that lacks -m.
+	if conntrack -D -m mark 1 2>/dev/null; then
+		: # scoped flush ok
+	elif conntrack -F 2>/dev/null; then
+		log "WARN: conntrack scoped flush unavailable; ran unscoped -F (drops ALL tracked connections)"
+	else
+		log "WARN: conntrack flush failed; pre-existing connections may persist"
 	fi
 	# Post-install verification: a silent nft -f failure would leave the
 	# watchdog believing killswitch is up while the kernel has no such
@@ -1395,7 +1390,7 @@ EXPECT_EOF
 			local _sock
 			_sock=$(mktemp /tmp/.surflare_auth.XXXXXX)
 			rm -f "$_sock"  # mktemp creates the file; sexpect needs the path free
-			trap "rm -f '$_sock'" EXIT
+			trap 'rm -f "'"$_sock"'"' EXIT
 			export _SURFLARE_AUTH_PW="$password"
 			if timeout 30 sh -c "
 				sexpect -s '$_sock' spawn -t 25 surflare login -u '$email' >/dev/null 2>&1
