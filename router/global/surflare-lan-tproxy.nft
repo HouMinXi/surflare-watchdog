@@ -1,0 +1,52 @@
+# LAN transparent proxy for global mode.
+# All LAN TCP/QUIC goes through surflare-proxy and exits via VPN.
+# bypass_devices: populated by watchdog from /etc/surflare/bypass-macs.conf
+#   for devices that need direct CN ISP (e.g. Thunder).
+# auto_bypass: DTLS 1.2 detection for corporate VPN clients (e.g. AnyConnect).
+table ip sw_lan_tproxy {
+    set bypass_devices {
+        type ipv4_addr;
+    }
+
+    set auto_bypass {
+        type ipv4_addr;
+        size 64;
+        flags dynamic, timeout;
+        timeout 5m;
+    }
+
+    chain prerouting {
+        type filter hook prerouting priority mangle - 10; policy accept;
+
+        # Private destinations: direct, no proxy needed
+        iifname "br-lan" ip daddr {
+            10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 127.0.0.0/8
+        } return
+
+        # Static bypass (bypass-macs.conf devices via watchdog)
+        iifname "br-lan" ip saddr @bypass_devices return
+
+        # Dynamic bypass: devices already detected as corporate VPN
+        iifname "br-lan" ip saddr @auto_bypass return
+
+        # AnyConnect DTLS detection: UDP/443 with DTLS 1.2 version (0xFEFD).
+        # Adds source IP to auto_bypass with 5-min timeout, then returns
+        # so the packet is NOT caught by the QUIC tproxy rule below.
+        # Keepalives (~30s) renew the timeout; VPN closes -> expires -> resumes proxy.
+        iifname "br-lan" udp dport 443 @th,72,16 0xfefd \
+            add @auto_bypass { ip saddr timeout 5m } return
+
+        # TCP tproxy: all remaining LAN TCP to surflare-proxy
+        iifname "br-lan" meta l4proto tcp \
+            tproxy ip to 127.0.0.1:10800 \
+            meta mark set 0x00000001 \
+            accept
+
+        # QUIC tproxy: UDP/443 to surflare-proxy (eliminates 300ms TCP fallback).
+        # Global mode: all QUIC exits via VPN like TCP.
+        iifname "br-lan" udp dport 443 \
+            tproxy ip to 127.0.0.1:10800 \
+            meta mark set 0x00000001 \
+            accept
+    }
+}
