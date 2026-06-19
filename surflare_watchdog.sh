@@ -594,6 +594,10 @@ table inet killswitch {
 		ct state established,related accept
 		ct state invalid drop
 		iifname "br-lan" oifname "br-lan" accept
+		# Modem management: LAN devices (e.g. mesh APs) reach the modem
+		# via eth0 (physical WAN port).  This traffic never traverses the
+		# VPN tunnel and should not trigger ks-fwd-mon log noise.
+		iifname "br-lan" oifname "eth0" ip daddr 192.168.1.0/24 accept
 		iifname "br-lan" ip daddr @server_ips accept
 		# server_ips6 always empty: surflare is IPv4-only; _update_server_endpoint
 		# only extracts IPv4 addrs.  Kept as no-op for future IPv6 VPN support.
