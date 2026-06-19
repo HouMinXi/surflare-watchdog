@@ -69,6 +69,13 @@ CRASH_WINDOW=600                      # seconds window for crash rate limiting
 CRASH_EXTENDED_COOLDOWN=300           # seconds extended cooldown after cascade detected
 CRASH_DEDUP_INTERVAL=121              # minimum seconds between counting two crashes as distinct (must exceed detection window)
 
+# Platform detection: router (procd/OpenWrt) vs laptop (systemd)
+if [ -f /etc/openwrt_release ]; then
+	PLATFORM="router"
+else
+	PLATFORM="laptop"
+fi
+
 # Validate NODE is configured (fail fast if placeholder is unchanged)
 if [ "$NODE" = "your_node_tag" ]; then
 	echo '<3>surflare_watchdog: NODE is not configured. Edit NODE= in the script first.' >/dev/kmsg
@@ -1396,7 +1403,7 @@ EXPECT_EOF
 				sexpect -s '$_sock' spawn -t 25 surflare login -u '$email' >/dev/null 2>&1
 				sexpect -s '$_sock' expect -t 15 'Password:' >/dev/null 2>&1 || exit 1
 				sexpect -s '$_sock' send -env _SURFLARE_AUTH_PW -enter >/dev/null 2>&1
-				sexpect -s '$_sock' wait -t 15 >/dev/null 2>&1
+				sexpect -s '$_sock' wait >/dev/null 2>&1
 			"; then
 				rc=0
 			fi
