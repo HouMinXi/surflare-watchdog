@@ -477,21 +477,17 @@ _setup_chnroute() {
 }
 
 # _cleanup_on_startup: called once at the top of the main loop.
-# If surflare-proxy is NOT running, nuke any stale watchdog-managed
-# nftables state left over from a previous (crashed/killed) watchdog
-# run.  This prevents the next startup from observing ghost rules
-# and passing check_vpn_local_state with a dead proxy, or from
-# leaving the LAN transparent proxy in place (which would black-hole
-# all LAN TCP to 127.0.0.1:10800 with no listener).
-# The proxy's own `inet surflare` table is also deleted since the
-# process owning it is gone; the proxy will re-create it on next start.
+# Unconditionally kill any inherited surflare-proxy and nuke stale
+# watchdog-managed nftables state.  This prevents ghost rules from a
+# crashed/killed watchdog, and stops orphan proxies from holding
+# port 10800 and blocking a fresh connection cycle.
 _cleanup_on_startup() {
+	# Always kill any existing surflare-proxy: orphans from a previous
+	# watchdog instance (crash or unclean restart) hold port 10800 and
+	# block the new connection cycle.  The previous "keep healthy proxy"
+	# shortcut caused orphans the new watchdog could not manage.
 	if _proc_alive surflare-proxy >/dev/null 2>&1; then
-		# Check if proxy has active VPN connections (not just alive but stale)
-		if ss -tnp 2>/dev/null | grep -qE 'ESTAB.*:443\s.*surflare'; then
-			return 0  # Healthy: proxy alive + active VPN connection
-		fi
-		log "Startup: proxy alive but no VPN conn (stale), killing"
+		log "Startup: killing inherited surflare-proxy"
 		killall surflare-proxy 2>/dev/null
 		sleep 2
 	fi
@@ -2195,17 +2191,17 @@ cleanup() {
 	[ -n "$storm_sleep_pid" ] && kill "$storm_sleep_pid" 2>/dev/null
 	# shellcheck disable=SC2086
 	[ -n "$_hc_tmp" ] && rm -f $_hc_tmp
+	# Kill surflare-proxy before tearing down nft tables: it daemonizes
+	# via setsid and survives watchdog exit, becoming an orphan that
+	# holds port 10800 and blocks the next restart.  Fire-and-forget
+	# (no wait): procd's term_timeout is only 5s, and _cleanup_on_startup
+	# in the next instance handles any survivor.
+	killall surflare-proxy 2>/dev/null
 	nft delete table inet surflare_moat 2>/dev/null || true
 	nft delete table ip sw_lan_tproxy 2>/dev/null || true
 	nft delete table ip dns_enforce 2>/dev/null || true
 	_remove_killswitch
-	# F10: also tear down watchdog-managed state.  inet surflare is
-	# only safe to delete if the proxy is gone (proxy owns the table
-	# exclusively); if proxy is still up, leave it alone and let the
-	# proxy manage its own cleanup on next exit.
-	if ! _proc_alive surflare-proxy >/dev/null 2>&1; then
-		nft delete table inet surflare 2>/dev/null || true
-	fi
+	nft delete table inet surflare 2>/dev/null || true
 	# Drop run-state sentinels so a future restart does not inherit
 	# stale "ready" markers.
 	# Forge finding #3: do NOT delete storm_cool_until here. On a graceful
