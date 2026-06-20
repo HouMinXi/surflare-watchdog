@@ -14,14 +14,17 @@
 
 NODE="Los Angeles"                    # Set to your node tag (run: surflare nodes)
 NODE_CANDIDATES=("Los Angeles" "Dallas" "Chicago" "New York")  # Atlanta/Miami excluded: Anthropic Cloudflare WAF hard-blocks their exit IPs (HTTP 403, not JS-challenge); verified 2026-06-17
-# Connection mode: set after PLATFORM detection below.
-# router: "rule" (Smart Routing) -- surflare-proxy splits CN-direct vs
-#   non-CN-tunnel at the application layer.  Without this, all tproxy'd
-#   LAN traffic goes through VPN and CN apps see a foreign IP.
-# laptop: "global" -- all traffic through VPN for privacy.  The kernel
-#   output chain cn_ipv4 handles CN-direct at the nft layer, but
-#   there is no tproxy so the split is irrelevant.
-MODE=""  # resolved after PLATFORM detection
+# Connection mode: loaded from /etc/surflare/mode.conf if present,
+# otherwise resolved from PLATFORM (router->rule, laptop->global).
+# Deploying surflare_watchdog.sh no longer resets the mode setting.
+#   router "rule": surflare-proxy Smart Routing (CN direct, non-CN VPN).
+#   router "global": all LAN TCP/QUIC via VPN; cn_direct sets for CN bypass.
+#   laptop "global": all traffic through VPN; cn_ipv4 kernel-level CN bypass.
+MODE=""
+if [ -f /etc/surflare/mode.conf ]; then
+	# shellcheck source=/dev/null
+	. /etc/surflare/mode.conf 2>/dev/null
+fi
 TRANSIT=""                                # Transit server: "" = use TRANSIT_CANDIDATES (logged), "auto" = surflare picks (opaque)
 TRANSIT_CANDIDATES=("Dallas" "Chicago" "Atlanta" "Miami" "New York")  # US-only; KR/HK/TW exits trigger Bing cn redirect
 TRANSIT_CONNECT_TIMEOUT=12             # max seconds for surflare connect per candidate

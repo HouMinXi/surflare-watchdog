@@ -59,6 +59,11 @@ if [ "$INIT" = "procd" ]; then
         echo "  WARN: removed stale /etc/nftables.d/surflare-lan-tproxy.nft (breaks fw4)"
     fi
     mkdir -p /etc/surflare
+    # Persist mode to /etc/surflare/mode.conf so scp re-deploys of
+    # surflare_watchdog.sh do not reset the mode setting.
+    echo "MODE=\"${_deploy_mode}\"" > /etc/surflare/mode.conf
+    chmod 644 /etc/surflare/mode.conf
+    echo "  mode.conf written (MODE=${_deploy_mode}) -> /etc/surflare/mode.conf"
     # Deploy mode-specific bypass-macs.conf (rule: empty, global: has devices).
     # Only create if absent -- do not overwrite user edits on re-install.
     if [ ! -f /etc/surflare/bypass-macs.conf ]; then
