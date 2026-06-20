@@ -648,16 +648,13 @@ _cleanup_on_startup() {
 	# Keep sw_lan_tproxy if it exists (tombstoned or live from a prior
 	# instance): bypass_devices/auto_bypass sets persist, and the connect
 	# flow will restore the tproxy rule via nft replace.
-	# Keep killswitch if it exists: CN traffic stays protected.
-	# The connect flow calls _install_killswitch only when
-	# _killswitch_armed is 0 (see main loop), so a surviving killswitch
-	# from the prior instance is reused.
+	# Old killswitch stays active until _install_killswitch() atomically
+	# replaces it (destroy + create in one nft -f batch, no gap).
+	# Always rebuild so rule changes from the updated script take effect.
 	if nft list table inet killswitch >/dev/null 2>&1; then
-		log "Reusing existing killswitch (surviving from prior instance)"
-		_killswitch_armed=1
+		log "Existing killswitch active (will be rebuilt on connect)"
 	fi
-	# dns_enforce lives outside the killswitch table; ensure it exists
-	# even when the killswitch reuse path skips _install_killswitch.
+	# dns_enforce lives outside the killswitch table; ensure it exists.
 	_ensure_dns_enforce
 	ip rule del fwmark 0x1 lookup 100 2>/dev/null || true
 	ip -6 rule del fwmark 0x1 lookup 100 2>/dev/null || true
@@ -2062,7 +2059,7 @@ probe_best_transit() {
 		fi
 		sleep "$TRANSIT_PROBE_SETTLE"
 		_update_server_endpoint
-		[ "$_killswitch_armed" -eq 1 ] && _update_killswitch_server_ips
+		_update_killswitch_server_ips
 		# Require 200/30x from Google -- local proxy errors (502/503) return
 		# instantly and would otherwise produce a falsely-low latency reading.
 		local probe_result http_code ms
