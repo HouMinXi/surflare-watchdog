@@ -50,7 +50,7 @@ cutoff_utc = now_utc - timedelta(minutes=window_min)
 
 # Parse log lines efficiently: tail last ~10k lines (avoids reading full 169K log)
 pat_urltest = re.compile(
-    r'^\+0800 (\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) ERROR .* outbound/urltest\[([^\]]+)\]: (.+)$'
+    r'^\+0800 (\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) ERROR (?:.* )?outbound/urltest\[([^\]]+)\]: (.+)$'
 )
 # tproxy inbound errors: reject loopback, 503, i/o timeout, connection timed out
 # Detects sing-box/sing-box#1688 (loopback reject) and proxy outbound failures
