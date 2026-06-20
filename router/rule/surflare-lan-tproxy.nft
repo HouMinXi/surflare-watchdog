@@ -15,6 +15,19 @@ table inet sw_lan_tproxy {
         timeout 5m;
     }
 
+    # CN destinations: direct ISP route in global mode (bypasses tproxy so
+    # CN apps see domestic IP and CDN acceleration works).  Empty in rule
+    # mode (surflare-proxy Smart Routing handles CN split at app layer).
+    set cn_direct {
+        type ipv4_addr;
+        flags interval;
+    }
+
+    set cn6_direct {
+        type ipv6_addr;
+        flags interval;
+    }
+
     chain prerouting {
         type filter hook prerouting priority mangle - 10; policy accept;
 
@@ -33,6 +46,12 @@ table inet sw_lan_tproxy {
 
         # Dynamic bypass: devices already detected as corporate VPN
         iifname "br-lan" ip saddr @auto_bypass return
+
+        # CN destinations: ISP direct (populated in global mode only).
+        # After device bypass so bypass_devices/auto_bypass users keep their
+        # explicit override for ALL traffic, not just non-CN.
+        iifname "br-lan" ip daddr @cn_direct return
+        iifname "br-lan" ip6 daddr @cn6_direct return
 
         # AnyConnect DTLS detection: UDP/443 with DTLS 1.2 version (0xFEFD).
         # Adds source IP to auto_bypass with 5-min timeout, then returns

@@ -523,6 +523,70 @@ _setup_chnroute() {
 	if [ "$bypass_applied" -eq 0 ]; then
 		log "WARN: no chnroute files; CN bypass disabled"
 	fi
+	# cn_direct is NOT populated here: _restore_tproxy (called later in the
+	# connect flow) does destroy+reload which empties all sets.  The connect
+	# flow calls _load_tproxy_cn_direct after _restore_tproxy instead.
+}
+
+# Load CN CIDRs into sw_lan_tproxy cn_direct/cn6_direct sets so that
+# CN-destined LAN traffic bypasses tproxy and exits via ISP direct.
+# This fixes CDN acceleration and CN app geo-detection in global mode.
+# In rule mode: no-op (surflare-proxy handles CN split at app layer).
+# Called after _restore_tproxy (which empties all sets via destroy+reload)
+# and at the end of _setup_chnroute (initial connect).
+_load_tproxy_cn_direct() {
+	[ "$MODE" = "global" ] || return 0
+	nft list table inet sw_lan_tproxy >/dev/null 2>&1 || return 0
+
+	local cn_v4_file="/etc/surflare/cn_ipv4.txt"
+	local cn_v4_extra_file="/etc/surflare/cn_ipv4_extra.txt"
+	local cn_v6_file="/etc/surflare/cn_ipv6.txt"
+	local _batch="/tmp/tproxy_cn_direct_$$.nft"
+	local _loaded=0
+
+	: > "$_batch"
+	# IPv4: cn_ipv4.txt + cn_ipv4_extra.txt
+	if [ -f "$cn_v4_file" ]; then
+		{
+			printf 'flush set inet sw_lan_tproxy cn_direct\n'
+			printf 'add element inet sw_lan_tproxy cn_direct { '
+			grep -v '^#' "$cn_v4_file" | grep -v '^[[:space:]]*$' | paste -sd, -
+			printf ' }\n'
+		} >> "$_batch"
+		_loaded=$((_loaded + 1))
+	fi
+	if [ -f "$cn_v4_extra_file" ]; then
+		{
+			printf 'add element inet sw_lan_tproxy cn_direct { '
+			grep -v '^#' "$cn_v4_extra_file" | \
+				grep -v '^[[:space:]]*$' | paste -sd, -
+			printf ' }\n'
+		} >> "$_batch"
+	fi
+	# IPv6: cn_ipv6.txt
+	if [ -f "$cn_v6_file" ]; then
+		{
+			printf 'flush set inet sw_lan_tproxy cn6_direct\n'
+			printf 'add element inet sw_lan_tproxy cn6_direct { '
+			grep -v '^#' "$cn_v6_file" | grep -v '^[[:space:]]*$' | paste -sd, -
+			printf ' }\n'
+		} >> "$_batch"
+		_loaded=$((_loaded + 1))
+	fi
+
+	if [ "$_loaded" -gt 0 ]; then
+		local _nft_err
+		_nft_err=$(nft -f "$_batch" 2>&1)
+		if [ $? -eq 0 ]; then
+			local _v4c _v6c
+			_v4c=$(nft list set inet sw_lan_tproxy cn_direct 2>/dev/null | grep -c '/')
+			_v6c=$(nft list set inet sw_lan_tproxy cn6_direct 2>/dev/null | grep -c '/')
+			log "Tproxy cn_direct loaded: ${_v4c} v4 + ${_v6c} v6 CIDRs (global mode LAN CN bypass)"
+		else
+			log "WARN: tproxy cn_direct load failed: ${_nft_err}"
+		fi
+	fi
+	rm -f "$_batch"
 }
 
 # _cleanup_on_startup: called once at the top of the main loop.
@@ -2711,6 +2775,7 @@ while true; do
 				_update_killswitch_server_ips
 				# Restore LAN tproxy now that the new proxy is ready on :10800.
 				_restore_tproxy
+				_load_tproxy_cn_direct
 				_update_bypass_devices
 				_record_connect "${_active_node}" "${new_health}"
 			else

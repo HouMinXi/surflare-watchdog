@@ -11,15 +11,25 @@ destinations.
 - No requirement for CN apps (bilibili, xiaohongshu, etc.) to detect a
   domestic IP address.
 
-## Known Limitations
+## CN Direct Bypass (cn_direct)
 
-- **CN apps on LAN devices see a foreign exit IP.**  surflare-proxy forwards
-  all tproxy'd TCP through the VPN tunnel without CN/non-CN splitting.
-  Apps that check geo-IP (bilibili, xiaohongshu, Taobao) will report "not
-  in China" or degrade functionality.
-- CN UDP from LAN devices (gaming, video conferencing) passes through the
-  killswitch `bypass_ipv4` set and routes directly via ISP.  Only TCP is
-  affected by the foreign-IP limitation.
+LAN traffic to CN destinations bypasses tproxy and routes via ISP direct.
+The `cn_direct` / `cn6_direct` sets in the tproxy table are populated from
+`cn_ipv4.txt` + `cn_ipv4_extra.txt` (cloud CDN) + `cn_ipv6.txt` after each
+VPN connect.  This gives CN apps a domestic IP (CDN acceleration works,
+geo-detection passes) while non-CN traffic still goes through VPN.
+
+In rule mode these sets are empty (surflare-proxy handles CN split at the
+application layer).
+
+## Remaining Limitations
+
+- CN IP list is static (updated weekly by `surflare_route_updater.sh`).
+  A CN service using a non-CN IP (e.g. CN company with US CDN) will still
+  go through VPN.
+- CN UDP on non-standard ports (gaming, VoIP) passes through the killswitch
+  `bypass_ipv4` directly (not tproxied, not through VPN).  This is correct
+  behavior -- these connections see the domestic ISP IP.
 
 ## Network Topology
 
