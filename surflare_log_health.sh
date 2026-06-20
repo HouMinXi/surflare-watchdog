@@ -49,12 +49,20 @@ now_utc = datetime.now(timezone.utc)
 cutoff_utc = now_utc - timedelta(minutes=window_min)
 
 # Parse log lines efficiently: tail last ~10k lines (avoids reading full 169K log)
-pat_line = re.compile(
+pat_urltest = re.compile(
     r'^\+0800 (\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) ERROR .* outbound/urltest\[([^\]]+)\]: (.+)$'
+)
+# tproxy inbound errors: reject loopback, 503, i/o timeout, connection timed out
+# Detects sing-box/sing-box#1688 (loopback reject) and proxy outbound failures
+pat_tproxy = re.compile(
+    r'^\+0800 (\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) ERROR .* inbound/tproxy\[[^\]]+\]: .*(reject loopback|503 Service Unavailable|i/o timeout|connection timed out)(.*)$'
 )
 TZ_CST = timezone(timedelta(hours=8))
 
 node_errors = {}   # node_name -> {"count": N, "last": "msg", "last_ts": datetime}
+# tproxy error counters by category
+tproxy_counts = {"loopback_reject": 0, "http_503": 0, "io_timeout": 0, "conn_timeout": 0}
+tproxy_last_ts = None
 lines_scanned = 0
 
 with open(log_path, 'rb') as f:
@@ -69,21 +77,43 @@ with open(log_path, 'rb') as f:
             line = raw.decode('utf-8', errors='ignore').rstrip()
         except Exception:
             continue
-        m = pat_line.match(line)
-        if not m:
+
+        # Match urltest outbound errors (existing)
+        m = pat_urltest.match(line)
+        if m:
+            ts_str, node, msg = m.group(1), m.group(2), m.group(3)
+            try:
+                log_dt = datetime.strptime(ts_str, '%Y-%m-%d %H:%M:%S').replace(tzinfo=TZ_CST)
+            except ValueError:
+                continue
+            if log_dt.astimezone(timezone.utc) < cutoff_utc:
+                continue
+            if node not in node_errors:
+                node_errors[node] = {"count": 0, "last_msg": "", "last_ts": None}
+            node_errors[node]["count"] += 1
+            node_errors[node]["last_msg"] = msg[:120]
+            node_errors[node]["last_ts"] = ts_str
             continue
-        ts_str, node, msg = m.group(1), m.group(2), m.group(3)
-        try:
-            log_dt = datetime.strptime(ts_str, '%Y-%m-%d %H:%M:%S').replace(tzinfo=TZ_CST)
-        except ValueError:
-            continue
-        if log_dt.astimezone(timezone.utc) < cutoff_utc:
-            continue   # outside window
-        if node not in node_errors:
-            node_errors[node] = {"count": 0, "last_msg": "", "last_ts": None}
-        node_errors[node]["count"] += 1
-        node_errors[node]["last_msg"] = msg[:120]
-        node_errors[node]["last_ts"] = ts_str
+
+        # Match tproxy inbound errors (sing-box/sing-box#1688 detection)
+        m2 = pat_tproxy.match(line)
+        if m2:
+            ts_str, category = m2.group(1), m2.group(2)
+            try:
+                log_dt = datetime.strptime(ts_str, '%Y-%m-%d %H:%M:%S').replace(tzinfo=TZ_CST)
+            except ValueError:
+                continue
+            if log_dt.astimezone(timezone.utc) < cutoff_utc:
+                continue
+            tproxy_last_ts = ts_str
+            if "reject loopback" in category:
+                tproxy_counts["loopback_reject"] += 1
+            elif "503" in category:
+                tproxy_counts["http_503"] += 1
+            elif "i/o timeout" in category:
+                tproxy_counts["io_timeout"] += 1
+            elif "connection timed out" in category:
+                tproxy_counts["conn_timeout"] += 1
 
 # Build result: include both observed nodes and infer healthy/unhealthy
 nodes_out = {}
@@ -95,11 +125,21 @@ for node, info in sorted(node_errors.items()):
         "last_error_ts": info["last_ts"],
     }
 
+# tproxy health: total errors and per-category breakdown
+tproxy_total = sum(tproxy_counts.values())
+tproxy_out = {
+    "healthy": tproxy_total == 0,
+    "total_errors": tproxy_total,
+    "categories": tproxy_counts,
+    "last_error_ts": tproxy_last_ts,
+}
+
 out = {
     "timestamp": ts_now,
     "window_minutes": window_min,
     "lines_scanned": lines_scanned,
     "nodes": nodes_out,
+    "tproxy": tproxy_out,
 }
 
 tmp = out_path + ".tmp"
@@ -109,12 +149,19 @@ os.chmod(tmp, 0o600)
 os.replace(tmp, out_path)
 
 # Print summary to stdout
-healthy_count = sum(1 for n in nodes_out.values() if n["healthy"])
 unhealthy = [(k, v["error_count"]) for k, v in nodes_out.items()]
 unhealthy.sort(key=lambda x: -x[1])
 print(f"Window: {window_min}min | Lines scanned: {lines_scanned}")
-print(f"Unhealthy nodes ({len(unhealthy)}):")
-for name, cnt in unhealthy:
-    print(f"  {'DEAD':6s} {name} ({cnt} errors)")
+if unhealthy:
+    print(f"Unhealthy nodes ({len(unhealthy)}):")
+    for name, cnt in unhealthy:
+        print(f"  {'DEAD':6s} {name} ({cnt} errors)")
+if tproxy_total > 0:
+    print(f"Tproxy errors ({tproxy_total}):")
+    for cat, cnt in tproxy_counts.items():
+        if cnt > 0:
+            print(f"  {cat}: {cnt}")
+if not unhealthy and tproxy_total == 0:
+    print("All healthy")
 print(f"Results -> {out_path}")
 PYEOF
