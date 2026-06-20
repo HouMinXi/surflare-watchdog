@@ -58,7 +58,7 @@ table inet sw_lan_tproxy {
 
         # AnyConnect DTLS detection: UDP/443 with DTLS 1.2 version (0xFEFD).
         # Adds source IP to auto_bypass with 5-min timeout, then returns
-        # so the packet is NOT caught by the QUIC tproxy rule below.
+        # so the packet is NOT caught by the QUIC drop rule below.
         # Keepalives (~30s) renew the timeout; VPN closes -> expires -> resumes proxy.
         # IPv4-only: auto_bypass set is type ipv4_addr.
         iifname "br-lan" meta nfproto ipv4 udp dport 443 @th,72,16 0xfefd \
@@ -80,13 +80,13 @@ table inet sw_lan_tproxy {
         # fallback.  DTLS 1.2 packets already matched and returned above.
         #
         # Why: QUIC-over-VPN produces 3s+ TTFB for foreign CDNs (Cloudflare
-        # anycast selects PoP by VPN exit IP, not client IP).  Rejecting QUIC
-        # sends ICMP port-unreachable -> client falls back to TCP instantly
-        # instead of waiting 3-5s for QUIC timeout (drop would be silent).
+        # anycast selects PoP by VPN exit IP, not client IP).  Silent drop
+        # avoids ICMP amplification at scale (200+ LAN devices); clients
+        # fall back to TCP after QUIC PTO (~1-3s).
         #
         # Chrome/Firefox/Android apps all implement automatic HTTP/2 fallback
         # when UDP/443 is unreachable (per Hysteria2 docs recommendation).
-        iifname "br-lan" meta nfproto ipv4 udp dport 443 reject
-        iifname "br-lan" meta nfproto ipv6 udp dport 443 reject
+        iifname "br-lan" meta nfproto ipv4 udp dport 443 drop
+        iifname "br-lan" meta nfproto ipv6 udp dport 443 drop
     }
 }
