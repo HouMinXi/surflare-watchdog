@@ -65,14 +65,17 @@ table inet sw_lan_tproxy {
             add @auto_bypass { ip saddr timeout 5m } return
 
         # TCP tproxy: all remaining LAN TCP to surflare-proxy (IPv4)
+        # Use bare port (:10800) to preserve the original destination IP.
+        # Explicit 127.0.0.1:10800 causes sing-box to reject the connection
+        # as loopback (sing-box/sing-box#1688).
         iifname "br-lan" meta nfproto ipv4 meta l4proto tcp \
-            tproxy ip to 127.0.0.1:10800 \
+            tproxy ip to :10800 \
             meta mark set 0x00000001 \
             accept
 
-        # TCP tproxy: IPv6
+        # TCP tproxy: IPv6 (same bare-port rationale as IPv4)
         iifname "br-lan" meta nfproto ipv6 meta l4proto tcp \
-            tproxy ip6 to [::1]:10800 \
+            tproxy ip6 to :10800 \
             meta mark set 0x00000001 \
             accept
 

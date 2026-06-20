@@ -1496,12 +1496,15 @@ check_vpn_health() {
 	) >"$tmp_myip" 2>/dev/null &
 	pid_myip=$!
 
-	# Probe 7: SOCKS5 proxy path -- detects G1 blindspot (tunnel dead but external
-	# probes succeed because both endpoints exit in same country). Shorter timeout
-	# since this is local (127.0.0.1 SOCKS5 -> tunnel -> destination).
+	# Probe 7: tproxy path -- detects G1 blindspot (tunnel dead but external
+	# probes succeed because both endpoints exit in same country).
+	# Uses direct curl (no --proxy): traffic flows through OUTPUT chain ->
+	# fwmark 0x1 -> tproxy -> sing-box -> VPN, testing the same path as
+	# LAN devices.  The previous SOCKS5 approach (--proxy socks5h://127.0.0.1)
+	# was rejected by sing-box's loopback detector (sing-box/sing-box#1688).
 	(
 		local _raw
-		_raw=$(curl -s --proxy socks5h://127.0.0.1:10800 \
+		_raw=$(curl -s \
 		       --connect-timeout 5 --max-time 10 \
 		       -o /dev/null \
 		       -w '%{http_code}\n%{time_namelookup}:%{time_connect}:%{time_appconnect}:%{time_starttransfer}:%{time_total}' \
