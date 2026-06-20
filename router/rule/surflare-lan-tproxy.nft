@@ -48,6 +48,8 @@ table inet sw_lan_tproxy {
         iifname "br-lan" ip saddr @auto_bypass return
 
         # CN destinations: ISP direct (populated in global mode only).
+        # In rule mode these sets remain empty -- rules never match;
+        # surflare-proxy handles CN split at app layer instead.
         # After device bypass so bypass_devices/auto_bypass users keep their
         # explicit override for ALL traffic, not just non-CN.
         iifname "br-lan" ip daddr @cn_direct return

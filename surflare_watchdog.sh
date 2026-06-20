@@ -546,6 +546,8 @@ _load_tproxy_cn_direct() {
 
 	: > "$_batch"
 	# IPv4: cn_ipv4.txt + cn_ipv4_extra.txt
+	[ ! -f "$cn_v4_file" ] && \
+		log "WARN: ${cn_v4_file} missing, cn_direct will be empty"
 	if [ -f "$cn_v4_file" ]; then
 		{
 			printf 'flush set inet sw_lan_tproxy cn_direct\n'
@@ -564,6 +566,8 @@ _load_tproxy_cn_direct() {
 		} >> "$_batch"
 	fi
 	# IPv6: cn_ipv6.txt
+	[ ! -f "$cn_v6_file" ] && \
+		log "WARN: ${cn_v6_file} missing, cn6_direct will be empty"
 	if [ -f "$cn_v6_file" ]; then
 		{
 			printf 'flush set inet sw_lan_tproxy cn6_direct\n'
