@@ -102,7 +102,7 @@ LAN device (TCP/QUIC/DNS)
 |  bypass_src? ---------> accept
 |  lan_ranges? ---------> accept
 |  NTP UDP/123? --------> accept
-|  log "ks-fwd-mon:" (5/s burst 10)
+|  non-UDP? log "ks-fwd-mon:" (5/s)
 |  IPv6: reject icmpv6
 |  IPv4: reject icmp
 +-----------------------------+
@@ -182,8 +182,8 @@ IPv6 TCP are proxied.  QUIC (UDP/443) is rejected (not tproxied) to
 force HTTP/2 fallback -- QUIC-over-VPN causes 3s+ TTFB because CDN
 anycast selects PoP by VPN exit IP.  Without IPv6 tproxy, Happy
 Eyeballs causes LAN devices to prefer IPv6 for dual-stack destinations,
-which would bypass the proxy and hit the killswitch forward chain,
-producing `ks-fwd-mon` log noise (~49 entries per 2 minutes).
+which would bypass the proxy and be silently rejected by the
+killswitch forward chain.
 
 Rules use `meta nfproto ipv4` / `meta nfproto ipv6` to prevent
 cross-family matching in the inet table.  The DTLS detection rule is
@@ -230,20 +230,10 @@ a WARN log (not swallowed).
 
 - Router's own CN traffic: continues via `bypass_ipv4` (direct ISP route).
 - LAN CN traffic: continues via killswitch forward `bypass_ipv4`.
-- Non-CN traffic (router + LAN): **REJECT** with `ks-fwd-mon` dmesg log.
-  This is the IP leak protection: any LAN device attempting to reach a
-  non-CN destination while VPN is down produces a dmesg entry.
-
-## IP Leak Protection Logging
-
-When VPN is down, the killswitch forward chain logs non-CN access attempts:
-
-```
-ks-fwd-mon: IN=br-lan OUT=pppoe-wan SRC=192.168.100.212 DST=104.18.32.7 ...
-```
-
-CN traffic (matched by `bypass_ipv4`) is accepted silently -- only
-non-CN traffic triggers the log + REJECT.
+- Non-CN UDP (router + LAN): silently **REJECT**ed (tproxy is TCP-only,
+  so non-CN UDP has no VPN path -- killswitch blocks it by design).
+- Non-CN non-UDP reaching killswitch: logged via `ks-fwd-mon` before
+  reject -- this means TCP escaped tproxy, worth investigating.
 
 ## Configuration
 

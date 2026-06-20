@@ -784,7 +784,7 @@ table inet killswitch {
 		iifname "br-lan" oifname "br-lan" accept
 		# Modem management: LAN devices (e.g. mesh APs) reach the modem
 		# via eth0 (physical WAN port).  This traffic never traverses the
-		# VPN tunnel and should not trigger ks-fwd-mon log noise.
+		# VPN tunnel; accept before the reject rules below.
 		iifname "br-lan" oifname "eth0" ip daddr 192.168.1.0/24 accept
 		iifname "br-lan" ip daddr @server_ips accept
 		# server_ips6 always empty: surflare is IPv4-only; _update_server_endpoint
@@ -800,9 +800,10 @@ table inet killswitch {
 		# NTP: basic utility, no privacy data, devices need accurate time
 		# for TLS certificate validation.
 		iifname "br-lan" udp dport 123 accept
-		# Log ALL remaining non-whitelisted traffic (IPv4 + IPv6) before
-		# rejecting.  The limit prevents dmesg flooding from QUIC bursts.
-		iifname "br-lan" limit rate 5/second burst 10 packets log prefix "ks-fwd-mon: "
+		# Only log non-UDP.  Non-CN UDP is correctly blocked here (tproxy
+		# is TCP-only); logging it flooded the 601-line dmesg ring buffer.
+		# TCP here means it escaped tproxy -- worth investigating.
+		iifname "br-lan" meta l4proto != udp limit rate 5/second burst 10 packets log prefix "ks-fwd-mon: "
 		iifname "br-lan" meta nfproto ipv6 reject with icmpv6 addr-unreachable
 		iifname "br-lan" reject with icmp host-unreachable
 	}
@@ -823,8 +824,8 @@ NFTEOF
 	fi
 
 	# Pre-populate bypass_src to close the startup race window.
-	# Without this, bypass device traffic hits ks-fwd-mon log during the
-	# brief gap between killswitch install and _update_bypass_devices call.
+	# Without this, bypass device traffic is rejected during the brief
+	# gap between killswitch install and _update_bypass_devices call.
 	if [ -n "$BYPASS_LAN_DEVICES" ]; then
 		nft add element inet killswitch bypass_src "{ $BYPASS_LAN_DEVICES }" 2>/dev/null || true
 	fi
