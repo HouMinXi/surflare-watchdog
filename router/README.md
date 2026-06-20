@@ -6,8 +6,10 @@ Scripts and config for N100 mini-PC running iStoreOS or OpenWrt (procd init).
 
 | File | Purpose |
 |------|---------|
-| `surflare-lan-tproxy.nft` | nftables LAN transparent proxy -- all br-lan TCP routed through surflare-proxy. Includes `auto_bypass` dynamic set: DTLS 1.2 detection on UDP/443 (`@th,72,16 0xfefd`) automatically bypasses corporate VPN clients with 5-min timeout. |
-| `bypass-macs.conf.example` | Template for `/etc/surflare/bypass-macs.conf`: one MAC per line; IPs resolved via dhcp.leases at each VPN connect. Use for devices that always need direct CN ISP (e.g. Thunder). **Not needed for AnyConnect -- DTLS auto-detection handles that automatically.** |
+| `rule/surflare-lan-tproxy.nft` | `table inet` dual-stack tproxy (rule mode). LAN TCP+QUIC IPv4+IPv6 to surflare-proxy. `cn_direct`/`cn6_direct` sets present but empty (proxy handles CN split). |
+| `global/surflare-lan-tproxy.nft` | Same table structure (global mode). `cn_direct`/`cn6_direct` populated by watchdog with CN CIDRs for ISP direct bypass. |
+| `rule/bypass-macs.conf` | Mode-specific bypass config: empty in rule mode (proxy handles CN for all devices equally). |
+| `global/bypass-macs.conf` | Mode-specific bypass config: devices needing full CN ISP direct (e.g. Thunder). **WARNING: bypassed devices have NO VPN protection.** |
 | `update-cn-domains.sh` | Weekly cron: downloads dnsmasq-china-list, converts to SmartDNS nameserver format, validates, restarts SmartDNS. |
 | `smartdns/custom.conf.example` | SmartDNS config template: domestic group (CN DoT/DoH), foreign group (1.1.1.1 via VPN), Bing fix, bootstrap isolation. |
 | `smartdns/force-foreign.conf.example` | Per-domain VPN-path overrides for CN-IP duality domains (e.g. bing.com). |
@@ -82,10 +84,10 @@ Cross-validation methodology:
 | Constraint | Reason |
 |---|---|
 | `CONNECT_SETTLE=20` | N100 chnroute load (3917 prefixes) + pppoe + TCP handshake takes >10s |
-| `table ip` not `table inet` | inet + ip saddr in tproxy = "conflicting protocols" error |
+| `table inet` with `meta nfproto` | Dual-stack tproxy; `meta nfproto ipv4`/`ipv6` prevents cross-family matching |
 | `tproxy ip to 127.0.0.1:10800` | Bare `:10800` silently fails for LAN forwarded packets |
 | `pgrep surflare-proxy` (no `-x`) | busybox `pgrep -x` always returns 1 |
-| `tr '\n' ','` not `paste -sd, -` | paste not installed on iStoreOS |
+| `coreutils-paste` required | busybox has no `paste`; installed via opkg by install.sh |
 | No `expect` needed | auth.dat covers daemon reconnects; expect only for fresh setup |
 
 ## SmartDNS Split DNS Architecture

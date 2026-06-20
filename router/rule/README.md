@@ -114,8 +114,9 @@ LAN device (TCP/QUIC/DNS)
   The return rules never match; surflare-proxy handles CN split at the
   application layer.  Sets are present for structural parity with global
   mode (same table schema, different population).
-- `bypass_devices` is empty: no per-device MAC bypass needed when proxy
-  handles CN routing.
+- `bypass_devices` is empty: `_update_bypass_devices()` has a `MODE != "global"`
+  guard that skips population in rule mode.  `router/rule/bypass-macs.conf`
+  is comments-only; even if MACs were listed, the code guard prevents activation.
 - `auto_bypass` is IPv4-only (`type ipv4_addr`).  DTLS detection rule
   uses `meta nfproto ipv4` to avoid IPv6 false matches.
 

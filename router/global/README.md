@@ -191,8 +191,14 @@ Two CN bypass mechanisms exist only in global mode:
 In rule mode, surflare-proxy handles CN/non-CN split at the application
 layer.  Both `cn_direct` sets and `cn_ipv4` accept rules are absent.
 
-`bypass_devices` is populated from `/etc/surflare/bypass-macs.conf` in
-global mode (specific devices skip tproxy entirely).  Empty in rule mode.
+`bypass_devices` is populated from `router/global/bypass-macs.conf`
+(deployed to `/etc/surflare/bypass-macs.conf` by install.sh).  Bypassed
+devices skip tproxy entirely -- ALL traffic (CN and non-CN) goes ISP
+direct.  Their IPs are synced to killswitch `bypass_src` (forward
+accept) and dns_enforce `vpn_bypass` (DNS exemption).  **WARNING:
+bypassed devices have NO VPN protection for non-CN traffic.**
+
+In rule mode, `bypass_devices` is empty (code guard skips population).
 
 ## VPN Downtime Behavior
 
