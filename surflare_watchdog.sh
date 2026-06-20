@@ -25,7 +25,7 @@ if [ -f /etc/surflare/mode.conf ]; then
 	# shellcheck source=/dev/null
 	. /etc/surflare/mode.conf 2>/dev/null
 fi
-TRANSIT=""                                # Transit server: "" = use TRANSIT_CANDIDATES (logged), "auto" = surflare picks (opaque)
+TRANSIT="auto"                            # Transit server: "" = use TRANSIT_CANDIDATES (logged), "auto" = surflare picks (opaque)
 TRANSIT_CANDIDATES=("Dallas" "Chicago" "Atlanta" "Miami" "New York")  # US-only; KR/HK/TW exits trigger Bing cn redirect
 TRANSIT_CONNECT_TIMEOUT=12             # max seconds for surflare connect per candidate
 TRANSIT_ROUTE_READY_TIMEOUT=15        # max seconds to poll for routing readiness after connect
