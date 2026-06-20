@@ -13,53 +13,113 @@ This is the default mode for router deployments.
 ## Network Topology
 
 ```
-[ISP Modem 192.168.1.1] (PPPoE passthrough)
-      |
-      eth0 (WAN, 192.168.1.100 modem-access)
-      |
-[N100 iStoreOS]  pppoe-wan (100.65.x.x)
-      |
-      br-lan (192.168.100.1/24)
-      +-- eth1/eth2/eth3 (bridge)
-            |
-            LAN devices (.2 mesh, .10 x500, .11 admin-PC,
-                          .147 Mac/AnyConnect, .212 vivo, ...)
+ISP (PPPoE)
+    |
+Modem (192.168.1.1, bridge mode)
+    |
+    | eth0 (192.168.1.100, modem management direct)
+    |
+N100 iStoreOS (8GB RAM, Intel J4125)
+    |
+    +-- pppoe-wan (100.65.x.x, PPPoE dial-up)
+    +-- br-lan   (192.168.100.1/24, IPv6: 240e:xxx::1/60)
+    |
+    +-- WTA301 mesh AP   (.2 master, .3 child)
+    +-- x500 Fedora      (.10)
+    +-- admin-PC Windows (.11, hardcoded DNS)
+    +-- Mac              (.147, AnyConnect DTLS auto_bypass)
+    +-- Xiaomi 17 Ultra  (.160)
+    +-- vivo X200 Pro    (.212)
+    +-- houminxi phone   (.246)
 ```
 
-## nftables Architecture (Rule Mode)
+eth0 directly reaches modem management (192.168.1.0/24), bypasses PPPoE.
+The killswitch has explicit rules to allow this traffic.
 
-### Packet Flow: LAN Device to Internet
+## nftables Chain Priority Map
+
+All tables that a LAN packet traverses, in priority order:
 
 ```
-LAN device
+Hook        Table              Priority    Policy
+==========  =================  ==========  ======
+prerouting  surflare_moat      raw         accept
+prerouting  dns_enforce        mangle-20   accept
+prerouting  sw_lan_tproxy      mangle-10   accept
+prerouting  surflare           mangle      accept
+forward     killswitch         filter-10   accept
+forward     surflare           mangle      accept
+forward     fw4                filter      drop
+output      surflare           mangle      accept
+output      killswitch         +20         drop
+```
+
+## Packet Flow: LAN Device to Internet
+
+```
+LAN device (TCP/QUIC/DNS)
   |
   v
-+-------------------------------------------------------+
-| sw_lan_tproxy prerouting (mangle-10)                  |
-|  1. private dest? ---------> return (direct)          |
-|  2. in bypass_devices? ----> return (empty in rule)   |
-|  3. in auto_bypass? -------> return (AnyConnect)      |
-|  4. DTLS UDP/443 0xFEFD? --> add auto_bypass, return  |
-|  5. TCP? ------------------> tproxy :10800 (mark 0x1) |
-|  6. UDP/443 (QUIC)? -------> tproxy :10800 (mark 0x1) |
-|  7. other UDP? ------------> fall through (accept)     |
-+-------------------------------------------------------+
++----------------------------------------------------------+
+| surflare_moat prerouting (raw)                           |
+|   WAN-only (iifname != "br-lan"):                        |
+|   detect upstream-injected FIN/RST (window 78)           |
+|   counter + log "moat:" (no drop by default)             |
++----------------------------------------------------------+
+  |
+  v
++----------------------------------------------------------+
+| dns_enforce prerouting (mangle-20)                       |
+|   vpn_bypass set? --------> accept (corporate VPN devs)  |
+|   DNS (UDP/TCP 53)? ------> reject (silent, no log)      |
+|   non-DNS? ---------------> fall through                  |
++----------------------------------------------------------+
+  |
+  v
++----------------------------------------------------------+
+| sw_lan_tproxy prerouting (mangle-10), table inet         |
+|   1. IPv4 private dest? ----------> return (direct)      |
+|   2. IPv6 private dest? ----------> return (direct)      |
+|   3. in bypass_devices? ----------> return (empty/rule)   |
+|   4. in auto_bypass? -------------> return (AnyConnect)   |
+|   5. in cn_direct? ---------------> return (empty/rule)   |
+|   6. in cn6_direct? --------------> return (empty/rule)   |
+|   7. DTLS 1.2 UDP/443 0xFEFD? ----> auto_bypass, return  |
+|   8. IPv4 TCP? ---> tproxy to 127.0.0.1:10800 (mark 0x1) |
+|   9. IPv6 TCP? ---> tproxy to [::1]:10800     (mark 0x1) |
+|  10. IPv4 QUIC? --> tproxy to 127.0.0.1:10800 (mark 0x1) |
+|  11. IPv6 QUIC? --> tproxy to [::1]:10800     (mark 0x1) |
+|  12. other UDP? --> fall through (accept)                 |
++----------------------------------------------------------+
   |                              |
   | (non-tproxy'd)               | (tproxy'd TCP + QUIC)
   v                              v
 +-----------------------------+  surflare-proxy (:10800)
 | killswitch forward (-10)    |    |
-|  bypass_ipv4 (CN)? -> accept|    +-> CN dest: direct ISP
-|  bypass_src? --------> accept|    +-> non-CN: VPN tunnel
-|  lan_ranges? --------> accept|
-|  NTP UDP/123? -------> accept|
-|  log ks-fwd-mon             |
-|  IPv6: reject icmpv6        |
-|  IPv4: reject icmp          |
+|  established/related accept |    +-> CN dest: direct ISP
+|  server_ips? ---------> accept    +-> non-CN: VPN tunnel
+|  bypass_ipv4 (CN)? ---> accept
+|  bypass_src? ---------> accept
+|  lan_ranges? ---------> accept
+|  NTP UDP/123? --------> accept
+|  log "ks-fwd-mon:" (5/s burst 10)
+|  IPv6: reject icmpv6
+|  IPv4: reject icmp
 +-----------------------------+
 ```
 
-### Packet Flow: Router to Internet
+### Rule mode tproxy notes
+
+- `cn_direct` / `cn6_direct` sets exist in the nft file but remain empty.
+  The return rules never match; surflare-proxy handles CN split at the
+  application layer.  Sets are present for structural parity with global
+  mode (same table schema, different population).
+- `bypass_devices` is empty: no per-device MAC bypass needed when proxy
+  handles CN routing.
+- `auto_bypass` is IPv4-only (`type ipv4_addr`).  DTLS detection rule
+  uses `meta nfproto ipv4` to avoid IPv6 false matches.
+
+## Packet Flow: Router to Internet
 
 ```
 Router process (opkg, curl, SSH)
@@ -88,29 +148,80 @@ Router process (opkg, curl, SSH)
 +-----------------------------------------------+
 ```
 
-### nftables Tables Summary
+## nftables Tables Summary
 
-| Table | Chain | Priority | Role |
-|-------|-------|----------|------|
-| `ip sw_lan_tproxy` | prerouting | mangle-10 | LAN TCP + QUIC to surflare-proxy |
-| `ip dns_enforce` | prerouting | mangle-20 | Force LAN DNS through router |
-| `inet surflare` | output | mangle | Router traffic to surflare-proxy |
-| `inet surflare` | prerouting | mangle | tproxy marked packets to :10800 |
-| `inet killswitch` | output | filter+20 | Router leak protection (policy drop) |
-| `inet killswitch` | forward | filter-10 | LAN leak protection + IP audit log |
-| `inet surflare_moat` | prerouting | raw | TCP fingerprint detection |
-| `inet fw4` | forward | filter | OpenWrt zone firewall (policy drop) |
+| Table | Family | Chain | Priority | Role |
+|-------|--------|-------|----------|------|
+| `surflare_moat` | inet | prerouting | raw | WAN TCP fingerprint detection (FIN/RST window 78) |
+| `dns_enforce` | ip | prerouting | mangle-20 | Force LAN DNS through router (silent reject) |
+| `sw_lan_tproxy` | inet | prerouting | mangle-10 | Dual-stack LAN TCP+QUIC tproxy to :10800 |
+| `surflare` | inet | output, prerouting | mangle | Router traffic routing + tproxy dispatch |
+| `killswitch` | inet | forward | filter-10 | LAN leak protection + IP audit log |
+| `killswitch` | inet | output | filter+20 | Router leak protection (policy drop) |
+| `fw4` | inet | forward | filter | OpenWrt zone firewall (policy drop) |
 
-### Key difference from global mode
+## Key Difference from Global Mode
 
-In global mode, `_setup_chnroute()` loads CN CIDRs into the `inet surflare`
-output chain as kernel-level accept rules.  In rule mode, surflare-proxy
-handles the CN/non-CN split at the application layer, so no cn_ipv4 accept
-rules are added to the surflare output chain.
+In global mode, `_load_tproxy_cn_direct()` populates the `cn_direct` /
+`cn6_direct` sets from cn_ipv4.txt + cn_ipv4_extra.txt + cn_ipv6.txt,
+so CN-destined LAN traffic returns before tproxy and routes via ISP
+direct (domestic IP for CDN + geo-detection).
+
+In rule mode, surflare-proxy handles CN/non-CN split at the application
+layer.  The `cn_direct` / `cn6_direct` sets remain empty, and no
+`cn_ipv4` accept rules are added to the surflare output chain.
 
 `bypass_ipv4` in the killswitch is populated in both modes (VPN-down
-resilience + LAN CN UDP direct routing).  `bypass_devices` is empty in
-rule mode (proxy handles CN; no per-device MAC bypass needed).
+resilience + LAN CN UDP direct routing).
+
+## Dual-Stack Tproxy (table inet)
+
+The tproxy table uses `table inet` (not `table ip`) so both IPv4 and
+IPv6 TCP/QUIC are proxied.  Without IPv6 tproxy, Happy Eyeballs causes
+LAN devices to prefer IPv6 for dual-stack destinations, which would
+bypass the proxy and hit the killswitch forward chain, producing
+`ks-fwd-mon` log noise (~49 entries per 2 minutes).
+
+Rules use `meta nfproto ipv4` / `meta nfproto ipv6` to prevent
+cross-family matching in the inet table.  The DTLS detection rule is
+IPv4-only because `auto_bypass` is `type ipv4_addr`.
+
+## Moat: TCP Fingerprint Detection
+
+`surflare_moat` detects upstream-injected TCP FIN/RST packets by
+matching unusual window sizes (32, 64, 78, 128).  The primary target is
+window=78, a known GFW fingerprint.
+
+Direction filter: `iifname != "br-lan"` ensures only WAN-originated
+packets trigger detection.  Without this filter, normal LAN TCP
+closures (iOS/macOS use window=78 for FIN+ACK) produce false positives
+(~118 per 2 minutes from LAN devices alone).
+
+Default mode is counter + log only.  Touch
+`/run/surflare_watchdog.moat_strict` to enable drop.
+
+## DNS Enforcement
+
+`dns_enforce` silently rejects DNS queries (UDP/TCP port 53) from LAN
+devices that bypass the router's DNS.  This prevents DNS leaks from
+devices with hardcoded DNS servers (e.g. admin-PC .11 using 8.8.8.8).
+
+No log output: DNS enforcement is a hygiene measure, not an IP leak
+indicator.  Logging it would produce noise (148+ entries per minute
+from admin-PC alone).
+
+The `vpn_bypass` set exempts corporate VPN devices (e.g. Mac .147) that
+need their own DNS for split-tunnel operation.
+
+## Tombstone / Restore Lifecycle
+
+VPN disconnect: each tproxy rule is replaced with a protocol-qualified
+reject (TCP -> `reject with tcp reset`, UDP -> bare `reject`).  This
+prevents LAN TCP connections from hanging on timeout during VPN outage.
+
+VPN reconnect: the tombstoned table is destroyed and reloaded atomically
+from `/etc/surflare-lan-tproxy.nft`.  Any nft load error is captured in
+a WARN log (not swallowed).
 
 ## VPN Downtime Behavior
 
@@ -128,10 +239,8 @@ When VPN is down, the killswitch forward chain logs non-CN access attempts:
 ks-fwd-mon: IN=br-lan OUT=pppoe-wan SRC=192.168.100.212 DST=104.18.32.7 ...
 ```
 
-This log is critical for auditing which LAN devices attempted to access
-foreign destinations during VPN downtime.  CN traffic (matched by
-`bypass_ipv4`) is accepted silently -- only non-CN traffic triggers the
-log + REJECT.
+CN traffic (matched by `bypass_ipv4`) is accepted silently -- only
+non-CN traffic triggers the log + REJECT.
 
 ## Configuration
 
@@ -146,4 +255,13 @@ grep '^MODE=' /usr/local/sbin/surflare_watchdog.sh
 
 # Verify surflare-proxy is in Smart Routing mode
 curl -s http://127.0.0.1:10800/api/config 2>/dev/null | grep -o '"mode":"[^"]*"'
+
+# Verify dual-stack tproxy table
+nft list table inet sw_lan_tproxy | head -3
+
+# Check moat detection (should show 0 hits from LAN)
+nft list chain inet surflare_moat prerouting | grep counter
+
+# Verify dns-bypass log count (should be 0)
+dmesg | grep -c "dns-bypass"
 ```

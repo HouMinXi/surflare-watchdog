@@ -1,86 +1,135 @@
 # Router / Global Mode
 
-All traffic from LAN devices is routed through the VPN tunnel at the
-application layer (surflare-proxy).  The kernel output chain uses chnroute
-(`cn_ipv4`/`cn_ipv6`) so the router's own processes bypass the VPN for CN
-destinations.
+All LAN TCP/QUIC traffic is routed through the VPN tunnel via
+surflare-proxy.  CN-destined traffic bypasses tproxy at the kernel level
+(`cn_direct` / `cn6_direct` sets) so CN apps see a domestic IP.  The
+router's own output chain also uses chnroute (`cn_ipv4`/`cn_ipv6`) for
+kernel-level CN bypass.
 
 ## When to Use
 
-- Privacy-focused household: every device's traffic exits through VPN.
-- No requirement for CN apps (bilibili, xiaohongshu, etc.) to detect a
-  domestic IP address.
+- Full encryption: every LAN device's non-CN traffic exits through VPN.
+- CN apps (bilibili, Taobao, etc.) still need domestic IP for CDN
+  acceleration and geo-detection.
 
 ## CN Direct Bypass (cn_direct)
 
 LAN traffic to CN destinations bypasses tproxy and routes via ISP direct.
-The `cn_direct` / `cn6_direct` sets in the tproxy table are populated from
-`cn_ipv4.txt` + `cn_ipv4_extra.txt` (cloud CDN) + `cn_ipv6.txt` after each
-VPN connect.  This gives CN apps a domestic IP (CDN acceleration works,
-geo-detection passes) while non-CN traffic still goes through VPN.
+The `cn_direct` / `cn6_direct` sets in the tproxy table are populated by
+`_load_tproxy_cn_direct()` from cn_ipv4.txt + cn_ipv4_extra.txt (cloud
+CDN) + cn_ipv6.txt after each VPN connect.  This gives CN apps a domestic
+IP while non-CN traffic still goes through VPN.
 
-In rule mode these sets are empty (surflare-proxy handles CN split at the
-application layer).
+In rule mode these sets are empty (surflare-proxy handles CN split at
+the application layer).
 
 ## Remaining Limitations
 
 - CN IP list is static (updated weekly by `surflare_route_updater.sh`).
-  A CN service using a non-CN IP (e.g. CN company with US CDN) will still
-  go through VPN.
-- CN UDP on non-standard ports (gaming, VoIP) passes through the killswitch
-  `bypass_ipv4` directly (not tproxied, not through VPN).  This is correct
-  behavior -- these connections see the domestic ISP IP.
+  A CN service using a non-CN IP (e.g. CN company with US CDN) will
+  still go through VPN.
+- CN UDP on non-standard ports (gaming, VoIP) passes through the
+  killswitch `bypass_ipv4` directly (not tproxied, not through VPN).
+  This is correct behavior -- these connections see the domestic ISP IP.
 
 ## Network Topology
 
 ```
-[ISP Modem 192.168.1.1] (PPPoE passthrough)
-      |
-      eth0 (WAN, 192.168.1.100 modem-access)
-      |
-[N100 iStoreOS]  pppoe-wan (100.65.x.x)
-      |
-      br-lan (192.168.100.1/24)
-      +-- eth1/eth2/eth3 (bridge)
-            |
-            LAN devices (.2 mesh, .10 x500, .11 admin-PC,
-                          .147 Mac/AnyConnect, .212 vivo, ...)
+ISP (PPPoE)
+    |
+Modem (192.168.1.1, bridge mode)
+    |
+    | eth0 (192.168.1.100, modem management direct)
+    |
+N100 iStoreOS (8GB RAM, Intel J4125)
+    |
+    +-- pppoe-wan (100.65.x.x, PPPoE dial-up)
+    +-- br-lan   (192.168.100.1/24, IPv6: 240e:xxx::1/60)
+    |
+    +-- WTA301 mesh AP   (.2 master, .3 child)
+    +-- x500 Fedora      (.10)
+    +-- admin-PC Windows (.11, hardcoded DNS)
+    +-- Mac              (.147, AnyConnect DTLS auto_bypass)
+    +-- Xiaomi 17 Ultra  (.160)
+    +-- vivo X200 Pro    (.212)
+    +-- houminxi phone   (.246)
 ```
 
-## nftables Architecture (Global Mode)
-
-### Packet Flow: LAN Device to Internet
+## nftables Chain Priority Map
 
 ```
-LAN device
+Hook        Table              Priority    Policy
+==========  =================  ==========  ======
+prerouting  surflare_moat      raw         accept
+prerouting  dns_enforce        mangle-20   accept
+prerouting  sw_lan_tproxy      mangle-10   accept
+prerouting  surflare           mangle      accept
+forward     killswitch         filter-10   accept
+forward     surflare           mangle      accept
+forward     fw4                filter      drop
+output      surflare           mangle      accept
+output      killswitch         +20         drop
+```
+
+## Packet Flow: LAN Device to Internet
+
+```
+LAN device (TCP/QUIC/DNS)
   |
   v
-+-------------------------------------------------------+
-| sw_lan_tproxy prerouting (mangle-10)                  |
-|  1. private dest? ---------> return (direct)          |
-|  2. in bypass_devices? ----> return (Thunder/.11)     |
-|  3. in auto_bypass? -------> return (AnyConnect)      |
-|  4. DTLS UDP/443 0xFEFD? --> add auto_bypass, return  |
-|  5. TCP? ------------------> tproxy :10800 (mark 0x1) |
-|  6. UDP/443 (QUIC)? -------> tproxy :10800 (mark 0x1) |
-|  7. other UDP? ------------> fall through (accept)     |
-+-------------------------------------------------------+
++----------------------------------------------------------+
+| surflare_moat prerouting (raw)                           |
+|   WAN-only (iifname != "br-lan"):                        |
+|   detect upstream-injected FIN/RST (window 78)           |
+|   counter + log "moat:" (no drop by default)             |
++----------------------------------------------------------+
+  |
+  v
++----------------------------------------------------------+
+| dns_enforce prerouting (mangle-20)                       |
+|   vpn_bypass set? --------> accept (corporate VPN devs)  |
+|   DNS (UDP/TCP 53)? ------> reject (silent, no log)      |
+|   non-DNS? ---------------> fall through                  |
++----------------------------------------------------------+
+  |
+  v
++----------------------------------------------------------+
+| sw_lan_tproxy prerouting (mangle-10), table inet         |
+|   1. IPv4 private dest? ----------> return (direct)      |
+|   2. IPv6 private dest? ----------> return (direct)      |
+|   3. in bypass_devices? ----------> return (MAC bypass)   |
+|   4. in auto_bypass? -------------> return (AnyConnect)   |
+|   5. in cn_direct? ---------------> return (CN ISP)  ***  |
+|   6. in cn6_direct? --------------> return (CN ISP)  ***  |
+|   7. DTLS 1.2 UDP/443 0xFEFD? ----> auto_bypass, return  |
+|   8. IPv4 TCP? ---> tproxy to 127.0.0.1:10800 (mark 0x1) |
+|   9. IPv6 TCP? ---> tproxy to [::1]:10800     (mark 0x1) |
+|  10. IPv4 QUIC? --> tproxy to 127.0.0.1:10800 (mark 0x1) |
+|  11. IPv6 QUIC? --> tproxy to [::1]:10800     (mark 0x1) |
+|  12. other UDP? --> fall through (accept)                 |
++----------------------------------------------------------+
   |                              |
-  | (non-tproxy'd / bypass)      | (tproxy'd TCP + QUIC)
+  | (non-tproxy'd / CN direct)   | (tproxy'd TCP + QUIC)
   v                              v
 +-----------------------------+  surflare-proxy (:10800)
 | killswitch forward (-10)    |    |
-|  bypass_ipv4 (CN)? -> accept|    +-> ALL traffic: VPN tunnel
-|  bypass_src? --------> accept|       (no CN/non-CN split)
-|  lan_ranges? --------> accept|
-|  NTP UDP/123? -------> accept|
-|  log ks-fwd-mon             |
-|  IPv6: reject icmpv6        |
-|  IPv4: reject icmp          |
+|  established/related accept |    +-> ALL: VPN tunnel
+|  server_ips? ---------> accept       (no CN split at proxy)
+|  bypass_ipv4 (CN)? ---> accept
+|  bypass_src? ---------> accept
+|  lan_ranges? ---------> accept
+|  NTP UDP/123? --------> accept
+|  log "ks-fwd-mon:" (5/s burst 10)
+|  IPv6: reject icmpv6
+|  IPv4: reject icmp
 +-----------------------------+
+
+*** cn_direct/cn6_direct: populated from cn_ipv4.txt + cn_ipv4_extra.txt
+    + cn_ipv6.txt after each VPN connect.  CN traffic returns here and
+    goes ISP direct (bypasses both tproxy and VPN).
 ```
 
-### Packet Flow: Router to Internet
+## Packet Flow: Router to Internet
 
 ```
 Router process (opkg, curl, SSH)
@@ -93,7 +142,7 @@ Router process (opkg, curl, SSH)
 |  loopback? -> accept                          |
 |  DNS? -> mark 0x1                             |
 |  private? -> accept                           |
-|  cn_ipv4? -> accept (kernel CN bypass)        |  <-- global only
+|  cn_ipv4? -> accept (kernel CN bypass)   ***  |
 |  TCP/UDP? -> mark 0x1 -> surflare-proxy       |
 +-----------------------------------------------+
   |
@@ -104,36 +153,46 @@ Router process (opkg, curl, SSH)
 |  mark 0xff/0x1? -> accept                     |
 |  bypass_ipv4 (CN)? -> accept                  |
 |  lan_ranges? -> accept                        |
-|  UDP -> reject                                |
+|  UDP -> reject (QUIC fallback)                |
 |  IPv6 -> reject                               |
 |  log ks-drop + DROP                           |
 +-----------------------------------------------+
+
+*** cn_ipv4 accept: global-only. Router's own CN traffic bypasses
+    surflare-proxy at kernel level (opkg, curl to CN mirrors).
 ```
 
-### nftables Tables Summary
+## nftables Tables Summary
 
-| Table | Chain | Priority | Role |
-|-------|-------|----------|------|
-| `inet sw_lan_tproxy` | prerouting | mangle-10 | LAN TCP + QUIC to surflare-proxy (IPv4+IPv6 dual-stack) |
-| `ip dns_enforce` | prerouting | mangle-20 | Force LAN DNS through router (silent reject, no log) |
-| `inet surflare` | output | mangle | Router traffic + **cn_ipv4 accept** |
-| `inet surflare` | prerouting | mangle | tproxy marked packets to :10800 |
-| `inet killswitch` | output | filter+20 | Router leak protection (policy drop) |
-| `inet killswitch` | forward | filter-10 | LAN leak protection + IP audit log |
-| `inet surflare_moat` | prerouting | raw | TCP fingerprint detection |
-| `inet fw4` | forward | filter | OpenWrt zone firewall (policy drop) |
+| Table | Family | Chain | Priority | Role |
+|-------|--------|-------|----------|------|
+| `surflare_moat` | inet | prerouting | raw | WAN TCP fingerprint detection (FIN/RST window 78) |
+| `dns_enforce` | ip | prerouting | mangle-20 | Force LAN DNS through router (silent reject) |
+| `sw_lan_tproxy` | inet | prerouting | mangle-10 | Dual-stack LAN TCP+QUIC tproxy + cn_direct bypass |
+| `surflare` | inet | output, prerouting | mangle | Router traffic routing + cn_ipv4 accept |
+| `killswitch` | inet | forward | filter-10 | LAN leak protection + IP audit log |
+| `killswitch` | inet | output | filter+20 | Router leak protection (policy drop) |
+| `fw4` | inet | forward | filter | OpenWrt zone firewall (policy drop) |
 
-### Key difference from rule mode
+## Key Difference from Rule Mode
 
-Global mode adds `ip daddr @cn_ipv4 accept` to the `inet surflare` output
-chain, giving the router's own processes a kernel-level CN bypass that does
-not go through surflare-proxy.  All LAN TCP/QUIC goes through surflare-proxy
-and exits via VPN regardless of destination -- no CN/non-CN split at the
-application layer.
+Two CN bypass mechanisms exist only in global mode:
 
-`bypass_devices` is populated from `/etc/surflare/bypass-macs.conf` so
-specific devices (e.g. admin-PC running Thunder) skip tproxy entirely and
-route via ISP for CN traffic.
+1. **LAN cn_direct bypass** (`sw_lan_tproxy`): `_load_tproxy_cn_direct()`
+   populates `cn_direct` / `cn6_direct` sets from cn_ipv4.txt +
+   cn_ipv4_extra.txt + cn_ipv6.txt after each VPN connect.  CN-destined
+   LAN traffic returns before tproxy, goes through killswitch forward
+   (`bypass_ipv4` accepts it), exits via ISP direct.
+
+2. **Router cn_ipv4 bypass** (`inet surflare` output): `_setup_chnroute()`
+   inserts `ip daddr @cn_ipv4 accept` so the router's own CN traffic
+   (opkg, curl) bypasses surflare-proxy at kernel level.
+
+In rule mode, surflare-proxy handles CN/non-CN split at the application
+layer.  Both `cn_direct` sets and `cn_ipv4` accept rules are absent.
+
+`bypass_devices` is populated from `/etc/surflare/bypass-macs.conf` in
+global mode (specific devices skip tproxy entirely).  Empty in rule mode.
 
 ## VPN Downtime Behavior
 
@@ -143,9 +202,8 @@ route via ISP for CN traffic.
 
 ## Configuration
 
-Set `MODE="global"` in `surflare_watchdog.sh` (or leave `MODE=""` and set
-`PLATFORM` detection to resolve it -- default for router is `rule`, so
-global mode requires explicit override):
+Set `MODE="global"` in `surflare_watchdog.sh` (default for router is
+`rule`, so global mode requires explicit override):
 
 ```bash
 # In surflare_watchdog.sh, before PLATFORM detection:
@@ -156,4 +214,17 @@ Or via install.sh sed on deployment:
 
 ```bash
 sudo sed -i 's/^MODE=""/MODE="global"/' /usr/local/sbin/surflare_watchdog.sh
+```
+
+To verify on a running system:
+
+```bash
+# Check mode
+grep '^MODE=' /usr/local/sbin/surflare_watchdog.sh
+
+# Verify cn_direct sets are populated (global only, ~4700 CIDRs)
+nft list set inet sw_lan_tproxy cn_direct | grep -c "/"
+
+# Verify cn_ipv4 accept in surflare output
+nft list chain inet surflare output | grep cn_ipv4
 ```
