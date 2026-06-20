@@ -394,18 +394,18 @@ _setup_chnroute() {
 			nft flush set inet surflare cn_ipv4 2>/dev/null || true
 
 			local tmp_nft="/tmp/cn_ipv4_$$.nft"
-			{
-				printf 'add element inet surflare cn_ipv4 { '
-				grep -v '^#' "$cn_v4_file" | grep -v '^[[:space:]]*$' | paste -sd, -
-				printf ' }\n'
-			} > "$tmp_nft"
+			local _v4_data
+			_v4_data=$(grep -v '^#' "$cn_v4_file" | grep -v '^[[:space:]]*$' | paste -sd, -)
+			if [ -z "$_v4_data" ]; then
+				log "WARN: ${cn_v4_file} has no valid CIDRs, skipping surflare cn_ipv4"
+			else
+			printf 'add element inet surflare cn_ipv4 { %s }\n' "$_v4_data" > "$tmp_nft"
 			local _v4_ok=0 _v4_try=0
 			while [ "$_v4_try" -lt 3 ] && [ "$_v4_ok" -eq 0 ]; do
 				if nft -f "$tmp_nft" 2>/dev/null; then _v4_ok=1
 				else _v4_try=$((_v4_try+1)); [ "$_v4_try" -lt 3 ] && sleep 2; fi
 			done
 			if [ "$_v4_ok" -eq 1 ]; then
-				# Insert rule only if not already present (avoids accumulation on reconnect).
 				if ! nft list chain inet surflare output 2>/dev/null \
 					| grep -q 'ip daddr @cn_ipv4 accept'; then
 					nft insert rule inet surflare output ip daddr @cn_ipv4 accept 2>/dev/null || true
@@ -414,6 +414,7 @@ _setup_chnroute() {
 				bypass_applied=$((bypass_applied + 1))
 			else
 				log "WARN: Failed to load Chnroute v4 into surflare output after 3 attempts"
+			fi
 			fi
 			rm -f "$tmp_nft"
 		fi
@@ -428,11 +429,12 @@ _setup_chnroute() {
 			nft flush set inet surflare cn_ipv6 2>/dev/null || true
 
 			local tmp_nft_v6="/tmp/cn_ipv6_$$.nft"
-			{
-				printf 'add element inet surflare cn_ipv6 { '
-				grep -v '^#' "$cn_v6_file" | grep -v '^[[:space:]]*$' | paste -sd, -
-				printf ' }\n'
-			} > "$tmp_nft_v6"
+			local _v6_data
+			_v6_data=$(grep -v '^#' "$cn_v6_file" | grep -v '^[[:space:]]*$' | paste -sd, -)
+			if [ -z "$_v6_data" ]; then
+				log "WARN: ${cn_v6_file} has no valid CIDRs, skipping surflare cn_ipv6"
+			else
+			printf 'add element inet surflare cn_ipv6 { %s }\n' "$_v6_data" > "$tmp_nft_v6"
 			local _v6_ok=0 _v6_try=0
 			while [ "$_v6_try" -lt 3 ] && [ "$_v6_ok" -eq 0 ]; do
 				if nft -f "$tmp_nft_v6" 2>/dev/null; then _v6_ok=1
@@ -448,6 +450,7 @@ _setup_chnroute() {
 			else
 				log "WARN: Failed to load Chnroute v6 into surflare output after 3 attempts"
 			fi
+			fi
 			rm -f "$tmp_nft_v6"
 		fi
 
@@ -458,16 +461,18 @@ _setup_chnroute() {
 			extra_date=$(stat -c '%y' "$cn_v4_extra_file" 2>/dev/null | cut -d' ' -f1)
 			log "Cloud CDN extra: ${extra_count} CIDRs (${extra_date}) -> surflare cn_ipv4"
 			local tmp_extra="/tmp/cn_v4_extra_$$.nft"
-			{
-				printf 'add element inet surflare cn_ipv4 { '
-				grep -v '^#' "$cn_v4_extra_file" | \
-					grep -v '^[[:space:]]*$' | paste -sd, -
-				printf ' }\n'
-			} > "$tmp_extra"
+			local _extra_data
+			_extra_data=$(grep -v '^#' "$cn_v4_extra_file" | \
+				grep -v '^[[:space:]]*$' | paste -sd, -)
+			if [ -z "$_extra_data" ]; then
+				log "WARN: ${cn_v4_extra_file} has no valid CIDRs"
+			else
+			printf 'add element inet surflare cn_ipv4 { %s }\n' "$_extra_data" > "$tmp_extra"
 			if nft -f "$tmp_extra" 2>/dev/null; then
 				log "Cloud CDN extra bypass applied to surflare cn_ipv4"
 			else
 				log "WARN: cloud CDN extra bypass load failed (nft error)"
+			fi
 			fi
 			rm -f "$tmp_extra"
 		fi
@@ -482,34 +487,40 @@ _setup_chnroute() {
 	: > "$_ks_batch"
 
 	if [ -f "$cn_v4_file" ]; then
-		local _cn_count _cn_date
+		local _cn_count _cn_date _ks_v4
 		_cn_count=$(grep -vc '^#' "$cn_v4_file" 2>/dev/null || echo 0)
 		_cn_date=$(stat -c '%y' "$cn_v4_file" 2>/dev/null | cut -d' ' -f1)
-		{
-			printf 'flush set inet killswitch bypass_ipv4\n'
-			printf 'add element inet killswitch bypass_ipv4 { '
-			grep -v '^#' "$cn_v4_file" | grep -v '^[[:space:]]*$' | paste -sd, -
-			printf ' }\n'
-		} >> "$_ks_batch"
-		_ks_sources=$((_ks_sources + 1))
+		_ks_v4=$(grep -v '^#' "$cn_v4_file" | grep -v '^[[:space:]]*$' | paste -sd, -)
+		if [ -n "$_ks_v4" ]; then
+			{
+				printf 'flush set inet killswitch bypass_ipv4\n'
+				printf 'add element inet killswitch bypass_ipv4 { %s }\n' "$_ks_v4"
+			} >> "$_ks_batch"
+			_ks_sources=$((_ks_sources + 1))
+		else
+			log "WARN: ${cn_v4_file} has no valid CIDRs, bypass_ipv4 not updated"
+		fi
 	fi
 	# Cloud CDN extra: additive to bypass_ipv4 (same batch, no separate flush).
 	if [ -f "$cn_v4_extra_file" ]; then
-		{
-			printf 'add element inet killswitch bypass_ipv4 { '
-			grep -v '^#' "$cn_v4_extra_file" | \
-				grep -v '^[[:space:]]*$' | paste -sd, -
-			printf ' }\n'
-		} >> "$_ks_batch"
+		local _ks_extra
+		_ks_extra=$(grep -v '^#' "$cn_v4_extra_file" | \
+			grep -v '^[[:space:]]*$' | paste -sd, -)
+		[ -n "$_ks_extra" ] && \
+			printf 'add element inet killswitch bypass_ipv4 { %s }\n' "$_ks_extra" >> "$_ks_batch"
 	fi
 	if [ -f "$cn_v6_file" ]; then
-		{
-			printf 'flush set inet killswitch bypass_ipv6\n'
-			printf 'add element inet killswitch bypass_ipv6 { '
-			grep -v '^#' "$cn_v6_file" | grep -v '^[[:space:]]*$' | paste -sd, -
-			printf ' }\n'
-		} >> "$_ks_batch"
-		_ks_sources=$((_ks_sources + 1))
+		local _ks_v6
+		_ks_v6=$(grep -v '^#' "$cn_v6_file" | grep -v '^[[:space:]]*$' | paste -sd, -)
+		if [ -n "$_ks_v6" ]; then
+			{
+				printf 'flush set inet killswitch bypass_ipv6\n'
+				printf 'add element inet killswitch bypass_ipv6 { %s }\n' "$_ks_v6"
+			} >> "$_ks_batch"
+			_ks_sources=$((_ks_sources + 1))
+		else
+			log "WARN: ${cn_v6_file} has no valid CIDRs, bypass_ipv6 not updated"
+		fi
 	fi
 
 	if [ "$_ks_sources" -gt 0 ]; then
