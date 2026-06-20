@@ -551,33 +551,40 @@ _load_tproxy_cn_direct() {
 	[ ! -f "$cn_v4_file" ] && \
 		log "WARN: ${cn_v4_file} missing, cn_direct will be empty"
 	if [ -f "$cn_v4_file" ]; then
-		{
-			printf 'flush set inet sw_lan_tproxy cn_direct\n'
-			printf 'add element inet sw_lan_tproxy cn_direct { '
-			grep -v '^#' "$cn_v4_file" | grep -v '^[[:space:]]*$' | paste -sd, -
-			printf ' }\n'
-		} >> "$_batch"
-		_loaded=$((_loaded + 1))
+		local _v4_cidrs
+		_v4_cidrs=$(grep -v '^#' "$cn_v4_file" | grep -v '^[[:space:]]*$' | paste -sd, -)
+		if [ -n "$_v4_cidrs" ]; then
+			{
+				printf 'flush set inet sw_lan_tproxy cn_direct\n'
+				printf 'add element inet sw_lan_tproxy cn_direct { %s }\n' "$_v4_cidrs"
+			} >> "$_batch"
+			_loaded=$((_loaded + 1))
+		else
+			log "WARN: ${cn_v4_file} has no valid CIDRs"
+		fi
 	fi
 	if [ -f "$cn_v4_extra_file" ]; then
-		{
-			printf 'add element inet sw_lan_tproxy cn_direct { '
-			grep -v '^#' "$cn_v4_extra_file" | \
-				grep -v '^[[:space:]]*$' | paste -sd, -
-			printf ' }\n'
-		} >> "$_batch"
+		local _extra_cidrs
+		_extra_cidrs=$(grep -v '^#' "$cn_v4_extra_file" | \
+			grep -v '^[[:space:]]*$' | paste -sd, -)
+		[ -n "$_extra_cidrs" ] && \
+			printf 'add element inet sw_lan_tproxy cn_direct { %s }\n' "$_extra_cidrs" >> "$_batch"
 	fi
 	# IPv6: cn_ipv6.txt
 	[ ! -f "$cn_v6_file" ] && \
 		log "WARN: ${cn_v6_file} missing, cn6_direct will be empty"
 	if [ -f "$cn_v6_file" ]; then
-		{
-			printf 'flush set inet sw_lan_tproxy cn6_direct\n'
-			printf 'add element inet sw_lan_tproxy cn6_direct { '
-			grep -v '^#' "$cn_v6_file" | grep -v '^[[:space:]]*$' | paste -sd, -
-			printf ' }\n'
-		} >> "$_batch"
-		_loaded=$((_loaded + 1))
+		local _v6_cidrs
+		_v6_cidrs=$(grep -v '^#' "$cn_v6_file" | grep -v '^[[:space:]]*$' | paste -sd, -)
+		if [ -n "$_v6_cidrs" ]; then
+			{
+				printf 'flush set inet sw_lan_tproxy cn6_direct\n'
+				printf 'add element inet sw_lan_tproxy cn6_direct { %s }\n' "$_v6_cidrs"
+			} >> "$_batch"
+			_loaded=$((_loaded + 1))
+		else
+			log "WARN: ${cn_v6_file} has no valid CIDRs"
+		fi
 	fi
 
 	if [ "$_loaded" -gt 0 ]; then
@@ -1133,7 +1140,23 @@ _update_bypass_devices() {
 			[ -n "$ip" ] && all_ips="${all_ips:+$all_ips,}$ip"
 		done < "$BYPASS_LAN_MACS_FILE"
 	fi
-	[ -z "$all_ips" ] && return 0
+	if [ -z "$all_ips" ]; then
+		# No bypass devices: sync auto_bypass only to killswitch bypass_src
+		# and dns_enforce vpn_bypass.  Without this, stale device IPs from
+		# a previous connect cycle remain in bypass_src after DHCP change.
+		if nft list table inet killswitch >/dev/null 2>&1; then
+			local _auto_ips
+			_auto_ips=$(nft list set inet sw_lan_tproxy auto_bypass 2>/dev/null \
+				| grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | paste -sd,)
+			{
+				printf 'flush set inet killswitch bypass_src\n'
+				[ -n "$_auto_ips" ] && \
+					printf 'add element inet killswitch bypass_src { %s }\n' "$_auto_ips"
+			} | nft -f - 2>/dev/null || true
+		fi
+		_sync_dns_enforce_bypass
+		return 0
+	fi
 	# Deduplicate in case same IP appears in both BYPASS_LAN_DEVICES and MAC file
 	all_ips=$(echo "$all_ips" | tr ',' '\n' | sort -u | paste -sd,)
 	nft add element inet sw_lan_tproxy bypass_devices "{ $all_ips }" 2>/dev/null || \
@@ -1173,13 +1196,16 @@ _sync_dns_enforce_bypass() {
 	[ -n "$_auto" ] && _dns_ips="${_dns_ips:+$_dns_ips,}$_auto"
 	_dns_ips=$(echo "$_dns_ips" | tr ',' '\n' | sort -u | paste -sd,)
 
-	# Sync to dns_enforce vpn_bypass (DNS exemption for VPN devices)
+	# Sync to dns_enforce vpn_bypass (DNS exemption for VPN devices).
+	# Atomic flush+add via nft -f to avoid a window where bypass devices'
+	# DNS queries are rejected between the flush and the add.
 	if nft list table ip dns_enforce >/dev/null 2>&1; then
-		nft flush set ip dns_enforce vpn_bypass 2>/dev/null
-		if [ -n "$_dns_ips" ]; then
-			nft add element ip dns_enforce vpn_bypass "{ $_dns_ips }" 2>/dev/null || \
-				log "WARN: dns_enforce vpn_bypass sync failed"
-		fi
+		{
+			printf 'flush set ip dns_enforce vpn_bypass\n'
+			[ -n "$_dns_ips" ] && \
+				printf 'add element ip dns_enforce vpn_bypass { %s }\n' "$_dns_ips"
+		} | nft -f - 2>/dev/null || \
+			log "WARN: dns_enforce vpn_bypass sync failed"
 	fi
 
 	# Sync auto_bypass IPs to killswitch bypass_src so the forward chain
