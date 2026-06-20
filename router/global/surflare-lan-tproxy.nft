@@ -76,17 +76,20 @@ table inet sw_lan_tproxy {
             meta mark set 0x00000001 \
             accept
 
-        # QUIC block: drop remaining UDP/443 (non-DTLS) to force TCP/HTTP2
+        # QUIC block: reject remaining UDP/443 (non-DTLS) to force TCP/HTTP2
         # fallback.  DTLS 1.2 packets already matched and returned above.
         #
         # Why: QUIC-over-VPN produces 3s+ TTFB for foreign CDNs (Cloudflare
-        # anycast selects PoP by VPN exit IP, not client IP).  Silent drop
-        # avoids ICMP amplification at scale (200+ LAN devices); clients
-        # fall back to TCP after QUIC PTO (~1-3s).
+        # anycast selects PoP by VPN exit IP, not client IP).  Reject sends
+        # ICMP port-unreachable so Chrome's connected UDP socket gets
+        # ECONNREFUSED instantly -- saves 3-5s vs silent drop where clients
+        # wait for QUIC PTO timeout.  Chrome caches broken alt-svc for
+        # 5-10 min after one reject, so sustained ICMP volume is negligible
+        # (verified on 14-device home LAN, 2026-06-20).
         #
         # Chrome/Firefox/Android apps all implement automatic HTTP/2 fallback
         # when UDP/443 is unreachable (per Hysteria2 docs recommendation).
-        iifname "br-lan" meta nfproto ipv4 udp dport 443 drop
-        iifname "br-lan" meta nfproto ipv6 udp dport 443 drop
+        iifname "br-lan" meta nfproto ipv4 udp dport 443 reject
+        iifname "br-lan" meta nfproto ipv6 udp dport 443 reject
     }
 }
