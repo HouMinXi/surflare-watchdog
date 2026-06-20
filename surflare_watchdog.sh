@@ -1498,10 +1498,14 @@ check_vpn_health() {
 
 	# Probe 7: tproxy path -- detects G1 blindspot (tunnel dead but external
 	# probes succeed because both endpoints exit in same country).
-	# Uses direct curl (no --proxy): traffic flows through OUTPUT chain ->
-	# fwmark 0x1 -> tproxy -> sing-box -> VPN, testing the same path as
-	# LAN devices.  The previous SOCKS5 approach (--proxy socks5h://127.0.0.1)
-	# was rejected by sing-box's loopback detector (sing-box/sing-box#1688).
+	# Uses direct curl (no --proxy): traffic flows through OUTPUT chain
+	# (inet surflare) -> fwmark 0x1 -> table 100 -> lo -> PREROUTING
+	# (inet surflare tproxy to :10800) -> sing-box -> VPN.
+	# NOTE: this enters sing-box via surflare's own tproxy rule, not via
+	# sw_lan_tproxy (which handles LAN br-lan traffic).  Both share the
+	# same sing-box tproxy inbound, so a sing-box outbound failure is
+	# detected either way.  The previous SOCKS5 approach was rejected by
+	# sing-box's loopback detector (sing-box/sing-box#1688).
 	(
 		local _raw
 		_raw=$(curl -s \
