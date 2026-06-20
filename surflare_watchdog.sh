@@ -301,22 +301,24 @@ _setup_kernel_moat() {
 		moat_set_ok=0
 	fi
 	# "flags & fin == fin" matches both pure FIN [F] and FIN+ACK [F.] --
-	# upstream filter sends [F.].
+	# upstream filter sends [F.].  iifname != "br-lan" restricts to
+	# WAN-originated packets so LAN devices' normal connection closures
+	# (which also have window=78 on iOS/macOS) are not false-positived.
 	# shellcheck disable=SC2086
 	nft add rule inet surflare_moat prerouting \
-		tcp flags \& fin == fin tcp window @win_sizes ${_moat_action} 2>/dev/null || \
+		iifname != "br-lan" tcp flags \& fin == fin tcp window @win_sizes ${_moat_action} 2>/dev/null || \
 		nft add rule inet surflare_moat prerouting \
-			tcp flags \& fin == fin tcp window 78 ${_moat_action} 2>/dev/null || \
+			iifname != "br-lan" tcp flags \& fin == fin tcp window 78 ${_moat_action} 2>/dev/null || \
 		nft add rule inet surflare_moat prerouting \
-			tcp flags \& fin == fin ${_moat_action} 2>/dev/null || moat_rules_ok=0
+			iifname != "br-lan" tcp flags \& fin == fin ${_moat_action} 2>/dev/null || moat_rules_ok=0
 	# RST injection
 	# shellcheck disable=SC2086
 	nft add rule inet surflare_moat prerouting \
-		tcp flags \& rst == rst tcp window @win_sizes ${_moat_action} 2>/dev/null || \
+		iifname != "br-lan" tcp flags \& rst == rst tcp window @win_sizes ${_moat_action} 2>/dev/null || \
 		nft add rule inet surflare_moat prerouting \
-			tcp flags \& rst == rst tcp window 78 ${_moat_action} 2>/dev/null || \
+			iifname != "br-lan" tcp flags \& rst == rst tcp window 78 ${_moat_action} 2>/dev/null || \
 		nft add rule inet surflare_moat prerouting \
-			tcp flags \& rst == rst ${_moat_action} 2>/dev/null || moat_rules_ok=0
+			iifname != "br-lan" tcp flags \& rst == rst ${_moat_action} 2>/dev/null || moat_rules_ok=0
 	# F9: explicitly allow ICMPv6 packet-too-big so PMTUD continues to
 	# work even when other ICMPv6 unreachables are being filtered.
 	# Without this, IPv6 connections that need to discover a smaller
