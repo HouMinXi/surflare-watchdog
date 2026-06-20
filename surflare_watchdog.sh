@@ -2714,7 +2714,6 @@ while true; do
 		if _control_probe; then
 			_diagnose_tunnel_failure
 			_record_disconnect
-			_rotate_node
 			log "Health check TCP block (tunnel confirmed, local network OK), triggering reconnect"
 			transient_count=0
 			fail_count=$FAIL_THRESHOLD
@@ -2789,6 +2788,7 @@ while true; do
 	# -- Shared reconnect path -----------------------------------------------
 	# Triggered by: LOCAL_FAIL (immediate), CN failure, or transient escalation
 	if [ "$fail_count" -ge "$FAIL_THRESHOLD" ]; then
+		_rotate_node
 		log "Consecutive failures: ${fail_count}, starting reconnect..."
 		connect_vpn
 		rc=$?
