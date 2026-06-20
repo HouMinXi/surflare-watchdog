@@ -18,7 +18,7 @@ NODE_CANDIDATES=("Los Angeles" "Dallas" "Chicago" "New York")  # Atlanta/Miami e
 # otherwise resolved from PLATFORM (router->rule, laptop->global).
 # Deploying surflare_watchdog.sh no longer resets the mode setting.
 #   router "rule": surflare-proxy Smart Routing (CN direct, non-CN VPN).
-#   router "global": all LAN TCP via VPN (QUIC dropped at nft); cn_direct for CN bypass.
+#   router "global": all LAN TCP via VPN (QUIC rejected at nft); cn_direct for CN bypass.
 #   laptop "global": all traffic through VPN; cn_ipv4 kernel-level CN bypass.
 MODE=""
 if [ -f /etc/surflare/mode.conf ]; then

@@ -55,7 +55,7 @@ pat_urltest = re.compile(
 # tproxy inbound errors: reject loopback, 503, i/o timeout, connection timed out
 # Detects sing-box/sing-box#1688 (loopback reject) and proxy outbound failures
 pat_tproxy = re.compile(
-    r'^\+0800 (\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) ERROR .* inbound/tproxy\[[^\]]+\]: .*(reject loopback|503 Service Unavailable|i/o timeout|connection timed out)(.*)$'
+    r'^\+0800 (\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) ERROR (?:.* )?inbound/tproxy\[[^\]]+\]: .*(reject loopback|503 Service Unavailable|i/o timeout|connection timed out)(.*)$'
 )
 TZ_CST = timezone(timedelta(hours=8))
 

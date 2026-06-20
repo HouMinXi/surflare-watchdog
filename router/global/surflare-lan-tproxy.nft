@@ -1,6 +1,6 @@
 # LAN transparent proxy for global mode.
 # All LAN TCP goes through surflare-proxy and exits via VPN.
-# QUIC (UDP/443) is dropped to force HTTP/2 fallback -- QUIC-over-VPN
+# QUIC (UDP/443) is rejected to force HTTP/2 fallback -- QUIC-over-VPN
 # causes 3s+ TTFB because CDN anycast selects PoP by VPN exit IP.
 # bypass_devices: populated by watchdog from /etc/surflare/bypass-macs.conf
 #   for devices that need direct CN ISP (e.g. Thunder).
@@ -58,7 +58,7 @@ table inet sw_lan_tproxy {
 
         # AnyConnect DTLS detection: UDP/443 with DTLS 1.2 version (0xFEFD).
         # Adds source IP to auto_bypass with 5-min timeout, then returns
-        # so the packet is NOT caught by the QUIC drop rule below.
+        # so the packet is NOT caught by the QUIC reject rule below.
         # Keepalives (~30s) renew the timeout; VPN closes -> expires -> resumes proxy.
         # IPv4-only: auto_bypass set is type ipv4_addr.
         iifname "br-lan" meta nfproto ipv4 udp dport 443 @th,72,16 0xfefd \
