@@ -104,8 +104,8 @@ Router process (opkg, curl, SSH)
 
 | Table | Chain | Priority | Role |
 |-------|-------|----------|------|
-| `ip sw_lan_tproxy` | prerouting | mangle-10 | LAN TCP + QUIC to surflare-proxy |
-| `ip dns_enforce` | prerouting | mangle-20 | Force LAN DNS through router |
+| `inet sw_lan_tproxy` | prerouting | mangle-10 | LAN TCP + QUIC to surflare-proxy (IPv4+IPv6 dual-stack) |
+| `ip dns_enforce` | prerouting | mangle-20 | Force LAN DNS through router (silent reject, no log) |
 | `inet surflare` | output | mangle | Router traffic + **cn_ipv4 accept** |
 | `inet surflare` | prerouting | mangle | tproxy marked packets to :10800 |
 | `inet killswitch` | output | filter+20 | Router leak protection (policy drop) |

@@ -403,7 +403,11 @@ _setup_chnroute() {
 				else _v4_try=$((_v4_try+1)); [ "$_v4_try" -lt 3 ] && sleep 2; fi
 			done
 			if [ "$_v4_ok" -eq 1 ]; then
-				nft insert rule inet surflare output ip daddr @cn_ipv4 accept 2>/dev/null || true
+				# Insert rule only if not already present (avoids accumulation on reconnect).
+				if ! nft list chain inet surflare output 2>/dev/null \
+					| grep -q 'ip daddr @cn_ipv4 accept'; then
+					nft insert rule inet surflare output ip daddr @cn_ipv4 accept 2>/dev/null || true
+				fi
 				log "Chnroute v4 applied: CN prefixes bypass proxy via output chain"
 				bypass_applied=$((bypass_applied + 1))
 			else
@@ -433,7 +437,10 @@ _setup_chnroute() {
 				else _v6_try=$((_v6_try+1)); [ "$_v6_try" -lt 3 ] && sleep 2; fi
 			done
 			if [ "$_v6_ok" -eq 1 ]; then
-				nft insert rule inet surflare output ip6 daddr @cn_ipv6 accept 2>/dev/null || true
+				if ! nft list chain inet surflare output 2>/dev/null \
+					| grep -q 'ip6 daddr @cn_ipv6 accept'; then
+					nft insert rule inet surflare output ip6 daddr @cn_ipv6 accept 2>/dev/null || true
+				fi
 				log "Chnroute v6 applied: CN v6 prefixes bypass proxy via output chain"
 				bypass_applied=$((bypass_applied + 1))
 			else
@@ -1040,9 +1047,6 @@ _update_bypass_devices() {
 		return 0
 	fi
 	nft flush set inet sw_lan_tproxy bypass_devices 2>/dev/null || true
-	# Flush bypass_src unconditionally alongside bypass_devices so stale IPs
-	# are cleared even when all bypass devices are removed from config.
-	nft flush set inet killswitch bypass_src 2>/dev/null || true
 
 	local all_ips="" ip_csv mac ip line
 	# Source 1: explicit IPs
@@ -1064,21 +1068,21 @@ _update_bypass_devices() {
 	all_ips=$(echo "$all_ips" | tr ',' '\n' | sort -u | paste -sd,)
 	nft add element inet sw_lan_tproxy bypass_devices "{ $all_ips }" 2>/dev/null || \
 		log "WARN: bypass_devices update failed (${all_ips})"
-	# Sync bypass device IPs into killswitch bypass_src so their non-CN traffic
-	# does not trigger ks-fwd-mon log noise (traffic is forwarded, just not logged).
-	# bypass_src was already flushed at function entry; only add elements here.
+	# Sync bypass device IPs + auto_bypass IPs into killswitch bypass_src
+	# so their non-CN traffic is accepted (not rejected/logged).
+	# Atomic flush+add via nft -f: bypass_src is never empty mid-update.
 	if nft list table inet killswitch >/dev/null 2>&1; then
-		nft add element inet killswitch bypass_src "{ $all_ips }" 2>/dev/null || \
-			log "WARN: kill switch bypass_src sync failed"
-		# Also sync auto_bypass IPs: these devices skip tproxy via PREROUTING
-		# return, so their non-CN traffic reaches the killswitch forward chain
-		# and must be accepted (not rejected).
 		local _auto_ips
 		_auto_ips=$(nft list set inet sw_lan_tproxy auto_bypass 2>/dev/null \
 			| grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | paste -sd,)
-		if [ -n "$_auto_ips" ]; then
-			nft add element inet killswitch bypass_src "{ $_auto_ips }" 2>/dev/null || true
-		fi
+		local _all_bypass="$all_ips"
+		[ -n "$_auto_ips" ] && _all_bypass="${_all_bypass},${_auto_ips}"
+		{
+			printf 'flush set inet killswitch bypass_src\n'
+			[ -n "$_all_bypass" ] && \
+				printf 'add element inet killswitch bypass_src { %s }\n' "$_all_bypass"
+		} | nft -f - 2>/dev/null || \
+			log "WARN: killswitch bypass_src atomic sync failed"
 	fi
 	_sync_dns_enforce_bypass
 }
