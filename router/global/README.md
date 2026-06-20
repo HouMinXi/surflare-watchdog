@@ -1,7 +1,8 @@
 # Router / Global Mode
 
-All LAN TCP/QUIC traffic is routed through the VPN tunnel via
-surflare-proxy.  CN-destined traffic bypasses tproxy at the kernel level
+All LAN TCP traffic is routed through the VPN tunnel via surflare-proxy;
+QUIC (UDP/443) is rejected to force HTTP/2 fallback.  CN-destined
+traffic bypasses tproxy at the kernel level
 (`cn_direct` / `cn6_direct` sets) so CN apps see a domestic IP.  The
 router's own output chain also uses chnroute (`cn_ipv4`/`cn_ipv6`) for
 kernel-level CN bypass.
@@ -102,14 +103,14 @@ LAN device (TCP/QUIC/DNS)
 |   5. in cn_direct? ---------------> return (CN ISP)  ***  |
 |   6. in cn6_direct? --------------> return (CN ISP)  ***  |
 |   7. DTLS 1.2 UDP/443 0xFEFD? ----> auto_bypass, return  |
-|   8. IPv4 TCP? ---> tproxy to 127.0.0.1:10800 (mark 0x1) |
-|   9. IPv6 TCP? ---> tproxy to [::1]:10800     (mark 0x1) |
-|  10. IPv4 QUIC? --> tproxy to 127.0.0.1:10800 (mark 0x1) |
-|  11. IPv6 QUIC? --> tproxy to [::1]:10800     (mark 0x1) |
+|   8. IPv4 TCP? ---> tproxy ip to :10800   (mark 0x1)     |
+|   9. IPv6 TCP? ---> tproxy ip6 to :10800  (mark 0x1)     |
+|  10. IPv4 QUIC? --> reject (ICMP port-unreachable)        |
+|  11. IPv6 QUIC? --> reject (ICMPv6 port-unreachable)      |
 |  12. other UDP? --> fall through (accept)                 |
 +----------------------------------------------------------+
   |                              |
-  | (non-tproxy'd / CN direct)   | (tproxy'd TCP + QUIC)
+  | (non-tproxy'd / CN direct)   | (tproxy'd TCP only)
   v                              v
 +-----------------------------+  surflare-proxy (:10800)
 | killswitch forward (-10)    |    |
@@ -168,7 +169,7 @@ Router process (opkg, curl, SSH)
 |-------|--------|-------|----------|------|
 | `surflare_moat` | inet | prerouting | raw | WAN TCP fingerprint detection (FIN/RST window 78) |
 | `dns_enforce` | ip | prerouting | mangle-20 | Force LAN DNS through router (silent reject) |
-| `sw_lan_tproxy` | inet | prerouting | mangle-10 | Dual-stack LAN TCP+QUIC tproxy + cn_direct bypass |
+| `sw_lan_tproxy` | inet | prerouting | mangle-10 | Dual-stack LAN TCP tproxy + QUIC reject + cn_direct bypass |
 | `surflare` | inet | output, prerouting | mangle | Router traffic routing + cn_ipv4 accept |
 | `killswitch` | inet | forward | filter-10 | LAN leak protection + IP audit log |
 | `killswitch` | inet | output | filter+20 | Router leak protection (policy drop) |

@@ -85,14 +85,14 @@ LAN device (TCP/QUIC/DNS)
 |   5. in cn_direct? ---------------> return (empty/rule)   |
 |   6. in cn6_direct? --------------> return (empty/rule)   |
 |   7. DTLS 1.2 UDP/443 0xFEFD? ----> auto_bypass, return  |
-|   8. IPv4 TCP? ---> tproxy to 127.0.0.1:10800 (mark 0x1) |
-|   9. IPv6 TCP? ---> tproxy to [::1]:10800     (mark 0x1) |
-|  10. IPv4 QUIC? --> tproxy to 127.0.0.1:10800 (mark 0x1) |
-|  11. IPv6 QUIC? --> tproxy to [::1]:10800     (mark 0x1) |
+|   8. IPv4 TCP? ---> tproxy ip to :10800   (mark 0x1)     |
+|   9. IPv6 TCP? ---> tproxy ip6 to :10800  (mark 0x1)     |
+|  10. IPv4 QUIC? --> reject (ICMP port-unreachable)        |
+|  11. IPv6 QUIC? --> reject (ICMPv6 port-unreachable)      |
 |  12. other UDP? --> fall through (accept)                 |
 +----------------------------------------------------------+
   |                              |
-  | (non-tproxy'd)               | (tproxy'd TCP + QUIC)
+  | (non-tproxy'd)               | (tproxy'd TCP only)
   v                              v
 +-----------------------------+  surflare-proxy (:10800)
 | killswitch forward (-10)    |    |
@@ -155,7 +155,7 @@ Router process (opkg, curl, SSH)
 |-------|--------|-------|----------|------|
 | `surflare_moat` | inet | prerouting | raw | WAN TCP fingerprint detection (FIN/RST window 78) |
 | `dns_enforce` | ip | prerouting | mangle-20 | Force LAN DNS through router (silent reject) |
-| `sw_lan_tproxy` | inet | prerouting | mangle-10 | Dual-stack LAN TCP+QUIC tproxy to :10800 |
+| `sw_lan_tproxy` | inet | prerouting | mangle-10 | Dual-stack LAN TCP tproxy + QUIC reject |
 | `surflare` | inet | output, prerouting | mangle | Router traffic routing + tproxy dispatch |
 | `killswitch` | inet | forward | filter-10 | LAN leak protection + IP audit log |
 | `killswitch` | inet | output | filter+20 | Router leak protection (policy drop) |
@@ -178,10 +178,12 @@ resilience + LAN CN UDP direct routing).
 ## Dual-Stack Tproxy (table inet)
 
 The tproxy table uses `table inet` (not `table ip`) so both IPv4 and
-IPv6 TCP/QUIC are proxied.  Without IPv6 tproxy, Happy Eyeballs causes
-LAN devices to prefer IPv6 for dual-stack destinations, which would
-bypass the proxy and hit the killswitch forward chain, producing
-`ks-fwd-mon` log noise (~49 entries per 2 minutes).
+IPv6 TCP are proxied.  QUIC (UDP/443) is rejected (not tproxied) to
+force HTTP/2 fallback -- QUIC-over-VPN causes 3s+ TTFB because CDN
+anycast selects PoP by VPN exit IP.  Without IPv6 tproxy, Happy
+Eyeballs causes LAN devices to prefer IPv6 for dual-stack destinations,
+which would bypass the proxy and hit the killswitch forward chain,
+producing `ks-fwd-mon` log noise (~49 entries per 2 minutes).
 
 Rules use `meta nfproto ipv4` / `meta nfproto ipv6` to prevent
 cross-family matching in the inet table.  The DTLS detection rule is
