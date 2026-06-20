@@ -13,7 +13,7 @@
 # View logs    : sudo dmesg | grep surflare_watchdog
 
 NODE="Los Angeles"                    # Set to your node tag (run: surflare nodes)
-NODE_CANDIDATES=("Los Angeles" "Dallas" "Chicago" "New York")  # Atlanta/Miami excluded: Anthropic Cloudflare WAF hard-blocks their exit IPs (HTTP 403, not JS-challenge); verified 2026-06-17
+NODE_CANDIDATES=("Los Angeles" "Dallas" "Chicago" "New York" "Atlanta" "Miami")
 # Connection mode: loaded from /etc/surflare/mode.conf if present,
 # otherwise resolved from PLATFORM (router->rule, laptop->global).
 # Deploying surflare_watchdog.sh no longer resets the mode setting.
