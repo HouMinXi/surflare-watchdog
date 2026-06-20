@@ -1,5 +1,7 @@
 # LAN transparent proxy for global mode.
-# All LAN TCP/QUIC goes through surflare-proxy and exits via VPN.
+# All LAN TCP goes through surflare-proxy and exits via VPN.
+# QUIC (UDP/443) is dropped to force HTTP/2 fallback -- QUIC-over-VPN
+# causes 3s+ TTFB because CDN anycast selects PoP by VPN exit IP.
 # bypass_devices: populated by watchdog from /etc/surflare/bypass-macs.conf
 #   for devices that need direct CN ISP (e.g. Thunder).
 # auto_bypass: DTLS 1.2 detection for corporate VPN clients (e.g. AnyConnect).
@@ -74,17 +76,17 @@ table inet sw_lan_tproxy {
             meta mark set 0x00000001 \
             accept
 
-        # QUIC tproxy: UDP/443 to surflare-proxy (eliminates 300ms TCP fallback).
-        # Global mode: all QUIC exits via VPN like TCP.
-        iifname "br-lan" meta nfproto ipv4 udp dport 443 \
-            tproxy ip to 127.0.0.1:10800 \
-            meta mark set 0x00000001 \
-            accept
-
-        # QUIC tproxy: IPv6 UDP/443
-        iifname "br-lan" meta nfproto ipv6 udp dport 443 \
-            tproxy ip6 to [::1]:10800 \
-            meta mark set 0x00000001 \
-            accept
+        # QUIC block: drop remaining UDP/443 (non-DTLS) to force TCP/HTTP2
+        # fallback.  DTLS 1.2 packets already matched and returned above.
+        #
+        # Why: QUIC-over-VPN produces 3s+ TTFB for foreign CDNs (Cloudflare
+        # anycast selects PoP by VPN exit IP, not client IP).  Rejecting QUIC
+        # sends ICMP port-unreachable -> client falls back to TCP instantly
+        # instead of waiting 3-5s for QUIC timeout (drop would be silent).
+        #
+        # Chrome/Firefox/Android apps all implement automatic HTTP/2 fallback
+        # when UDP/443 is unreachable (per Hysteria2 docs recommendation).
+        iifname "br-lan" meta nfproto ipv4 udp dport 443 reject
+        iifname "br-lan" meta nfproto ipv6 udp dport 443 reject
     }
 }
