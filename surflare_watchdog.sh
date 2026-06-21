@@ -903,9 +903,12 @@ NFTEOF
 	# Prefer scoped flush (-D -m mark N) to only kill tproxy-marked flows,
 	# leaving unrelated connections (LAN, monitoring) untouched.
 	# Fall back to unscoped -F on older conntrack (<1.4.4) that lacks -m.
-	if conntrack -D -m mark 1 2>/dev/null; then
+	# stdout MUST be captured (not inherited): conntrack -D/-F print
+	# every deleted entry to stdout, which procd would forward to syslog,
+	# flooding the log with thousands of conntrack lines on a busy router.
+	if conntrack -D -m mark 1 >/dev/null 2>&1; then
 		: # scoped flush ok
-	elif conntrack -F 2>/dev/null; then
+	elif conntrack -F >/dev/null 2>&1; then
 		log "WARN: conntrack scoped flush unavailable; ran unscoped -F (drops ALL tracked connections)"
 	else
 		log "WARN: conntrack flush failed; pre-existing connections may persist"
