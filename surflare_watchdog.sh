@@ -644,6 +644,73 @@ _cleanup_on_startup() {
 		fi
 		sleep 1
 	fi
+
+	# --- Crash-safe recovery: clean up stale state from a previous crash ---
+	# A hard crash (SIGKILL, OOM) leaves stale PID/lock files, zombie
+	# processes, and tombstoned tproxy rules.  Normal startup cannot
+	# proceed until these are cleaned.
+
+	# 1. Stale PID file: if the recorded PID is dead, remove it.
+	if [ -f "$PIDFILE" ]; then
+		local _old_pid
+		_old_pid=$(cat "$PIDFILE" 2>/dev/null)
+		if [ -n "$_old_pid" ] && ! kill -0 "$_old_pid" 2>/dev/null; then
+			rm -f "$PIDFILE"
+			log "Crash recovery: cleaned stale PID file (was PID ${_old_pid})"
+		fi
+	fi
+
+	# 2. Stale lock file: always remove on startup.  The lock only matters
+	#    while the watchdog is running; a fresh start must not be blocked.
+	if [ -f "$LOCK_FILE" ]; then
+		rm -f "$LOCK_FILE"
+		log "Crash recovery: removed stale lock file"
+	fi
+
+	# 3. Zombie surflare processes: a hard crash during reconnect leaves
+	#    defunct [surflare] processes that procd does not reap.
+	#    Unconditionally kill at startup (no new surflare should exist yet);
+	#    count-after-kill for the log message only.
+	killall -9 surflare 2>/dev/null || true
+	sleep 1  # allow reaping
+	local _zombie_count
+	_zombie_count=$(find /proc -maxdepth 2 -name comm -path '/proc/[0-9]*/comm' 2>/dev/null | while read -r _f; do
+		[ "$(cat "$_f" 2>/dev/null)" = "surflare" ] && echo x
+	done | wc -l)
+	if [ "$_zombie_count" -gt 0 ]; then
+		log "Crash recovery: ${_zombie_count} surflare zombie(s) survived SIGKILL (kernel will reap)"
+	else
+		log "Crash recovery: zombie surflare processes cleaned"
+	fi
+
+	# 4. Tombstoned tproxy: the previous watchdog tombstoned the tproxy
+	#    rules (replaced tproxy with REJECT) before crashing.  LAN TCP
+	#    gets ICMP host-unreachable instead of being proxied.  Detect by
+	#    checking for reject rules in the tproxy chain and reload from
+	#    the nft config file.  Mode-aware: global mode also needs
+	#    cn_direct sets repopulated.
+	if nft list table inet sw_lan_tproxy >/dev/null 2>&1; then
+		if nft list chain inet sw_lan_tproxy prerouting 2>/dev/null | \
+		   grep -q 'reject.*icmp\|reject.*icmpv6'; then
+			_restore_tproxy
+			if [ "$MODE" = "global" ]; then
+				_load_tproxy_cn_direct
+			fi
+			log "Crash recovery: restored tombstoned tproxy (mode=${MODE})"
+		fi
+	fi
+
+	# 5. Orphaned watchdog_trace table: survives a crash because no one
+	#    deletes it.  Harmless but noisy; clean it up.
+	nft delete table inet watchdog_trace 2>/dev/null || true
+
+	# 6. Stale IPC files in /run/: survive a crash between write and read.
+	#    Without cleanup, a stale signal file causes false reconnect on
+	#    the next instance (parent reads old auth result as current).
+	rm -f /run/surflare_auth_fail_signal 2>/dev/null || true
+	rm -f /run/surflare_stale_warn 2>/dev/null || true
+	rm -f /run/surflare_auth_bg_active 2>/dev/null || true
+
 	log "Startup cleanup: surflare-proxy not running, flushing stale watchdog state"
 	nft delete table inet surflare 2>/dev/null || true
 	# Keep sw_lan_tproxy if it exists (tombstoned or live from a prior
@@ -1677,7 +1744,7 @@ _classify_auth_error() {
 	err=$(cat "$errfile" 2>/dev/null)
 	[ -z "$err" ] && echo "retryable" && return  # empty stderr = likely timeout
 	case "$err" in
-		*"Too Many Requests"*|*"429"*|*"rate limit"*|*"Rate Limit"*)
+		*"Too Many Requests"*|*"HTTP"*"429"*|*"429"*"Too Many"*|*"rate limit"*|*"Rate Limit"*)
 			log "AUTH_FATAL: rate-limited by server (HTTP 429)"
 			echo "fatal" ;;
 		*"invalid username"*|*"invalid password"*|*"Invalid credentials"*|*"authentication failed"*)
@@ -2281,16 +2348,26 @@ connect_vpn() {
 		[ -f "$LAST_REFRESH_FILE" ] && _last_ref=$(cat "$LAST_REFRESH_FILE" 2>/dev/null)
 		_last_ref=${_last_ref:-0}  # defense: empty/corrupt file -> 0
 		if [ $(($(date +%s) - _last_ref)) -ge "$TOKEN_REFRESH_INTERVAL" ]; then
-			refresh_auth
-			_auth_rc=$?
-			if [ "$_auth_rc" -eq 0 ]; then
-				date +%s > "$LAST_REFRESH_FILE"
-			elif [ "$_auth_rc" -eq 2 ]; then
-				log "refresh_auth FATAL (rate-limit/creds/expired), signaling parent"
-				echo "fatal" > /run/surflare_auth_fail_signal 2>/dev/null || true
+			# Skip if a background auth is already running (launched by the
+			# healthy branch in a previous cycle).  Its result will be
+			# collected by the main loop's top-of-cycle collector.
+			# Without this guard, two surflare-login processes run
+			# concurrently, wasting auth server quota.
+			if [ -f /run/surflare_auth_bg_active ]; then
+				log "Background auth in progress, skipping connect_vpn auth"
 			else
-				log "refresh_auth failed (retryable), will retry next cycle"
-				echo "retryable" > /run/surflare_auth_fail_signal 2>/dev/null || true
+				refresh_auth
+				_auth_rc=$?
+				if [ "$_auth_rc" -eq 0 ]; then
+					date +%s > "$LAST_REFRESH_FILE"
+					rm -f /run/surflare_stale_warn
+				elif [ "$_auth_rc" -eq 2 ]; then
+					log "refresh_auth FATAL (rate-limit/creds/expired), signaling parent"
+					echo "fatal" > /run/surflare_auth_fail_signal 2>/dev/null || true
+				else
+					log "refresh_auth failed (retryable), will retry next cycle"
+					echo "retryable" > /run/surflare_auth_fail_signal 2>/dev/null || true
+				fi
 			fi
 		fi
 
@@ -2662,6 +2739,20 @@ trap '
     log "EARLY_WARN_TRIGGERED: detector requested immediate health check"
 ' USR1
 
+# USR2: diagnostic mode -- pause the main loop WITHOUT tearing down
+# nftables protections.  Allows manual surflare CLI diagnosis while
+# killswitch/tproxy/moat stay active.  Send SIGUSR2 again to resume.
+_diag_mode=0
+trap '
+    if [ "$_diag_mode" -eq 0 ]; then
+        _diag_mode=1
+        log "DIAGNOSTIC MODE: main loop paused (nft protections active). Send SIGUSR2 to resume."
+    else
+        _diag_mode=0
+        log "DIAGNOSTIC MODE: resumed"
+    fi
+' USR2
+
 echo $$ >"$PIDFILE"
 taskset -pc 0 $$ >/dev/null 2>&1 || true
 
@@ -2703,6 +2794,15 @@ _setup_kernel_moat
 _cleanup_on_startup
 
 while true; do
+	# Diagnostic mode: pause without tearing down protections.
+	# SIGUSR2 toggles _diag_mode; while active, the loop sleeps
+	# and skips all health checks/reconnects.  nft tables stay up.
+	if [ "${_diag_mode:-0}" -eq 1 ]; then
+		sleep "$CHECK_INTERVAL" & storm_sleep_pid=$!
+		wait "$storm_sleep_pid" || true
+		storm_sleep_pid=""
+		continue
+	fi
 	# Change 6: probe defer guard -- skip entire cycle when node_probe holds the session
 	if _probe_active; then
 		log "node_probe active; deferring health check + reactions this cycle"
@@ -2726,9 +2826,11 @@ while true; do
 		wait "$_auth_bg_pid" 2>/dev/null
 		_auth_bg_rc=$?
 		_auth_bg_pid=""
+		rm -f /run/surflare_auth_bg_active
 		if [ "$_auth_bg_rc" -eq 0 ]; then
 			date +%s > "$LAST_REFRESH_FILE"
 			auth_fail_count=0
+			rm -f /run/surflare_stale_warn
 			log "Background auth refresh succeeded"
 		elif [ "$_auth_bg_rc" -eq 2 ]; then
 			# Fatal error (rate-limit, invalid creds, subscription expired) --
@@ -2828,13 +2930,20 @@ while true; do
 		# been refreshed in 2x the normal interval, the auth session is likely dead while
 		# the tunnel survives on the existing connection.  This catches the "TUNNEL_OK +
 		# auth failed" paradox before it silently persists.
+		# Rate-limited to once per TOKEN_REFRESH_INTERVAL to avoid double-counting with
+		# background auth failures (stale check would otherwise fire every 30s cycle).
 		now=$(date +%s)
 		_stale_ref=0
 		[ -f "$LAST_REFRESH_FILE" ] && _stale_ref=$(cat "$LAST_REFRESH_FILE" 2>/dev/null)
 		_stale_ref=${_stale_ref:-0}
+		_last_stale_warn=0
+		[ -f /run/surflare_stale_warn ] && _last_stale_warn=$(cat /run/surflare_stale_warn 2>/dev/null)
+		_last_stale_warn=${_last_stale_warn:-0}
 		if [ "$_stale_ref" -gt 0 ] && \
-		   [ $((now - _stale_ref)) -ge $((TOKEN_REFRESH_INTERVAL * 2)) ]; then
+		   [ $((now - _stale_ref)) -ge $((TOKEN_REFRESH_INTERVAL * 2)) ] && \
+		   [ $((now - _last_stale_warn)) -ge "$TOKEN_REFRESH_INTERVAL" ]; then
 			auth_fail_count=$((auth_fail_count + 1))
+			date +%s > /run/surflare_stale_warn
 			log "WARN: auth token stale ($(( (now - _stale_ref) / 60 ))min, threshold $(( TOKEN_REFRESH_INTERVAL * 2 / 60 ))min), counting as auth failure (${auth_fail_count}/${AUTH_FAIL_THRESHOLD})"
 			if [ "$auth_fail_count" -ge "$AUTH_FAIL_THRESHOLD" ]; then
 				log "Auth failure threshold reached via stale-token detection, forcing reconnect"
@@ -2861,6 +2970,7 @@ while true; do
 				# Launch auth refresh in background; result collected at top of next cycle
 				refresh_auth &
 				_auth_bg_pid=$!
+				echo "$_auth_bg_pid" > /run/surflare_auth_bg_active
 				log "Background auth refresh started (PID=${_auth_bg_pid})"
 			fi
 		fi
