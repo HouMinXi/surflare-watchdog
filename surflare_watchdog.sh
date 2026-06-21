@@ -51,6 +51,7 @@ LOGIN_RETRIES=5                       # max login attempts per refresh cycle
 LOGIN_RETRY_DELAY=3                   # seconds between login retries
 HEARTBEAT_INTERVAL=600                # seconds between periodic "VPN healthy" log entries (0=off)
 TRANSIENT_THRESHOLD=6                 # consecutive external timeouts (local state OK) before escalating to fail_count
+AUTH_FAIL_THRESHOLD=3                 # consecutive auth refresh failures before forcing reconnect
 BYPASS_LAN_DEVICES=""                 # space-separated LAN IPs that skip tproxy (e.g. "192.168.100.147 192.168.100.148")
 # One MAC per line; current IP resolved from /tmp/dhcp.leases at connect time
 BYPASS_LAN_MACS_FILE="/etc/surflare/bypass-macs.conf"
@@ -1665,6 +1666,37 @@ wait_for_exit() {
 	fi
 }
 
+# _classify_auth_error: classify surflare login stderr into error categories.
+# Returns via stdout: "fatal" (do not retry), "retryable" (network/timeout), or "" (unknown).
+# Fatal errors: rate limiting (HTTP 429), invalid credentials, subscription expired, device limit.
+AUTH_STDERR_FILE="/tmp/surflare_auth_stderr.log"
+_classify_auth_error() {
+	local errfile="${1:-$AUTH_STDERR_FILE}"
+	[ -f "$errfile" ] || return
+	local err
+	err=$(cat "$errfile" 2>/dev/null)
+	[ -z "$err" ] && echo "retryable" && return  # empty stderr = likely timeout
+	case "$err" in
+		*"Too Many Requests"*|*"429"*|*"rate limit"*|*"Rate Limit"*)
+			log "AUTH_FATAL: rate-limited by server (HTTP 429)"
+			echo "fatal" ;;
+		*"invalid username"*|*"invalid password"*|*"Invalid credentials"*|*"authentication failed"*)
+			log "AUTH_FATAL: invalid credentials"
+			echo "fatal" ;;
+		*"Subscription expired"*|*"subscription expired"*)
+			log "AUTH_FATAL: subscription expired"
+			echo "fatal" ;;
+		*"Device limit"*|*"device limit"*)
+			log "AUTH_FATAL: device limit reached"
+			echo "fatal" ;;
+		*"Account check failed"*|*"账户检查失败"*)
+			log "AUTH_FATAL: account check failed (server-side)"
+			echo "fatal" ;;
+		*)
+			echo "retryable" ;;
+	esac
+}
+
 # refresh_auth: refresh surflare auth token using stored credentials.
 # Two credential paths, tried in order:
 #   1. systemd-creds (laptop): SURFLARE_EMAIL env + CREDENTIALS_DIRECTORY
@@ -1707,11 +1739,13 @@ refresh_auth() {
 		return 2
 	fi
 
-	local i=0 rc=1
+	local i=0 rc=1 _backoff="$LOGIN_RETRY_DELAY" _err_class=""
+	rm -f "$AUTH_STDERR_FILE"
 	while [ "$i" -lt "$LOGIN_RETRIES" ]; do
 		if command -v expect >/dev/null 2>&1; then
-			# expect (laptop): PTY-based login via Tcl heredoc
-			if timeout 30 expect <<EXPECT_EOF >/dev/null 2>&1
+			# expect (laptop): PTY-based login via Tcl heredoc.
+			# stdout suppressed; stderr captured for error classification.
+			if timeout 30 expect <<EXPECT_EOF >/dev/null 2>"$AUTH_STDERR_FILE"
 set timeout 15
 log_user 0
 spawn surflare login -u {${email}}
@@ -1743,12 +1777,14 @@ EXPECT_EOF
 			rm -f "$_sock"  # mktemp creates the file; sexpect needs the path free
 			trap 'rm -f "'"$_sock"'"' EXIT
 			export _SURFLARE_AUTH_PW="$password"
+			# stderr from surflare login captured to AUTH_STDERR_FILE for error classification.
+			# sexpect stderr (control messages) suppressed; spawned process stderr captured.
 			if timeout 30 sh -c "
 				sexpect -s '$_sock' spawn -t 25 surflare login -u '$email' >/dev/null 2>&1
 				sexpect -s '$_sock' expect -t 15 'Password:' >/dev/null 2>&1 || exit 1
 				sexpect -s '$_sock' send -env _SURFLARE_AUTH_PW -enter >/dev/null 2>&1
 				sexpect -s '$_sock' wait >/dev/null 2>&1
-			"; then
+			" 2>"$AUTH_STDERR_FILE"; then
 				rc=0
 			fi
 			unset _SURFLARE_AUTH_PW
@@ -1760,15 +1796,29 @@ EXPECT_EOF
 			return 2
 		fi
 		if [ "$rc" -eq 0 ]; then
+			rm -f "$AUTH_STDERR_FILE"
 			log "Auth token refreshed (attempt $((i + 1))/${LOGIN_RETRIES})"
 			break
 		fi
+		# Classify error from stderr to decide retry strategy
+		_err_class=$(_classify_auth_error "$AUTH_STDERR_FILE")
+		if [ "$_err_class" = "fatal" ]; then
+			log "Auth attempt $((i + 1))/${LOGIN_RETRIES}: fatal error, not retrying"
+			rc=2
+			break
+		fi
 		i=$((i + 1))
-		[ "$i" -lt "$LOGIN_RETRIES" ] && sleep "$LOGIN_RETRY_DELAY"
+		if [ "$i" -lt "$LOGIN_RETRIES" ]; then
+			sleep "$_backoff"
+			_backoff=$((_backoff * 2))
+			[ "$_backoff" -gt 60 ] && _backoff=60
+		fi
 	done
 	unset password
-	if [ "$rc" -ne 0 ]; then
-		log "Auth token refresh failed after ${LOGIN_RETRIES} attempts"
+	if [ "$rc" -eq 1 ]; then
+		log "Auth token refresh failed after ${LOGIN_RETRIES} attempts (retryable)"
+	elif [ "$rc" -eq 2 ]; then
+		log "Auth token refresh failed: fatal error (see ${AUTH_STDERR_FILE})"
 	fi
 	return "$rc"
 }
@@ -2231,10 +2281,16 @@ connect_vpn() {
 		[ -f "$LAST_REFRESH_FILE" ] && _last_ref=$(cat "$LAST_REFRESH_FILE" 2>/dev/null)
 		_last_ref=${_last_ref:-0}  # defense: empty/corrupt file -> 0
 		if [ $(($(date +%s) - _last_ref)) -ge "$TOKEN_REFRESH_INTERVAL" ]; then
-			if refresh_auth; then
+			refresh_auth
+			_auth_rc=$?
+			if [ "$_auth_rc" -eq 0 ]; then
 				date +%s > "$LAST_REFRESH_FILE"
+			elif [ "$_auth_rc" -eq 2 ]; then
+				log "refresh_auth FATAL (rate-limit/creds/expired), signaling parent"
+				echo "fatal" > /run/surflare_auth_fail_signal 2>/dev/null || true
 			else
-				log "refresh_auth failed, will retry next cycle"
+				log "refresh_auth failed (retryable), will retry next cycle"
+				echo "retryable" > /run/surflare_auth_fail_signal 2>/dev/null || true
 			fi
 		fi
 
@@ -2550,6 +2606,11 @@ cleanup() {
 	# Preserve /run/surflare_watchdog.moat_strict as a user opt-in:
 	# the user may want it to survive a watchdog restart, so we leave it
 	# alone here.
+	# Kill any background auth refresh in progress
+	if [ -n "${_auth_bg_pid:-}" ] && kill -0 "$_auth_bg_pid" 2>/dev/null; then
+		kill "$_auth_bg_pid" 2>/dev/null
+		wait "$_auth_bg_pid" 2>/dev/null
+	fi
 	rm -f "$PIDFILE"
 	rm -f "$WATCHDOG_ACK_FILE" 2>/dev/null || true
 }
@@ -2611,6 +2672,9 @@ _startup_cleanup_dns_fallback
 fail_count=0
 reconnect_count=0
 transient_count=0
+auth_fail_count=0
+_auth_bg_pid=""                      # PID of background refresh_auth, if running
+_auth_force_reconnect=0              # 1 if auth failure threshold reached; healthy branch triggers reconnect
 last_heartbeat=$(date +%s)
 _active_node="$NODE"
 _node_idx=0
@@ -2656,6 +2720,30 @@ while true; do
 			log "WARN: early_detector_stale age=${_det_age}s -- P0 coverage degraded"
 		fi
 		unset _det_age
+	fi
+	# Collect background auth refresh result from previous cycle (Fix 2)
+	if [ -n "${_auth_bg_pid:-}" ] && ! kill -0 "$_auth_bg_pid" 2>/dev/null; then
+		wait "$_auth_bg_pid" 2>/dev/null
+		_auth_bg_rc=$?
+		_auth_bg_pid=""
+		if [ "$_auth_bg_rc" -eq 0 ]; then
+			date +%s > "$LAST_REFRESH_FILE"
+			auth_fail_count=0
+			log "Background auth refresh succeeded"
+		elif [ "$_auth_bg_rc" -eq 2 ]; then
+			# Fatal error (rate-limit, invalid creds, subscription expired) --
+			# force reconnect immediately, no point retrying.
+			auth_fail_count=$AUTH_FAIL_THRESHOLD
+			_auth_force_reconnect=1
+			log "Background auth refresh FATAL (rc=2), forcing reconnect"
+		else
+			auth_fail_count=$((auth_fail_count + 1))
+			log "Background auth refresh failed (${auth_fail_count}/${AUTH_FAIL_THRESHOLD})"
+			if [ "$auth_fail_count" -ge "$AUTH_FAIL_THRESHOLD" ]; then
+				log "Auth failure threshold reached (${auth_fail_count}/${AUTH_FAIL_THRESHOLD}), will force reconnect"
+				_auth_force_reconnect=1
+			fi
+		fi
 	fi
 	if recent_wifi_crash 120; then
 		record_crash
@@ -2736,15 +2824,44 @@ while true; do
 		_transit_grace_ts=0
 		_remove_dns_fallback
 
+		# Fix 3: stale-token detection -- if VPN reports healthy but auth token has not
+		# been refreshed in 2x the normal interval, the auth session is likely dead while
+		# the tunnel survives on the existing connection.  This catches the "TUNNEL_OK +
+		# auth failed" paradox before it silently persists.
+		now=$(date +%s)
+		_stale_ref=0
+		[ -f "$LAST_REFRESH_FILE" ] && _stale_ref=$(cat "$LAST_REFRESH_FILE" 2>/dev/null)
+		_stale_ref=${_stale_ref:-0}
+		if [ "$_stale_ref" -gt 0 ] && \
+		   [ $((now - _stale_ref)) -ge $((TOKEN_REFRESH_INTERVAL * 2)) ]; then
+			auth_fail_count=$((auth_fail_count + 1))
+			log "WARN: auth token stale ($(( (now - _stale_ref) / 60 ))min, threshold $(( TOKEN_REFRESH_INTERVAL * 2 / 60 ))min), counting as auth failure (${auth_fail_count}/${AUTH_FAIL_THRESHOLD})"
+			if [ "$auth_fail_count" -ge "$AUTH_FAIL_THRESHOLD" ]; then
+				log "Auth failure threshold reached via stale-token detection, forcing reconnect"
+				fail_count=$FAIL_THRESHOLD
+			fi
+		fi
+
 		# Proactive token refresh -- runs whenever VPN is confirmed healthy so tokens stay
 		# fresh for reconnects. Uses same file as connect_vpn O3 for cross-subshell sync.
+		# Fix 2: runs in background to avoid 194s auth retry blocking health monitoring.
 		now=$(date +%s)
-		_last_ref=0
-		[ -f "$LAST_REFRESH_FILE" ] && _last_ref=$(cat "$LAST_REFRESH_FILE" 2>/dev/null)
-		_last_ref=${_last_ref:-0}
-		if [ $((now - _last_ref)) -ge "$TOKEN_REFRESH_INTERVAL" ]; then
-			if refresh_auth; then
-				date +%s > "$LAST_REFRESH_FILE"
+
+		# Check if background auth failure threshold was reached (set by top-of-loop collector)
+		if [ "${_auth_force_reconnect:-0}" -eq 1 ]; then
+			_auth_force_reconnect=0
+			log "Auth failure threshold reached, forcing reconnect"
+			fail_count=$FAIL_THRESHOLD
+		else
+			_last_ref=0
+			[ -f "$LAST_REFRESH_FILE" ] && _last_ref=$(cat "$LAST_REFRESH_FILE" 2>/dev/null)
+			_last_ref=${_last_ref:-0}
+			if [ $((now - _last_ref)) -ge "$TOKEN_REFRESH_INTERVAL" ] && \
+			   [ -z "${_auth_bg_pid:-}" ]; then
+				# Launch auth refresh in background; result collected at top of next cycle
+				refresh_auth &
+				_auth_bg_pid=$!
+				log "Background auth refresh started (PID=${_auth_bg_pid})"
 			fi
 		fi
 
@@ -2797,6 +2914,18 @@ while true; do
 		log "Consecutive failures: ${fail_count}, starting reconnect..."
 		connect_vpn
 		rc=$?
+		# Collect auth-fail signal from connect_vpn subshell (its variables are lost)
+		if [ -f /run/surflare_auth_fail_signal ]; then
+			_signal_type=$(cat /run/surflare_auth_fail_signal 2>/dev/null)
+			rm -f /run/surflare_auth_fail_signal
+			if [ "$_signal_type" = "fatal" ]; then
+				auth_fail_count=$AUTH_FAIL_THRESHOLD
+				log "FATAL auth failure from connect_vpn subshell, forcing reconnect"
+			else
+				auth_fail_count=$((auth_fail_count + 1))
+				log "Auth failure from connect_vpn subshell (${auth_fail_count}/${AUTH_FAIL_THRESHOLD})"
+			fi
+		fi
 		if [ "$rc" -eq 2 ]; then
 			# connect_vpn was skipped (another instance holds flock).
 			# Reset fail_count to FAIL_THRESHOLD-1 so we retry once next cycle
@@ -2812,6 +2941,7 @@ while true; do
 				fail_count=0
 				reconnect_count=0
 				transient_count=0
+				auth_fail_count=0
 				_transit_fail_count=0
 				_transit_grace_ts=0
 				_remove_dns_fallback
