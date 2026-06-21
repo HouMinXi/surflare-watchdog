@@ -145,7 +145,7 @@ log() {
 # _proc_alive: returns 0 if any process has /proc/<pid>/comm == _name.
 # Replaces pgrep -f / pgrep -x which are unreliable on busybox (known
 # -x bug) and pattern-based matching which false-positives on log files
-# and monitoring scripts (e.g. "tail -f /var/log/surflare-proxy.log").
+# and monitoring scripts (e.g. "tail -f /var/log/surflare/surflare-proxy.log").
 # /proc/<pid>/comm is the kernel's authoritative executable name
 # (truncated to 15 chars), set by the kernel at exec time, and cannot
 # be spoofed by argv manipulation. Both busybox and GNU ps honor it.

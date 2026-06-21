@@ -13,7 +13,7 @@
 # (or the postrotate below forces it). size 50M is bigger than the event
 # log because the proxy logs are chatty (per-connection debug); 5 rotations
 # keeps ~250M of history before oldest is dropped.
-/var/log/surflare-proxy.log {
+/var/log/surflare/surflare-proxy.log {
     size 50M
     rotate 5
     compress

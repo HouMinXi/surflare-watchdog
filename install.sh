@@ -216,7 +216,7 @@ _rucron="/usr/local/sbin/surflare_route_updater.sh"
 ROUTE_UPDATE_CRON="30 2 * * * $_rucron >> /dev/null 2>&1"
 # Daily 04:30: run logrotate. /etc/logrotate.d/surflare-watchdog only fires
 # when logrotate is actually invoked -- on N100 the binary is present
-# (3.22.0-r1) but no cron trigger ran before this fix, so /var/log/surflare-proxy.log
+# (3.22.0-r1) but no cron trigger ran before this fix, so /var/log/surflare/surflare-proxy.log
 # grew to 14MB (observed 2026-06-18). 04:30 avoids the 02:30 and 03:00 windows
 # and runs before the 3-min health cron.
 LOGROTATE_CRON="30 4 * * * /usr/sbin/logrotate /etc/logrotate.conf >> /var/log/logrotate.log 2>&1"
