@@ -99,6 +99,309 @@ After:   detect <30s + skip dead nodes immediately
 
 ---
 
+## Three-Mode State Machine
+
+The watchdog operates in three modes, selected by the `MODE` variable in
+`/etc/surflare/mode.conf` (survives redeploy on iStoreOS overlay). Each mode
+differs in which nftables tables are created and how traffic is routed.
+
+### Mode overview
+
+| Mode | Target | Value | Traffic path |
+|------|--------|-------|-------------|
+| **Router Rule** | N100 router (default) | `rule` | LAN tproxy + cn_direct EMPTY (all foreign via VPN) |
+| **Router Global** | N100 router (alt) | `global` | LAN tproxy + cn_direct POPULATED (CN bypass) |
+| **Laptop Global** | Z66 laptop | `global` | No tproxy, no dns_enforce; local traffic only |
+
+Router Rule is the default for the N100. It forces all LAN foreign traffic
+through the VPN with no CN bypass sets. Router Global populates cn_direct
+sets so CN-destined LAN traffic goes direct. Laptop Global skips LAN-facing
+tables entirely (no tproxy, no dns_enforce) since there is no downstream LAN.
+
+---
+
+### nftables table ownership
+
+The watchdog and the surflare binary each own specific nftables tables. This
+matrix shows who creates, manages, and tears down each table.
+
+```
++--------------------+-------------------+-----------------+-----------------+-----------------+
+| Table              | Owner             | Router Rule     | Router Global   | Laptop Global   |
++--------------------+-------------------+-----------------+-----------------+-----------------+
+| inet surflare      | surflare binary   | output chain    | same + watchdog | same as router  |
+|                    |                   | (fwmark route)  | adds cn_ipv4/   | global          |
+|                    |                   | + prerouting    | cn_ipv6 sets    |                 |
+|                    |                   | (tproxy :10800) | + accept rules  |                 |
+|                    |                   | + server_ports  |                 |                 |
+|                    |                   | + icmp drop     |                 |                 |
++--------------------+-------------------+-----------------+-----------------+-----------------+
+| inet killswitch    | watchdog          | output (policy  | same            | same            |
+|                    |                   | drop, server_ips|                 |                 |
+|                    |                   | /bypass)        |                 |                 |
+|                    |                   | + forward (LAN  |                 |                 |
+|                    |                   | protection)     |                 |                 |
++--------------------+-------------------+-----------------+-----------------+-----------------+
+| inet sw_lan_tproxy | watchdog          | prerouting (LAN | same but        | same as router  |
+|                    |                   | TCP tproxy      | cn_direct       | global          |
+|                    |                   | :10800, QUIC    | POPULATED       |                 |
+|                    |                   | reject),        |                 |                 |
+|                    |                   | cn_direct EMPTY |                 |                 |
++--------------------+-------------------+-----------------+-----------------+-----------------+
+| ip dns_enforce     | watchdog          | DNS enforcement | same            | NOT CREATED     |
+|                    |                   | (LAN DNS thru   |                 | (laptop)        |
+|                    |                   | router)         |                 |                 |
++--------------------+-------------------+-----------------+-----------------+-----------------+
+| inet surflare_moat | watchdog          | FIN/RST window  | same            | same            |
+|                    |                   | detection       |                 |                 |
++--------------------+-------------------+-----------------+-----------------+-----------------+
+| inet watchdog_trace| watchdog          | packet trace    | same            | same            |
+|                    |                   | diagnostics     |                 |                 |
++--------------------+-------------------+-----------------+-----------------+-----------------+
+| inet               | bootlock init     | boot-time       | same            | NOT CREATED     |
+| surflare_boot_lock | script (S18)      | lockdown,       |                 | (laptop)        |
+|                    |                   | removed by      |                 |                 |
+|                    |                   | watchdog or     |                 |                 |
+|                    |                   | self-destructs  |                 |                 |
+|                    |                   | at 120s         |                 |                 |
++--------------------+-------------------+-----------------+-----------------+-----------------+
+```
+
+---
+
+### Main loop state machine
+
+The main loop runs every `CHECK_INTERVAL` (default 30s). Each iteration
+follows this decision tree:
+
+```
+                          START cycle
+                              |
+                      +-------v--------+
+                      | _diag_mode=1 ? |
+                      +-------+--------+
+                          /       \
+                        yes        no
+                         |          |
+                    sleep +    +----v-----------+
+                    continue   | node_probe     |
+                    (skip      | active?        |
+                     cycle)    +----+-----------+
+                                  /    \
+                                yes     no
+                                 |       |
+                            skip cycle  +----v-------------------+
+                                        | collect background auth|
+                                        | (from previous cycle)  |
+                                        +----+-------------------+
+                                             |
+                                  +----------v-----------+
+                                  | rc from bg auth:     |
+                                  |  0 = success (reset) |
+                                  |  1 = retryable       |
+                                  |  2 = fatal (force    |
+                                  |       reconnect)     |
+                                  +----------+-----------+
+                                             |
+                                  +----------v-----------+
+                                  | iwlwifi crash        |
+                                  | detected?            |
+                                  +----------+-----------+
+                                         /       \
+                                       yes        no
+                                        |          |
+                                   cooldown +  +---v------------------+
+                                   reconnect  | check_vpn_health()   |
+                                              +---+------------------+
+                                                  |
+                               +------------------+------------------+
+                               |                  |                  |
+                          LOCAL_FAIL         OK/TUNNEL_OK       CN/empty
+                               |             /COUNTRY                 |
+                               |                  |              +----v------+
+                          immediate        +-------v--------+   | CN:       |
+                          reconnect        | stale-token    |   | fail_cnt++|
+                                           | check          |   |           |
+                                           +-------+--------+   | empty:    |
+                                                   |            | transient++|
+                                           +-------v--------+   +-----------+
+                                           | launch bg auth |
+                                           | (if due and    |
+                                           |  none running) |
+                                           +-------+--------+
+                                                   |
+                                           +-------v--------+
+                                           | heartbeat log  |
+                                           | "VPN healthy"  |
+                                           +----------------+
+
+                               +---------------------------+
+                               | fail_cnt >= threshold?    |
+                               +-----------+---------------+
+                                          / \
+                                        yes   no --> next cycle (sleep 30s)
+                                         |
+                                  +------v----------+
+                                  | connect_vpn()   |
+                                  | (subshell+flock)|
+                                  |  - disconnect   |
+                                  |  - nft flush    |
+                                  |  - tombstone    |
+                                  |    tproxy       |
+                                  |  - refresh_auth |
+                                  |  - connect      |
+                                  |    --daemon     |
+                                  +------+----------+
+                                         |
+                                  +------v----------+
+                                  | post-reconnect  |
+                                  | health check    |
+                                  +------+----------+
+                                         |
+                                  +------v----------+
+                                  | success?        |
+                                  | reset counters  |
+                                  +-----------------+
+```
+
+---
+
+### Auth lifecycle
+
+Authentication runs in the background to avoid blocking the main health-check
+loop. Errors are classified into three categories with different retry
+strategies.
+
+```
+Background auth (healthy branch):
+
+  Launch:   refresh_auth & --> PID --> marker file (/run/surflare_auth_bg_active)
+  Result:   collected at top of NEXT cycle (30s later)
+  Success:  update /run/surflare_last_refresh, reset auth_fail_count, remove stale_warn
+  Fatal:    auth_fail_count = threshold, force reconnect (skip retries)
+  Retryable: auth_fail_count++, check threshold for reconnect
+
+Error classification (_classify_auth_error):
+
+  Reads stderr from surflare login. Patterns:
+  +---------------------------+-----------+----------------------------------+
+  | Pattern                   | Class     | Action                           |
+  +---------------------------+-----------+----------------------------------+
+  | Too Many Requests         | FATAL     | immediate break, rc=2            |
+  | HTTP 429                  | FATAL     | immediate break, rc=2            |
+  | invalid username/password | FATAL     | immediate break, rc=2            |
+  | Subscription expired      | FATAL     | immediate break, rc=2            |
+  | Device limit              | FATAL     | immediate break, rc=2            |
+  | Account check failed      | FATAL     | immediate break, rc=2            |
+  | timeout / network error   | RETRYABLE | auth_fail_count++, retry         |
+  | (anything else)           | RETRYABLE | auth_fail_count++, retry         |
+  +---------------------------+-----------+----------------------------------+
+
+Exponential backoff:
+
+  3s --> 6s --> 12s --> 24s --> 48s (cap 60s)
+  Fatal error: immediate break, return rc=2
+
+Stale-token detection (healthy branch):
+
+  If /run/surflare_last_refresh age > 2x CHECK_INTERVAL:
+    auth_fail_count++
+    Log warning (rate-limited via /run/surflare_stale_warn)
+    At threshold: force reconnect
+```
+
+---
+
+### Crash recovery (_cleanup_on_startup)
+
+On startup (or watchdog restart), the cleanup function restores a consistent
+state from any prior crash or unclean shutdown. Steps execute in order:
+
+```
+ 1. Kill stale surflare-proxy holding port 10800
+ 2. Clean stale PID file (check if process is actually dead)
+ 3. Remove stale lock file (unconditional)
+ 4. Kill zombie surflare processes (killall -9)
+ 5. Detect tombstoned tproxy
+      - reject rules left behind from prior crash
+      - restore tproxy rules from nft file
+      - Global mode: also repopulate cn_direct sets
+ 6. Clean orphaned watchdog_trace table
+ 7. Clean stale IPC files
+      - /run/surflare_auth_fail_signal
+      - /run/surflare_stale_warn
+      - /run/surflare_auth_bg_active
+ 8. Flush inet surflare (binary's table)
+ 9. Ensure dns_enforce table (router only; skipped on laptop)
+10. Clean ip rules (remove stale fwmark entries)
+```
+
+After cleanup, the watchdog proceeds to the normal main loop.
+
+---
+
+### Diagnostic mode (SIGUSR2)
+
+Sending SIGUSR2 to the watchdog PID toggles diagnostic mode. This is useful
+when you need to manually interact with the surflare CLI while keeping the
+VPN tunnel and nftables rules alive.
+
+```
+  Normal operation               SIGUSR2 received
+  +------------------+          +------------------+
+  | _diag_mode = 0   | ------->| _diag_mode = 1   |
+  | full health loop |          | sleep only       |
+  +------------------+          +------------------+
+         ^                              |
+         |         SIGUSR2 again        |
+         +------------------------------+
+
+When _diag_mode=1:
+  - Main loop sleeps CHECK_INTERVAL, skips all logic
+  - nft tables stay active (killswitch, tproxy, moat)
+  - User can run surflare CLI for manual diagnosis
+  - Send USR2 again to resume normal operation
+```
+
+---
+
+### IPC files
+
+All IPC uses files under `/run/` (tmpfs). Writers and readers are listed
+below. Crash recovery cleans stale files on startup.
+
+```
++-----------------------------+--------------+--------------+-------------------+
+| File                        | Writer       | Reader       | Cleaner           |
++-----------------------------+--------------+--------------+-------------------+
+| surflare_watchdog.pid       | main loop    | USR1 trap,   | cleanup()         |
+|                             | (echo $$)    | early_detect |                   |
++-----------------------------+--------------+--------------+-------------------+
+| surflare_watchdog.lock      | connect_vpn  | connect_vpn  | crash recovery    |
+|                             | (flock)      | (flock)      |                   |
++-----------------------------+--------------+--------------+-------------------+
+| surflare_last_refresh       | auth success | stale-token  | never (persist)   |
++-----------------------------+--------------+--------------+-------------------+
+| surflare_auth_fail_signal   | connect_vpn  | main loop    | crash recovery,   |
+|                             | subshell     | reconnect    | reader            |
++-----------------------------+--------------+--------------+-------------------+
+| surflare_stale_warn         | stale-token  | stale-token  | auth success,     |
+|                             | check        | rate limit   | crash recovery    |
++-----------------------------+--------------+--------------+-------------------+
+| surflare_auth_bg_active     | bg auth      | connect_vpn  | collector,        |
+|                             | launch       | skip guard   | crash recovery    |
++-----------------------------+--------------+--------------+-------------------+
+| surflare_detector.alive     | early_detect | main loop    | never             |
++-----------------------------+--------------+--------------+-------------------+
+| surflare_watchdog.early_ack | USR1 trap    | early_detect | cleanup()         |
++-----------------------------+--------------+--------------+-------------------+
+```
+
+All paths are relative to `/run/`. Files are mode 0600 and live on tmpfs
+(no persistent storage needed).
+
+---
+
 ## Components
 
 ### `surflare_watchdog.sh` -- Main daemon

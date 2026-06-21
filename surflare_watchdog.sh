@@ -668,9 +668,11 @@ _cleanup_on_startup() {
 	fi
 
 	# 3. Zombie surflare processes: a hard crash during reconnect leaves
-	#    defunct [surflare] processes that procd does not reap.
-	#    Unconditionally kill at startup (no new surflare should exist yet);
-	#    count-after-kill for the log message only.
+	#    defunct [surflare] processes that procd does not reap.  Their
+	#    parent is sexpect (the PTY tool used by refresh_auth), which
+	#    survives the watchdog crash in sleeping state.  Kill sexpect
+	#    first (reparents zombies to init for reaping), then surflare.
+	killall sexpect 2>/dev/null || true
 	killall -9 surflare 2>/dev/null || true
 	sleep 1  # allow reaping
 	local _zombie_count
