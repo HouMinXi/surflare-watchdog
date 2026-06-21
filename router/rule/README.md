@@ -63,8 +63,8 @@ LAN device (TCP/QUIC/DNS)
 +----------------------------------------------------------+
 | surflare_moat prerouting (raw)                           |
 |   WAN-only (iifname != "br-lan"):                        |
-|   detect upstream-injected FIN/RST (window 78)           |
-|   counter + log "moat:" (no drop by default)             |
+|   log FIN/RST with window 78 (CN CDN server closes)     |
+|   counter + log "moat:" (passive, no drop)               |
 +----------------------------------------------------------+
   |
   v
@@ -153,7 +153,7 @@ Router process (opkg, curl, SSH)
 
 | Table | Family | Chain | Priority | Role |
 |-------|--------|-------|----------|------|
-| `surflare_moat` | inet | prerouting | raw | WAN TCP fingerprint detection (FIN/RST window 78) |
+| `surflare_moat` | inet | prerouting | raw | WAN TCP FIN/RST monitor (window 78, log only) |
 | `dns_enforce` | ip | prerouting | mangle-20 | Force LAN DNS through router (silent reject) |
 | `sw_lan_tproxy` | inet | prerouting | mangle-10 | Dual-stack LAN TCP tproxy + QUIC reject |
 | `surflare` | inet | output, prerouting | mangle | Router traffic routing + tproxy dispatch |
@@ -189,16 +189,37 @@ Rules use `meta nfproto ipv4` / `meta nfproto ipv6` to prevent
 cross-family matching in the inet table.  The DTLS detection rule is
 IPv4-only because `auto_bypass` is `type ipv4_addr`.
 
-## Moat: TCP Fingerprint Detection
+## Moat: WAN TCP FIN/RST Monitor
 
-`surflare_moat` detects upstream-injected TCP FIN/RST packets by
-matching unusual window sizes (32, 64, 78, 128).  The primary target is
-window=78, a known GFW fingerprint.
+`surflare_moat` is a passive monitor at the raw prerouting hook.  It
+logs WAN-inbound TCP packets that carry FIN or RST with window size 78.
+It does NOT drop anything by default -- packets continue through
+conntrack normally after being logged.
+
+What triggers it in practice: Chinese CDN servers (Alibaba Cloud /
+Tengine, Tencent, etc.) use window=78 on FIN-ACK when closing idle
+connections.  When a LAN device connects to a CN server directly (rule
+mode routes CN traffic via ISP), the server eventually sends FIN to
+close the connection.  If conntrack still has the entry, the FIN is
+handled normally AND logged.  If conntrack already expired the entry
+(established timeout is 7440s / 2 hours on iStoreOS), the FIN is
+logged and then dropped as INVALID by conntrack -- both are harmless.
 
 Direction filter: `iifname != "br-lan"` ensures only WAN-originated
 packets trigger detection.  Without this filter, normal LAN TCP
-closures (iOS/macOS use window=78 for FIN+ACK) produce false positives
-(~118 per 2 minutes from LAN devices alone).
+closures (iOS/macOS also use window=78 for FIN+ACK) produce false
+positives (~118 per 2 minutes from LAN devices alone).
+
+How to read the logs:
+
+```
+moat: SRC=47.96.x.x ... SPT=443 ... ACK FIN   -- CN server closing HTTPS, normal
+moat: SRC=x.x.x.x   ... SPT=443 ... ACK RST   -- possible upstream injection
+```
+
+FIN from CN server IPs (SPT=443) is normal server behavior.  RST with
+window=78 could indicate upstream injection -- the RST counter should
+normally stay at 0.
 
 Default mode is counter + log only.  Touch
 `/run/surflare_watchdog.moat_strict` to enable drop.

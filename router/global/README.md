@@ -81,8 +81,8 @@ LAN device (TCP/QUIC/DNS)
 +----------------------------------------------------------+
 | surflare_moat prerouting (raw)                           |
 |   WAN-only (iifname != "br-lan"):                        |
-|   detect upstream-injected FIN/RST (window 78)           |
-|   counter + log "moat:" (no drop by default)             |
+|   log FIN/RST with window 78 (CN CDN server closes)     |
+|   counter + log "moat:" (passive, no drop)               |
 +----------------------------------------------------------+
   |
   v
@@ -167,7 +167,7 @@ Router process (opkg, curl, SSH)
 
 | Table | Family | Chain | Priority | Role |
 |-------|--------|-------|----------|------|
-| `surflare_moat` | inet | prerouting | raw | WAN TCP fingerprint detection (FIN/RST window 78) |
+| `surflare_moat` | inet | prerouting | raw | WAN TCP FIN/RST monitor (window 78, log only) |
 | `dns_enforce` | ip | prerouting | mangle-20 | Force LAN DNS through router (silent reject) |
 | `sw_lan_tproxy` | inet | prerouting | mangle-10 | Dual-stack LAN TCP tproxy + QUIC reject + cn_direct bypass |
 | `surflare` | inet | output, prerouting | mangle | Router traffic routing + cn_ipv4 accept |
