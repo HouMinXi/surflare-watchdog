@@ -267,6 +267,46 @@ _startup_cleanup_dns_fallback() {
 	rm -f "$DNS_STUCK_FILE"
 }
 
+# surflare drops all ICMP/ICMPv6 in output to prevent tunnel leaks.
+# That kills LAN RA/DHCPv6/PMTUD -- insert LAN bypass before the drop.
+# Must re-run after every connect since surflare recreates its table.
+_patch_surflare_icmp_lan() {
+	nft list table inet surflare >/dev/null 2>&1 || return 0
+	# already patched
+	if nft -a list chain inet surflare output 2>/dev/null \
+		| grep -q 'oifname "br-lan" ip6 nexthdr ipv6-icmp accept'; then
+		return 0
+	fi
+	local handle
+	handle=$(nft -a list chain inet surflare output 2>/dev/null \
+		| grep 'ip protocol icmp drop' | awk '/handle /{print $NF}' | head -1)
+	[ -z "$handle" ] && return 0
+	# inserts stack in reverse at same position: final order is
+	# br-lan-icmpv6, br-lan-icmp, ff00/8, fe80/10, then the drop
+	nft insert rule inet surflare output position "$handle" \
+		ip6 daddr fe80::/10 accept 2>/dev/null || true
+	nft insert rule inet surflare output position "$handle" \
+		ip6 daddr ff00::/8 accept 2>/dev/null || true
+	nft insert rule inet surflare output position "$handle" \
+		oifname "br-lan" ip protocol icmp accept 2>/dev/null || true
+	nft insert rule inet surflare output position "$handle" \
+		oifname "br-lan" ip6 nexthdr ipv6-icmp accept 2>/dev/null || true
+	log "Surflare ICMP LAN bypass: inserted before drop (handle ${handle})"
+}
+
+_cleanup_surflare_icmp_lan() {
+	nft list table inet surflare >/dev/null 2>&1 || return 0
+	local h
+	for pat in 'oifname "br-lan" ip6 nexthdr ipv6-icmp accept' \
+		'oifname "br-lan" ip protocol icmp accept' \
+		'ip6 daddr ff00::/8 accept' \
+		'ip6 daddr fe80::/10 accept'; do
+		h=$(nft -a list chain inet surflare output 2>/dev/null \
+			| grep -F "$pat" | awk '/handle /{print $NF}' | head -1)
+		[ -n "$h" ] && nft delete rule inet surflare output handle "$h" 2>/dev/null
+	done
+}
+
 _setup_kernel_moat() {
 	if ! command -v nft >/dev/null 2>&1; then
 		return 0
@@ -2764,6 +2804,7 @@ taskset -pc 0 $$ >/dev/null 2>&1 || true
 # Clean up orphaned trace table from previous SIGKILL
 nft delete table inet watchdog_trace 2>/dev/null || true
 _startup_cleanup_dns_fallback
+_patch_surflare_icmp_lan
 
 fail_count=0
 reconnect_count=0
@@ -2930,6 +2971,7 @@ while true; do
 		transient_count=0
 		_transit_grace_ts=0
 		_remove_dns_fallback
+		_patch_surflare_icmp_lan
 
 		# Fix 3: stale-token detection -- if VPN reports healthy but auth token has not
 		# been refreshed in 2x the normal interval, the auth session is likely dead while
@@ -3073,6 +3115,7 @@ while true; do
 				_restore_tproxy
 				_load_tproxy_cn_direct
 				_update_bypass_devices
+				_patch_surflare_icmp_lan
 				_record_connect "${_active_node}" "${new_health}"
 			else
 				reconnect_count=$((reconnect_count + 1))
