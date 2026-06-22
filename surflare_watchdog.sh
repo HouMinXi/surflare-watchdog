@@ -195,6 +195,37 @@ check_vpn_local_state() {
 	return 0
 }
 
+# --- Proxy log monitor: forward critical errors to dmesg/kmsg ---
+# surflare-proxy writes errors to PROXY_LOG but they don't appear in
+# dmesg.  This monitor tails the log and forwards ERROR lines to
+# logger (which writes to kmsg), rate-limited to PROXY_LOG_RATE_SEC.
+_proxy_log_pid=""
+PROXY_LOG="/var/log/surflare/surflare-proxy.log"
+PROXY_LOG_RATE_SEC=60
+
+_start_proxy_log_monitor() {
+	_stop_proxy_log_monitor
+	[ -f "$PROXY_LOG" ] || return 0
+	# Background: tail new lines, forward ERRORs to logger.
+	# Rate-limited: after forwarding one ERROR, sleep before the next.
+	(   tail -n 0 -F "$PROXY_LOG" 2>/dev/null | while IFS= read -r _line; do
+			echo "$_line" | grep -q 'ERROR' || continue
+			logger -t surflare-proxy "$_line"
+			sleep "$PROXY_LOG_RATE_SEC"
+		done
+	) &
+	_proxy_log_pid=$!
+}
+
+_stop_proxy_log_monitor() {
+	if [ -n "${_proxy_log_pid:-}" ]; then
+		kill "$_proxy_log_pid" 2>/dev/null
+		wait "$_proxy_log_pid" 2>/dev/null
+		_proxy_log_pid=""
+	fi
+	pkill -f "tail -n 0 -F $PROXY_LOG" 2>/dev/null || true
+}
+
 PROXY_CPU_SET=""
 DESKTOP_CPU_SET=""
 
@@ -684,6 +715,7 @@ _cleanup_on_startup() {
 	if _proc_alive surflare-proxy >/dev/null 2>&1; then
 		log "Startup: killing inherited surflare-proxy"
 		killall surflare-proxy 2>/dev/null
+		_stop_proxy_log_monitor
 		sleep 2
 	fi
 	# Port-based cleanup: ensure 10800 is free
@@ -2237,6 +2269,7 @@ maybe_reprobe_transit() {
 cleanup_probe_state() {
 	surflare disconnect >/dev/null 2>&1
 	killall surflare-proxy 2>/dev/null
+	_stop_proxy_log_monitor
 	wait_for_exit surflare-proxy
 	if nft list table inet surflare >/dev/null 2>&1; then
 		nft flush table inet surflare 2>/dev/null || true
@@ -2758,6 +2791,7 @@ storm_sleep_pid=""
 _hc_tmp=""
 cleanup() {
 	stop_packet_trace >/dev/null 2>&1
+	_stop_proxy_log_monitor
 	[ -n "$storm_sleep_pid" ] && kill "$storm_sleep_pid" 2>/dev/null
 	# shellcheck disable=SC2086
 	[ -n "$_hc_tmp" ] && rm -f $_hc_tmp
@@ -3023,6 +3057,7 @@ while true; do
 				_update_bypass_devices
 				_patch_surflare_icmp_lan
 				_record_connect
+				_start_proxy_log_monitor
 			else
 				fail_count=$((fail_count + 1))
 			fi
@@ -3223,6 +3258,7 @@ while true; do
 				_update_bypass_devices
 				_patch_surflare_icmp_lan
 				_record_connect "${_active_node}" "${new_health}"
+				_start_proxy_log_monitor
 			else
 				reconnect_count=$((reconnect_count + 1))
 				log "Post-reconnect health check anomalous (reconnect_count=${reconnect_count})"
