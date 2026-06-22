@@ -1574,12 +1574,35 @@ crash_rate_exceeded() {
 	[ "$count" -ge "$CRASH_MAX_PER_WINDOW" ]
 }
 
+# _health_is_failure: return 0 if the health result indicates a failure state.
+# Centralizes the failure-state check used in multiple main-loop branches.
+_health_is_failure() {
+	case "$1" in
+		CN|LOCAL_FAIL|TCP_BLOCK|PROXY_BROKEN) return 0 ;;
+	esac
+	return 1
+}
+
+# _check_proxy_path: test whether surflare-proxy:10800 actually forwards traffic.
+# Uses the same tproxy path as LAN devices (nftables -> surflare-proxy -> VPN).
+# Returns 0 if proxy works, 1 if broken.  Called after the primary health check
+# succeeds to detect the blind spot where the tunnel is up but the proxy is dead.
+_check_proxy_path() {
+	local _code
+	_code=$(curl -s --connect-timeout 5 --max-time 10 \
+	       -o /dev/null -w '%{http_code}' \
+	       https://connectivitycheck.gstatic.com/generate_204 2>/dev/null)
+	case "$_code" in 200|204) return 0 ;; esac
+	return 1
+}
+
 # check_vpn_health: two-layer check -- local state first, then parallel external probes.
 # Returns:
-#   "OK"         -- Google 200/30x (VPN is working, tunnel working)
-#   "LOCAL_FAIL" -- local VPN state lost (process/nftables/routing gone)
-#   <country>    -- country probe returned a country code (non-empty)
-#   ""           -- all external probes timed out (but local state was OK = transient)
+#   "OK"           -- Google 200/30x AND proxy path works
+#   "PROXY_BROKEN" -- tunnel OK but surflare-proxy:10800 not forwarding
+#   "LOCAL_FAIL"   -- local VPN state lost (process/nftables/routing gone)
+#   <country>      -- country probe returned a country code (non-empty)
+#   ""             -- all external probes timed out (but local state was OK = transient)
 # "CN" is a valid country code return (VPN up but routing via China = broken exit).
 #
 # Architecture: "first success wins" -- probes run in parallel; results are polled
@@ -1856,6 +1879,19 @@ check_vpn_health() {
 	rm -f "$tmp_g" "$tmp_cf" "$tmp_cf2" "$tmp_ifc" "$tmp_ich" "$tmp_myip" "$tmp_proxy" \
 	      "$tmp_gt" "$tmp_cft" "$tmp_cf2t" "$tmp_ifct" "$tmp_icht" "$tmp_myt" "$tmp_proxyt"
 	_hc_tmp=""
+
+	# Proxy path check: the primary probes test tunnel connectivity from N100
+	# itself (direct curl).  But LAN devices go through surflare-proxy:10800
+	# via tproxy.  If the tunnel is healthy but the proxy is dead (503, hang),
+	# LAN traffic breaks while the watchdog reports "healthy".  Run a dedicated
+	# proxy path test after a positive primary result to catch this blind spot.
+	if [ -n "$result" ] && [ "$result" != "TCP_BLOCK" ] && \
+	   [ "$result" != "LOCAL_FAIL" ] && [ "$result" != "CN" ]; then
+		if ! _check_proxy_path; then
+			log "Proxy path check failed: surflare-proxy:10800 not forwarding (primary=${result})"
+			result="PROXY_BROKEN"
+		fi
+	fi
 
 	echo "$result"
 }
@@ -2713,7 +2749,7 @@ _manage_trace() {
 		return 0
 	fi
 
-	if [ "$health" = "LOCAL_FAIL" ] || [ "$health" = "TCP_BLOCK" ]; then
+	if [ "$health" = "LOCAL_FAIL" ] || [ "$health" = "TCP_BLOCK" ] || [ "$health" = "PROXY_BROKEN" ]; then
 		[ "${_trace_active:-0}" -eq 0 ] && start_packet_trace
 	fi
 	# CN and "": caller handles fail_count logic, start on first failure
@@ -3039,7 +3075,7 @@ while true; do
 			new_health=$(check_vpn_health)
 			log "Post-crash reconnect health: ${new_health:-failed}"
 			if [ "$new_health" = "OK" ] || \
-			   { [ "$new_health" != "CN" ] && [ "$new_health" != "LOCAL_FAIL" ] && [ "$new_health" != "TCP_BLOCK" ] && [ -n "$new_health" ]; }; then
+			   { ! _health_is_failure "$new_health" && [ -n "$new_health" ]; }; then
 				fail_count=0
 				reconnect_count=0
 				transient_count=0
@@ -3103,8 +3139,15 @@ while true; do
 			log "Health check TCP block but local network also down, treating as transient ${transient_count}/${TRANSIENT_THRESHOLD}"
 		fi
 
+	elif [ "$health" = "PROXY_BROKEN" ]; then
+		# Tunnel is healthy (direct probes succeed) but surflare-proxy:10800
+		# is not forwarding traffic.  LAN devices would have no connectivity.
+		log "Proxy path broken: surflare-proxy:10800 not forwarding, triggering reconnect"
+		transient_count=0
+		fail_count=$FAIL_THRESHOLD
+
 	elif [ "$health" = "OK" ] || \
-	     { [ "$health" != "CN" ] && [ "$health" != "LOCAL_FAIL" ] && [ "$health" != "TCP_BLOCK" ] && [ -n "$health" ]; }; then
+	     { ! _health_is_failure "$health" && [ -n "$health" ]; }; then
 		# VPN healthy -- Google 200/30x (tunnel working) OR country probe returned non-CN country
 		fail_count=0
 		reconnect_count=0
@@ -3234,7 +3277,7 @@ while true; do
 			new_health=$(check_vpn_health)
 			log "Post-reconnect health: ${new_health:-failed}"
 			if [ "$new_health" = "OK" ] || \
-			   { [ "$new_health" != "CN" ] && [ "$new_health" != "LOCAL_FAIL" ] && [ "$new_health" != "TCP_BLOCK" ] && [ -n "$new_health" ]; }; then
+			   { ! _health_is_failure "$new_health" && [ -n "$new_health" ]; }; then
 				stop_packet_trace >/dev/null 2>&1
 				fail_count=0
 				reconnect_count=0
