@@ -77,7 +77,7 @@ TRANSIT_GRACE_TTL=300                 # seconds to honor transit grace before ex
 EVENT_LOG="/var/log/surflare_events.jsonl"
 # Auto-detect WiFi interface; fallback to wlp9s0f0 if iw is unavailable
 WIFI_INTERFACE=$(iw dev 2>/dev/null | awk '/Interface/{print $2; exit}')
-[ -z "$WIFI_INTERFACE" ] && WIFI_INTERFACE="wlp9s0f0"
+[ -z "$WIFI_INTERFACE" ] && WIFI_INTERFACE=""
 CRASH_COOLDOWN=60                     # seconds to wait after detecting firmware crash before reconnect
 CRASH_MAX_PER_WINDOW=3                # max crashes in CRASH_WINDOW before extended cooldown
 CRASH_WINDOW=600                      # seconds window for crash rate limiting
@@ -225,7 +225,7 @@ _stop_proxy_log_monitor() {
 		wait "$_proxy_log_pid" 2>/dev/null
 		_proxy_log_pid=""
 	fi
-	pkill -f "tail -n 0 -F $PROXY_LOG" 2>/dev/null || true
+	pkill -f "tail -n 0 -F $(echo "$PROXY_LOG" | sed 's/[.]/\\./g')" 2>/dev/null || true
 }
 
 PROXY_CPU_SET=""
@@ -253,7 +253,11 @@ _insert_dns_fallback() {
 	local gw handle
 	gw=$(ip route show default | awk '/default/{print $3; exit}')
 	[ -z "$gw" ] && return 0
-	[[ "$gw" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 0
+	if [[ "$gw" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+		[ "${BASH_REMATCH[1]}" -le 255 ] && [ "${BASH_REMATCH[2]}" -le 255 ] && 		[ "${BASH_REMATCH[3]}" -le 255 ] && [ "${BASH_REMATCH[4]}" -le 255 ] || return 0
+	else
+		return 0
+	fi
 	if [ "$_dns_fallback_active" -eq 1 ]; then
 		if nft -a list chain inet surflare output 2>/dev/null \
 			| grep -qE "ip daddr ${gw//./\\.} (tcp|udp) dport 53 accept"; then
@@ -313,7 +317,7 @@ _patch_surflare_icmp_lan() {
 	local handle
 	handle=$(nft -a list chain inet surflare output 2>/dev/null \
 		| grep 'ip protocol icmp drop' | awk '/handle /{print $NF}' | head -1)
-	[ -z "$handle" ] && return 0
+	[ -z "$handle" ] && { log "WARN: ICMP LAN bypass: icmp drop rule not found in inet surflare output"; return 0; }
 	# inserts stack in reverse at same position: final order is
 	# br-lan-icmpv6, br-lan-icmp, ff00/8, fe80/10, then the drop
 	nft insert rule inet surflare output position "$handle" \
@@ -330,6 +334,7 @@ _patch_surflare_icmp_lan() {
 _cleanup_surflare_icmp_lan() {
 	nft list table inet surflare >/dev/null 2>&1 || return 0
 	local h
+	local pat
 	for pat in 'oifname "br-lan" ip6 nexthdr ipv6-icmp accept' \
 		'oifname "br-lan" ip protocol icmp accept' \
 		'ip6 daddr ff00::/8 accept' \
@@ -470,7 +475,8 @@ _setup_chnroute() {
 			nft add set inet surflare cn_ipv4 '{ type ipv4_addr; flags interval; }' 2>/dev/null || true
 			nft flush set inet surflare cn_ipv4 2>/dev/null || true
 
-			local tmp_nft="/tmp/cn_ipv4_$$.nft"
+			local tmp_nft
+tmp_nft=$(mktemp /tmp/cn_ipv4.XXXXXX)
 			local _v4_data
 			_v4_data=$(grep -v '^#' "$cn_v4_file" | grep -v '^[[:space:]]*$' | paste -sd, -)
 			if [ -z "$_v4_data" ]; then
@@ -505,7 +511,8 @@ _setup_chnroute() {
 			nft add set inet surflare cn_ipv6 '{ type ipv6_addr; flags interval; }' 2>/dev/null || true
 			nft flush set inet surflare cn_ipv6 2>/dev/null || true
 
-			local tmp_nft_v6="/tmp/cn_ipv6_$$.nft"
+			local tmp_nft_v6
+tmp_nft_v6=$(mktemp /tmp/cn_ipv6.XXXXXX)
 			local _v6_data
 			_v6_data=$(grep -v '^#' "$cn_v6_file" | grep -v '^[[:space:]]*$' | paste -sd, -)
 			if [ -z "$_v6_data" ]; then
@@ -559,7 +566,8 @@ _setup_chnroute() {
 	# Build a single nft batch file containing flush+add for all sources
 	# (v4 + cloud CDN extra + v6).  One nft -f call = one netlink transaction.
 	# No race window between cn_ipv4.txt and cn_ipv4_extra.txt loading.
-	local _ks_batch="/tmp/ks_bypass_all_$$.nft"
+	local _ks_batch
+_ks_batch=$(mktemp /tmp/ks_bypass_all.XXXXXX)
 	local _ks_sources=0
 	: > "$_ks_batch"
 
@@ -702,7 +710,7 @@ _cleanup_on_startup() {
 	if ! touch /tmp/.surflare_probe 2>/dev/null; then
 		log "CRITICAL: /tmp not writable -- killswitch/tproxy/health check will fail"
 		log "Attempting to free /tmp by removing stale surflare files"
-		rm -f /tmp/surflare_* /tmp/ks_swap_* /tmp/tproxy_* /tmp/ct_* 2>/dev/null
+		rm -f /tmp/surflare_* /tmp/ks_swap_* /tmp/tproxy_* /tmp/ct_* /tmp/cn_ipv4.* /tmp/cn_ipv6.* /tmp/cn_v4_extra.* /tmp/ks_bypass_all.* 2>/dev/null
 		if ! touch /tmp/.surflare_probe 2>/dev/null; then
 			log "CRITICAL: /tmp still not writable after cleanup -- exiting"
 			exit 1
@@ -1250,6 +1258,11 @@ EOF
 # Case (c): table exists with live tproxy -> reload is idempotent
 #           (destroy + recreate with same content).
 _restore_tproxy() {
+	# Guard: skip if connect_vpn subshell is running (it manages tproxy lifecycle)
+	if [ -f "$LOCK_FILE" ] && ! flock -n 9 2>/dev/null; then
+		log "Skipping _restore_tproxy: connect_vpn holds flock"
+		return 0
+	fi
 	local _lan_tproxy_nft="/etc/surflare-lan-tproxy.nft"
 	if [ ! -f "$_lan_tproxy_nft" ]; then
 		log "WARN: $_lan_tproxy_nft not found, cannot restore tproxy"
@@ -2004,6 +2017,13 @@ refresh_auth() {
 	if [ -z "$email" ] || [ -z "$password" ]; then
 		[ -f /etc/surflare/credentials ] && \
 			log "WARN: /etc/surflare/credentials exists but email= or password= is missing"
+		unset password 2>/dev/null
+		return 2
+	fi
+	# Validate email format (reject shell metacharacters)
+	if ! echo "$email" | grep -qE "^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+$"; then
+		log "WARN: invalid email format, rejecting"
+		unset password 2>/dev/null
 		return 2
 	fi
 
@@ -2098,6 +2118,7 @@ _update_server_endpoint() {
 	local ips
 	# ss -tnp format: Recv-Q Send-Q Local($3) Peer($4) Process
 	# Exclude RFC1918 (10.x, 172.16-31.x, 192.168.x) to get only public server IPs.
+t# IPv4-only: surflare is IPv4-only; colon-split breaks for IPv6
 	ips=$(ss -tnp state established 2>/dev/null \
 		| awk '/surflare/{split($4,a,":");ip=a[1];
 		        if (ip ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ &&
@@ -2236,7 +2257,7 @@ _record_connect() {
 		OK|TUNNEL_OK) exit_country="?" ;;
 	esac
 	now=$(date +%s)
-	_sess_prev_node="$_sess_node"
+	_sess_prev_node="$_san_node"
 	_sess_prev_s=$(( _sess_connect_s > 0 ? now - _sess_connect_s : 0 ))
 	_sess_node="$node"
 	_sess_exit="$exit_country"
@@ -2257,15 +2278,19 @@ _record_connect() {
 # Appends one JSON line to EVENT_LOG for pattern analysis.
 _record_disconnect() {
 	[ "$_sess_connect_s" -eq 0 ] && return
-	local now lifetime
+	local now lifetime _san_node _san_transit _san_exit
 	now=$(date +%s)
+	# Sanitize session vars for JSON (strip quotes/backslashes)
+	_san_node=$(echo "${_sess_node:-?}" | tr -d '"\')
+	_san_transit=$(echo "$_san_transit" | tr -d '"\')
+	_san_exit=$(echo "$_san_exit" | tr -d '"\')
 	lifetime=$(( now - _sess_connect_s ))
 	[ ! -f "$EVENT_LOG" ] && install -m 644 /dev/null "$EVENT_LOG" 2>/dev/null || true
 	printf '{"ts":"%s","node":"%s","lifetime_s":%d,"transit":"%s","exit":"%s","prev_node":"%s","prev_s":%d,"hour":%d,"diag":"%s","out":%d,"in":%d,"syn_out":%d,"syn_ack":%d,"sack_pct":%d,"rst_in":%d}\n' \
 		"$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-		"$_sess_node" "$lifetime" \
-		"${_sess_transit:-unknown}" \
-		"${_sess_exit:-?}" \
+		"$_san_node" "$lifetime" \
+		"$_san_transit" \
+		"$_san_exit" \
 		"${_sess_prev_node:-none}" "$_sess_prev_s" \
 		"$((10#$(date +%H)))" \
 		"${_diag_conclusion:-no_diag}" \
@@ -2484,7 +2509,13 @@ _rotate_node() {
 		fi
 		break
 	done
-	_active_node="${NODE_CANDIDATES[$_node_idx]}"
+	# Verify the selected node is actually healthy (not a fallthrough to unhealthy)
+	if ! _node_is_log_healthy "${NODE_CANDIDATES[$_node_idx]}" "$effective_transit"; then
+		log "WARN: all nodes unhealthy, keeping ${prev} (skipped ${_active_node})"
+		_active_node="$prev"
+	else
+		_active_node="${NODE_CANDIDATES[$_node_idx]}"
+	fi
 	log "Node rotation: ${prev} -> ${_active_node} ($((_node_idx + 1))/${n})"
 	printf '%s\t%d\n' "$_active_node" "$_node_idx" > "$ROTATION_STATE" 2>/dev/null || true
 }
@@ -3225,7 +3256,7 @@ while true; do
 			if [ $((now - _last_ref)) -ge "$TOKEN_REFRESH_INTERVAL" ] && \
 			   [ -z "${_auth_bg_pid:-}" ]; then
 				# Launch auth refresh in background; result collected at top of next cycle
-				refresh_auth &
+				refresh_auth </dev/null &
 				_auth_bg_pid=$!
 				echo "$_auth_bg_pid" > /run/surflare_auth_bg_active
 				log "Background auth refresh started (PID=${_auth_bg_pid})"

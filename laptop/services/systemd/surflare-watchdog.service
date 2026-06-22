@@ -6,10 +6,14 @@ Wants=network-online.target surflare-early-detector.service
 [Service]
 Type=simple
 ExecStart=/usr/local/sbin/surflare_watchdog.sh
-ExecStop=/bin/sh -c '[ -n "$MAINPID" ] && /bin/kill -TERM $MAINPID || true'
+ExecStop=/bin/sh -c 'PID=${MAINPID:-$(cat /run/surflare_watchdog.pid 2>/dev/null)}; [ -n "$PID" ] && /bin/kill -TERM $PID || true'
 TimeoutStopSec=30
 Restart=always
+EnvironmentFile=-/etc/surflare/watchdog.conf
 RestartSec=10
+SyslogIdentifier=surflare_watchdog
 
 [Install]
 WantedBy=multi-user.target
+# Weak dep: detector failure does not block watchdog.
+# Detector has BindsTo=us (stops when we stop).

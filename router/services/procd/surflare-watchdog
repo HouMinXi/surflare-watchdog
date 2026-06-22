@@ -19,7 +19,10 @@ start_service() {
 }
 
 restart() {
-    touch /run/surflare_restarting
+    touch /run/surflare_restarting || {
+        logger -t surflare-watchdog "WARN: failed to create restart marker"
+        return 1
+    }
     stop "$@"
     start "$@"
     rm -f /run/surflare_restarting
@@ -54,8 +57,10 @@ stop_service() {
     fi
 }
 
+# DUPLICATE: also defined in surflare_watchdog.sh _full_teardown(). Sync changes.
 _full_teardown() {
-    nft delete table inet killswitch 2>/dev/null
+    nft delete table inet killswitch 2>/dev/null || \
+        logger -t surflare-watchdog "WARN: failed to remove killswitch table"
     nft delete table inet sw_lan_tproxy 2>/dev/null
     nft delete table ip dns_enforce 2>/dev/null
     nft delete table inet surflare 2>/dev/null
