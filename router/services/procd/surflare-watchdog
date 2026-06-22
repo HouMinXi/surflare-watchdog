@@ -9,10 +9,6 @@ SCRIPT=/usr/local/sbin/surflare_watchdog.sh
 start_service() {
     procd_open_instance
     procd_set_param command "$SCRIPT"
-    # respawn <threshold> <timeout> <retry>
-    # threshold=3600: crashes within 1h count toward retry limit
-    # timeout=5: wait 5s between restarts
-    # retry=0: NEVER give up restarting (prevents orphan killswitch)
     procd_set_param respawn 3600 5 0
     procd_set_param stdout 1
     procd_set_param stderr 1
@@ -20,57 +16,25 @@ start_service() {
 }
 
 restart() {
-    # Sentinel: tell stop_service this is a restart, not a full stop.
-    # cleanup() in the watchdog handles modular teardown on SIGTERM
-    # (killswitch persists, tproxy tombstoned), so stop_service skips
-    # full teardown during restart.
-    touch /run/surflare_restarting
     stop "$@"
     start "$@"
-    rm -f /run/surflare_restarting
 }
 
+# procd sends SIGTERM to the watchdog, which triggers cleanup() ->
+# _full_teardown().  stop_service waits for exit, then belt-and-suspenders.
 stop_service() {
-    if [ -f /run/surflare_restarting ]; then
-        # Restart: cleanup() trap already did modular teardown.
-        # Killswitch persists so CN traffic keeps flowing.
-        return 0
-    fi
-
-    # Already stopped: PID file removed by cleanup() in a previous call.
-    # Avoids double-teardown when procd calls stop_service() again after
-    # detecting the watchdog process exit.
-    if [ ! -f /var/run/surflare_watchdog.pid ]; then
-        return 0
-    fi
-
-    # Signal watchdog to do full teardown via its own cleanup() trap.
-    # Sentinel tells cleanup() this is an explicit stop, not a restart.
     local pid
     pid=$(cat /var/run/surflare_watchdog.pid 2>/dev/null)
-    touch /run/surflare_watchdog.stopping
     if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
-        kill -TERM "$pid"
-        # Wait up to 10s for watchdog to exit (cleanup is fast)
         local i=0
         while [ $i -lt 10 ] && kill -0 "$pid" 2>/dev/null; do
             sleep 1; i=$((i + 1))
         done
     fi
-    # Belt-and-suspenders: if watchdog didn't clean up (crashed,
-    # hung), do it ourselves.
-    if nft list table inet killswitch >/dev/null 2>&1; then
-        _full_teardown
-    fi
-    rm -f /run/surflare_watchdog.stopping
-    if nft list table inet killswitch >/dev/null 2>&1; then
-        logger -t surflare-watchdog "WARN: service stopped but killswitch persists"
-    else
-        logger -t surflare-watchdog "Service stopped: all nft tables removed"
-    fi
+    _full_teardown
+    logger -t surflare-watchdog "Service stopped: all nft tables removed"
 }
 
-# Shared teardown logic for stop_service and the dead-man's switch cron.
 _full_teardown() {
     nft delete table inet killswitch 2>/dev/null
     nft delete table inet sw_lan_tproxy 2>/dev/null
@@ -83,43 +47,18 @@ _full_teardown() {
     rm -f /run/surflare_watchdog.storm_cool_until
 }
 
-# Dead-man's switch: remove orphan killswitch if watchdog is not running.
-# Called via cron every minute.  Prevents self-lock when procd cannot
-# restart the watchdog (binary missing, disk full, OOM continuous).
 extra_command "deadman" "Remove orphan killswitch if watchdog is dead"
 deadman() {
-    # Skip during restart: sentinel exists between stop and start.
-    # Guard: if sentinel is older than 120s, the restart must have failed
-    # (normal restart takes <10s).  Stale sentinel + dead watchdog = self-lock.
-    if [ -f /run/surflare_restarting ]; then
-        local age=$(( $(date +%s) - $(stat -c %Y /run/surflare_restarting 2>/dev/null || echo 0) ))
-        if [ "$age" -lt 120 ]; then
-            return 0
-        fi
-        rm -f /run/surflare_restarting
-        logger -t surflare-deadman "Stale restart sentinel removed (age=${age}s)"
-    fi
-    # Remove stale stopping sentinel (stop_service crashed or was killed
-    # before it could clean up).  If watchdog is dead and killswitch is
-    # orphaned, the _full_teardown below handles it.
-    rm -f /run/surflare_watchdog.stopping
-    # Check PID file first (fast), fall back to pgrep
     local pid
     pid=$(cat /var/run/surflare_watchdog.pid 2>/dev/null)
     if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
-        return 0  # alive
+        return 0
     fi
-    # PID stale or missing -- double-check with pgrep
     if pgrep -f surflare_watchdog.sh >/dev/null 2>&1; then
-        return 0  # alive (PID file was stale)
+        return 0
     fi
-    # Watchdog is dead.  Only act if killswitch is actually orphaned.
     if nft list table inet killswitch >/dev/null 2>&1; then
         _full_teardown
-        if nft list table inet killswitch >/dev/null 2>&1; then
-            logger -t surflare-deadman "WARN: teardown attempted but killswitch persists"
-        else
-            logger -t surflare-deadman "Orphan killswitch removed (watchdog not running)"
-        fi
+        logger -t surflare-deadman "Orphan killswitch removed (watchdog not running)"
     fi
 }

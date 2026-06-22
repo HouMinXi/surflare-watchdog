@@ -833,8 +833,6 @@ _cleanup_on_startup() {
 		fi
 		rm -f "$_cool_file"
 	fi
-	# Remove stale stopping sentinel (e.g. watchdog killed mid-cleanup)
-	rm -f /run/surflare_watchdog.stopping
 }
 
 # Ensure dns_enforce table exists.  Idempotent: skips if already present.
@@ -2837,35 +2835,11 @@ cleanup() {
 	# (no wait): procd's term_timeout is only 5s, and _cleanup_on_startup
 	# in the next instance handles any survivor.
 	killall surflare-proxy 2>/dev/null
-	# Sentinel-based teardown mode: the stop mechanism (procd
-	# stop_service or systemd ExecStop) creates the stopping sentinel
-	# before sending SIGTERM.  Its presence means explicit stop: tear
-	# down everything to prevent self-lock (killswitch output policy
-	# drop with no watchdog = total network loss).  Without the
-	# sentinel this is a restart: modular teardown only so the
-	# killswitch protects CN traffic during the respawn gap.
-	if [ -f /run/surflare_watchdog.stopping ]; then
-		_full_teardown
-		log "Explicit stop: all nft tables removed"
-	else
-		nft delete table inet surflare_moat 2>/dev/null || true
-		_tombstone_tproxy
-		nft flush set inet killswitch server_ips 2>/dev/null || true
-		nft flush set inet killswitch server_ips6 2>/dev/null || true
-		nft delete table inet surflare 2>/dev/null || true
-		# Drop run-state sentinels so a future restart does not inherit
-		# stale "ready" markers.
-		# Forge finding #3: do NOT delete storm_cool_until here. On a
-		# graceful exit followed by an immediate procd respawn,
-		# _cleanup_on_startup reads storm_cool_until to sleep the
-		# remaining window.  Deleting it here would lose the cool state
-		# and allow immediate storm re-trigger.  _cleanup_on_startup
-		# deletes the file itself after consuming it.
-		rm -f /run/surflare_watchdog.killswitch_ready
-	fi
-	# Preserve /run/surflare_watchdog.moat_strict as a user opt-in:
-	# the user may want it to survive a watchdog restart, so we leave it
-	# alone here.
+	# Always full teardown on exit.  No restart-vs-stop distinction:
+	# restart = stop + start, and _cleanup_on_startup rebuilds everything
+	# from scratch.  This prevents orphaned killswitch (self-lock) when
+	# the watchdog exits without a respawn (explicit stop, crash, OOM).
+	_full_teardown
 	# Kill any background auth refresh in progress
 	if [ -n "${_auth_bg_pid:-}" ] && kill -0 "$_auth_bg_pid" 2>/dev/null; then
 		kill "$_auth_bg_pid" 2>/dev/null
@@ -2876,7 +2850,7 @@ cleanup() {
 }
 
 # Full teardown: remove ALL nft tables and routing rules.
-# Called by cleanup() on explicit stop (sentinel present).
+# Called by cleanup() on every exit (stop, crash, restart).
 # Idempotent: safe to call on already-clean state.
 _full_teardown() {
 	nft delete table inet killswitch 2>/dev/null
@@ -2888,7 +2862,6 @@ _full_teardown() {
 	ip -6 rule del fwmark 0x1 lookup 100 2>/dev/null
 	rm -f /run/surflare_watchdog.killswitch_ready
 	rm -f /run/surflare_watchdog.storm_cool_until
-	rm -f /run/surflare_watchdog.stopping
 }
 
 trap 'log "watchdog stopped"; cleanup; exit 0' INT TERM
