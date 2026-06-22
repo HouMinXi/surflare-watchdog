@@ -23,15 +23,19 @@ restart() {
 # procd sends SIGTERM to the watchdog, which triggers cleanup() ->
 # _full_teardown().  stop_service waits for exit, then belt-and-suspenders.
 stop_service() {
+    # Kill watchdog by PID file (always points to main process).
     local pid
     pid=$(cat /var/run/surflare_watchdog.pid 2>/dev/null)
     if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+        kill -TERM "$pid" 2>/dev/null
         local i=0
         while [ $i -lt 10 ] && kill -0 "$pid" 2>/dev/null; do
             sleep 1; i=$((i + 1))
         done
+        kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null
     fi
     _full_teardown
+    rm -f /var/run/surflare_watchdog.pid
     logger -t surflare-watchdog "Service stopped: all nft tables removed"
 }
 

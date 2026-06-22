@@ -718,6 +718,33 @@ _cleanup_on_startup() {
 		_stop_proxy_log_monitor
 		sleep 2
 	fi
+	# Kill orphan watchdog from previous instance.
+	# The PID file always points to the main watchdog process (not
+	# bash subshells from pipelines).  Kill it by PID, not pgrep.
+	if [ -f "$PIDFILE" ]; then
+		local _old_pid
+		_old_pid=$(cat "$PIDFILE" 2>/dev/null)
+		if [ -n "$_old_pid" ] && [ "$_old_pid" != "$$" ] && 		   kill -0 "$_old_pid" 2>/dev/null; then
+			log "Startup: killing orphan watchdog PID $_old_pid"
+			kill -TERM "$_old_pid" 2>/dev/null
+			sleep 1
+			kill -0 "$_old_pid" 2>/dev/null && kill -9 "$_old_pid" 2>/dev/null
+		fi
+	# Kill any OTHER orphan watchdogs (PPid=1, stdin=pipe).
+	# procd starts services with piped stdout/stderr, so orphan
+	# watchdogs have stdin=pipe.  New instance has stdin=/dev/null.
+	local _opid
+	for _opid in $(pgrep -f surflare_watchdog.sh 2>/dev/null); do
+		[ "$_opid" = "$$" ] && continue
+		local _oppid _ofd0
+		_oppid=$(cat /proc/$_opid/status 2>/dev/null | awk "/^PPid/{print \$2}")
+		[ "$_oppid" != "1" ] && continue
+		_ofd0=$(readlink /proc/$_opid/fd/0 2>/dev/null)
+		case "$_ofd0" in pipe:*) ;; *) continue ;; esac
+		log "Startup: killing orphan watchdog PID $_opid"
+		kill -9 "$_opid" 2>/dev/null
+	done
+	fi
 	# Port-based cleanup: ensure 10800 is free
 	if ss -ltn 2>/dev/null | grep -qE ':10800(\s|$)'; then
 		if command -v fuser >/dev/null 2>&1; then
@@ -2809,11 +2836,19 @@ fi
 if [ -f "$PIDFILE" ]; then
 	_old_pid=$(cat "$PIDFILE" 2>/dev/null)
 	if [ -n "$_old_pid" ] && kill -0 "$_old_pid" 2>/dev/null; then
-		if grep -q 'surflare_watchdog' "/proc/$_old_pid/cmdline" 2>/dev/null; then
-			echo "watchdog already running (PID $_old_pid)" >&2
-			exit 1
+		local _old_ppid
+		_old_ppid=$(cat /proc/$_old_pid/status 2>/dev/null | awk "/^PPid/{print \$2}")
+		if [ "$_old_ppid" = "1" ]; then
+			# Orphan watchdog (PPid=1 after procd lost track).  Kill it
+			# instead of refusing to start -- the old instance is stuck and
+			# blocking the new one from taking over.
+			log "Stale watchdog process (PID $_old_pid), killing"
+			kill -TERM "$_old_pid" 2>/dev/null
+			sleep 1
+			kill -0 "$_old_pid" 2>/dev/null && kill -9 "$_old_pid" 2>/dev/null
+		else
+			log "WARN: stale PID file ($PIDFILE) references non-watchdog PID $_old_pid; clearing"
 		fi
-		log "WARN: stale PID file ($PIDFILE) references non-watchdog PID $_old_pid; clearing"
 	fi
 	rm -f "$PIDFILE"
 fi
