@@ -663,6 +663,20 @@ _load_tproxy_cn_direct() {
 # crashed/killed watchdog, and stops orphan proxies from holding
 # port 10800 and blocking a fresh connection cycle.
 _cleanup_on_startup() {
+	# /tmp writability gate: nft batch files, probe temp files, and
+	# conntrack operations all depend on /tmp.  If /tmp is full or
+	# read-only, every downstream operation silently fails.
+	if ! touch /tmp/.surflare_probe 2>/dev/null; then
+		log "CRITICAL: /tmp not writable -- killswitch/tproxy/health check will fail"
+		log "Attempting to free /tmp by removing stale surflare files"
+		rm -f /tmp/surflare_* /tmp/ks_swap_* /tmp/tproxy_* /tmp/ct_* 2>/dev/null
+		if ! touch /tmp/.surflare_probe 2>/dev/null; then
+			log "CRITICAL: /tmp still not writable after cleanup -- exiting"
+			exit 1
+		fi
+	fi
+	rm -f /tmp/.surflare_probe 2>/dev/null
+
 	# Always kill any existing surflare-proxy: orphans from a previous
 	# watchdog instance (crash or unclean restart) hold port 10800 and
 	# block the new connection cycle.  The previous "keep healthy proxy"
@@ -1053,12 +1067,11 @@ _update_killswitch_server_ips() {
 	nft list table inet killswitch >/dev/null 2>&1 || return
 	local ip_csv
 	ip_csv=$(echo "$_diag_server_ips" | tr ' ' ',')
-	# F7: best-effort near-atomic swap of server_ips. True atomic rename
-	# is not available in nft (<1.1); the approach is: validate in a
-	# scratch table, then flush+add in the production table, then verify.
-	# If the add fails after flush (ENOMEM, transient nft error), re-try
-	# once from the validated scratch data. If that also fails, log a
-	# CRITICAL and leave the set empty (operator must intervene).
+	# F7: atomic swap of server_ips via single nft -f batch.
+	# flush + add in one file = one netlink transaction = no empty window.
+	# Validate in a scratch table first; if validation passes, swap
+	# production in a single batch.  If the batch fails, fall back to
+	# disk backup.
 	local _ks_tmp="/tmp/ks_swap_$$.nft"
 	cat > "$_ks_tmp" << NFTEOF
 table inet killswitch_swap {
@@ -1067,25 +1080,35 @@ table inet killswitch_swap {
 NFTEOF
 	if nft -f "$_ks_tmp" 2>/dev/null \
 		&& nft add element inet killswitch_swap server_ips "{ $ip_csv }" 2>/dev/null; then
-		nft flush set inet killswitch server_ips 2>/dev/null || true
-		if ! nft add element inet killswitch server_ips "{ $ip_csv }" 2>/dev/null; then
-			log "WARN: server_ips swap-in failed on first attempt; retrying"
-			if ! nft add element inet killswitch server_ips "{ $ip_csv }" 2>/dev/null; then
-				# Phase 2B: emergency restore from disk (3rd fallback level)
+		# Atomic swap: flush + add in one batch file
+		local _swap_tmp="/tmp/ks_swap_prod_$$.nft"
+		cat > "$_swap_tmp" << SWAPEOF
+flush set inet killswitch server_ips
+add element inet killswitch server_ips { $ip_csv }
+SWAPEOF
+		if ! nft -f "$_swap_tmp" 2>/dev/null; then
+			log "WARN: server_ips atomic swap failed; retrying"
+			if ! nft -f "$_swap_tmp" 2>/dev/null; then
 				local _disk_ips=""
 				[ -f /etc/surflare/server_ips ] && \
 					_disk_ips=$(tr -s ' \t\n' ',' < /etc/surflare/server_ips)
 				if [ -n "$_disk_ips" ] && \
-				   nft add element inet killswitch server_ips "{ $_disk_ips }" 2>/dev/null; then
+				   nft -f - 2>/dev/null << DISKEOF
+flush set inet killswitch server_ips
+add element inet killswitch server_ips { $_disk_ips }
+DISKEOF
+				then
 					log "WARN: server_ips swap-in failed; restored from disk backup"
 				else
 					log "CRITICAL: server_ips swap-in failed, disk restore failed; killswitch server_ips is EMPTY"
 				fi
 			fi
 		fi
+		rm -f "$_swap_tmp"
 		nft delete table inet killswitch_swap 2>/dev/null || true
 	else
 		log "WARN: killswitch server_ips scratch build failed; keeping previous set"
+		nft delete table inet killswitch_swap 2>/dev/null || true
 	fi
 	rm -f "$_ks_tmp"
 	# F8: persist the current node's server IPs to disk so a watchdog
@@ -1437,15 +1460,17 @@ _classify_timeout() {
 		(*[!0-9.]|.|*..*) return ;;
 	esac
 	local stuck="unknown"
-	# shellcheck disable=SC2288  # false positive: awk closing brace in single-quoted string
-	awk -v d="$dns" -v t="$tcp" -v l="$tls" -v f="$ttfb" \
-	'BEGIN{exit !(t+0>0 && l+0<=0)}' && stuck="TCP"
-	awk -v d="$dns" -v t="$tcp" -v l="$tls" -v f="$ttfb" \
-	'BEGIN{exit !(d+0>0 && t+0<=0)}' && stuck="TCP"
-	awk -v d="$dns" -v t="$tcp" -v l="$tls" -v f="$ttfb" \
-	'BEGIN{exit !(l+0>0 && f+0<=0)}' && stuck="TLS"
-	awk -v d="$dns" -v t="$tcp" -v l="$tls" -v f="$ttfb" \
-	'BEGIN{exit !(f+0>0)}' && stuck="TTFB"
+	# Priority: TCP > TLS > TTFB.  Once classified, stop.
+	# Pure bash arithmetic -- no fork per check.
+	if [ "${tcp%.*}" -gt 0 ] 2>/dev/null && [ "${tls%.*}" -le 0 ] 2>/dev/null; then
+		stuck="TCP"
+	elif [ "${dns%.*}" -gt 0 ] 2>/dev/null && [ "${tcp%.*}" -le 0 ] 2>/dev/null; then
+		stuck="TCP"
+	elif [ "${tls%.*}" -gt 0 ] 2>/dev/null && [ "${ttfb%.*}" -le 0 ] 2>/dev/null; then
+		stuck="TLS"
+	elif [ "${ttfb%.*}" -gt 0 ] 2>/dev/null; then
+		stuck="TTFB"
+	fi
 	log "probe timeout ${label}: dns=${dns} tcp=${tcp} tls=${tls} ttfb=${ttfb} stuck=${stuck}"
 	echo "$stuck"  # return value: callers must use $() to capture
 }
@@ -1658,13 +1683,19 @@ check_vpn_health() {
 		done
 
 		# Check IP probes (icanhazip, myip.wtf) -- a valid IP from a CDN
-		# proves the tunnel works. We don't know the country, so return "TUNNEL_OK"
-		# which the caller treats same as a non-CN country code (healthy).
+		# proves the tunnel works but does NOT prove the exit country.
+		# Cross-check against killswitch bypass_ipv4 (CN ranges): if the
+		# exit IP is in a CN range, report "CN" so the caller triggers
+		# a reconnect instead of treating it as healthy.
 		local r_ip
 		for tmp_file in "$tmp_ich" "$tmp_myip"; do
 			r_ip=$(cat "$tmp_file" 2>/dev/null)
 			if [ -n "$r_ip" ]; then
-				result="TUNNEL_OK"
+				if nft get element inet killswitch bypass_ipv4 "{ $r_ip }" >/dev/null 2>&1; then
+					result="CN"
+				else
+					result="TUNNEL_OK"
+				fi
 				break 2
 			fi
 		done
@@ -2675,10 +2706,12 @@ fi
 # appear live if an unrelated process reused it (observed: orphan subshell
 # held PID after SIGKILL storm, causing false "already running" exit).
 # Double-check: the live process must be a surflare_watchdog.sh process.
+# /proc/PID/comm is "bash" for shebang-launched scripts (15-char limit),
+# so we check /proc/PID/cmdline for the full script path instead.
 if [ -f "$PIDFILE" ]; then
 	_old_pid=$(cat "$PIDFILE" 2>/dev/null)
 	if [ -n "$_old_pid" ] && kill -0 "$_old_pid" 2>/dev/null; then
-		if _pids_by_comm surflare_watchdog.sh | grep -qw "$_old_pid"; then
+		if grep -q 'surflare_watchdog' "/proc/$_old_pid/cmdline" 2>/dev/null; then
 			echo "watchdog already running (PID $_old_pid)" >&2
 			exit 1
 		fi
@@ -2917,10 +2950,30 @@ while true; do
 		if [ "$rc" -eq 2 ]; then
 			log "Post-crash reconnect skipped (flock held), will retry next cycle"
 		elif [ "$rc" -eq 0 ]; then
-			fail_count=0
-			reconnect_count=0
-			transient_count=0
-			_remove_dns_fallback
+			new_health=$(check_vpn_health)
+			log "Post-crash reconnect health: ${new_health:-failed}"
+			if [ "$new_health" = "OK" ] || \
+			   { [ "$new_health" != "CN" ] && [ "$new_health" != "LOCAL_FAIL" ] && [ "$new_health" != "TCP_BLOCK" ] && [ -n "$new_health" ]; }; then
+				fail_count=0
+				reconnect_count=0
+				transient_count=0
+				_remove_dns_fallback
+				_update_server_endpoint
+				if [ "$_killswitch_armed" -eq 0 ]; then
+					if _install_killswitch; then
+						_killswitch_armed=1
+					else
+						log "WARN: post-crash killswitch install failed -- IP leak protection inactive"
+					fi
+				fi
+				_update_killswitch_server_ips
+				_restore_tproxy
+				_update_bypass_devices
+				_patch_surflare_icmp_lan
+				_record_connect
+			else
+				fail_count=$((fail_count + 1))
+			fi
 		else
 			reconnect_count=$((reconnect_count + 1))
 			log "Post-crash reconnect failed (reconnect_count=${reconnect_count})"
@@ -3069,6 +3122,7 @@ while true; do
 	if [ "$fail_count" -ge "$FAIL_THRESHOLD" ]; then
 		_rotate_node
 		log "Consecutive failures: ${fail_count}, starting reconnect..."
+		rm -f /run/surflare_auth_fail_signal 2>/dev/null || true
 		connect_vpn
 		rc=$?
 		# Collect auth-fail signal from connect_vpn subshell (its variables are lost)
