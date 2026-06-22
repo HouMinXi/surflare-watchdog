@@ -1258,11 +1258,6 @@ EOF
 # Case (c): table exists with live tproxy -> reload is idempotent
 #           (destroy + recreate with same content).
 _restore_tproxy() {
-	# Guard: skip if connect_vpn subshell is running (it manages tproxy lifecycle)
-	if [ -f "$LOCK_FILE" ] && ! flock -n 9 2>/dev/null; then
-		log "Skipping _restore_tproxy: connect_vpn holds flock"
-		return 0
-	fi
 	local _lan_tproxy_nft="/etc/surflare-lan-tproxy.nft"
 	if [ ! -f "$_lan_tproxy_nft" ]; then
 		log "WARN: $_lan_tproxy_nft not found, cannot restore tproxy"
