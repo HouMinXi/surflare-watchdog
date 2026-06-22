@@ -1,7 +1,7 @@
 [Unit]
 Description=Surflare Watchdog Daemon
 After=network-online.target
-Wants=network-online.target
+Wants=network-online.target surflare-early-detector.service
 
 [Service]
 Type=simple
