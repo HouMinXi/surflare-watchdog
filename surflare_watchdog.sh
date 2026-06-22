@@ -1058,9 +1058,17 @@ _update_killswitch_server_ips() {
 			[ -n "$_diag_server_ips" ] && \
 				log "server_ips: socket empty, using disk backup"
 		fi
+		# Level 2.5: try persist file (saved before storm cooldown flush)
+		if [ -z "$_diag_server_ips" ] && [ -f /run/surflare_watchdog.server_ips_v4 ]; then
+			_diag_server_ips=$(tr -s '[:space:]' ' ' \
+				< /run/surflare_watchdog.server_ips_v4 2>/dev/null \
+				| sed 's/^ //; s/ $//')
+			[ -n "$_diag_server_ips" ] && \
+				log "server_ips: socket+disk empty, using persist file"
+		fi
 		# Level 3: keep existing set unchanged
 		[ -z "$_diag_server_ips" ] && {
-			log "CRITICAL: no server IPs from socket or disk; keeping existing set"
+			log "CRITICAL: no server IPs from socket, disk, or persist; keeping existing set"
 			return
 		}
 	fi
@@ -1183,10 +1191,15 @@ _restore_tproxy() {
 		log "WARN: $_lan_tproxy_nft not found, cannot restore tproxy"
 		return 1
 	fi
+	# Snapshot bypass sets before destroy so they survive the reload.
+	# _update_bypass_devices overwrites these on the next connect.
+	local _saved_bypass _saved_auto
+	_saved_bypass=$(nft list set inet sw_lan_tproxy bypass_devices 2>/dev/null \
+		| grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | tr '\n' ',' | sed 's/,$//')
+	_saved_auto=$(nft list set inet sw_lan_tproxy auto_bypass 2>/dev/null \
+		| grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | tr '\n' ',' | sed 's/,$//')
 	# Prepend destroy so the load is atomic: old table removed and new
-	# table created in one nft -f transaction.  bypass_devices and
-	# auto_bypass sets are re-created empty; the connect flow repopulates
-	# them via _update_bypass_devices after restore.
+	# table created in one nft -f transaction.
 	local _restore_tmp="/tmp/tproxy_restore_$$.nft"
 	{
 		printf 'destroy table inet sw_lan_tproxy\n'
@@ -1200,6 +1213,17 @@ _restore_tproxy() {
 		log "WARN: LAN tproxy restore failed: ${_nft_err}"
 	fi
 	rm -f "$_restore_tmp"
+	# Restore saved bypass IPs immediately to close the rebuild gap.
+	# _update_bypass_devices will overwrite these on the next connect,
+	# but until then bypass devices keep their exemption.
+	if [ -n "$_saved_bypass" ]; then
+		nft add element inet sw_lan_tproxy bypass_devices \
+			"{ $_saved_bypass }" 2>/dev/null || true
+	fi
+	if [ -n "$_saved_auto" ]; then
+		nft add element inet sw_lan_tproxy auto_bypass \
+			"{ $_saved_auto }" 2>/dev/null || true
+	fi
 }
 
 # Enter storm-protection cooldown. Called from the three storm trigger
@@ -1218,6 +1242,12 @@ _enter_storm_cooldown() {
 	# Before v64: deleted tproxy + killswitch -> 600s IP leak window.
 	# Tombstone: killswitch stays armed, overseas gets REJECT (fast fail).
 	_tombstone_tproxy
+	# Persist server_ips to tmpfs before flushing; _update_killswitch_server_ips
+	# reads this as a fallback after cooldown.
+	local _persist_v4="/run/surflare_watchdog.server_ips_v4"
+	if [ -n "$_diag_server_ips" ]; then
+		echo "$_diag_server_ips" > "$_persist_v4" 2>/dev/null || true
+	fi
 	# Flush server_ips so VPN server traffic is also blocked by killswitch
 	nft flush set inet killswitch server_ips 2>/dev/null || true
 	nft flush set inet killswitch server_ips6 2>/dev/null || true
