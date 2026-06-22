@@ -801,6 +801,8 @@ _cleanup_on_startup() {
 		fi
 		rm -f "$_cool_file"
 	fi
+	# Remove stale stopping sentinel (e.g. watchdog killed mid-cleanup)
+	rm -f /run/surflare_watchdog.stopping
 }
 
 # Ensure dns_enforce table exists.  Idempotent: skips if already present.
@@ -2765,28 +2767,32 @@ cleanup() {
 	# (no wait): procd's term_timeout is only 5s, and _cleanup_on_startup
 	# in the next instance handles any survivor.
 	killall surflare-proxy 2>/dev/null
-	nft delete table inet surflare_moat 2>/dev/null || true
-	# Modular teardown: keep killswitch and dns_enforce alive across
-	# restart so CN traffic continues flowing and LAN DNS enforcement
-	# persists.  Only flush server_ips so VPN server traffic is blocked
-	# until the next instance reconnects.  Tombstone tproxy (replace
-	# tproxy rule with reject) so non-CN LAN TCP gets fast ICMP failure
-	# instead of black-holing into a dead proxy or leaking via direct
-	# forwarding.  The next instance's connect flow restores tproxy.
-	# stop_service() in the init script handles full teardown on
-	# explicit service stop (prevents self-lock).
-	_tombstone_tproxy
-	nft flush set inet killswitch server_ips 2>/dev/null || true
-	nft flush set inet killswitch server_ips6 2>/dev/null || true
-	nft delete table inet surflare 2>/dev/null || true
-	# Drop run-state sentinels so a future restart does not inherit
-	# stale "ready" markers.
-	# Forge finding #3: do NOT delete storm_cool_until here. On a graceful
-	# exit followed by an immediate procd respawn, _cleanup_on_startup
-	# reads storm_cool_until to sleep the remaining window. Deleting it
-	# here would lose the cool state and allow immediate storm re-trigger.
-	# _cleanup_on_startup deletes the file itself after consuming it.
-	rm -f /run/surflare_watchdog.killswitch_ready
+	# Sentinel-based teardown mode: the stop mechanism (procd
+	# stop_service or systemd ExecStop) creates the stopping sentinel
+	# before sending SIGTERM.  Its presence means explicit stop: tear
+	# down everything to prevent self-lock (killswitch output policy
+	# drop with no watchdog = total network loss).  Without the
+	# sentinel this is a restart: modular teardown only so the
+	# killswitch protects CN traffic during the respawn gap.
+	if [ -f /run/surflare_watchdog.stopping ]; then
+		_full_teardown
+		log "Explicit stop: all nft tables removed"
+	else
+		nft delete table inet surflare_moat 2>/dev/null || true
+		_tombstone_tproxy
+		nft flush set inet killswitch server_ips 2>/dev/null || true
+		nft flush set inet killswitch server_ips6 2>/dev/null || true
+		nft delete table inet surflare 2>/dev/null || true
+		# Drop run-state sentinels so a future restart does not inherit
+		# stale "ready" markers.
+		# Forge finding #3: do NOT delete storm_cool_until here. On a
+		# graceful exit followed by an immediate procd respawn,
+		# _cleanup_on_startup reads storm_cool_until to sleep the
+		# remaining window.  Deleting it here would lose the cool state
+		# and allow immediate storm re-trigger.  _cleanup_on_startup
+		# deletes the file itself after consuming it.
+		rm -f /run/surflare_watchdog.killswitch_ready
+	fi
 	# Preserve /run/surflare_watchdog.moat_strict as a user opt-in:
 	# the user may want it to survive a watchdog restart, so we leave it
 	# alone here.
@@ -2798,6 +2804,23 @@ cleanup() {
 	rm -f "$PIDFILE"
 	rm -f "$WATCHDOG_ACK_FILE" 2>/dev/null || true
 }
+
+# Full teardown: remove ALL nft tables and routing rules.
+# Called by cleanup() on explicit stop (sentinel present).
+# Idempotent: safe to call on already-clean state.
+_full_teardown() {
+	nft delete table inet killswitch 2>/dev/null
+	nft delete table inet sw_lan_tproxy 2>/dev/null
+	nft delete table ip dns_enforce 2>/dev/null
+	nft delete table inet surflare 2>/dev/null
+	nft delete table inet surflare_moat 2>/dev/null
+	ip rule del fwmark 0x1 lookup 100 2>/dev/null
+	ip -6 rule del fwmark 0x1 lookup 100 2>/dev/null
+	rm -f /run/surflare_watchdog.killswitch_ready
+	rm -f /run/surflare_watchdog.storm_cool_until
+	rm -f /run/surflare_watchdog.stopping
+}
+
 trap 'log "watchdog stopped"; cleanup; exit 0' INT TERM
 trap 'cleanup' EXIT
 
