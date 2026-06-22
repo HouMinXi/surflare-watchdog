@@ -616,6 +616,48 @@ copies `surflare-lan-tproxy.nft` to `/etc/surflare-lan-tproxy.nft`.
 The watchdog loads this file via `_install_lan_tproxy()` after every VPN
 connect, so the rule is automatically re-applied on reconnect or restart.
 
+### LAN bypass mechanisms
+
+Devices that run their own VPN (e.g. Cisco AnyConnect) must bypass tproxy
+entirely. The tproxy intercepts TCP 443 and routes it through surflare-proxy,
+which breaks the VPN's TLS control channel even though the DTLS data channel
+(UDP 443) is independently bypassed by the `0xfefd` detection rule.
+
+**Configuration** (`/etc/surflare/bypass-macs.conf`):
+
+```
+# One MAC per line. IPs auto-resolved from /tmp/dhcp.leases.
+00:11:22:33:44:55   # admin-PC Windows (.11)
+00:66:77:88:99:aa   # Mac (.147) -- Cisco AnyConnect
+```
+
+**Traffic path for bypassed devices**:
+
+```
+LAN device -> br-lan
+  -> sw_lan_tproxy prerouting: ip saddr @bypass_devices return (skip tproxy)
+  -> killswitch forward: ip saddr @bypass_src accept
+  -> fw4 forward: forward_lan -> accept_to_wan
+  -> NAT masquerade -> pppoe-wan -> WAN (direct, no VPN)
+```
+
+**What bypass covers**: all protocols (TCP, UDP, ICMP), all destinations.
+Bypassed devices are synced to killswitch `bypass_src` (forward accept) and
+`dns_enforce vpn_bypass` (DNS exemption). No log pollution: `ks-fwd-mon`
+is short-circuited by `bypass_src accept` before the log rule.
+
+**DTLS-only bypass** (UDP 443 detection, no config needed):
+
+```
+iifname "br-lan" udp dport 443 @th,72,16 0xfefd return
+```
+
+Every DTLS 1.2 record carries `0xFEFD` at byte 1-2 (protocol version),
+so this matches ALL DTLS packets, not just the initial handshake. QUIC
+versions never have `0xFEFD` at this offset, so QUIC rejection is unaffected.
+This handles the DTLS data channel but NOT the TCP control channel -- devices
+that use both (like AnyConnect) need `bypass-macs.conf` entries.
+
 ### Known iStoreOS / busybox constraints
 
 | Constraint | Reason |

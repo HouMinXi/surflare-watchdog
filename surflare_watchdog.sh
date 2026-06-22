@@ -1088,7 +1088,6 @@ table inet killswitch_swap {
 NFTEOF
 	if nft -f "$_ks_tmp" 2>/dev/null \
 		&& nft add element inet killswitch_swap server_ips "{ $ip_csv }" 2>/dev/null; then
-		# Atomic swap: flush + add in one batch file
 		local _swap_tmp="/tmp/ks_swap_prod_$$.nft"
 		cat > "$_swap_tmp" << SWAPEOF
 flush set inet killswitch server_ips
