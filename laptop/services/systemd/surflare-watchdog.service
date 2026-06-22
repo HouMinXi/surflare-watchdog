@@ -6,8 +6,8 @@ Wants=network-online.target surflare-early-detector.service
 [Service]
 Type=simple
 ExecStart=/usr/local/sbin/surflare_watchdog.sh
-ExecStop=/bin/sh -c 'touch /run/surflare_watchdog.restart; [ -n "$MAINPID" ] && /bin/kill -TERM $MAINPID || true'
-TimeoutStopSec=15
+ExecStop=/bin/sh -c '[ -n "$MAINPID" ] && /bin/kill -TERM $MAINPID || true'
+TimeoutStopSec=30
 Restart=always
 RestartSec=10
 

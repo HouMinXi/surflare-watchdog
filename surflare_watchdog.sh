@@ -22,8 +22,9 @@ NODE_CANDIDATES=("Los Angeles" "Dallas" "Chicago" "New York" "Atlanta" "Miami")
 #   laptop "global": all traffic through VPN; cn_ipv4 kernel-level CN bypass.
 MODE=""
 if [ -f /etc/surflare/mode.conf ]; then
-	# shellcheck source=/dev/null
-	. /etc/surflare/mode.conf 2>/dev/null
+	# Safe parse: only accept MODE= assignments, reject arbitrary shell code.
+	_conf_mode=$(grep -E "^[[:space:]]*MODE=" /etc/surflare/mode.conf 2>/dev/null | tail -1 | cut -d= -f2- | tr -d "\"'")
+	[ -n "$_conf_mode" ] && MODE="$_conf_mode"
 fi
 TRANSIT="auto"                            # Transit server: "" = use TRANSIT_CANDIDATES (logged), "auto" = surflare picks (opaque)
 TRANSIT_CANDIDATES=("Dallas" "Chicago" "Atlanta" "Miami" "New York")  # US-only; KR/HK/TW exits trigger Bing cn redirect
@@ -726,8 +727,11 @@ _cleanup_on_startup() {
 		local _old_pid
 		_old_pid=$(cat "$PIDFILE" 2>/dev/null)
 		if [ -n "$_old_pid" ] && [ "$_old_pid" != "$$" ] && 		   kill -0 "$_old_pid" 2>/dev/null; then
-			log "Startup: killing orphan watchdog PID $_old_pid"
-			kill -TERM "$_old_pid" 2>/dev/null
+			# Verify it's actually a watchdog, not a recycled PID
+			if grep -q "surflare_watchdog" "/proc/$_old_pid/cmdline" 2>/dev/null; then
+				log "Startup: killing orphan watchdog PID $_old_pid"
+				kill -TERM "$_old_pid" 2>/dev/null
+			fi
 			sleep 1
 			kill -0 "$_old_pid" 2>/dev/null && kill -9 "$_old_pid" 2>/dev/null
 		fi
