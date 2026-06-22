@@ -3089,6 +3089,7 @@ while true; do
 		log "Firmware stable, triggering VPN reconnect"
 		[ "${_trace_active:-0}" -eq 0 ] && start_packet_trace
 		connect_vpn
+		_block_unreachable_doh
 		rc=$?
 		if [ "$rc" -eq 2 ]; then
 			log "Post-crash reconnect skipped (flock held), will retry next cycle"
@@ -3276,6 +3277,7 @@ while true; do
 		log "Consecutive failures: ${fail_count}, starting reconnect..."
 		rm -f /run/surflare_auth_fail_signal 2>/dev/null || true
 		connect_vpn
+		_block_unreachable_doh
 		rc=$?
 		# Collect auth-fail signal from connect_vpn subshell (its variables are lost)
 		if [ -f /run/surflare_auth_fail_signal ]; then
