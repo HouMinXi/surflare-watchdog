@@ -35,6 +35,7 @@ DEGRADED_INTERVAL=15                  # Shortened interval when degraded (transi
 FAIL_THRESHOLD=4                      # Consecutive failures before reconnect
 LOCK_FILE=/run/surflare_watchdog.lock # Mutex lock to prevent concurrent reconnects
 PIDFILE=/run/surflare_watchdog.pid    # PID file for reliable daemon shutdown
+RESTART_MARKER=/run/surflare_watchdog.restart  # set by main loop before reconnect; cleanup checks it
 ROTATION_STATE=/var/tmp/surflare_rotation  # Persists active node across restarts
 DIAG_SACK_THRESHOLD=20                # % of packets with SACK blocks to flag transit degradation
 DISCONNECT_SETTLE=1                   # seconds after surflare disconnect before killing processes
@@ -2854,7 +2855,10 @@ fi
 # _hc_tmp: health-check temp files -- cleaned on SIGTERM in case wait is interrupted
 storm_sleep_pid=""
 _hc_tmp=""
+_cleanup_done=0
 cleanup() {
+	[ "$_cleanup_done" -eq 1 ] && return 0
+	_cleanup_done=1
 	stop_packet_trace >/dev/null 2>&1
 	_stop_proxy_log_monitor
 	[ -n "$storm_sleep_pid" ] && kill "$storm_sleep_pid" 2>/dev/null
@@ -2866,11 +2870,24 @@ cleanup() {
 	# (no wait): procd's term_timeout is only 5s, and _cleanup_on_startup
 	# in the next instance handles any survivor.
 	killall surflare-proxy 2>/dev/null
-	# Always full teardown on exit.  No restart-vs-stop distinction:
-	# restart = stop + start, and _cleanup_on_startup rebuilds everything
-	# from scratch.  This prevents orphaned killswitch (self-lock) when
-	# the watchdog exits without a respawn (explicit stop, crash, OOM).
-	_full_teardown
+	# Restart marker: set by the main loop before triggering reconnect.
+	# If present, this is a restart (procd respawn) : modular teardown:
+	# keep killswitch (protects CN traffic), tombstone tproxy (fast reject
+	# instead of black-hole).  If absent, this is an explicit stop or
+	# crash : full teardown to prevent orphaned killswitch (self-lock).
+	if [ -f "$RESTART_MARKER" ]; then
+		rm -f "$RESTART_MARKER"
+		nft delete table inet surflare_moat 2>/dev/null || true
+		_tombstone_tproxy
+		nft flush set inet killswitch server_ips 2>/dev/null || true
+		nft flush set inet killswitch server_ips6 2>/dev/null || true
+		nft delete table inet surflare 2>/dev/null || true
+		rm -f /run/surflare_watchdog.killswitch_ready
+		log "Restart: modular teardown (killswitch preserved)"
+	else
+		_full_teardown
+		log "Stop: full teardown"
+	fi
 	# Kill any background auth refresh in progress
 	if [ -n "${_auth_bg_pid:-}" ] && kill -0 "$_auth_bg_pid" 2>/dev/null; then
 		kill "$_auth_bg_pid" 2>/dev/null
