@@ -808,6 +808,7 @@ _cleanup_on_startup() {
 		if nft list chain inet sw_lan_tproxy prerouting 2>/dev/null | \
 		   grep -q 'reject.*icmp\|reject.*icmpv6'; then
 			_restore_tproxy
+			_block_unreachable_doh
 			if [ "$MODE" = "global" ]; then
 				_load_tproxy_cn_direct
 			fi
@@ -1589,6 +1590,20 @@ _health_is_failure() {
 	return 1
 }
 
+
+# _block_unreachable_doh: reject DoH servers that are unreachable from this
+# network (e.g. 1.1.1.1/8.8.8.8 blocked by GFW on N100 CGNAT).
+# Without this, surflare-proxy waits 10s timeout per unreachable DoH server
+# before falling back to the next, causing DNS failures and 503 errors.
+# Idempotent: duplicate rules are harmless (nft add is append-only).
+_block_unreachable_doh() {
+	nft list table inet surflare >/dev/null 2>&1 || return 0
+	# Only on N100 (CGNAT): 1.1.1.1 and 8.8.8.8 are unreachable.
+	# Laptop (direct ISP) can reach them, so skip.
+	[ "$PLATFORM" = "laptop" ] && return 0
+	nft add rule inet surflare output \
+		ip daddr { 1.1.1.1, 1.0.0.1, 8.8.8.8, 8.8.4.4 } reject 2>/dev/null || true
+}
 # _check_proxy_path: test whether surflare-proxy:10800 actually forwards traffic.
 # Uses the same tproxy path as LAN devices (nftables -> surflare-proxy -> VPN).
 # Returns 0 if proxy works, 1 if broken.  Called after the primary health check
@@ -3079,6 +3094,7 @@ while true; do
 				fi
 				_update_killswitch_server_ips
 				_restore_tproxy
+				_block_unreachable_doh
 				_update_bypass_devices
 				_patch_surflare_icmp_lan
 				_record_connect
@@ -3286,6 +3302,7 @@ while true; do
 				_update_killswitch_server_ips
 				# Restore LAN tproxy now that the new proxy is ready on :10800.
 				_restore_tproxy
+				_block_unreachable_doh
 				_load_tproxy_cn_direct
 				_update_bypass_devices
 				_patch_surflare_icmp_lan
