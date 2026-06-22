@@ -58,12 +58,11 @@ table inet sw_lan_tproxy {
         iifname "br-lan" ip6 daddr @cn6_direct return
 
         # AnyConnect DTLS detection: UDP/443 with DTLS 1.2 version (0xFEFD).
-        # Adds source IP to auto_bypass with 5-min timeout, then returns
-        # so the packet is NOT caught by the QUIC reject rule below.
-        # Keepalives (~30s) renew the timeout; VPN closes -> expires -> resumes proxy.
-        # IPv4-only: auto_bypass set is type ipv4_addr.
-        iifname "br-lan" meta nfproto ipv4 udp dport 443 @th,72,16 0xfefd \
-            add @auto_bypass { ip saddr timeout 5m } return
+        # Every DTLS 1.2 record carries 0xFEFD at byte 1-2 (protocol version),
+        # so the rule matches ALL DTLS packets, not just the initial handshake.
+        # No auto_bypass needed: each DTLS packet independently bypasses the
+        # QUIC reject below.  QUIC versions never have 0xFEFD at this offset.
+        iifname "br-lan" meta nfproto ipv4 udp dport 443 @th,72,16 0xfefd return
 
         # TCP tproxy: all remaining LAN TCP to surflare-proxy (IPv4)
         # Use bare port (:10800) to preserve the original destination IP.
