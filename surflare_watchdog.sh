@@ -1340,25 +1340,6 @@ _enter_storm_cooldown() {
 # regardless of DHCP reassignment.
 _update_bypass_devices() {
 	nft list table inet sw_lan_tproxy >/dev/null 2>&1 || return 0
-	# Rule mode: surflare-proxy Smart Routing handles CN/non-CN split at
-	# the application layer, so bypass_devices is not populated.  Only
-	# sync auto_bypass IPs to killswitch bypass_src (corporate VPN clients
-	# still need the forward chain exemption).
-	if [ "$MODE" != "global" ]; then
-		local _auto_ips
-		_auto_ips=$(nft list set inet sw_lan_tproxy auto_bypass 2>/dev/null \
-			| grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | paste -sd,)
-		# Atomic flush+add via nft -f so bypass_src is never empty mid-update.
-		if nft list table inet killswitch >/dev/null 2>&1; then
-			{
-				printf 'flush set inet killswitch bypass_src\n'
-				[ -n "$_auto_ips" ] && \
-					printf 'add element inet killswitch bypass_src { %s }\n' "$_auto_ips"
-			} | nft -f - 2>/dev/null || true
-		fi
-		_sync_dns_enforce_bypass
-		return 0
-	fi
 	nft flush set inet sw_lan_tproxy bypass_devices 2>/dev/null || true
 
 	local all_ips="" ip_csv mac ip line
