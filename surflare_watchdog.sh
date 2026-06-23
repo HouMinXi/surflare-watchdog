@@ -2153,7 +2153,7 @@ _update_server_endpoint() {
 	local ips
 	# ss -tnp format: Recv-Q Send-Q Local($3) Peer($4) Process
 	# Exclude RFC1918 (10.x, 172.16-31.x, 192.168.x) to get only public server IPs.
-t# IPv4-only: surflare is IPv4-only; colon-split breaks for IPv6
+# IPv4-only: surflare is IPv4-only; colon-split breaks for IPv6
 	ips=$(ss -tnp state established 2>/dev/null \
 		| awk '/surflare/{split($4,a,":");ip=a[1];
 		        if (ip ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ &&
