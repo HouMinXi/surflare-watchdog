@@ -755,7 +755,7 @@ _cleanup_on_startup() {
 	for _opid in $(pgrep -f surflare_watchdog.sh 2>/dev/null); do
 		[ "$_opid" = "$$" ] && continue
 		local _oppid _ofd0
-		_oppid=$(cat /proc/"$_opid"/status 2>/dev/null | awk "/^PPid/{print \$2}")
+		_oppid=$(awk '/^PPid/{print $2}' /proc/"$_opid"/status 2>/dev/null)
 		[ "$_oppid" != "1" ] && continue
 		_ofd0=$(readlink /proc/"$_opid"/fd/0 2>/dev/null)
 		case "$_ofd0" in pipe:*) ;; *) continue ;; esac
@@ -1847,11 +1847,12 @@ check_vpn_health() {
 		# Cross-check against killswitch bypass_ipv4 (CN ranges): if the
 		# exit IP is in a CN range, report "CN" so the caller triggers
 		# a reconnect instead of treating it as healthy.
-		local r_ip
+		local r_ip _bare_ip
 		for tmp_file in "$tmp_ich" "$tmp_myip"; do
 			r_ip=$(cat "$tmp_file" 2>/dev/null)
 			if [ -n "$r_ip" ]; then
-				if nft get element inet killswitch bypass_ipv4 "{ $r_ip }" >/dev/null 2>&1; then
+				_bare_ip="${r_ip#IP:}"
+				if nft get element inet killswitch bypass_ipv4 "{ $_bare_ip }" >/dev/null 2>&1; then
 					result="CN"
 				else
 					result="TUNNEL_OK"
@@ -1937,8 +1938,8 @@ check_vpn_health() {
 	fi
 
 	# G1 blindspot detection: external probes succeeded (OK/TUNNEL_OK/country)
-	# but the SOCKS5 proxy probe COMPLETED with a non-OK result -- tunnel is
-	# dead, external probes succeeded because both exit in same country.
+	# but the proxy probe COMPLETED with a non-OK result -- VPN data path
+	# broken despite positive external results.
 	# Only override when proxy probe actually finished (non-empty output).
 	# An empty tmp_proxy means the probe was killed before completing (early
 	# exit from polling loop) -- not evidence of tunnel failure.
@@ -1946,7 +1947,7 @@ check_vpn_health() {
 		local r_proxy
 		r_proxy=$(cat "$tmp_proxy" 2>/dev/null)
 		if [ -n "$r_proxy" ] && [ "$r_proxy" != "OK" ]; then
-			result="TCP_BLOCK"
+			result="PROXY_BROKEN"
 		fi
 	fi
 
@@ -1960,7 +1961,8 @@ check_vpn_health() {
 	# LAN traffic breaks while the watchdog reports "healthy".  Run a dedicated
 	# tunnel egress test after a positive primary result to catch this blind spot.
 	if [ -n "$result" ] && [ "$result" != "TCP_BLOCK" ] && \
-	   [ "$result" != "LOCAL_FAIL" ] && [ "$result" != "CN" ]; then
+	   [ "$result" != "LOCAL_FAIL" ] && [ "$result" != "CN" ] && \
+	   [ "$result" != "PROXY_BROKEN" ]; then
 		if ! _check_tunnel_egress; then
 			log "Tunnel egress check failed: VPN path not forwarding (primary=${result})"
 			result="PROXY_BROKEN"
@@ -2297,7 +2299,7 @@ _record_connect() {
 		OK|TUNNEL_OK) exit_country="?" ;;
 	esac
 	now=$(date +%s)
-	_sess_prev_node="$_san_node"
+	_sess_prev_node="$_sess_node"
 	_sess_prev_s=$(( _sess_connect_s > 0 ? now - _sess_connect_s : 0 ))
 	_sess_node="$node"
 	_sess_exit="$exit_country"
@@ -2992,7 +2994,7 @@ for _opid in $(pgrep -f surflare_watchdog.sh 2>/dev/null); do
 	[ "$_opid" = "$_old_pid_from_file" ] && continue
 	# Guard against PID recycling: verify cmdline before killing.
 	grep -q surflare_watchdog /proc/"$_opid"/cmdline 2>/dev/null || continue
-	_op_ppid=$(cat /proc/"$_opid"/status 2>/dev/null | awk "/^PPid/{print \$2}")
+	_op_ppid=$(awk '/^PPid/{print $2}' /proc/"$_opid"/status 2>/dev/null)
 	if [ "$_op_ppid" = "1" ]; then
 		log "Orphan watchdog process (PID $_opid), killing"
 		kill -TERM "$_opid" 2>/dev/null
@@ -3006,7 +3008,7 @@ if [ "$_orphan_killed" -gt 0 ]; then
 		[ "$_opid" = "$_self_pid" ] && continue
 		[ "$_opid" = "$_old_pid_from_file" ] && continue
 		grep -q surflare_watchdog /proc/"$_opid"/cmdline 2>/dev/null || continue
-		_op_ppid=$(cat /proc/"$_opid"/status 2>/dev/null | awk "/^PPid/{print \$2}")
+		_op_ppid=$(awk '/^PPid/{print $2}' /proc/"$_opid"/status 2>/dev/null)
 		if [ "$_op_ppid" = "1" ]; then
 			kill -9 "$_opid" 2>/dev/null
 		fi
@@ -3018,8 +3020,9 @@ fi
 if [ -f "$PIDFILE" ]; then
 	_old_pid=$(cat "$PIDFILE" 2>/dev/null)
 	if [ -n "$_old_pid" ] && kill -0 "$_old_pid" 2>/dev/null; then
-		# Process still alive after orphan cleanup -- unusual, warn
-		log "WARN: PID file process $_old_pid survived orphan cleanup"
+		# PID file process still alive (skipped in Phase 1, expected
+		# to have been stopped by procd); duplicate check will handle it
+		log "WARN: previous watchdog $_old_pid still alive after procd stop"
 	fi
 	rm -f "$PIDFILE"
 fi
@@ -3259,7 +3262,7 @@ while true; do
 				_block_unreachable_doh
 				_update_bypass_devices
 				_patch_surflare_icmp_lan
-				_record_connect
+				_record_connect "${_active_node}" "${new_health}"
 				_start_proxy_log_monitor
 			else
 				fail_count=$((fail_count + 1))

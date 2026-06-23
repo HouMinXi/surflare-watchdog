@@ -35,7 +35,7 @@ stop_service() {
         touch "$RESTART_MARKER"
     fi
     local pid
-    pid=$(cat /var/run/surflare_watchdog.pid 2>/dev/null)
+    pid=$(cat /run/surflare_watchdog.pid 2>/dev/null)
     if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
         kill -TERM "$pid"
         local i=0
@@ -70,7 +70,7 @@ stop_service() {
         done
         rm -f "$RESTART_MARKER"
     fi
-    rm -f /var/run/surflare_watchdog.pid
+    rm -f /run/surflare_watchdog.pid
     if [ -f /run/surflare_restarting ]; then
         logger -t surflare-watchdog "Service stopped for restart (killswitch preserved)"
     else
@@ -80,8 +80,7 @@ stop_service() {
 
 # DUPLICATE: also defined in surflare_watchdog.sh _full_teardown(). Sync changes.
 _full_teardown() {
-    nft delete table inet killswitch 2>/dev/null || \
-        logger -t surflare-watchdog "WARN: failed to remove killswitch table"
+    nft delete table inet killswitch 2>/dev/null
     nft delete table inet sw_lan_tproxy 2>/dev/null
     nft delete table ip dns_enforce 2>/dev/null
     nft delete table inet surflare 2>/dev/null
@@ -95,7 +94,7 @@ _full_teardown() {
 extra_command "deadman" "Remove orphan killswitch if watchdog is dead"
 deadman() {
     local pid
-    pid=$(cat /var/run/surflare_watchdog.pid 2>/dev/null)
+    pid=$(cat /run/surflare_watchdog.pid 2>/dev/null)
     if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
         return 0
     fi
