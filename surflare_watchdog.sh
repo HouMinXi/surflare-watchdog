@@ -172,6 +172,8 @@ _proc_alive() {
 _pids_by_comm() {
 	local _name="${1:0:15}"  # /proc/pid/comm truncates to 15 chars
 	local _pid _comm
+	# Guard: if no numeric entries, glob is literal
+	[ -d /proc/1 ] || return 0
 	for _pid in /proc/[0-9]*; do
 		[ -r "$_pid/comm" ] || continue
 		_comm=$(cat "$_pid/comm" 2>/dev/null) || continue
@@ -238,6 +240,10 @@ DNS_STUCK_FILE="/run/surflare_dns_stuck"
 _cleanup_dns_fallback_rules() {
 	local gw="${1:-}"
 	[ -z "$gw" ] && return 0
+	# Validate IP format (defense-in-depth: callers already validate)
+	if ! [[ "$gw" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+		return 0
+	fi
 	local h removed=0
 	for h in $(nft -a list chain inet surflare output 2>/dev/null \
 		| grep -E "ip daddr ${gw//./\\.} (tcp|udp) dport 53 accept" | awk '/handle /{print $NF}'); do
@@ -1258,6 +1264,11 @@ EOF
 # Case (c): table exists with live tproxy -> reload is idempotent
 #           (destroy + recreate with same content).
 _restore_tproxy() {
+	# Guard: skip if connect_vpn is running (it manages tproxy lifecycle)
+	if [ "${_connect_vpn_active:-0}" -eq 1 ]; then
+		log "Skipping _restore_tproxy: connect_vpn active"
+		return 0
+	fi
 	local _lan_tproxy_nft="/etc/surflare-lan-tproxy.nft"
 	if [ ! -f "$_lan_tproxy_nft" ]; then
 		log "WARN: $_lan_tproxy_nft not found, cannot restore tproxy"
@@ -1338,10 +1349,17 @@ _enter_storm_cooldown() {
 	# process -- but a foreground trap is not required for the
 	# background sleep, which receives the signal directly).
 	storm_sleep_pid=$!; wait "$storm_sleep_pid"; storm_sleep_pid=""
-	reconnect_count=0
-	fail_count=0
-	transient_count=0
-	_transit_grace_ts=0
+	# Only reset counters if cooldown actually elapsed (not interrupted by USR1)
+	local _now
+	_now=$(date +%s)
+	if [ "$_now" -ge "$_cool_until" ] 2>/dev/null; then
+		reconnect_count=0
+		fail_count=0
+		transient_count=0
+		_transit_grace_ts=0
+	else
+		log "Storm cooldown interrupted early, counters not reset"
+	fi
 }
 
 # Populate the bypass_devices set in sw_lan_tproxy.
@@ -2179,6 +2197,11 @@ _diagnose_tunnel_failure() {
 	pcap="/tmp/surflare_phys_$(date +%Y%m%d_%H%M%S).pcap"
 	tcpdump -i "$phys_if" -nn -w "$pcap" "$filter" 2>/dev/null &
 	local td_pid=$!
+	# Verify tcpdump started successfully
+	if ! kill -0 "$td_pid" 2>/dev/null; then
+		log "WARN: tcpdump failed to start on $phys_if"
+		return 0
+	fi
 	sleep 3
 	kill "$td_pid" 2>/dev/null; wait "$td_pid" 2>/dev/null
 
@@ -2870,6 +2893,8 @@ if [ -f "$PIDFILE" ]; then
 			# instead of refusing to start -- the old instance is stuck and
 			# blocking the new one from taking over.
 			log "Stale watchdog process (PID $_old_pid), killing"
+			# TOCTOU note: process may exit between kill -0 and kill -TERM.
+			# Harmless: kill -TERM fails silently with ESRCH.
 			kill -TERM "$_old_pid" 2>/dev/null
 			sleep 1
 			kill -0 "$_old_pid" 2>/dev/null && kill -9 "$_old_pid" 2>/dev/null
@@ -2994,6 +3019,7 @@ trap '
 # nftables protections.  Allows manual surflare CLI diagnosis while
 # killswitch/tproxy/moat stay active.  Send SIGUSR2 again to resume.
 _diag_mode=0
+_connect_vpn_active=0  # 1 while connect_vpn subshell is running
 trap '
     if [ "$_diag_mode" -eq 0 ]; then
         _diag_mode=1
@@ -3369,7 +3395,11 @@ while true; do
 			fi
 		else
 			reconnect_count=$((reconnect_count + 1))
-			log "Reconnect attempt failed (reconnect_count=${reconnect_count})"
+			if [ "$rc" -gt 128 ]; then
+				log "Reconnect killed by signal $((rc - 128)) (reconnect_count=${reconnect_count})"
+			else
+				log "Reconnect attempt failed (reconnect_count=${reconnect_count})"
+			fi
 			maybe_reprobe_transit
 			if [ "$reconnect_count" -ge "$STORM_MAX" ]; then
 				_enter_storm_cooldown "connect-failure"
