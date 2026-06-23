@@ -1624,6 +1624,10 @@ _health_is_failure() {
 	return 1
 }
 
+# Helper: check if nft table exists (returns "yes" or "no")
+_table_exists() {
+	nft list table inet "$1" >/dev/null 2>&1 && echo "yes" || echo "no"
+}
 
 # _block_unreachable_doh: reject DoH to servers unreachable from this network.
 # N100 CGNAT: 1.1.1.1/8.8.8.8 are GFW-blocked (SYN blackholed, 10s timeout).
@@ -1647,11 +1651,22 @@ _block_unreachable_doh() {
 # Returns 0 if proxy works, 1 if broken.  Called after the primary health check
 # succeeds to detect the blind spot where the tunnel is up but the proxy is dead.
 _check_proxy_path() {
-	local _code
-	_code=$(curl -s --connect-timeout 5 --max-time 10 \
-	       -o /dev/null -w '%{http_code}' \
-	       https://connectivitycheck.gstatic.com/generate_204 2>/dev/null)
-	case "$_code" in 200|204) return 0 ;; esac
+	# Test whether the VPN tunnel can reach external endpoints.
+	# Uses multiple targets with retry to avoid false positives from
+	# transient CDN routing issues (gstatic.com PoP instability observed).
+	# This tests the tunnel path (OUTPUT -> mark 0x1 -> VPN), NOT the
+	# surflare-proxy:10800 tproxy path (kernel tproxy is LAN-only).
+	local _targets="https://connectivitycheck.gstatic.com/generate_204 https://ifconfig.me https://icanhazip.com"
+	local _attempt _url _code
+	for _attempt in 1 2; do
+		for _url in $_targets; do
+			_code=$(curl -s --connect-timeout 3 --max-time 8 \
+			       -o /dev/null -w '%{http_code}' \
+			       "$_url" 2>/dev/null)
+			case "$_code" in 200|204) return 0 ;; esac
+		done
+		[ "$_attempt" -lt 2 ] && sleep 1
+	done
 	return 1
 }
 
@@ -2701,6 +2716,17 @@ connect_vpn() {
 
 		_setup_chnroute
 
+		# Load sw_lan_tproxy and killswitch tables immediately after connect.
+		# Previously these were only loaded on the first healthy health check
+		# cycle, leaving LAN devices without tproxy rules for 30+ seconds.
+		if ! nft list table inet sw_lan_tproxy >/dev/null 2>&1; then
+			_restore_tproxy
+			_update_bypass_devices
+		fi
+		if ! nft list table inet killswitch >/dev/null 2>&1; then
+			_install_killswitch
+		fi
+
 		exit 0
 	) 9>"$LOCK_FILE"
 	return $?
@@ -3109,6 +3135,31 @@ _killswitch_armed=0
 _setup_kernel_moat
 _cleanup_on_startup
 
+# === 启动时完整加载所有 nftables 表 ===
+# 不依赖 connect_vpn 成功，确保 LAN 设备在 VPN 连接前就有保护。
+# 这是对称性设计：启动 = 加载全部表，停止 = _full_teardown 删除全部表。
+
+# 1. sw_lan_tproxy: LAN 流量透明代理规则
+if ! nft list table inet sw_lan_tproxy >/dev/null 2>&1; then
+	_restore_tproxy && log "Startup: sw_lan_tproxy loaded" || log "WARN: startup sw_lan_tproxy load failed"
+	_update_bypass_devices
+fi
+
+# 2. killswitch: 防止流量泄漏（CN bypass）
+if ! nft list table inet killswitch >/dev/null 2>&1; then
+	if _install_killswitch; then
+		_killswitch_armed=1
+		log "Startup: killswitch installed"
+	else
+		log "WARN: startup killswitch install failed"
+	fi
+fi
+
+# 3. dns_enforce: LAN DNS 强制走路由器
+_ensure_dns_enforce && log "Startup: dns_enforce loaded" || true
+
+log "Startup nftables: sw_lan_tproxy=$(_table_exists sw_lan_tproxy) killswitch=$(_table_exists killswitch) dns_enforce=$(_table_exists dns_enforce) surflare_moat=$(_table_exists surflare_moat)"
+
 while true; do
 	# Diagnostic mode: pause without tearing down protections.
 	# SIGUSR2 toggles _diag_mode; while active, the loop sleeps
@@ -3272,6 +3323,20 @@ while true; do
 		_transit_grace_ts=0
 		_remove_dns_fallback
 		_patch_surflare_icmp_lan
+
+		# Ensure sw_lan_tproxy is loaded on first successful connect.
+		# Without this, LAN devices have no tproxy rules until the first reconnect.
+		if ! nft list table inet sw_lan_tproxy >/dev/null 2>&1; then
+			_restore_tproxy
+			_update_bypass_devices
+		fi
+		if [ "$_killswitch_armed" -eq 0 ]; then
+			if _install_killswitch; then
+				_killswitch_armed=1
+			else
+				log "WARN: killswitch install failed -- IP leak protection inactive"
+			fi
+		fi
 
 		# Fix 3: stale-token detection -- if VPN reports healthy but auth token has not
 		# been refreshed in 2x the normal interval, the auth session is likely dead while
