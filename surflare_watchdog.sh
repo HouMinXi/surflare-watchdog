@@ -227,7 +227,7 @@ _stop_proxy_log_monitor() {
 		wait "$_proxy_log_pid" 2>/dev/null
 		_proxy_log_pid=""
 	fi
-	pkill -f "tail -n 0 -F $(echo "$PROXY_LOG" | sed 's/[.]/\\./g')" 2>/dev/null || true
+	pkill -f "tail -n 0 -F ${PROXY_LOG//./\\.}" 2>/dev/null || true
 }
 
 PROXY_CPU_SET=""
@@ -691,8 +691,7 @@ _load_tproxy_cn_direct() {
 
 	if [ "$_loaded" -gt 0 ]; then
 		local _nft_err
-		_nft_err=$(nft -f "$_batch" 2>&1)
-		if [ $? -eq 0 ]; then
+		if _nft_err=$(nft -f "$_batch" 2>&1); then
 			local _v4c _v6c
 			_v4c=$(nft list set inet sw_lan_tproxy cn_direct 2>/dev/null | grep -c '/')
 			_v6c=$(nft list set inet sw_lan_tproxy cn6_direct 2>/dev/null | grep -c '/')
@@ -756,9 +755,9 @@ _cleanup_on_startup() {
 	for _opid in $(pgrep -f surflare_watchdog.sh 2>/dev/null); do
 		[ "$_opid" = "$$" ] && continue
 		local _oppid _ofd0
-		_oppid=$(cat /proc/$_opid/status 2>/dev/null | awk "/^PPid/{print \$2}")
+		_oppid=$(cat /proc/"$_opid"/status 2>/dev/null | awk "/^PPid/{print \$2}")
 		[ "$_oppid" != "1" ] && continue
-		_ofd0=$(readlink /proc/$_opid/fd/0 2>/dev/null)
+		_ofd0=$(readlink /proc/"$_opid"/fd/0 2>/dev/null)
 		case "$_ofd0" in pipe:*) ;; *) continue ;; esac
 		log "Startup: killing orphan watchdog PID $_opid"
 		kill -9 "$_opid" 2>/dev/null
@@ -1292,8 +1291,7 @@ _restore_tproxy() {
 		cat "$_lan_tproxy_nft"
 	} > "$_restore_tmp"
 	local _nft_err
-	_nft_err=$(nft -f "$_restore_tmp" 2>&1)
-	if [ $? -eq 0 ]; then
+	if _nft_err=$(nft -f "$_restore_tmp" 2>&1); then
 		log "LAN tproxy restored (fresh load from ${_lan_tproxy_nft})"
 	else
 		log "WARN: LAN tproxy restore failed: ${_nft_err}"
@@ -1355,7 +1353,7 @@ _enter_storm_cooldown() {
 	# Only reset counters if cooldown actually elapsed (not interrupted by USR1)
 	local _now
 	_now=$(date +%s)
-	if [ "$_now" -ge "$_cool_until" ] 2>/dev/null; then
+	if [ "$_now" -ge "$_cool_target" ] 2>/dev/null; then
 		reconnect_count=0
 		fail_count=0
 		transient_count=0
@@ -1642,20 +1640,19 @@ _block_unreachable_doh() {
 	# Dedup: skip if reject rule already present (multiple call sites)
 	nft list chain inet surflare output 2>/dev/null | \
 		grep -q '1.1.1.1.*reject' && return 0
+	# shellcheck disable=SC1083  # braces are nft set syntax, not bash
 	nft insert rule inet surflare output \
 		ip daddr { 1.1.1.1, 1.0.0.1, 8.8.8.8, 8.8.4.4 } tcp dport 443 reject \
 		2>/dev/null || true
 }
-# _check_proxy_path: test whether surflare-proxy:10800 actually forwards traffic.
-# Uses the same tproxy path as LAN devices (nftables -> surflare-proxy -> VPN).
-# Returns 0 if proxy works, 1 if broken.  Called after the primary health check
-# succeeds to detect the blind spot where the tunnel is up but the proxy is dead.
-_check_proxy_path() {
-	# Test whether the VPN tunnel can reach external endpoints.
+# _check_tunnel_egress: test whether the VPN tunnel can reach external endpoints.
+# Tests OUTPUT -> mark 0x1 -> VPN path (locally originated traffic).
+# Does NOT test surflare-proxy:10800 tproxy path (kernel tproxy is LAN-only).
+# Returns 0 if tunnel works, 1 if broken.  Called after primary health check
+# succeeds to detect the blind spot where the tunnel is up but egress is dead.
+_check_tunnel_egress() {
 	# Uses multiple targets with retry to avoid false positives from
 	# transient CDN routing issues (gstatic.com PoP instability observed).
-	# This tests the tunnel path (OUTPUT -> mark 0x1 -> VPN), NOT the
-	# surflare-proxy:10800 tproxy path (kernel tproxy is LAN-only).
 	local _targets="https://connectivitycheck.gstatic.com/generate_204 https://ifconfig.me https://icanhazip.com"
 	local _attempt _url _code
 	for _attempt in 1 2; do
@@ -1958,11 +1955,11 @@ check_vpn_health() {
 	# itself (direct curl).  But LAN devices go through surflare-proxy:10800
 	# via tproxy.  If the tunnel is healthy but the proxy is dead (503, hang),
 	# LAN traffic breaks while the watchdog reports "healthy".  Run a dedicated
-	# proxy path test after a positive primary result to catch this blind spot.
+	# tunnel egress test after a positive primary result to catch this blind spot.
 	if [ -n "$result" ] && [ "$result" != "TCP_BLOCK" ] && \
 	   [ "$result" != "LOCAL_FAIL" ] && [ "$result" != "CN" ]; then
-		if ! _check_proxy_path; then
-			log "Proxy path check failed: surflare-proxy:10800 not forwarding (primary=${result})"
+		if ! _check_tunnel_egress; then
+			log "Tunnel egress check failed: VPN path not forwarding (primary=${result})"
 			result="PROXY_BROKEN"
 		fi
 	fi
@@ -2321,9 +2318,12 @@ _record_disconnect() {
 	local now lifetime _san_node _san_transit _san_exit
 	now=$(date +%s)
 	# Sanitize session vars for JSON (strip quotes/backslashes)
+	# shellcheck disable=SC1003  # backslash is literal inside single quotes
 	_san_node=$(echo "${_sess_node:-?}" | tr -d '"\')
-	_san_transit=$(echo "$_san_transit" | tr -d '"\')
-	_san_exit=$(echo "$_san_exit" | tr -d '"\')
+	# shellcheck disable=SC1003
+	_san_transit=$(echo "${_sess_transit:-?}" | tr -d '"\')
+	# shellcheck disable=SC1003
+	_san_exit=$(echo "${_sess_exit:-?}" | tr -d '"\')
 	lifetime=$(( now - _sess_connect_s ))
 	[ ! -f "$EVENT_LOG" ] && install -m 644 /dev/null "$EVENT_LOG" 2>/dev/null || true
 	printf '{"ts":"%s","node":"%s","lifetime_s":%d,"transit":"%s","exit":"%s","prev_node":"%s","prev_s":%d,"hour":%d,"diag":"%s","out":%d,"in":%d,"syn_out":%d,"syn_ack":%d,"sack_pct":%d,"rst_in":%d}\n' \
@@ -2923,7 +2923,7 @@ fi
 _orphan_killed=0
 for _opid in $(pgrep -f surflare_watchdog.sh 2>/dev/null); do
 	# Check PPid=1 (orphan after procd lost track)
-	_op_ppid=$(cat /proc/$_opid/status 2>/dev/null | awk "/^PPid/{print \$2}")
+	_op_ppid=$(cat /proc/"$_opid"/status 2>/dev/null | awk "/^PPid/{print \$2}")
 	if [ "$_op_ppid" = "1" ]; then
 		log "Orphan watchdog process (PID $_opid), killing"
 		kill -TERM "$_opid" 2>/dev/null
@@ -2934,7 +2934,7 @@ done
 if [ "$_orphan_killed" -gt 0 ]; then
 	sleep 2
 	for _opid in $(pgrep -f surflare_watchdog.sh 2>/dev/null); do
-		_op_ppid=$(cat /proc/$_opid/status 2>/dev/null | awk "/^PPid/{print \$2}")
+		_op_ppid=$(cat /proc/"$_opid"/status 2>/dev/null | awk "/^PPid/{print \$2}")
 		if [ "$_op_ppid" = "1" ]; then
 			kill -9 "$_opid" 2>/dev/null
 		fi
@@ -3089,9 +3089,9 @@ taskset -pc 0 $$ >/dev/null 2>&1 || true
 sleep 3
 for _dup in $(pgrep -f surflare_watchdog.sh 2>/dev/null); do
 	[ "$_dup" = "$$" ] && continue
-	_dup_ppid=$(awk '/^PPid/{print $2}' /proc/$_dup/status 2>/dev/null)
+	_dup_ppid=$(awk '/^PPid/{print $2}' /proc/"$_dup"/status 2>/dev/null)
 	[ "$_dup_ppid" != "1" ] && continue
-	_dup_fd0=$(readlink /proc/$_dup/fd/0 2>/dev/null)
+	_dup_fd0=$(readlink /proc/"$_dup"/fd/0 2>/dev/null)
 	case "$_dup_fd0" in pipe:*) ;; *) continue ;; esac
 	kill -9 "$_dup" 2>/dev/null && \
 		log "Startup: killed duplicate watchdog PID $_dup"
@@ -3135,17 +3135,12 @@ _killswitch_armed=0
 _setup_kernel_moat
 _cleanup_on_startup
 
-# === 启动时完整加载所有 nftables 表 ===
-# 不依赖 connect_vpn 成功，确保 LAN 设备在 VPN 连接前就有保护。
-# 这是对称性设计：启动 = 加载全部表，停止 = _full_teardown 删除全部表。
-
-# 1. sw_lan_tproxy: LAN 流量透明代理规则
-if ! nft list table inet sw_lan_tproxy >/dev/null 2>&1; then
-	_restore_tproxy && log "Startup: sw_lan_tproxy loaded" || log "WARN: startup sw_lan_tproxy load failed"
-	_update_bypass_devices
-fi
-
-# 2. killswitch: 防止流量泄漏（CN bypass）
+# Load dns_enforce + killswitch at startup (neither depends on proxy).
+# dns_enforce FIRST: without it, killswitch forward policy-drop silently
+# blackholes LAN DNS to external servers (slow timeout vs fast reject).
+# sw_lan_tproxy is NOT loaded here: it tproxies LAN traffic to :10800,
+# but surflare-proxy is not running yet.  Loaded after connect_vpn.
+_ensure_dns_enforce || true
 if ! nft list table inet killswitch >/dev/null 2>&1; then
 	if _install_killswitch; then
 		_killswitch_armed=1
@@ -3155,10 +3150,7 @@ if ! nft list table inet killswitch >/dev/null 2>&1; then
 	fi
 fi
 
-# 3. dns_enforce: LAN DNS 强制走路由器
-_ensure_dns_enforce && log "Startup: dns_enforce loaded" || true
-
-log "Startup nftables: sw_lan_tproxy=$(_table_exists sw_lan_tproxy) killswitch=$(_table_exists killswitch) dns_enforce=$(_table_exists dns_enforce) surflare_moat=$(_table_exists surflare_moat)"
+log "Startup nftables: killswitch=$(_table_exists killswitch) dns_enforce=$(_table_exists dns_enforce) surflare_moat=$(_table_exists surflare_moat)"
 
 while true; do
 	# Diagnostic mode: pause without tearing down protections.
