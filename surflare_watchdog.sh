@@ -57,7 +57,8 @@ AUTH_FAIL_THRESHOLD=3                 # consecutive auth refresh failures before
 BYPASS_LAN_DEVICES=""                 # space-separated LAN IPs that skip tproxy (e.g. "192.168.100.147 192.168.100.148")
 # One MAC per line; current IP resolved from /tmp/dhcp.leases at connect time
 BYPASS_LAN_MACS_FILE="/etc/surflare/bypass-macs.conf"
-_diag_server_ips=""                   # space-separated VPN server IPs captured after each successful connect
+MIN_RELAY_CONNS=5                     # minimum connections to classify an IP as relay (vs DNS/proxied noise)
+_diag_server_ips=""                   # space-separated VPN relay IPs (filtered by MIN_RELAY_CONNS)
 _diag_connect_time=0                  # epoch seconds of last successful connect
 _sess_node=""                         # exit node of current VPN session
 _sess_transit=""                      # transit node of current session
@@ -2148,26 +2149,33 @@ EXPECT_EOF
 	return "$rc"
 }
 
-# _update_server_endpoint: capture ALL public VPN server IPs from active
-# surflare-proxy sockets. Stores space-separated list in _diag_server_ips.
-# Called after every confirmed-healthy reconnect.
+# _update_server_endpoint: capture VPN relay IPs from surflare-proxy sockets.
+# In rule mode, sing-box has 4 types of outbound connections (relay, transit,
+# DNS resolvers, proxied traffic) but only relay/transit should be captured.
+# Filter: count connections per peer IP, keep only IPs with >= MIN_RELAY_CONNS.
+# Relay has 47-89 connections (persistent tunnel), transit has 6-12; DNS and
+# proxied traffic have 1-3 (ephemeral).  Called after confirmed-healthy reconnect.
 _update_server_endpoint() {
 	local ips
 	# ss -tnp format: Recv-Q Send-Q Local($3) Peer($4) Process
-	# Exclude RFC1918 (10.x, 172.16-31.x, 192.168.x) to get only public server IPs.
-# IPv4-only: surflare is IPv4-only; colon-split breaks for IPv6
+	# Step 1: extract public IPv4 peer addresses from surflare-proxy connections
+	# Step 2: count per IP, keep only >= MIN_RELAY_CONNS (relay/transit)
 	ips=$(ss -tnp state established 2>/dev/null \
 		| awk '/surflare/{split($4,a,":");ip=a[1];
 		        if (ip ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ &&
 		            ip !~ /^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.|127\.)/) print ip}' \
-		| sort -u | tr '\n' ' ' | sed 's/[[:space:]]*$//')
+		| sort | uniq -c | sort -rn \
+		| awk -v min="$MIN_RELAY_CONNS" '$1 >= min {print $2}' \
+		| tr '\n' ' ' | sed 's/[[:space:]]*$//')
 	# UDP fallback: Netid State Recv-Q Send-Q Local($5) Peer($6) Process
 	if [ -z "$ips" ]; then
 		ips=$(ss -unp 2>/dev/null \
 			| awk '/surflare/{split($6,a,":");ip=a[1];
 			        if (ip ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ &&
 			            ip !~ /^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.|127\.)/) print ip}' \
-			| sort -u | tr '\n' ' ' | sed 's/[[:space:]]*$//')
+			| sort | uniq -c | sort -rn \
+			| awk -v min="$MIN_RELAY_CONNS" '$1 >= min {print $2}' \
+			| tr '\n' ' ' | sed 's/[[:space:]]*$//')
 	fi
 	_diag_server_ips="$ips"
 	_diag_connect_time=$(date +%s)
