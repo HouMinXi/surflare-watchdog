@@ -827,7 +827,10 @@ _cleanup_on_startup() {
 		if nft list chain inet sw_lan_tproxy prerouting 2>/dev/null | \
 		   grep -q 'reject.*icmp\|reject.*icmpv6'; then
 			_restore_tproxy
-			_block_unreachable_doh
+			# _block_unreachable_doh not called here: inet surflare does
+			# not exist yet (deleted in modular teardown, recreated by
+			# surflare connect --daemon later).  DoH reject is inserted
+			# after connect_vpn returns in the main loop.
 			if [ "$MODE" = "global" ]; then
 				_load_tproxy_cn_direct
 			fi
@@ -1622,18 +1625,22 @@ _health_is_failure() {
 }
 
 
-# _block_unreachable_doh: reject DoH servers that are unreachable from this
-# network (e.g. 1.1.1.1/8.8.8.8 blocked by GFW on N100 CGNAT).
-# Without this, surflare-proxy waits 10s timeout per unreachable DoH server
-# before falling back to the next, causing DNS failures and 503 errors.
-# Idempotent: duplicate rules are harmless (nft add is append-only).
+# _block_unreachable_doh: reject DoH to servers unreachable from this network.
+# N100 CGNAT: 1.1.1.1/8.8.8.8 are GFW-blocked (SYN blackholed, 10s timeout).
+# surflare-proxy tries DoH in order 1.1.1.1 -> 8.8.8.8 -> 223.5.5.5; the
+# two blocked IPs waste 20s before fallback, causing DNS failures and 503.
+# nft insert (not add) places the reject BEFORE the mark-0xff accept rule
+# so the proxy gets instant ECONNREFUSED and falls back in <1ms.
+# Scoped to tcp dport 443 (DoH only); UDP 53 and DoT 853 are unaffected.
 _block_unreachable_doh() {
 	nft list table inet surflare >/dev/null 2>&1 || return 0
-	# Only on N100 (CGNAT): 1.1.1.1 and 8.8.8.8 are unreachable.
-	# Laptop (direct ISP) can reach them, so skip.
 	[ "$PLATFORM" = "laptop" ] && return 0
-	nft add rule inet surflare output \
-		ip daddr { 1.1.1.1, 1.0.0.1, 8.8.8.8, 8.8.4.4 } reject 2>/dev/null || true
+	# Dedup: skip if reject rule already present (multiple call sites)
+	nft list chain inet surflare output 2>/dev/null | \
+		grep -q '1.1.1.1.*reject' && return 0
+	nft insert rule inet surflare output \
+		ip daddr { 1.1.1.1, 1.0.0.1, 8.8.8.8, 8.8.4.4 } tcp dport 443 reject \
+		2>/dev/null || true
 }
 # _check_proxy_path: test whether surflare-proxy:10800 actually forwards traffic.
 # Uses the same tproxy path as LAN devices (nftables -> surflare-proxy -> VPN).
@@ -3033,6 +3040,23 @@ trap '
 echo $$ >"$PIDFILE"
 taskset -pc 0 $$ >/dev/null 2>&1 || true
 
+# Self-heal: kill duplicate watchdog instances from procd respawn race.
+# procd respawn can start a new instance between init stop and start,
+# creating two parallel main loops.  Wait 3s for any late spawns to
+# initialise, then kill orphans (PPid=1 + stdin=pipe from procd).
+# Same filters as _cleanup_on_startup to avoid hitting connect_vpn
+# subshells or other legitimate children of $$.
+sleep 3
+for _dup in $(pgrep -f surflare_watchdog.sh 2>/dev/null); do
+	[ "$_dup" = "$$" ] && continue
+	_dup_ppid=$(awk '/^PPid/{print $2}' /proc/$_dup/status 2>/dev/null)
+	[ "$_dup_ppid" != "1" ] && continue
+	_dup_fd0=$(readlink /proc/$_dup/fd/0 2>/dev/null)
+	case "$_dup_fd0" in pipe:*) ;; *) continue ;; esac
+	kill -9 "$_dup" 2>/dev/null && \
+		log "Startup: killed duplicate watchdog PID $_dup"
+done
+
 # Clean up orphaned trace table from previous SIGKILL
 nft delete table inet watchdog_trace 2>/dev/null || true
 _startup_cleanup_dns_fallback
@@ -3145,8 +3169,8 @@ while true; do
 		log "Firmware stable, triggering VPN reconnect"
 		[ "${_trace_active:-0}" -eq 0 ] && start_packet_trace
 		connect_vpn
-		_block_unreachable_doh
 		rc=$?
+		_block_unreachable_doh
 		if [ "$rc" -eq 2 ]; then
 			log "Post-crash reconnect skipped (flock held), will retry next cycle"
 		elif [ "$rc" -eq 0 ]; then
@@ -3333,8 +3357,8 @@ while true; do
 		log "Consecutive failures: ${fail_count}, starting reconnect..."
 		rm -f /run/surflare_auth_fail_signal 2>/dev/null || true
 		connect_vpn
-		_block_unreachable_doh
 		rc=$?
+		_block_unreachable_doh
 		# Collect auth-fail signal from connect_vpn subshell (its variables are lost)
 		if [ -f /run/surflare_auth_fail_signal ]; then
 			_signal_type=$(cat /run/surflare_auth_fail_signal 2>/dev/null)
