@@ -1624,7 +1624,10 @@ _health_is_failure() {
 
 # Helper: check if nft table exists (returns "yes" or "no")
 _table_exists() {
-	nft list table inet "$1" >/dev/null 2>&1 && echo "yes" || echo "no"
+	# Try inet first (most tables), then ip (dns_enforce uses ip family)
+	nft list table inet "$1" >/dev/null 2>&1 && echo "yes" && return
+	nft list table ip "$1" >/dev/null 2>&1 && echo "yes" && return
+	echo "no"
 }
 
 # _block_unreachable_doh: reject DoH to servers unreachable from this network.
