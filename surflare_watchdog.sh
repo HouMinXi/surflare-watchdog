@@ -2920,9 +2920,19 @@ fi
 # Phase 1: Clean up ALL orphan watchdog processes (PPid=1)
 # Restart cycles can accumulate multiple orphan processes that PID file
 # tracking misses. Scan all processes, not just the one in PID file.
+# CRITICAL: On OpenWrt, procd IS PID 1.  All procd-managed processes
+# have PPid=1, which is the normal parent -- NOT an orphan.  We must
+# skip $$ (ourselves) and the PID in PIDFILE to avoid self-kill.
 _orphan_killed=0
+_self_pid=$$
+_old_pid_from_file=""
+[ -f "$PIDFILE" ] && _old_pid_from_file=$(cat "$PIDFILE" 2>/dev/null)
 for _opid in $(pgrep -f surflare_watchdog.sh 2>/dev/null); do
-	# Check PPid=1 (orphan after procd lost track)
+	# Skip ourselves -- we are not an orphan
+	[ "$_opid" = "$_self_pid" ] && continue
+	# Skip the PID recorded in PIDFILE (previous instance, may still
+	# be shutting down)
+	[ "$_opid" = "$_old_pid_from_file" ] && continue
 	_op_ppid=$(cat /proc/"$_opid"/status 2>/dev/null | awk "/^PPid/{print \$2}")
 	if [ "$_op_ppid" = "1" ]; then
 		log "Orphan watchdog process (PID $_opid), killing"
@@ -2934,6 +2944,8 @@ done
 if [ "$_orphan_killed" -gt 0 ]; then
 	sleep 2
 	for _opid in $(pgrep -f surflare_watchdog.sh 2>/dev/null); do
+		[ "$_opid" = "$_self_pid" ] && continue
+		[ "$_opid" = "$_old_pid_from_file" ] && continue
 		_op_ppid=$(cat /proc/"$_opid"/status 2>/dev/null | awk "/^PPid/{print \$2}")
 		if [ "$_op_ppid" = "1" ]; then
 			kill -9 "$_opid" 2>/dev/null
