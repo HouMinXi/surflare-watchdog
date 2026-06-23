@@ -2890,24 +2890,38 @@ fi
 # Double-check: the live process must be a surflare_watchdog.sh process.
 # /proc/PID/comm is "bash" for shebang-launched scripts (15-char limit),
 # so we check /proc/PID/cmdline for the full script path instead.
+
+# Phase 1: Clean up ALL orphan watchdog processes (PPid=1)
+# Restart cycles can accumulate multiple orphan processes that PID file
+# tracking misses. Scan all processes, not just the one in PID file.
+_orphan_killed=0
+for _opid in $(pgrep -f surflare_watchdog.sh 2>/dev/null); do
+	# Check PPid=1 (orphan after procd lost track)
+	_op_ppid=$(cat /proc/$_opid/status 2>/dev/null | awk "/^PPid/{print \$2}")
+	if [ "$_op_ppid" = "1" ]; then
+		log "Orphan watchdog process (PID $_opid), killing"
+		kill -TERM "$_opid" 2>/dev/null
+		_orphan_killed=$((_orphan_killed + 1))
+	fi
+done
+# Wait for SIGTERM to take effect, then SIGKILL stragglers
+if [ "$_orphan_killed" -gt 0 ]; then
+	sleep 2
+	for _opid in $(pgrep -f surflare_watchdog.sh 2>/dev/null); do
+		_op_ppid=$(cat /proc/$_opid/status 2>/dev/null | awk "/^PPid/{print \$2}")
+		if [ "$_op_ppid" = "1" ]; then
+			kill -9 "$_opid" 2>/dev/null
+		fi
+	done
+	log "Killed $_orphan_killed orphan watchdog process(es)"
+fi
+
+# Phase 2: Check PID file for the most recent tracked process
 if [ -f "$PIDFILE" ]; then
 	_old_pid=$(cat "$PIDFILE" 2>/dev/null)
 	if [ -n "$_old_pid" ] && kill -0 "$_old_pid" 2>/dev/null; then
-		local _old_ppid
-		_old_ppid=$(cat /proc/$_old_pid/status 2>/dev/null | awk "/^PPid/{print \$2}")
-		if [ "$_old_ppid" = "1" ]; then
-			# Orphan watchdog (PPid=1 after procd lost track).  Kill it
-			# instead of refusing to start -- the old instance is stuck and
-			# blocking the new one from taking over.
-			log "Stale watchdog process (PID $_old_pid), killing"
-			# TOCTOU note: process may exit between kill -0 and kill -TERM.
-			# Harmless: kill -TERM fails silently with ESRCH.
-			kill -TERM "$_old_pid" 2>/dev/null
-			sleep 1
-			kill -0 "$_old_pid" 2>/dev/null && kill -9 "$_old_pid" 2>/dev/null
-		else
-			log "WARN: stale PID file ($PIDFILE) references non-watchdog PID $_old_pid; clearing"
-		fi
+		# Process still alive after orphan cleanup -- unusual, warn
+		log "WARN: PID file process $_old_pid survived orphan cleanup"
 	fi
 	rm -f "$PIDFILE"
 fi
