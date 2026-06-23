@@ -1900,7 +1900,12 @@ check_vpn_health() {
 			for tmp_file in "$tmp_ich" "$tmp_myip"; do
 				r_ip=$(cat "$tmp_file" 2>/dev/null)
 				if [ -n "$r_ip" ]; then
-					result="TUNNEL_OK"
+					_bare_ip="${r_ip#IP:}"
+					if nft get element inet killswitch bypass_ipv4 "{ $_bare_ip }" >/dev/null 2>&1; then
+						result="CN"
+					else
+						result="TUNNEL_OK"
+					fi
 					break
 				fi
 			done
