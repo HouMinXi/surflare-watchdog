@@ -2936,6 +2936,10 @@ cleanup() {
 	[ -n "$storm_sleep_pid" ] && kill "$storm_sleep_pid" 2>/dev/null
 	# shellcheck disable=SC2086
 	[ -n "$_hc_tmp" ] && rm -f $_hc_tmp
+	# Belt-and-suspenders: remove any leaked health-check temp files from
+	# interrupted mktemp sequences (SIGTERM between individual mktemp calls
+	# before _hc_tmp is fully populated).
+	rm -f /tmp/surflare_hc.* 2>/dev/null
 	killall surflare-proxy 2>/dev/null
 	if [ -f "$RESTART_MARKER" ]; then
 		rm -f "$RESTART_MARKER"
@@ -2984,11 +2988,10 @@ _self_pid=$$
 _old_pid_from_file=""
 [ -f "$PIDFILE" ] && _old_pid_from_file=$(cat "$PIDFILE" 2>/dev/null)
 for _opid in $(pgrep -f surflare_watchdog.sh 2>/dev/null); do
-	# Skip ourselves -- we are not an orphan
 	[ "$_opid" = "$_self_pid" ] && continue
-	# Skip the PID recorded in PIDFILE (previous instance, may still
-	# be shutting down)
 	[ "$_opid" = "$_old_pid_from_file" ] && continue
+	# Guard against PID recycling: verify cmdline before killing.
+	grep -q surflare_watchdog /proc/"$_opid"/cmdline 2>/dev/null || continue
 	_op_ppid=$(cat /proc/"$_opid"/status 2>/dev/null | awk "/^PPid/{print \$2}")
 	if [ "$_op_ppid" = "1" ]; then
 		log "Orphan watchdog process (PID $_opid), killing"
@@ -3002,6 +3005,7 @@ if [ "$_orphan_killed" -gt 0 ]; then
 	for _opid in $(pgrep -f surflare_watchdog.sh 2>/dev/null); do
 		[ "$_opid" = "$_self_pid" ] && continue
 		[ "$_opid" = "$_old_pid_from_file" ] && continue
+		grep -q surflare_watchdog /proc/"$_opid"/cmdline 2>/dev/null || continue
 		_op_ppid=$(cat /proc/"$_opid"/status 2>/dev/null | awk "/^PPid/{print \$2}")
 		if [ "$_op_ppid" = "1" ]; then
 			kill -9 "$_opid" 2>/dev/null
