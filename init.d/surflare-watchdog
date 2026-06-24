@@ -50,8 +50,11 @@ stop_service() {
         # signal), then disconnect CLI (may involve network, needs timeout).
         # Teardown nftables LAST so killswitch stays active during disconnect.
         killall surflare-proxy 2>/dev/null || true
+        killall sexpect 2>/dev/null || true
+        killall -9 surflare 2>/dev/null || true
         timeout 8 surflare disconnect >/dev/null 2>&1 || true
         _full_teardown
+        killall surflare_route_updater.sh 2>/dev/null || true
         # Kill orphan watchdog processes (PPid=1) accumulated from prior
         # restart cycles.  Exclude the PIDFILE PID: that is the procd-managed
         # watchdog, which procd will SIGTERM itself after stop_service returns.

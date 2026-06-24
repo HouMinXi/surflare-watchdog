@@ -891,6 +891,15 @@ _cleanup_on_startup() {
 		fi
 		rm -f "$_cool_file"
 	fi
+	# Rotate proxy log if > 10MB to prevent unbounded growth
+	if [ -f "$PROXY_LOG" ]; then
+		local _log_size
+		_log_size=$(stat -c %s "$PROXY_LOG" 2>/dev/null || echo 0)
+		if [ "$_log_size" -gt 10485760 ]; then
+			mv "$PROXY_LOG" "${PROXY_LOG}.old" 2>/dev/null || true
+			log "Proxy log rotated (was $((_log_size / 1048576))MB)"
+		fi
+	fi
 }
 
 # Ensure dns_enforce table exists.  Idempotent: skips if already present.
@@ -3148,6 +3157,8 @@ cleanup() {
 	# before _hc_tmp is fully populated).
 	rm -f /tmp/surflare_hc.* 2>/dev/null
 	killall surflare-proxy 2>/dev/null
+	killall sexpect 2>/dev/null || true
+	killall -9 surflare 2>/dev/null || true
 	if [ -f "$RESTART_MARKER" ]; then
 		rm -f "$RESTART_MARKER"
 		nft delete table inet surflare_moat 2>/dev/null || true
@@ -3159,6 +3170,7 @@ cleanup() {
 		log "Restart: modular teardown (killswitch preserved)"
 	else
 		_full_teardown
+		killall surflare_route_updater.sh 2>/dev/null || true
 		log "Stop: full teardown"
 	fi
 	if [ -n "${_auth_bg_pid:-}" ] && kill -0 "$_auth_bg_pid" 2>/dev/null; then
