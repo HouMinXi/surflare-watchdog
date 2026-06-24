@@ -2849,18 +2849,16 @@ connect_vpn() {
 			effective_transit=""
 		fi
 		printf '%s\n' "${effective_transit:-off}" > /run/surflare_last_transit 2>/dev/null || true
-		# killswitch self-lock workaround: when server_ips is empty and
-		# 0xff bootstrap rule is sealed, the killswitch blocks all non-CN
-		# outbound traffic — including surflare connect's API calls to US
-		# relay servers.  Save and temporarily unarm the killswitch so
-		# surflare connect can reach its API; re-arm after proxy starts.
-		local _ks_saved _ks_was_armed=0
+		# killswitch self-lock workaround: when server_ips is empty
+		# (fresh install) or stale (from a previous node's relay),
+		# the killswitch output policy-drop blocks all non-CN outbound
+		# traffic — including surflare connect's API calls to US relay
+		# servers.  Temporarily unarm the killswitch so surflare connect
+		# can reach its API, then re-install a fresh killswitch with the
+		# bootstrap 0xff accept rule so non-CN traffic is not blocked
+		# while the watchdog populates server_ips.
+		local _ks_was_armed=0
 		if nft list table inet killswitch >/dev/null 2>&1; then
-			_ks_saved=$(mktemp /tmp/ks_save_connect.XXXXXX)
-			nft list ruleset > "$_ks_saved" 2>/dev/null || true
-			# Always unarm: fresh server_ips may be empty, and stale
-			# server_ips from a previous node block API access to the
-			# new node's relay (different IPs, not in bypass set).
 			nft delete table inet killswitch 2>/dev/null || true
 			_ks_was_armed=1
 			log "connect_vpn: killswitch unarmed for API access"
@@ -2871,21 +2869,19 @@ connect_vpn() {
 			${effective_transit:+--transit "$effective_transit"} \
 			--daemon 9>&-; then
 			log "Connection failed, will retry on next check cycle"
-			# Re-arm killswitch on failure before exit (main loop won't reach _install_killswitch)
-			if [ "$_ks_was_armed" -eq 1 ] && [ -f "${_ks_saved:-}" ]; then
-				nft -f "$_ks_saved" 2>/dev/null || true
-				rm -f "$_ks_saved"
-			fi
+			# Re-install fresh killswitch with bootstrap 0xff on failure
+			[ "$_ks_was_armed" -eq 1 ] && _install_killswitch
 			exit 1
 		fi
-		# Re-arm killswitch immediately after surflare connect succeeds.
-		# The proxy's inet surflare table now handles output routing; killswitch
-		# protects against inet surflare deletion + provides forward-chain LAN blocking.
-		if [ "$_ks_was_armed" -eq 1 ] && [ -f "${_ks_saved:-}" ]; then
-			nft -f "$_ks_saved" 2>/dev/null || true
-			rm -f "$_ks_saved"
-			log "connect_vpn: killswitch re-armed after connect"
+		# Re-install fresh killswitch with bootstrap 0xff immediately after
+		# surflare connect succeeds.  The proxy's inet surflare table now
+		# handles output routing; the fresh killswitch protects against
+		# inet surflare deletion and provides forward-chain LAN blocking.
+		if [ "$_ks_was_armed" -eq 1 ]; then
+			_install_killswitch
+			log "connect_vpn: killswitch re-installed after connect"
 		fi
+		# The proxy's inet surflare table now handles output routing; killswitch
 		# O1 (v3.2): poll-based readiness with relay-aware handshake.
 		# Phase 1: wait for local state (process/nftables/routing).
 		# Phase 2: wait for relay connections (surflare-proxy TCP conns to relay IP).
@@ -2903,9 +2899,7 @@ connect_vpn() {
 			done
 			if [ "$_ready_wait" -ge "$CONNECT_SETTLE" ]; then
 				log "VPN establishment timed out: not ready after ${CONNECT_SETTLE}s"
-				[ "$_ks_was_armed" -eq 1 ] && [ -f "${_ks_saved:-}" ] && \
-					nft -f "$_ks_saved" 2>/dev/null || true
-				rm -f "${_ks_saved:-}"
+				[ "$_ks_was_armed" -eq 1 ] && _install_killswitch
 				exit 1
 			fi
 			# Phase 2: poll for relay connections
@@ -2941,6 +2935,7 @@ connect_vpn() {
 			sleep "$CONNECT_SETTLE"
 			if ! _proc_alive surflare-proxy >/dev/null 2>&1; then
 				log "VPN establishment timed out: surflare-proxy not running after ${CONNECT_SETTLE}s"
+				[ "$_ks_was_armed" -eq 1 ] && _install_killswitch
 				exit 1
 			fi
 		fi
@@ -2978,7 +2973,6 @@ connect_vpn() {
 			_install_killswitch
 		fi
 
-		rm -f "${_ks_saved:-}"
 		exit 0
 	) 9>"$LOCK_FILE"
 	return $?
