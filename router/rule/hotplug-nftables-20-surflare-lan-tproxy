@@ -1,0 +1,6 @@
+#!/bin/sh
+# Reload sw_lan_tproxy after firewall restart (nftables hotplug).
+# Placed at /etc/hotplug.d/nftables/20-surflare-lan-tproxy on N100.
+[ "$ACTION" = "load" ] || exit 0
+nft delete table inet sw_lan_tproxy 2>/dev/null || true
+nft -f /etc/surflare-lan-tproxy.nft 2>/dev/null

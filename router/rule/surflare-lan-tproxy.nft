@@ -2,12 +2,16 @@
 # surflare-proxy splits CN-direct vs non-CN-tunnel at the application layer.
 # TCP only: QUIC (UDP/443) is rejected to force HTTP/2 fallback -- QUIC-over-VPN
 # causes 3s+ TTFB because CDN anycast selects PoP by VPN exit IP.
-# bypass_devices: empty shell, not populated in rule mode (proxy handles CN).
+# bypass_devices/bypass_devices6: LAN devices that skip tproxy entirely.
 # auto_bypass: DTLS 1.2 detection for corporate VPN clients (e.g. AnyConnect).
 # IPv6: tproxied alongside IPv4; auto_bypass is IPv4-only (no IPv6 DTLS use case).
 table inet sw_lan_tproxy {
     set bypass_devices {
         type ipv4_addr;
+    }
+
+    set bypass_devices6 {
+        type ipv6_addr;
     }
 
     set auto_bypass {
@@ -45,6 +49,7 @@ table inet sw_lan_tproxy {
 
         # Static bypass (empty in rule mode; retained for manual override)
         iifname "br-lan" ip saddr @bypass_devices return
+        iifname "br-lan" ip6 saddr @bypass_devices6 return
 
         # Dynamic bypass: devices already detected as corporate VPN
         iifname "br-lan" ip saddr @auto_bypass return

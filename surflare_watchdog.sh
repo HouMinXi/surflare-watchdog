@@ -41,7 +41,7 @@ ROTATION_STATE=/var/tmp/surflare_rotation  # Persists active node across restart
 DIAG_SACK_THRESHOLD=20                # % of packets with SACK blocks to flag transit degradation
 DISCONNECT_SETTLE=1                   # seconds after surflare disconnect before killing processes
 CONNECT_SETTLE=20                     # seconds after surflare connect --daemon for VPN to establish
-RELAY_SETTLE=30                       # max seconds to wait for relay connections after local state ready
+RELAY_SETTLE=60                       # max seconds to wait for relay connections after local state ready
 LAST_REFRESH_FILE="/run/surflare_last_refresh"  # cross-subshell token refresh timestamp
 NETWORK_WAIT_FALLBACK=15              # seconds to wait for network when nm-online is unavailable
 NETWORK_WAIT_TIMEOUT=30               # nm-online timeout in seconds
@@ -933,9 +933,10 @@ table inet killswitch {
 	set server_ips6 { type ipv6_addr; }
 	set bypass_ipv4 { type ipv4_addr; flags interval; }
 	set bypass_ipv6 { type ipv6_addr; flags interval; }
-	# bypass_src: LAN device source IPs that skip tproxy (bypass_devices).
+	# bypass_src/bypass_src6: LAN device source IPs that skip tproxy.
 	# Their non-CN traffic is forwarded directly; no log noise needed.
 	set bypass_src  { type ipv4_addr; }
+	set bypass_src6 { type ipv6_addr; }
 	set lan_ranges {
 		type ipv4_addr
 		flags interval
@@ -1004,6 +1005,7 @@ table inet killswitch {
 		iifname "br-lan" ip daddr @bypass_ipv4 accept
 		iifname "br-lan" ip6 daddr @bypass_ipv6 accept
 		iifname "br-lan" ip saddr @bypass_src accept
+		iifname "br-lan" ip6 saddr @bypass_src6 accept
 		# Private destinations from LAN (carrier IPs, app-internal VPNs)
 		# are not external leaks; accept like the output chain does.
 		iifname "br-lan" ip daddr @lan_ranges accept
@@ -1287,9 +1289,11 @@ _restore_tproxy() {
 	fi
 	# Snapshot bypass sets before destroy so they survive the reload.
 	# _update_bypass_devices overwrites these on the next connect.
-	local _saved_bypass _saved_auto
+	local _saved_bypass _saved_auto _saved_bypass6
 	_saved_bypass=$(nft list set inet sw_lan_tproxy bypass_devices 2>/dev/null \
 		| grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | tr '\n' ',' | sed 's/,$//')
+	_saved_bypass6=$(nft list set inet sw_lan_tproxy bypass_devices6 2>/dev/null \
+		| grep -oE '[0-9a-f:]+:[0-9a-f:]+' | grep -v '^fe80' | tr '\n' ',' | sed 's/,$//')
 	_saved_auto=$(nft list set inet sw_lan_tproxy auto_bypass 2>/dev/null \
 		| grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | tr '\n' ',' | sed 's/,$//')
 	# Prepend destroy so the load is atomic: old table removed and new
@@ -1312,6 +1316,10 @@ _restore_tproxy() {
 	if [ -n "$_saved_bypass" ]; then
 		nft add element inet sw_lan_tproxy bypass_devices \
 			"{ $_saved_bypass }" 2>/dev/null || true
+	fi
+	if [ -n "$_saved_bypass6" ]; then
+		nft add element inet sw_lan_tproxy bypass_devices6 \
+			"{ $_saved_bypass6 }" 2>/dev/null || true
 	fi
 	if [ -n "$_saved_auto" ]; then
 		nft add element inet sw_lan_tproxy auto_bypass \
@@ -1400,7 +1408,27 @@ _update_bypass_devices() {
 			[ -n "$ip" ] && all_ips="${all_ips:+$all_ips,}$ip"
 		done < "$BYPASS_LAN_MACS_FILE"
 	fi
-	if [ -z "$all_ips" ]; then
+	# IPv6: resolve bypass MACs to GUA addresses via neighbor table.
+	# Link-local (fe80::) excluded: tproxy only matches routable addresses.
+	local all_v6=""
+	if [ -f "$BYPASS_LAN_MACS_FILE" ]; then
+		while IFS= read -r line; do
+			mac=$(echo "$line" | awk '{print tolower($1)}' | tr -d '\r')
+			case "$mac" in '#'*|'') continue ;; esac
+			local _v6
+			_v6=$(ip -6 neigh show dev br-lan 2>/dev/null \
+				| awk -v m="$mac" 'tolower($5)==tolower(m) && $1!~/^fe80/ {print $1}')
+			[ -n "$_v6" ] && all_v6="${all_v6:+$all_v6,}$(echo "$_v6" | tr '\n' ',' | sed 's/,$//')"
+		done < "$BYPASS_LAN_MACS_FILE"
+	fi
+	# Flush + repopulate bypass_devices6 (atomic: empty is valid when no IPv6 neighbors)
+	nft flush set inet sw_lan_tproxy bypass_devices6 2>/dev/null || true
+	if [ -n "$all_v6" ]; then
+		nft add element inet sw_lan_tproxy bypass_devices6 "{ $all_v6 }" 2>/dev/null || \
+			log "WARN: bypass_devices6 update failed (${all_v6})"
+	fi
+
+	if [ -z "$all_ips" ] && [ -z "$all_v6" ]; then
 		# No bypass devices: sync auto_bypass only to killswitch bypass_src
 		# and dns_enforce vpn_bypass.  Without this, stale device IPs from
 		# a previous connect cycle remain in bypass_src after DHCP change.
@@ -1410,6 +1438,7 @@ _update_bypass_devices() {
 				| grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | paste -sd,)
 			{
 				printf 'flush set inet killswitch bypass_src\n'
+				printf 'flush set inet killswitch bypass_src6\n'
 				[ -n "$_auto_ips" ] && \
 					printf 'add element inet killswitch bypass_src { %s }\n' "$_auto_ips"
 			} | nft -f - 2>/dev/null || true
@@ -1418,9 +1447,11 @@ _update_bypass_devices() {
 		return 0
 	fi
 	# Deduplicate in case same IP appears in both BYPASS_LAN_DEVICES and MAC file
-	all_ips=$(echo "$all_ips" | tr ',' '\n' | sort -u | paste -sd,)
-	nft add element inet sw_lan_tproxy bypass_devices "{ $all_ips }" 2>/dev/null || \
-		log "WARN: bypass_devices update failed (${all_ips})"
+	if [ -n "$all_ips" ]; then
+		all_ips=$(echo "$all_ips" | tr ',' '\n' | sort -u | paste -sd,)
+		nft add element inet sw_lan_tproxy bypass_devices "{ $all_ips }" 2>/dev/null || \
+			log "WARN: bypass_devices update failed (${all_ips})"
+	fi
 	# Sync bypass device IPs + auto_bypass IPs into killswitch bypass_src
 	# so their non-CN traffic is accepted (not rejected/logged).
 	# Atomic flush+add via nft -f: bypass_src is never empty mid-update.
@@ -1428,14 +1459,23 @@ _update_bypass_devices() {
 		local _auto_ips
 		_auto_ips=$(nft list set inet sw_lan_tproxy auto_bypass 2>/dev/null \
 			| grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | paste -sd,)
-		local _all_bypass="$all_ips"
-		[ -n "$_auto_ips" ] && _all_bypass="${_all_bypass},${_auto_ips}"
+		local _all_bypass=""
+		[ -n "$all_ips" ] && _all_bypass="$all_ips"
+		if [ -n "$_auto_ips" ]; then
+			_all_bypass="${_all_bypass:+$_all_bypass,}$_auto_ips"
+		fi
 		{
 			printf 'flush set inet killswitch bypass_src\n'
 			[ -n "$_all_bypass" ] && \
 				printf 'add element inet killswitch bypass_src { %s }\n' "$_all_bypass"
 		} | nft -f - 2>/dev/null || \
 			log "WARN: killswitch bypass_src atomic sync failed"
+		# IPv6: sync bypass_devices6 to killswitch bypass_src6
+		{
+			printf 'flush set inet killswitch bypass_src6\n'
+			[ -n "$all_v6" ] && \
+				printf 'add element inet killswitch bypass_src6 { %s }\n' "$all_v6"
+		} | nft -f - 2>/dev/null || true
 	fi
 	_sync_dns_enforce_bypass
 }
@@ -1885,9 +1925,19 @@ check_vpn_health() {
 	# --- Early-exit polling loop ---
 	# Poll results every 1s. Return as soon as any probe produces a usable result.
 	# Maximum wait = max-time (12s), but typically returns in 1-3s when tunnel is healthy.
+	#
+	# CN deferred confirmation: when a probe returns CN, do not immediately
+	# accept it.  Wait up to 3s for other probes to return a non-CN result.
+	# Rationale: surflare relay 503 causes sing-box to mark outbound
+	# unavailable; new connections (including health probes) get routed
+	# direct while existing long-lived connections (chat sessions, etc.) keep
+	# working.  A single non-CN probe overrides CN because it proves the
+	# tunnel is still forwarding traffic.
 	local all_pids="$pid_g $pid_cf $pid_cf2 $pid_ifc $pid_ich $pid_myip $pid_proxy"
 	local deadline=$((SECONDS + 13))  # 13s absolute deadline (max-time + 1s margin)
 	local result=""
+	local _cn_candidate=""  # holds "CN" if a probe returned CN
+	local _cn_wait_start=0  # SECONDS when CN was first seen
 
 	while [ "$SECONDS" -lt "$deadline" ]; do
 		# Check Google first (most reliable external connectivity indicator)
@@ -1920,20 +1970,36 @@ check_vpn_health() {
 			if [ -n "$r_ip" ]; then
 				_bare_ip="${r_ip#IP:}"
 				if nft get element inet killswitch bypass_ipv4 "{ $_bare_ip }" >/dev/null 2>&1; then
-					# IP in CN range: check if tunnel broken or just CN exit
 					if [ -n "$ISP_IP" ] && [ "$_bare_ip" != "$ISP_IP" ]; then
-						# Exit IP != ISP IP: tunnel working, just exiting via CN
 						result="TUNNEL_OK"
+						break 2
 					else
-						# Either ISP IP unknown, or exit IP == ISP IP (tunnel broken)
-						result="CN"
+						# CN: defer confirmation, keep polling for non-CN
+						if [ -z "$_cn_candidate" ]; then
+							_cn_candidate="CN"
+							_cn_wait_start=$SECONDS
+						fi
 					fi
 				else
 					result="TUNNEL_OK"
+					break 2
 				fi
-				break 2
 			fi
 		done
+
+		# Probe 7 (tproxy path): if proxy probe returned OK, tunnel works
+		local r_proxy
+		r_proxy=$(cat "$tmp_proxy" 2>/dev/null)
+		if [ "$r_proxy" = "OK" ]; then
+			result="TUNNEL_OK"
+			break
+		fi
+
+		# CN deferred: if we have a CN candidate and waited 3s, confirm it
+		if [ -n "$_cn_candidate" ] && [ $((SECONDS - _cn_wait_start)) -ge 3 ]; then
+			result="$_cn_candidate"
+			break
+		fi
 
 		# Check if all probes have already exited (no point polling further)
 		local still_running=0
@@ -1943,7 +2009,11 @@ check_vpn_health() {
 				break
 			fi
 		done
-		[ "$still_running" -eq 0 ] && break
+		# If all probes exited and we have a CN candidate, confirm immediately
+		if [ "$still_running" -eq 0 ]; then
+			[ -n "$_cn_candidate" ] && result="$_cn_candidate"
+			break
+		fi
 
 		# Sleep 1s before next poll (safer than 0.2s for POSIX/busybox compatibility)
 		sleep 1
