@@ -2849,13 +2849,43 @@ connect_vpn() {
 			effective_transit=""
 		fi
 		printf '%s\n' "${effective_transit:-off}" > /run/surflare_last_transit 2>/dev/null || true
+		# killswitch self-lock workaround: when server_ips is empty and
+		# 0xff bootstrap rule is sealed, the killswitch blocks all non-CN
+		# outbound traffic — including surflare connect's API calls to US
+		# relay servers.  Save and temporarily unarm the killswitch so
+		# surflare connect can reach its API; re-arm after proxy starts.
+		local _ks_saved _ks_was_armed=0
+		if nft list table inet killswitch >/dev/null 2>&1; then
+			_ks_saved=$(mktemp /tmp/ks_save_connect.XXXXXX)
+			nft list ruleset > "$_ks_saved" 2>/dev/null || true
+			# Only unarm if server_ips is empty (sealed killswitch = deadlock)
+			if ! nft list set inet killswitch server_ips 2>/dev/null \
+				| grep -qE '[0-9]+\.[0-9]'; then
+				nft delete table inet killswitch 2>/dev/null || true
+				_ks_was_armed=1
+				log "connect_vpn: killswitch unarmed for API access (empty server_ips)"
+			fi
+		fi
 		log "Connecting to ${use_node} mode=${MODE:-global} transit=${effective_transit:-off} (daemon mode)..."
 		if ! surflare connect --node "$use_node" \
 			${MODE:+--mode "$MODE"} \
 			${effective_transit:+--transit "$effective_transit"} \
 			--daemon 9>&-; then
 			log "Connection failed, will retry on next check cycle"
+			# Re-arm killswitch on failure before exit (main loop won't reach _install_killswitch)
+			if [ "$_ks_was_armed" -eq 1 ] && [ -f "${_ks_saved:-}" ]; then
+				nft -f "$_ks_saved" 2>/dev/null || true
+				rm -f "$_ks_saved"
+			fi
 			exit 1
+		fi
+		# Re-arm killswitch immediately after surflare connect succeeds.
+		# The proxy's inet surflare table now handles output routing; killswitch
+		# protects against inet surflare deletion + provides forward-chain LAN blocking.
+		if [ "$_ks_was_armed" -eq 1 ] && [ -f "${_ks_saved:-}" ]; then
+			nft -f "$_ks_saved" 2>/dev/null || true
+			rm -f "$_ks_saved"
+			log "connect_vpn: killswitch re-armed after connect"
 		fi
 		# O1 (v3.2): poll-based readiness with relay-aware handshake.
 		# Phase 1: wait for local state (process/nftables/routing).
@@ -2874,6 +2904,9 @@ connect_vpn() {
 			done
 			if [ "$_ready_wait" -ge "$CONNECT_SETTLE" ]; then
 				log "VPN establishment timed out: not ready after ${CONNECT_SETTLE}s"
+				[ "$_ks_was_armed" -eq 1 ] && [ -f "${_ks_saved:-}" ] && \
+					nft -f "$_ks_saved" 2>/dev/null || true
+				rm -f "${_ks_saved:-}"
 				exit 1
 			fi
 			# Phase 2: poll for relay connections
@@ -2946,6 +2979,7 @@ connect_vpn() {
 			_install_killswitch
 		fi
 
+		rm -f "${_ks_saved:-}"
 		exit 0
 	) 9>"$LOCK_FILE"
 	return $?
