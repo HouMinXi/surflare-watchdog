@@ -3731,6 +3731,15 @@ while true; do
 	# Sync auto_bypass IPs to dns_enforce (devices may appear/expire between reconnects)
 	_sync_dns_enforce_bypass
 
+	# Repopulate bypass_devices if hotplug or firewall restart emptied the set.
+	# Cost: one nft list + grep per cycle (~1ms). Full refresh only when empty.
+	if [ -s "$BYPASS_LAN_MACS_FILE" ] && \
+	   nft list table inet sw_lan_tproxy >/dev/null 2>&1 && \
+	   ! nft list set inet sw_lan_tproxy bypass_devices 2>/dev/null | grep -qE '[0-9]+\.[0-9]'; then
+		log "bypass_devices empty (hotplug rebuild?), repopulating"
+		_update_bypass_devices
+	fi
+
 	# Adaptive interval -- shorter poll when degraded for faster recovery.
 	# 15s floor (not lower): 7 probes x 12s max-time overlap at <14s interval.
 	_interval="$CHECK_INTERVAL"
