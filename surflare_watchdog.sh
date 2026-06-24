@@ -2858,13 +2858,12 @@ connect_vpn() {
 		if nft list table inet killswitch >/dev/null 2>&1; then
 			_ks_saved=$(mktemp /tmp/ks_save_connect.XXXXXX)
 			nft list ruleset > "$_ks_saved" 2>/dev/null || true
-			# Only unarm if server_ips is empty (sealed killswitch = deadlock)
-			if ! nft list set inet killswitch server_ips 2>/dev/null \
-				| grep -qE '[0-9]+\.[0-9]'; then
-				nft delete table inet killswitch 2>/dev/null || true
-				_ks_was_armed=1
-				log "connect_vpn: killswitch unarmed for API access (empty server_ips)"
-			fi
+			# Always unarm: fresh server_ips may be empty, and stale
+			# server_ips from a previous node block API access to the
+			# new node's relay (different IPs, not in bypass set).
+			nft delete table inet killswitch 2>/dev/null || true
+			_ks_was_armed=1
+			log "connect_vpn: killswitch unarmed for API access"
 		fi
 		log "Connecting to ${use_node} mode=${MODE:-global} transit=${effective_transit:-off} (daemon mode)..."
 		if ! surflare connect --node "$use_node" \
