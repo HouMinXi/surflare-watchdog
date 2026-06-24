@@ -57,7 +57,7 @@ AUTH_FAIL_THRESHOLD=3                 # consecutive auth refresh failures before
 BYPASS_LAN_DEVICES=""                 # space-separated LAN IPs that skip tproxy (e.g. "192.168.100.147 192.168.100.148")
 # One MAC per line; current IP resolved from /tmp/dhcp.leases at connect time
 BYPASS_LAN_MACS_FILE="/etc/surflare/bypass-macs.conf"
-MIN_RELAY_CONNS=5                     # minimum connections to classify an IP as relay (vs DNS/proxied noise)
+MIN_RELAY_CONNS=2                     # minimum connections to classify an IP as relay (vs DNS/proxied noise)
 _diag_server_ips=""                   # space-separated VPN relay IPs (filtered by MIN_RELAY_CONNS)
 _diag_connect_time=0                  # epoch seconds of last successful connect
 _sess_node=""                         # exit node of current VPN session
@@ -921,6 +921,18 @@ DNS_EOF
 	fi
 }
 
+_seal_killswitch_ff() {
+	# Prerequisite: server_ips must contain relay IPs, otherwise deleting 0xff will break VPN
+	nft list set inet killswitch server_ips 2>/dev/null \
+		| grep -qE '[0-9]+\.[0-9]' || return 0
+	local _h
+	_h=$(nft -a list chain inet killswitch output 2>/dev/null \
+		| awk '/meta mark.*0x000000ff accept/{print $NF}' | head -1)
+	[ -z "$_h" ] && return 0
+	nft delete rule inet killswitch output handle "$_h" 2>/dev/null && \
+		log "killswitch: sealed mark 0xff accept (server_ips populated)"
+}
+
 _install_killswitch() {
 	local _ks_tmp="/tmp/ks_install_$$.nft"
 	# Atomic table replacement: destroy + create in a single nft -f transaction.
@@ -957,7 +969,6 @@ table inet killswitch {
 		ip daddr @server_ips accept
 		ip6 daddr @server_ips6 accept
 		meta mark == 0xff accept
-		meta mark == 0x1 accept
 		ip daddr @bypass_ipv4 accept
 		ip6 daddr @bypass_ipv6 accept
 		ip daddr @lan_ranges accept
@@ -1139,6 +1150,7 @@ NFTEOF
 				log "WARN: failed to load cloud CDN extra bypass_ipv4"
 		fi
 	fi
+	_seal_killswitch_ff
 }
 
 _update_killswitch_server_ips() {
@@ -1220,6 +1232,7 @@ DISKEOF
 			log "WARN: failed to persist server_ips to $_persist_v4"
 	fi
 	log "Kill switch: server_ips updated (${_diag_server_ips})"
+	_seal_killswitch_ff
 }
 
 # Unused: cleanup() uses modular teardown (flush server_ips, keep table),
@@ -2312,26 +2325,24 @@ EXPECT_EOF
 # proxied traffic have 1-3 (ephemeral).  Called after confirmed-healthy reconnect.
 _update_server_endpoint() {
 	local ips
-	# ss -tnp format: Recv-Q Send-Q Local($3) Peer($4) Process
-	# Step 1: extract public IPv4 peer addresses from surflare-proxy connections
-	# Step 2: count per IP, keep only >= MIN_RELAY_CONNS (relay/transit)
-	ips=$(ss -tnp state established 2>/dev/null \
-		| awk '/surflare/{split($4,a,":");ip=a[1];
-		        if (ip ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ &&
-		            ip !~ /^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.|127\.)/) print ip}' \
-		| sort | uniq -c | sort -rn \
-		| awk -v min="$MIN_RELAY_CONNS" '$1 >= min {print $2}' \
-		| tr '\n' ' ' | sed 's/[[:space:]]*$//')
-	# UDP fallback: Netid State Recv-Q Send-Q Local($5) Peer($6) Process
-	if [ -z "$ips" ]; then
-		ips=$(ss -unp 2>/dev/null \
-			| awk '/surflare/{split($6,a,":");ip=a[1];
+	# Merge TCP + UDP raw IPs first, then count per IP across both protocols,
+	# then filter by MIN_RELAY_CONNS.  This ensures an IP with 1 TCP + 1 UDP
+	# connection (total 2) is correctly counted as 2, not filtered by each
+	# protocol independently.
+	# ss format (N100 iproute2-tiny): Recv-Q($1) Send-Q($2) Local($3) Peer($4) Process($5)
+	# Both -tnp and -unp use the same 5-field layout on this platform.
+	ips=$({
+		ss -tnp state established 2>/dev/null \
+			| awk '/surflare/{split($4,a,":");ip=a[1];
 			        if (ip ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ &&
-			            ip !~ /^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.|127\.)/) print ip}' \
-			| sort | uniq -c | sort -rn \
-			| awk -v min="$MIN_RELAY_CONNS" '$1 >= min {print $2}' \
-			| tr '\n' ' ' | sed 's/[[:space:]]*$//')
-	fi
+			            ip !~ /^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.|127\.)/) print ip}'
+		ss -unp 2>/dev/null \
+			| awk '/surflare/{split($4,a,":");ip=a[1];
+			        if (ip ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ &&
+			            ip !~ /^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.|127\.)/) print ip}'
+	} | sort | uniq -c | sort -rn \
+	  | awk -v min="$MIN_RELAY_CONNS" '$1 >= min {print $2}' \
+	  | tr '\n' ' ' | sed 's/[[:space:]]*$//')
 	_diag_server_ips="$ips"
 	_diag_connect_time=$(date +%s)
 	[ -n "$ips" ] && log "Diag: server endpoints=${ips}"
@@ -3746,6 +3757,7 @@ while true; do
 	if [ "${transient_count:-0}" -gt 0 ] || [ "${fail_count:-0}" -gt 0 ]; then
 		_interval="$DEGRADED_INTERVAL"
 	fi
+	_seal_killswitch_ff
 	sleep "$_interval" & storm_sleep_pid=$!
 	wait "$storm_sleep_pid" || true
 	storm_sleep_pid=""
