@@ -12,8 +12,8 @@
 #                     /etc/systemd/system-sleep/surflare-resume.sh
 # View logs    : sudo dmesg | grep surflare_watchdog
 
-NODE="Los Angeles"                    # Set to your node tag (run: surflare nodes)
-NODE_CANDIDATES=("Los Angeles" "Dallas" "Chicago" "New York" "Atlanta" "Miami")
+NODE="Auto Best"                      # Set to your node tag (run: surflare nodes)
+NODE_CANDIDATES=("Auto Best" "Los Angeles" "Tokyo" "Hong Kong" "Singapore" "Dallas" "Chicago" "New York" "Atlanta" "Miami")
 # Connection mode: loaded from /etc/surflare/mode.conf if present,
 # otherwise resolved from PLATFORM (router->rule, laptop->global).
 # Deploying surflare_watchdog.sh no longer resets the mode setting.
@@ -41,7 +41,7 @@ ROTATION_STATE=/var/tmp/surflare_rotation  # Persists active node across restart
 DIAG_SACK_THRESHOLD=20                # % of packets with SACK blocks to flag transit degradation
 DISCONNECT_SETTLE=1                   # seconds after surflare disconnect before killing processes
 CONNECT_SETTLE=20                     # seconds after surflare connect --daemon for VPN to establish
-POST_READY_SETTLE=2                   # seconds after local routing ready before declaring VPN up
+RELAY_SETTLE=30                       # max seconds to wait for relay connections after local state ready
 LAST_REFRESH_FILE="/run/surflare_last_refresh"  # cross-subshell token refresh timestamp
 NETWORK_WAIT_FALLBACK=15              # seconds to wait for network when nm-online is unavailable
 NETWORK_WAIT_TIMEOUT=30               # nm-online timeout in seconds
@@ -84,6 +84,14 @@ CRASH_MAX_PER_WINDOW=3                # max crashes in CRASH_WINDOW before exten
 CRASH_WINDOW=600                      # seconds window for crash rate limiting
 CRASH_EXTENDED_COOLDOWN=300           # seconds extended cooldown after cascade detected
 CRASH_DEDUP_INTERVAL=121              # minimum seconds between counting two crashes as distinct (must exceed detection window)
+
+# ISP IP baseline for CN exit detection
+# In smart routing mode, CN exit can mean two things:
+# 1. Tunnel broken: traffic leaked direct -> exit IP == ISP IP -> real failure
+# 2. Tunnel working but exit in CN: exit IP != ISP IP -> not a failure
+ISP_IP=""                             # cached ISP public IP (set at startup)
+ISP_IP_CACHE="/etc/surflare/isp_ip"   # persistent cache file
+ISP_IP_MAX_AGE=86400                  # refresh ISP IP every 24 hours
 
 # Platform detection: router (procd/OpenWrt) vs laptop (systemd)
 if [ -f /etc/openwrt_release ]; then
@@ -1358,6 +1366,7 @@ _enter_storm_cooldown() {
 		reconnect_count=0
 		fail_count=0
 		transient_count=0
+		_cn_consecutive=0
 		_transit_grace_ts=0
 	else
 		log "Storm cooldown interrupted early, counters not reset"
@@ -1614,8 +1623,64 @@ crash_rate_exceeded() {
 	[ "$count" -ge "$CRASH_MAX_PER_WINDOW" ]
 }
 
+# _get_isp_ip: retrieve and cache the ISP public IP address.
+# This IP is used as a baseline to distinguish between:
+# 1. Tunnel broken (exit IP == ISP IP): traffic leaked direct
+# 2. Tunnel working but exit in CN (exit IP != ISP IP): not a failure
+# Must be called BEFORE VPN connects (traffic goes direct to ISP).
+_get_isp_ip() {
+	local _cached_ip _cache_age _now
+
+	# Try to load from cache file
+	if [ -f "$ISP_IP_CACHE" ]; then
+		_cached_ip=$(cat "$ISP_IP_CACHE" 2>/dev/null | head -1 | tr -d '[:space:]')
+		_cache_age=$(( $(date +%s) - $(stat -c %Y "$ISP_IP_CACHE" 2>/dev/null || echo 0) ))
+		if [ -n "$_cached_ip" ] && [ "$_cache_age" -lt "$ISP_IP_MAX_AGE" ]; then
+			ISP_IP="$_cached_ip"
+			log "ISP IP loaded from cache: ${ISP_IP} (${_cache_age}s old)"
+			return 0
+		fi
+	fi
+
+	# Cache expired or missing: fetch fresh IP.
+	# On restart, killswitch may still be active from previous run.
+	# Plain curl without mark 0xff gets blocked by ks-drop.
+	if nft list table inet killswitch >/dev/null 2>&1; then
+		log "WARN: killswitch active, ISP IP fetch skipped (using cache only)"
+		return 1
+	fi
+	local _targets="https://icanhazip.com https://ifconfig.me https://api.ipify.org"
+	local _attempt _url _ip
+	for _attempt in 1 2 3; do
+		for _url in $_targets; do
+			_ip=$(curl -s --connect-timeout 5 --max-time 10 "$_url" 2>/dev/null | tr -d '[:space:]')
+			# Validate: must be a valid IPv4 address
+			if [[ "$_ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+				ISP_IP="$_ip"
+				# Persist to cache file
+				mkdir -p "$(dirname "$ISP_IP_CACHE")" 2>/dev/null || true
+				echo "$ISP_IP" > "$ISP_IP_CACHE" 2>/dev/null || true
+				log "ISP IP fetched and cached: ${ISP_IP}"
+				return 0
+			fi
+		done
+		[ "$_attempt" -lt 3 ] && sleep 2
+	done
+
+	log "WARN: failed to fetch ISP IP after 3 attempts"
+	return 1
+}
+
+# _is_isp_ip: check if an IP matches the cached ISP IP.
+# Returns 0 if IP matches ISP IP (tunnel broken), 1 otherwise.
+_is_isp_ip() {
+	local _check_ip="$1"
+	[ -n "$ISP_IP" ] && [ "$_check_ip" = "$ISP_IP" ]
+}
+
 # _health_is_failure: return 0 if the health result indicates a failure state.
 # Centralizes the failure-state check used in multiple main-loop branches.
+# CN exit: ISP IP baseline check is done in check_vpn_health() at detection time.
 _health_is_failure() {
 	case "$1" in
 		CN|LOCAL_FAIL|TCP_BLOCK|PROXY_BROKEN) return 0 ;;
@@ -1846,15 +1911,23 @@ check_vpn_health() {
 		# Check IP probes (icanhazip, myip.wtf) -- a valid IP from a CDN
 		# proves the tunnel works but does NOT prove the exit country.
 		# Cross-check against killswitch bypass_ipv4 (CN ranges): if the
-		# exit IP is in a CN range, report "CN" so the caller triggers
-		# a reconnect instead of treating it as healthy.
+		# exit IP is in a CN range, check ISP IP baseline:
+		# - exit IP == ISP IP: tunnel broken (traffic leaked direct) -> "CN"
+		# - exit IP != ISP IP: tunnel working but exit in CN -> "TUNNEL_OK"
 		local r_ip _bare_ip
 		for tmp_file in "$tmp_ich" "$tmp_myip"; do
 			r_ip=$(cat "$tmp_file" 2>/dev/null)
 			if [ -n "$r_ip" ]; then
 				_bare_ip="${r_ip#IP:}"
 				if nft get element inet killswitch bypass_ipv4 "{ $_bare_ip }" >/dev/null 2>&1; then
-					result="CN"
+					# IP in CN range: check if tunnel broken or just CN exit
+					if [ -n "$ISP_IP" ] && [ "$_bare_ip" != "$ISP_IP" ]; then
+						# Exit IP != ISP IP: tunnel working, just exiting via CN
+						result="TUNNEL_OK"
+					else
+						# Either ISP IP unknown, or exit IP == ISP IP (tunnel broken)
+						result="CN"
+					fi
 				else
 					result="TUNNEL_OK"
 				fi
@@ -1902,7 +1975,14 @@ check_vpn_health() {
 				if [ -n "$r_ip" ]; then
 					_bare_ip="${r_ip#IP:}"
 					if nft get element inet killswitch bypass_ipv4 "{ $_bare_ip }" >/dev/null 2>&1; then
-						result="CN"
+						# IP in CN range: check if tunnel broken or just CN exit
+						if [ -n "$ISP_IP" ] && [ "$_bare_ip" != "$ISP_IP" ]; then
+							# Exit IP != ISP IP: tunnel working, just exiting via CN
+							result="TUNNEL_OK"
+						else
+							# Either ISP IP unknown, or exit IP == ISP IP (tunnel broken)
+							result="CN"
+						fi
 					else
 						result="TUNNEL_OK"
 					fi
@@ -2687,14 +2767,16 @@ connect_vpn() {
 			log "Connection failed, will retry on next check cycle"
 			exit 1
 		fi
-		# O1 (v3.2): poll-based readiness with handshake buffer.
-		# _use_poll=0 (rollback flag) reverts to original fixed sleep.
+		# O1 (v3.2): poll-based readiness with relay-aware handshake.
+		# Phase 1: wait for local state (process/nftables/routing).
+		# Phase 2: wait for relay connections (surflare-proxy TCP conns to relay IP).
+		# Before relay: sing-box routes internally but no tunnel -> health check
+		# would see CN/direct exit. Log surflare internal state during wait.
 		if [ "$_use_poll" -eq 1 ]; then
 			local _ready_wait=0
 			while [ "$_ready_wait" -lt "$CONNECT_SETTLE" ]; do
 				if check_vpn_local_state; then
-					sleep "$POST_READY_SETTLE"
-					log "VPN routing ready: polled ${_ready_wait}s + buffer ${POST_READY_SETTLE}s"
+					log "Local state ready after ${_ready_wait}s, waiting for relay..."
 					break
 				fi
 				sleep 1
@@ -2704,6 +2786,35 @@ connect_vpn() {
 				log "VPN establishment timed out: not ready after ${CONNECT_SETTLE}s"
 				exit 1
 			fi
+			# Phase 2: poll for relay connections
+			local _relay_wait=0 _relay_ready=0
+			while [ "$_relay_wait" -lt "$RELAY_SETTLE" ]; do
+				local _relay_count
+				_relay_count=$(ss -tnp state established 2>/dev/null \
+					| awk '/surflare/{split($4,a,":");ip=a[1];
+					        if (ip ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ &&
+					            ip !~ /^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.|127\.)/) print ip}' \
+					| sort | uniq -c | sort -rn \
+					| awk -v min="$MIN_RELAY_CONNS" '$1 >= min {print $1}' \
+					| head -1)
+				if [ -n "$_relay_count" ] && [ "$_relay_count" -ge "$MIN_RELAY_CONNS" ]; then
+					_relay_ready=1
+					log "Relay ready: ${_relay_count} connections after ${_relay_wait}s"
+					break
+				fi
+				# Log surflare internal state every 5s during wait
+				if [ $((_relay_wait % 5)) -eq 0 ] && [ "$_relay_wait" -gt 0 ]; then
+					local _conn_count
+					_conn_count=$(ss -tnp state established 2>/dev/null | grep -c surflare)
+					log "Waiting for relay: ${_relay_wait}s, surflare connections=${_conn_count}"
+				fi
+				sleep 1
+				_relay_wait=$((_relay_wait + 1))
+			done
+			if [ "$_relay_ready" -eq 0 ]; then
+				log "WARN: relay not established after ${RELAY_SETTLE}s, proceeding anyway"
+			fi
+			log "VPN routing ready: local=${_ready_wait}s + relay=${_relay_wait}s"
 		else
 			sleep "$CONNECT_SETTLE"
 			if ! _proc_alive surflare-proxy >/dev/null 2>&1; then
@@ -3129,6 +3240,7 @@ fail_count=0
 reconnect_count=0
 transient_count=0
 auth_fail_count=0
+_cn_consecutive=0                    # consecutive CN exit detections across node rotations
 _auth_bg_pid=""                      # PID of background refresh_auth, if running
 _auth_force_reconnect=0              # 1 if auth failure threshold reached; healthy branch triggers reconnect
 last_heartbeat=$(date +%s)
@@ -3154,6 +3266,11 @@ if [ -f "$ROTATION_STATE" ]; then
 	fi
 fi
 log "watchdog started: node=${_active_node} candidates=${#NODE_CANDIDATES[@]} interval=${CHECK_INTERVAL}s threshold=${FAIL_THRESHOLD} transient=${TRANSIENT_THRESHOLD}"
+
+# Fetch ISP public IP BEFORE killswitch/VPN setup.
+# Used to distinguish CN exit: tunnel broken (IP == ISP) vs tunnel working (IP != ISP).
+_get_isp_ip || log "WARN: ISP IP unavailable, CN exit will be treated as failure"
+
 _killswitch_armed=0
 _setup_kernel_moat
 _cleanup_on_startup
@@ -3308,6 +3425,7 @@ while true; do
 			log "Flushed stale nftables/routing (${_stale} rule(s))"
 		fi
 		transient_count=0
+		_cn_consecutive=0
 		fail_count=$FAIL_THRESHOLD
 
 	elif [ "$health" = "TCP_BLOCK" ]; then
@@ -3316,6 +3434,7 @@ while true; do
 			_record_disconnect
 			log "Health check TCP block (tunnel confirmed, local network OK), triggering reconnect"
 			transient_count=0
+			_cn_consecutive=0
 			fail_count=$FAIL_THRESHOLD
 		else
 			transient_count=$((transient_count + 1))
@@ -3327,6 +3446,7 @@ while true; do
 		# is not forwarding traffic.  LAN devices would have no connectivity.
 		log "Proxy path broken: surflare-proxy:10800 not forwarding, triggering reconnect"
 		transient_count=0
+		_cn_consecutive=0
 		fail_count=$FAIL_THRESHOLD
 
 	elif [ "$health" = "OK" ] || \
@@ -3335,6 +3455,7 @@ while true; do
 		fail_count=0
 		reconnect_count=0
 		transient_count=0
+		_cn_consecutive=0
 		_transit_grace_ts=0
 		_remove_dns_fallback
 		_patch_surflare_icmp_lan
@@ -3409,10 +3530,20 @@ while true; do
 		fi
 
 	elif [ "$health" = "CN" ]; then
-		# External confirmed: traffic is exiting via China -- VPN is routing incorrectly
+		# CN exit detected: tunnel broken (exit IP == ISP IP).
+		# ISP IP baseline check is done in check_vpn_health() at detection time.
+		# Track consecutive CN across rotations: if every candidate has been
+		# tried (one full rotation), the relay infrastructure is down and
+		# further reconnects only add downtime.  Enter storm cooldown instead.
 		transient_count=0
-		fail_count=$((fail_count + 1))
-		log "Health check failed (CN exit), consecutive count: ${fail_count}"
+		_cn_consecutive=$((_cn_consecutive + 1))
+		if [ "$_cn_consecutive" -ge "${#NODE_CANDIDATES[@]}" ]; then
+			_enter_storm_cooldown "cn-exit-all-nodes"
+			_cn_consecutive=0
+		else
+			fail_count=$((fail_count + 1))
+			log "Health check failed (CN exit, tunnel broken), consecutive count: ${fail_count}, cn_rotation: ${_cn_consecutive}/${#NODE_CANDIDATES[@]}"
+		fi
 
 	else
 		# health="" -- all external probes timed out; local state was OK (check_vpn_health
@@ -3481,6 +3612,7 @@ while true; do
 				reconnect_count=0
 				transient_count=0
 				auth_fail_count=0
+				_cn_consecutive=0
 				_transit_fail_count=0
 				_transit_grace_ts=0
 				_remove_dns_fallback
