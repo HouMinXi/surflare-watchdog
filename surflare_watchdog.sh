@@ -12,8 +12,8 @@
 #                     /etc/systemd/system-sleep/surflare-resume.sh
 # View logs    : sudo dmesg | grep surflare_watchdog
 
-NODE="Auto Best"                      # Set to your node tag (run: surflare nodes)
-NODE_CANDIDATES=("Auto Best" "Los Angeles" "Tokyo" "Hong Kong" "Singapore" "Dallas" "Chicago" "New York" "Atlanta" "Miami")
+NODE="Dallas"                          # Exit node (US only); transit/relay is auto
+NODE_CANDIDATES=("Dallas" "Los Angeles" "Chicago" "New York" "Atlanta" "Miami")
 # Connection mode: loaded from /etc/surflare/mode.conf if present,
 # otherwise resolved from PLATFORM (router->rule, laptop->global).
 # Deploying surflare_watchdog.sh no longer resets the mode setting.
