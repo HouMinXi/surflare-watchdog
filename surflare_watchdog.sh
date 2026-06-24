@@ -977,6 +977,7 @@ table inet killswitch {
 		oif "lo" accept
 		ip daddr @server_ips accept
 		ip6 daddr @server_ips6 accept
+		meta mark == 0x1 accept
 		meta mark == 0xff accept
 		ip daddr @bypass_ipv4 accept
 		ip6 daddr @bypass_ipv6 accept
