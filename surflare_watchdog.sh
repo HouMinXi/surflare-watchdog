@@ -932,15 +932,12 @@ DNS_EOF
 }
 
 _seal_killswitch_ff() {
-	# Prerequisite: server_ips must contain relay IPs, otherwise deleting 0xff will break VPN
-	nft list set inet killswitch server_ips 2>/dev/null \
-		| grep -qE '[0-9]+\.[0-9]' || return 0
-	local _h
-	_h=$(nft -a list chain inet killswitch output 2>/dev/null \
-		| awk '/meta mark.*0x000000ff accept/{print $NF}' | head -1)
-	[ -z "$_h" ] && return 0
-	nft delete rule inet killswitch output handle "$_h" 2>/dev/null && \
-		log "killswitch: sealed mark 0xff accept (server_ips populated)"
+	# DEPRECATED: surflare-proxy uses SO_MARK=0xff for its outbound relay
+	# connections permanently, not just during bootstrap.  Removing the 0xff
+	# accept rule after server_ips is populated (seal) causes surflare-proxy's
+	# new connections to be dropped by ks-drop, triggering tunnel degradation.
+	# The 0xff accept in _install_killswitch is now permanent (like 0x1).
+	return 0
 }
 
 _install_killswitch() {
@@ -1161,7 +1158,6 @@ NFTEOF
 				log "WARN: failed to load cloud CDN extra bypass_ipv4"
 		fi
 	fi
-	_seal_killswitch_ff
 }
 
 _update_killswitch_server_ips() {
@@ -1243,7 +1239,6 @@ DISKEOF
 			log "WARN: failed to persist server_ips to $_persist_v4"
 	fi
 	log "Kill switch: server_ips updated (${_diag_server_ips})"
-	_seal_killswitch_ff
 }
 
 # Unused: cleanup() uses modular teardown (flush server_ips, keep table),
@@ -3811,7 +3806,6 @@ while true; do
 	if [ "${transient_count:-0}" -gt 0 ] || [ "${fail_count:-0}" -gt 0 ]; then
 		_interval="$DEGRADED_INTERVAL"
 	fi
-	_seal_killswitch_ff
 	sleep "$_interval" & storm_sleep_pid=$!
 	wait "$storm_sleep_pid" || true
 	storm_sleep_pid=""
