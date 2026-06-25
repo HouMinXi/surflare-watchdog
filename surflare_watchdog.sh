@@ -873,6 +873,7 @@ _cleanup_on_startup() {
 	rm -f /run/surflare_auth_fail_signal 2>/dev/null || true
 	rm -f /run/surflare_stale_warn 2>/dev/null || true
 	rm -f /run/surflare_auth_bg_active 2>/dev/null || true
+	rm -f /run/surflare_urltest_all_unhealthy 2>/dev/null || true
 
 	log "Startup cleanup: surflare-proxy not running, flushing stale watchdog state"
 	nft delete table inet surflare 2>/dev/null || true
@@ -2752,6 +2753,11 @@ _rotate_node() {
 	if ! _node_is_log_healthy "${NODE_CANDIDATES[$_node_idx]}" "$effective_transit"; then
 		log "WARN: all nodes unhealthy, keeping ${prev} (skipped ${_active_node})"
 		_active_node="$prev"
+		# Signal connect_vpn to force auth refresh: when ALL nodes show
+		# urltest errors (503), the auth token may be stale regardless
+		# of TOKEN_REFRESH_INTERVAL.  The signal file bypasses the
+		# interval gate for one refresh cycle, then self-destructs.
+		touch /run/surflare_urltest_all_unhealthy 2>/dev/null || true
 	else
 		_active_node="${NODE_CANDIDATES[$_node_idx]}"
 	fi
@@ -2816,10 +2822,22 @@ connect_vpn() {
 		# direct-routing window (nft flushed, API reachable via ISP).
 		# File-based because this subshell's variable updates are lost on exit.
 		# Only writes timestamp on success; failure must not suppress retry.
-		local _last_ref=0
+		local _last_ref=0 _force_refresh=0
 		[ -f "$LAST_REFRESH_FILE" ] && _last_ref=$(cat "$LAST_REFRESH_FILE" 2>/dev/null)
 		_last_ref=${_last_ref:-0}  # defense: empty/corrupt file -> 0
-		if [ $(($(date +%s) - _last_ref)) -ge "$TOKEN_REFRESH_INTERVAL" ]; then
+		# O3b: urltest all-node 503 bypasses the interval gate.
+		# When ALL nodes show urltest errors, the auth token is likely
+		# stale (relay rejects at HTTP layer).  Force refresh if the
+		# last refresh was >5 min ago (avoid double-refresh on
+		# sequential reconnect cycles).  Signal file self-destructs.
+		if [ -f /run/surflare_urltest_all_unhealthy ]; then
+			if [ $(($(date +%s) - _last_ref)) -ge 300 ]; then
+				log "connect_vpn: forcing auth refresh (urltest all nodes unhealthy)"
+				_force_refresh=1
+			fi
+			rm -f /run/surflare_urltest_all_unhealthy
+		fi
+		if [ "$_force_refresh" -eq 1 ] || [ $(($(date +%s) - _last_ref)) -ge "$TOKEN_REFRESH_INTERVAL" ]; then
 			# Skip if a background auth is already running (launched by the
 			# healthy branch in a previous cycle).  Its result will be
 			# collected by the main loop's top-of-cycle collector.
