@@ -41,7 +41,7 @@ ROTATION_STATE=/var/tmp/surflare_rotation  # Persists active node across restart
 DIAG_SACK_THRESHOLD=20                # % of packets with SACK blocks to flag transit degradation
 DISCONNECT_SETTLE=1                   # seconds after surflare disconnect before killing processes
 CONNECT_SETTLE=20                     # seconds after surflare connect --daemon for VPN to establish
-RELAY_SETTLE=60                       # max seconds to wait for relay connections after local state ready
+DATAPLANE_SETTLE=60                       # max seconds to wait for data-plane ping after local state ready
 LAST_REFRESH_FILE="/run/surflare_last_refresh"  # cross-subshell token refresh timestamp
 NETWORK_WAIT_FALLBACK=15              # seconds to wait for network when nm-online is unavailable
 NETWORK_WAIT_TIMEOUT=30               # nm-online timeout in seconds
@@ -891,12 +891,13 @@ _cleanup_on_startup() {
 		fi
 		rm -f "$_cool_file"
 	fi
-	# Rotate proxy log if > 10MB to prevent unbounded growth
+	# Rotate proxy log if > 10MB to prevent unbounded growth.
+	# Timestamp suffix avoids overwriting the only backup on crash loops.
 	if [ -f "$PROXY_LOG" ]; then
 		local _log_size
 		_log_size=$(stat -c %s "$PROXY_LOG" 2>/dev/null || echo 0)
 		if [ "$_log_size" -gt 10485760 ]; then
-			mv "$PROXY_LOG" "${PROXY_LOG}.old" 2>/dev/null || true
+			mv "$PROXY_LOG" "${PROXY_LOG}.$(date +%Y%m%d_%H%M%S)" 2>/dev/null || true
 			log "Proxy log rotated (was $((_log_size / 1048576))MB)"
 		fi
 	fi
@@ -2883,16 +2884,17 @@ connect_vpn() {
 			log "connect_vpn: killswitch re-installed after connect"
 		fi
 		# The proxy's inet surflare table now handles output routing; killswitch
-		# O1 (v3.2): poll-based readiness with relay-aware handshake.
+		# O1 (v3.2): poll-based readiness with data-plane verification.
 		# Phase 1: wait for local state (process/nftables/routing).
-		# Phase 2: wait for relay connections (surflare-proxy TCP conns to relay IP).
-		# Before relay: sing-box routes internally but no tunnel -> health check
-		# would see CN/direct exit. Log surflare internal state during wait.
+		# Phase 2: verify data-plane forwarding (surflare ping through tunnel).
+		# Uses surflare ping instead of relay connection counting (ss) because
+		# relay TCP establishment does not guarantee data forwarding -- auth
+		# staleness passes relay count but fails ping.
 		if [ "$_use_poll" -eq 1 ]; then
 			local _ready_wait=0
 			while [ "$_ready_wait" -lt "$CONNECT_SETTLE" ]; do
 				if check_vpn_local_state; then
-					log "Local state ready after ${_ready_wait}s, waiting for relay..."
+					log "Local state ready after ${_ready_wait}s, waiting for data-plane..."
 					break
 				fi
 				sleep 1
@@ -2903,35 +2905,39 @@ connect_vpn() {
 				[ "$_ks_was_armed" -eq 1 ] && _install_killswitch
 				exit 1
 			fi
-			# Phase 2: poll for relay connections
-			local _relay_wait=0 _relay_ready=0
-			while [ "$_relay_wait" -lt "$RELAY_SETTLE" ]; do
-				local _relay_count
-				_relay_count=$(ss -tnp state established 2>/dev/null \
-					| awk '/surflare/{split($4,a,":");ip=a[1];
-					        if (ip ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ &&
-					            ip !~ /^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.|127\.)/) print ip}' \
-					| sort | uniq -c | sort -rn \
-					| awk -v min="$MIN_RELAY_CONNS" '$1 >= min {print $1}' \
-					| head -1)
-				if [ -n "$_relay_count" ] && [ "$_relay_count" -ge "$MIN_RELAY_CONNS" ]; then
-					_relay_ready=1
-					log "Relay ready: ${_relay_count} connections after ${_relay_wait}s"
+			# Phase 2: verify data-plane forwarding with surflare ping.
+			# Replaces relay connection counting (ss), which only checks TCP
+			# establishment, not actual forwarding.  When auth is stale the
+			# relay accepts TCP handshakes but drops data -- relay count
+			# passes but external probes all time out.  surflare ping sends
+			# TCP SYN through the tunnel and catches this.
+			# Working tunnel: ping returns in 1-2s (first probe succeeds).
+			# Broken tunnel: each probe times out after 5s; timeout(1) caps
+			# each attempt at 8s to avoid blocking the full 20s.
+			# Uses $SECONDS (bash builtin, seconds since shell start) to
+			# track wall-clock elapsed time, not loop-counter approximations.
+			local _ping_start=$SECONDS _ping_elapsed=0 _ping_ready=0
+			while [ "$_ping_elapsed" -lt "$DATAPLANE_SETTLE" ]; do
+				if timeout 8 surflare ping google.com -p 443 2>&1 \
+					| grep -q 'Loss:[[:space:]]*0\.0%'; then
+					_ping_elapsed=$((SECONDS - _ping_start))
+					_ping_ready=1
+					log "Data-plane ready: ping OK after ${_ping_elapsed}s"
 					break
 				fi
-				# Log surflare internal state every 5s during wait
-				if [ $((_relay_wait % 5)) -eq 0 ] && [ "$_relay_wait" -gt 0 ]; then
+				_ping_elapsed=$((SECONDS - _ping_start))
+				if [ $((_ping_elapsed % 10)) -eq 0 ] && [ "$_ping_elapsed" -gt 0 ]; then
 					local _conn_count
 					_conn_count=$(ss -tnp state established 2>/dev/null | grep -c surflare)
-					log "Waiting for relay: ${_relay_wait}s, surflare connections=${_conn_count}"
+					log "Waiting for data-plane: ${_ping_elapsed}s (${_conn_count} surflare conns)"
 				fi
-				sleep 1
-				_relay_wait=$((_relay_wait + 1))
+				sleep 2
+				_ping_elapsed=$((SECONDS - _ping_start))
 			done
-			if [ "$_relay_ready" -eq 0 ]; then
-				log "WARN: relay not established after ${RELAY_SETTLE}s, proceeding anyway"
+			if [ "$_ping_ready" -eq 0 ]; then
+				log "WARN: data-plane not ready after ${_ping_elapsed}s (limit ${DATAPLANE_SETTLE}s), proceeding anyway"
 			fi
-			log "VPN routing ready: local=${_ready_wait}s + relay=${_relay_wait}s"
+			log "VPN routing ready: local=${_ready_wait}s + data-plane=${_ping_elapsed}s"
 		else
 			sleep "$CONNECT_SETTLE"
 			if ! _proc_alive surflare-proxy >/dev/null 2>&1; then
@@ -3184,9 +3190,10 @@ cleanup() {
 	# interrupted mktemp sequences (SIGTERM between individual mktemp calls
 	# before _hc_tmp is fully populated).
 	rm -f /tmp/surflare_hc.* 2>/dev/null
-	killall surflare-proxy 2>/dev/null
+	killall surflare-proxy 2>/dev/null || true
 	killall sexpect 2>/dev/null || true
 	killall -9 surflare 2>/dev/null || true
+	killall surflare_route_updater.sh 2>/dev/null || true
 	if [ -f "$RESTART_MARKER" ]; then
 		rm -f "$RESTART_MARKER"
 		nft delete table inet surflare_moat 2>/dev/null || true
@@ -3198,7 +3205,6 @@ cleanup() {
 		log "Restart: modular teardown (killswitch preserved)"
 	else
 		_full_teardown
-		killall surflare_route_updater.sh 2>/dev/null || true
 		log "Stop: full teardown"
 	fi
 	if [ -n "${_auth_bg_pid:-}" ] && kill -0 "$_auth_bg_pid" 2>/dev/null; then

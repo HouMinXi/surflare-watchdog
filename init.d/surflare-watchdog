@@ -46,13 +46,14 @@ stop_service() {
     # cleaned up while the watchdog is still alive (it will exit via
     # procd's SIGTERM shortly after).
     if [ ! -f /run/surflare_restarting ]; then
-        # Stop VPN tunnel and proxy.  Kill proxy first (fast local
-        # signal), then disconnect CLI (may involve network, needs timeout).
-        # Teardown nftables LAST so killswitch stays active during disconnect.
+        # Stop VPN tunnel and proxy.  Disconnect first (may involve
+        # network, needs timeout) so surflare can clean up server-side
+        # state, then hard-kill all processes.  Teardown nftables LAST
+        # so killswitch stays active during disconnect.
+        timeout 8 surflare disconnect >/dev/null 2>&1 || true
         killall surflare-proxy 2>/dev/null || true
         killall sexpect 2>/dev/null || true
         killall -9 surflare 2>/dev/null || true
-        timeout 8 surflare disconnect >/dev/null 2>&1 || true
         _full_teardown
         killall surflare_route_updater.sh 2>/dev/null || true
         # Kill orphan watchdog processes (PPid=1) accumulated from prior
