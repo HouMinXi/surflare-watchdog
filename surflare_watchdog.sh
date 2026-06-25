@@ -1802,24 +1802,58 @@ _block_unreachable_doh() {
 		ip daddr { 1.1.1.1, 1.0.0.1, 8.8.8.8, 8.8.4.4 } tcp dport 443 reject \
 		2>/dev/null || true
 }
-# _exempt_local_dns_servers: accept SmartDNS/https-dns-proxy DoT/DoH to
-# CN DNS servers before the output catchall marks them 0x1.  Without this
-# exemption, SmartDNS upstream queries loop through tproxy (:10800) and
-# sing-box rejects them as loopback (src=100.65.183.92, the VPN local IP).
-# DoT 853: AliDNS (223.5.5.5/223.6.6.6), Tencent (120.53.53.53)
-# DoH 443: doh.pub / dns.alidns.com (resolved to 1.12.12.12)
-# surflare-proxy uses SO_MARK=0xff (caught at handle 4), not affected.
-# nft insert (not add) places the rule at chain head (before all other rules).
-_exempt_local_dns_servers() {
+# _exempt_cn_output: load all CN IPv4 CIDRs into an nftables set and insert
+# an accept rule before the output chain catchall so N100-local traffic to
+# CN IPs never enters tproxy.  Replaces the narrower _exempt_local_dns_servers
+# which only covered 4 hard-coded DNS IPs on ports 443/853.
+# The output chain is type-route: changing mark triggers kernel reroute.
+# Without this exemption, locally-generated CN traffic is marked 0x1 by the
+# catchall -> rerouted to lo -> tproxy:10800 -> sing-box may reject it as
+# loopback (source 100.65.183.92 is a local WAN address).
+# Called after every successful connect_vpn (table is freshly created).
+# Idempotent: dedup check returns early if the set already has elements.
+_exempt_cn_output() {
 	nft list table inet surflare >/dev/null 2>&1 || return 0
 	[ "$PLATFORM" = "laptop" ] && return 0
-	# Dedup: skip if exempt rule already present
+	# Dedup: skip if set already has elements (persists across crashes)
+	nft list set inet surflare cn_output 2>/dev/null | \
+		grep -q 'elements' && return 0
+
+	local cn_v4_file="/etc/surflare/cn_ipv4.txt"
+	local _batch="/tmp/surflare_cn_output_$$.nft"
+
+	# Create the interval set (idempotent)
+	nft add set inet surflare cn_output { type ipv4_addr\; flags interval\; } \
+		2>/dev/null || true
+
+	# Batch-load all CIDRs from cn_ipv4.txt
+	if [ -f "$cn_v4_file" ]; then
+		local _v4_cidrs
+		_v4_cidrs=$(grep -v '^#' "$cn_v4_file" | grep -v '^[[:space:]]*$' | paste -sd, -)
+		if [ -n "$_v4_cidrs" ]; then
+			{
+				printf 'flush set inet surflare cn_output\n'
+				printf 'add element inet surflare cn_output { %s }\n' "$_v4_cidrs"
+			} > "$_batch"
+			nft -f "$_batch" 2>/dev/null || \
+				log "WARN: cn_output set load failed"
+			rm -f "$_batch"
+		else
+			log "WARN: ${cn_v4_file} has no valid CIDRs"
+			rm -f "$_batch"
+			return 0
+		fi
+	else
+		log "WARN: ${cn_v4_file} missing, cn_output will be empty"
+		return 0
+	fi
+
+	# Insert accept rule at chain head (before catchall).  Dedup: skip if
+	# a rule referencing @cn_output already exists.
 	nft list chain inet surflare output 2>/dev/null | \
-		grep -q '223\.5\.5\.5.*dport.*853' && return 0
-	# shellcheck disable=SC1083  # braces are nft set syntax, not bash
+		grep -q 'daddr @cn_output ' && return 0
 	nft insert rule inet surflare output \
-		ip daddr { 223.5.5.5, 223.6.6.6, 120.53.53.53, 1.12.12.12 } \
-		meta l4proto tcp th dport { 443, 853 } accept \
+		ip daddr @cn_output accept \
 		2>/dev/null || true
 }
 # _check_tunnel_egress: test whether the VPN tunnel can reach external endpoints.
@@ -3573,7 +3607,7 @@ while true; do
 		connect_vpn
 		rc=$?
 		_block_unreachable_doh
-		_exempt_local_dns_servers
+		_exempt_cn_output
 		if [ "$rc" -eq 2 ]; then
 			log "Post-crash reconnect skipped (flock held), will retry next cycle"
 		elif [ "$rc" -eq 0 ]; then
@@ -3596,7 +3630,7 @@ while true; do
 				_update_killswitch_server_ips
 				_restore_tproxy
 				_block_unreachable_doh
-				_exempt_local_dns_servers
+				_exempt_cn_output
 				_update_bypass_devices
 				_patch_surflare_icmp_lan
 				_record_connect "${_active_node}" "${new_health}"
@@ -3791,7 +3825,7 @@ while true; do
 		connect_vpn
 		rc=$?
 		_block_unreachable_doh
-		_exempt_local_dns_servers
+		_exempt_cn_output
 		# Collect auth-fail signal from connect_vpn subshell (its variables are lost)
 		if [ -f /run/surflare_auth_fail_signal ]; then
 			_signal_type=$(cat /run/surflare_auth_fail_signal 2>/dev/null)
@@ -3836,7 +3870,7 @@ while true; do
 				# Restore LAN tproxy now that the new proxy is ready on :10800.
 				_restore_tproxy
 				_block_unreachable_doh
-				_exempt_local_dns_servers
+				_exempt_cn_output
 				_load_tproxy_cn_direct
 				_update_bypass_devices
 				_patch_surflare_icmp_lan
