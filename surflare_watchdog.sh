@@ -878,11 +878,13 @@ _cleanup_on_startup() {
 	# 6. Stale pcap and log artifacts: packet trace pcaps, diagnostic
 	#    phys pcaps, tcpdump error files, and old proxy log rotations
 	#    accumulate across restarts on tmpfs (/tmp) and persist on disk.
-	find /tmp -name 'surflare_phys_*.pcap' -mmin +30 -delete 2>/dev/null || true
-	find /tmp -name 'surflare_watchdog_*.pcap' -mmin +30 -delete 2>/dev/null || true
-	find /tmp -name 'surflare_watchdog_*.pcap.err' -mmin +30 -delete 2>/dev/null || true
+	#    Globbing rm (not find -mmin) because busybox -mmin is unreliable
+	#    on tmpfs with NTP-stepped clocks.
+	rm -f /tmp/surflare_phys_*.pcap 2>/dev/null || true
+	rm -f /tmp/surflare_watchdog_*.pcap 2>/dev/null || true
+	rm -f /tmp/surflare_watchdog_*.pcap.err 2>/dev/null || true
 	# Clean pre-timestamp-rotation .old artifact (23MB observed)
-	find /var/log/surflare -name 'surflare-proxy.log.old' -delete 2>/dev/null || true
+	rm -f /var/log/surflare/surflare-proxy.log.old 2>/dev/null || true
 
 	log "Startup cleanup: surflare-proxy not running, flushing stale watchdog state"
 	nft delete table inet surflare 2>/dev/null || true
