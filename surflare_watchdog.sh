@@ -422,6 +422,16 @@ _setup_kernel_moat() {
 	# MTU hang indefinitely.
 	nft add rule inet surflare_moat prerouting \
 		ip6 nexthdr icmpv6 icmpv6 type packet-too-big accept 2>/dev/null || moat_rules_ok=0
+	# Output chain at priority -160 (before surflare mangle=-150):
+	# redirect 0xff DNS (plain + DoT) to 0x1 so surflare routes it
+	# through the VPN tunnel instead of leaking it to the ISP.
+	# surflare-proxy relay connections (0xff, dport 443) are NOT
+	# touched -- they bypass surflare mark-0x1 rule and go direct.
+	nft add chain inet surflare_moat output \
+		'{ type route hook output priority -160; policy accept; }' 2>/dev/null
+	nft add rule inet surflare_moat output \
+		'meta mark 0x000000ff meta l4proto {tcp, udp} th dport {53, 853} meta mark set 0x00000001' \
+		2>/dev/null || true
 	if [ "$moat_rules_ok" -eq 1 ]; then
 		local _mode_desc
 		if [ -f /run/surflare_watchdog.moat_strict ]; then
