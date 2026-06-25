@@ -951,7 +951,7 @@ DNS_EOF
 # NOTE: _seal_killswitch_ff() removed (was called after server_ips populated).
 # surflare-proxy uses SO_MARK=0xff for outbound relay connections permanently,
 # not just during bootstrap.  Removing the 0xff accept rule caused ks-drop of
-# new connections → tunnel degradation.  0xff is now permanent (like 0x1) in
+# new connections -> tunnel degradation.  0xff is now permanent (like 0x1) in
 # the _install_killswitch() heredoc.
 
 _install_killswitch() {
@@ -2863,7 +2863,7 @@ connect_vpn() {
 		# killswitch self-lock workaround: when server_ips is empty
 		# (fresh install) or stale (from a previous node's relay),
 		# the killswitch output policy-drop blocks all non-CN outbound
-		# traffic — including surflare connect's API calls to US relay
+		# traffic -- including surflare connect's API calls to US relay
 		# servers.  Temporarily unarm the killswitch so surflare connect
 		# can reach its API, then re-install a fresh killswitch with the
 		# bootstrap 0xff accept rule so non-CN traffic is not blocked
