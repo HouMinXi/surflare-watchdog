@@ -660,7 +660,9 @@ _ks_batch=$(mktemp /tmp/ks_bypass_all.XXXXXX)
 # Called after _restore_tproxy (which empties all sets via destroy+reload)
 # and at the end of _setup_chnroute (initial connect).
 _load_tproxy_cn_direct() {
-	[ "$MODE" = "global" ] || return 0
+	# Called with "force" arg during tombstone to protect CN traffic
+	# regardless of mode. Normal (no arg) call only runs in global mode.
+	[ "${1:-}" = "force" ] || [ "$MODE" = "global" ] || return 0
 	nft list table inet sw_lan_tproxy >/dev/null 2>&1 || return 0
 
 	local cn_v4_file="/etc/surflare/cn_ipv4.txt"
@@ -839,22 +841,21 @@ _cleanup_on_startup() {
 
 	# 4. Tombstoned tproxy: the previous watchdog tombstoned the tproxy
 	#    rules (replaced tproxy with REJECT) before crashing.  LAN TCP
-	#    gets ICMP host-unreachable instead of being proxied.  Detect by
-	#    checking for reject rules in the tproxy chain and reload from
-	#    the nft config file.  Mode-aware: global mode also needs
-	#    cn_direct sets repopulated.
+	#    gets ICMP host-unreachable instead of being proxied.  Don't
+	#    restore live tproxy here: surflare-proxy is not running yet
+	#    (:10800 has no listener -> ECONNREFUSED).  Just load cn_direct
+	#    so CN traffic bypasses the REJECT rules via ISP direct routing
+	#    during the startup window.  connect_vpn will restore live
+	#    tproxy after surflare-proxy is ready.
 	if nft list table inet sw_lan_tproxy >/dev/null 2>&1; then
 		if nft list chain inet sw_lan_tproxy prerouting 2>/dev/null | \
 		   grep -q 'reject.*icmp\|reject.*icmpv6'; then
-			_restore_tproxy
+			_load_tproxy_cn_direct force
 			# _block_unreachable_doh not called here: inet surflare does
 			# not exist yet (deleted in modular teardown, recreated by
 			# surflare connect --daemon later).  DoH reject is inserted
 			# after connect_vpn returns in the main loop.
-			if [ "$MODE" = "global" ]; then
-				_load_tproxy_cn_direct
-			fi
-			log "Crash recovery: restored tombstoned tproxy (mode=${MODE})"
+			log "Crash recovery: cn_direct loaded, tproxy stays tombstoned (proxy not running)"
 		fi
 	fi
 
@@ -1276,6 +1277,13 @@ _remove_killswitch() {
 # the DTLS detection rule intact so they survive across the tombstone window.
 _tombstone_tproxy() {
 	nft list table inet sw_lan_tproxy >/dev/null 2>&1 || return 0
+	# Load CN IPs into cn_direct so domestic traffic bypasses tproxy
+	# during the tombstone window.  In rule mode cn_direct is normally
+	# empty (sing-box handles CN split); during tombstone sing-box is
+	# dead so we must route CN direct at the nftables layer.
+	# _restore_tproxy() recreates cn_direct as empty (destroy+reload),
+	# returning to normal rule-mode behavior automatically.
+	_load_tproxy_cn_direct force
 	# Replace each tproxy rule with a protocol-matched reject so only
 	# the originally proxied protocols are blocked.  Without the qualifier
 	# the first reject catches ALL br-lan traffic and over-blocks
