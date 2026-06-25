@@ -373,6 +373,8 @@ _setup_kernel_moat() {
 	# deciding whether to enforce the drop in production.
 	nft add table inet surflare_moat 2>/dev/null || true
 	nft flush table inet surflare_moat 2>/dev/null || true
+	# Clean up removed output chain (was 0xff DNS redirect, caused tproxy loop).
+	nft delete chain inet surflare_moat output 2>/dev/null || true
 	if ! nft add chain inet surflare_moat prerouting '{ type filter hook prerouting priority -300; policy accept; }' 2>/dev/null; then
 		log "WARN: Kernel moat chain creation failed"
 		return 1
@@ -422,23 +424,16 @@ _setup_kernel_moat() {
 	# MTU hang indefinitely.
 	nft add rule inet surflare_moat prerouting \
 		ip6 nexthdr icmpv6 icmpv6 type packet-too-big accept 2>/dev/null || moat_rules_ok=0
-	# Output chain at priority -160 (before surflare mangle=-150):
-	# redirect 0xff DNS (plain + DoT) to 0x1 so surflare routes it
-	# through the VPN tunnel instead of leaking it to the ISP.
-	# surflare-proxy relay connections (0xff, dport 443) are NOT
-	# touched -- they bypass surflare mark-0x1 rule and go direct.
-	# Does NOT cover DoH (port 443): nftables cannot distinguish DoH
-	# from relay HTTPS at the packet level.  The surflare output chain
-	# rejects DoT to 1.0.0.1/1.1.1.1/8.8.4.4/8.8.8.8:443 as a partial
-	# mitigation; other DoH endpoints on port 443 remain unprotected.
-	if nft add chain inet surflare_moat output \
-		'{ type route hook output priority -160; policy accept; }' 2>/dev/null; then
-		nft add rule inet surflare_moat output \
-			'meta mark 0x000000ff meta l4proto {tcp, udp} th dport {53, 853} meta mark set 0x00000001' \
-			2>/dev/null || true
-	else
-		log "WARN: moat output chain failed, 0xff DNS protection unavailable"
-	fi
+	# NOTE: moat output chain (0xff DNS -> 0x1) REMOVED.
+	# surflare-proxy uses SO_MARK=0xff for ALL outbound including its
+	# own DNS (DoT to 223.5.5.5/120.53.53.53:853, DoH to 223.6.6.6:443).
+	# Redirecting 0xff+{53,853} -> 0x1 routes those queries through
+	# tproxy (ip rule fwmark 0x1 -> lo) back to surflare-proxy's own
+	# :10800 listener, where sing-box detects self-loop and rejects.
+	# surflare-proxy's direct DNS is intentional -- it needs to resolve
+	# relay nodes.  DNS leak protection belongs at the resolver layer
+	# (SmartDNS routes domestic direct, foreign via VPN), not at the
+	# nftables mark level for the proxy's own traffic.
 	if [ "$moat_rules_ok" -eq 1 ]; then
 		local _mode_desc
 		if [ -f /run/surflare_watchdog.moat_strict ]; then
@@ -2367,11 +2362,13 @@ _update_server_endpoint() {
 		ss -tnp state established 2>/dev/null \
 			| awk '/surflare/{split($4,a,":");ip=a[1];
 			        if (ip ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ &&
-			            ip !~ /^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.|127\.)/) print ip}'
+			            ip !~ /^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.|127\.)/ &&
+			            ip !~ /^(223\.(5\.5\.5|6\.6\.6)|120\.53\.53\.53|119\.29\.29\.29|180\.76\.76\.76|1\.(0\.0\.1|1\.1\.1|12\.12\.12)|8\.8\.(4\.4|8\.8)|114\.114\.(114\.114|115\.115)|208\.67\.(220\.220|222\.222))$/) print ip}'
 		ss -unp 2>/dev/null \
 			| awk '/surflare/{split($4,a,":");ip=a[1];
 			        if (ip ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ &&
-			            ip !~ /^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.|127\.)/) print ip}'
+			            ip !~ /^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.|127\.)/ &&
+			            ip !~ /^(223\.(5\.5\.5|6\.6\.6)|120\.53\.53\.53|119\.29\.29\.29|180\.76\.76\.76|1\.(0\.0\.1|1\.1\.1|12\.12\.12)|8\.8\.(4\.4|8\.8)|114\.114\.(114\.114|115\.115)|208\.67\.(220\.220|222\.222))$/) print ip}'
 	} | sort | uniq -c | sort -rn \
 	  | awk -v min="$MIN_RELAY_CONNS" '$1 >= min {print $2}' \
 	  | tr '\n' ' ' | sed 's/[[:space:]]*$//')
