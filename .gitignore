@@ -21,6 +21,10 @@ CLAUDE.md
 # Format: snapshots/n100-YYYYMMDD.tar.gz
 # Refresh: ssh root@192.168.100.1 "tar czf - /etc/config/ /etc/surflare/ ..."
 snapshots/
+
+# Captured sing-box configs (sensitive: node IPs, transit topology, auth endpoints)
+analysis/*.json
+
 .planning/
 .worktrees
 .worktrees/
