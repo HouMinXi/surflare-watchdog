@@ -3209,7 +3209,15 @@ cleanup() {
 	fi
 	if [ -n "${_auth_bg_pid:-}" ] && kill -0 "$_auth_bg_pid" 2>/dev/null; then
 		kill "$_auth_bg_pid" 2>/dev/null
-		wait "$_auth_bg_pid" 2>/dev/null
+		# wait with timeout: poll with kill -0 for up to 5s, then
+		# SIGKILL.  Plain 'wait' blocks indefinitely if the child
+		# ignores SIGTERM (e.g. surflare login stuck on network).
+		local _auth_wait_start=$SECONDS
+		while kill -0 "$_auth_bg_pid" 2>/dev/null && [ $((SECONDS - _auth_wait_start)) -lt 5 ]; do
+			sleep 1
+		done
+		kill -9 "$_auth_bg_pid" 2>/dev/null || true
+		wait "$_auth_bg_pid" 2>/dev/null  # reap zombie (non-blocking: process is dead)
 	fi
 	rm -f "$PIDFILE"
 	rm -f "$WATCHDOG_ACK_FILE" 2>/dev/null || true
