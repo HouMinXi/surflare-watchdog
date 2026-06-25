@@ -1794,6 +1794,26 @@ _block_unreachable_doh() {
 		ip daddr { 1.1.1.1, 1.0.0.1, 8.8.8.8, 8.8.4.4 } tcp dport 443 reject \
 		2>/dev/null || true
 }
+# _exempt_local_dns_servers: accept SmartDNS/https-dns-proxy DoT/DoH to
+# CN DNS servers before the output catchall marks them 0x1.  Without this
+# exemption, SmartDNS upstream queries loop through tproxy (:10800) and
+# sing-box rejects them as loopback (src=100.65.183.92, the VPN local IP).
+# DoT 853: AliDNS (223.5.5.5/223.6.6.6), Tencent (120.53.53.53)
+# DoH 443: doh.pub / dns.alidns.com (resolved to 1.12.12.12)
+# surflare-proxy uses SO_MARK=0xff (caught at handle 4), not affected.
+# nft insert (not add) places the rule at chain head (before all other rules).
+_exempt_local_dns_servers() {
+	nft list table inet surflare >/dev/null 2>&1 || return 0
+	[ "$PLATFORM" = "laptop" ] && return 0
+	# Dedup: skip if exempt rule already present
+	nft list chain inet surflare output 2>/dev/null | \
+		grep -q '223\.5\.5\.5.*dport.*853' && return 0
+	# shellcheck disable=SC1083  # braces are nft set syntax, not bash
+	nft insert rule inet surflare output \
+		ip daddr { 223.5.5.5, 223.6.6.6, 120.53.53.53, 1.12.12.12 } \
+		meta l4proto tcp th dport { 443, 853 } accept \
+		2>/dev/null || true
+}
 # _check_tunnel_egress: test whether the VPN tunnel can reach external endpoints.
 # Tests OUTPUT -> mark 0x1 -> VPN path (locally originated traffic).
 # Does NOT test surflare-proxy:10800 tproxy path (kernel tproxy is LAN-only).
@@ -3545,6 +3565,7 @@ while true; do
 		connect_vpn
 		rc=$?
 		_block_unreachable_doh
+		_exempt_local_dns_servers
 		if [ "$rc" -eq 2 ]; then
 			log "Post-crash reconnect skipped (flock held), will retry next cycle"
 		elif [ "$rc" -eq 0 ]; then
@@ -3567,6 +3588,7 @@ while true; do
 				_update_killswitch_server_ips
 				_restore_tproxy
 				_block_unreachable_doh
+				_exempt_local_dns_servers
 				_update_bypass_devices
 				_patch_surflare_icmp_lan
 				_record_connect "${_active_node}" "${new_health}"
@@ -3761,6 +3783,7 @@ while true; do
 		connect_vpn
 		rc=$?
 		_block_unreachable_doh
+		_exempt_local_dns_servers
 		# Collect auth-fail signal from connect_vpn subshell (its variables are lost)
 		if [ -f /run/surflare_auth_fail_signal ]; then
 			_signal_type=$(cat /run/surflare_auth_fail_signal 2>/dev/null)
@@ -3805,6 +3828,7 @@ while true; do
 				# Restore LAN tproxy now that the new proxy is ready on :10800.
 				_restore_tproxy
 				_block_unreachable_doh
+				_exempt_local_dns_servers
 				_load_tproxy_cn_direct
 				_update_bypass_devices
 				_patch_surflare_icmp_lan
