@@ -427,11 +427,18 @@ _setup_kernel_moat() {
 	# through the VPN tunnel instead of leaking it to the ISP.
 	# surflare-proxy relay connections (0xff, dport 443) are NOT
 	# touched -- they bypass surflare mark-0x1 rule and go direct.
-	nft add chain inet surflare_moat output \
-		'{ type route hook output priority -160; policy accept; }' 2>/dev/null
-	nft add rule inet surflare_moat output \
-		'meta mark 0x000000ff meta l4proto {tcp, udp} th dport {53, 853} meta mark set 0x00000001' \
-		2>/dev/null || true
+	# Does NOT cover DoH (port 443): nftables cannot distinguish DoH
+	# from relay HTTPS at the packet level.  The surflare output chain
+	# rejects DoT to 1.0.0.1/1.1.1.1/8.8.4.4/8.8.8.8:443 as a partial
+	# mitigation; other DoH endpoints on port 443 remain unprotected.
+	if nft add chain inet surflare_moat output \
+		'{ type route hook output priority -160; policy accept; }' 2>/dev/null; then
+		nft add rule inet surflare_moat output \
+			'meta mark 0x000000ff meta l4proto {tcp, udp} th dport {53, 853} meta mark set 0x00000001' \
+			2>/dev/null || true
+	else
+		log "WARN: moat output chain failed, 0xff DNS protection unavailable"
+	fi
 	if [ "$moat_rules_ok" -eq 1 ]; then
 		local _mode_desc
 		if [ -f /run/surflare_watchdog.moat_strict ]; then
@@ -941,14 +948,11 @@ DNS_EOF
 	fi
 }
 
-_seal_killswitch_ff() {
-	# DEPRECATED: surflare-proxy uses SO_MARK=0xff for its outbound relay
-	# connections permanently, not just during bootstrap.  Removing the 0xff
-	# accept rule after server_ips is populated (seal) causes surflare-proxy's
-	# new connections to be dropped by ks-drop, triggering tunnel degradation.
-	# The 0xff accept in _install_killswitch is now permanent (like 0x1).
-	return 0
-}
+# NOTE: _seal_killswitch_ff() removed (was called after server_ips populated).
+# surflare-proxy uses SO_MARK=0xff for outbound relay connections permanently,
+# not just during bootstrap.  Removing the 0xff accept rule caused ks-drop of
+# new connections → tunnel degradation.  0xff is now permanent (like 0x1) in
+# the _install_killswitch() heredoc.
 
 _install_killswitch() {
 	local _ks_tmp="/tmp/ks_install_$$.nft"
