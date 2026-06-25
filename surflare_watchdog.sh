@@ -3097,6 +3097,8 @@ stop_packet_trace() {
 		done
 		kill -0 "$_trace_tcpdump_pid" 2>/dev/null && \
 			kill -9 "$_trace_tcpdump_pid" 2>/dev/null || true
+			wait "$_trace_tcpdump_pid" 2>/dev/null  # reap zombie
+			_trace_tcpdump_pid=""
 	fi
 
 	nft delete table "$_trace_table" 2>/dev/null || true
@@ -3129,8 +3131,10 @@ _check_trace_alive() {
 	[ "${_trace_active:-0}" -eq 0 ] && return 0
 	if ! kill -0 "$_trace_tcpdump_pid" 2>/dev/null; then
 		log "WARNING: tcpdump died (PID $_trace_tcpdump_pid), cleaning up"
+		wait "$_trace_tcpdump_pid" 2>/dev/null  # reap zombie
 		nft delete table "$_trace_table" 2>/dev/null || true
 		_trace_active=0
+		_trace_tcpdump_pid=""
 	fi
 }
 
