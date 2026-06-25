@@ -3097,8 +3097,8 @@ stop_packet_trace() {
 		done
 		kill -0 "$_trace_tcpdump_pid" 2>/dev/null && \
 			kill -9 "$_trace_tcpdump_pid" 2>/dev/null || true
-			wait "$_trace_tcpdump_pid" 2>/dev/null  # reap zombie
-			_trace_tcpdump_pid=""
+		wait "$_trace_tcpdump_pid" 2>/dev/null  # reap zombie
+		_trace_tcpdump_pid=""
 	fi
 
 	nft delete table "$_trace_table" 2>/dev/null || true
