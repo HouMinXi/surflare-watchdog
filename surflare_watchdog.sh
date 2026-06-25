@@ -3203,23 +3203,26 @@ cleanup() {
 	# interrupted mktemp sequences (SIGTERM between individual mktemp calls
 	# before _hc_tmp is fully populated).
 	rm -f /tmp/surflare_hc.* 2>/dev/null
-	killall surflare-proxy 2>/dev/null || true
-	killall sexpect 2>/dev/null || true
-	killall -9 surflare 2>/dev/null || true
-	killall surflare_route_updater.sh 2>/dev/null || true
-	if [ -f "$RESTART_MARKER" ]; then
-		rm -f "$RESTART_MARKER"
-		nft delete table inet surflare_moat 2>/dev/null || true
-		_tombstone_tproxy
-		nft flush set inet killswitch server_ips 2>/dev/null || true
-		nft flush set inet killswitch server_ips6 2>/dev/null || true
-		nft delete table inet surflare 2>/dev/null || true
-		rm -f /run/surflare_watchdog.killswitch_ready
-		log "Restart: modular teardown (killswitch preserved)"
-	else
-		_full_teardown
-		log "Stop: full teardown"
-	fi
+		# Tear down nftables FIRST so forward-chain logging (ks-fwd-mon)
+		# stops immediately.  Process kills come after -- they are
+		# idempotent and do not need nftables protection at this point.
+		if [ -f "$RESTART_MARKER" ]; then
+			rm -f "$RESTART_MARKER"
+			nft delete table inet surflare_moat 2>/dev/null || true
+			_tombstone_tproxy
+			nft flush set inet killswitch server_ips 2>/dev/null || true
+			nft flush set inet killswitch server_ips6 2>/dev/null || true
+			nft delete table inet surflare 2>/dev/null || true
+			rm -f /run/surflare_watchdog.killswitch_ready
+			log "Restart: modular teardown (killswitch preserved)"
+		else
+			_full_teardown
+			log "Stop: full teardown"
+		fi
+		killall surflare-proxy 2>/dev/null || true
+		killall sexpect 2>/dev/null || true
+		killall -9 surflare 2>/dev/null || true
+		killall surflare_route_updater.sh 2>/dev/null || true
 	if [ -n "${_auth_bg_pid:-}" ] && kill -0 "$_auth_bg_pid" 2>/dev/null; then
 		kill "$_auth_bg_pid" 2>/dev/null
 		# wait with timeout: poll with kill -0 for up to 5s, then
