@@ -2980,6 +2980,13 @@ connect_vpn() {
 			_install_killswitch
 			log "connect_vpn: killswitch re-installed after connect"
 		fi
+		# Load CN output bypass immediately after Phase 1 table creation.
+		# surflare connect has already created inet surflare with the output
+		# chain catchall (mark->reroute->tproxy).  Without cn_output, CN
+		# outbound traffic hits the catchall during the Phase 2 data-plane
+		# settle window (~60s), causing sing-box loopback rejects.
+		# Loading here shrinks the gap from ~2min to <1s.
+		_exempt_cn_output
 		# The proxy's inet surflare table now handles output routing; killswitch
 		# O1 (v3.2): poll-based readiness with data-plane verification.
 		# Phase 1: wait for local state (process/nftables/routing).
@@ -3607,7 +3614,6 @@ while true; do
 		connect_vpn
 		rc=$?
 		_block_unreachable_doh
-		_exempt_cn_output
 		if [ "$rc" -eq 2 ]; then
 			log "Post-crash reconnect skipped (flock held), will retry next cycle"
 		elif [ "$rc" -eq 0 ]; then
@@ -3630,7 +3636,6 @@ while true; do
 				_update_killswitch_server_ips
 				_restore_tproxy
 				_block_unreachable_doh
-				_exempt_cn_output
 				_update_bypass_devices
 				_patch_surflare_icmp_lan
 				_record_connect "${_active_node}" "${new_health}"
@@ -3825,7 +3830,6 @@ while true; do
 		connect_vpn
 		rc=$?
 		_block_unreachable_doh
-		_exempt_cn_output
 		# Collect auth-fail signal from connect_vpn subshell (its variables are lost)
 		if [ -f /run/surflare_auth_fail_signal ]; then
 			_signal_type=$(cat /run/surflare_auth_fail_signal 2>/dev/null)
@@ -3870,7 +3874,6 @@ while true; do
 				# Restore LAN tproxy now that the new proxy is ready on :10800.
 				_restore_tproxy
 				_block_unreachable_doh
-				_exempt_cn_output
 				_load_tproxy_cn_direct
 				_update_bypass_devices
 				_patch_surflare_icmp_lan
