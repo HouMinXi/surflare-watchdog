@@ -2020,7 +2020,7 @@ check_vpn_health() {
 		echo "$_raw" | tail -1 >"$tmp_proxyt"
 		local code
 		code=$(echo "$_raw" | head -1)
-		case "$code" in 204|200) echo "OK" ;; esac
+		case "$code" in 204|200) echo "OK" ;; *) echo "FAIL" ;; esac
 	) >"$tmp_proxy" 2>/dev/null &
 	pid_proxy=$!
 
@@ -2035,7 +2035,7 @@ check_vpn_health() {
 	# direct while existing long-lived connections (chat sessions, etc.) keep
 	# working.  A single non-CN probe overrides CN because it proves the
 	# tunnel is still forwarding traffic.
-	local all_pids="$pid_g $pid_cf $pid_cf2 $pid_ifc $pid_ich $pid_myip $pid_proxy"
+	local all_pids="$pid_g $pid_cf $pid_cf2 $pid_ifc $pid_ich $pid_myip"
 	local deadline=$((SECONDS + 13))  # 13s absolute deadline (max-time + 1s margin)
 	local result=""
 	local _cn_candidate=""  # holds "CN" if a probe returned CN
@@ -2127,6 +2127,9 @@ check_vpn_health() {
 	done
 	# shellcheck disable=SC2086
 	wait $all_pids 2>/dev/null || true
+	# Wait for Probe 7 independently -- excluded from early-exit kill so
+	# G1 blindspot detection always has data.
+	wait "$pid_proxy" 2>/dev/null || true
 
 	# Final check after wait: a probe may have written between the last poll and exit
 	if [ -z "$result" ]; then
