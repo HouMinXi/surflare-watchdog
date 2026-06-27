@@ -221,8 +221,24 @@ _start_proxy_log_monitor() {
 	[ -f "$PROXY_LOG" ] || return 0
 	# Background: tail new lines, forward ERRORs to logger.
 	# Rate-limited: after forwarding one ERROR, sleep before the next.
-	(   tail -n 0 -F "$PROXY_LOG" 2>/dev/null | while IFS= read -r _line; do
+	# urltest 503 lines bypass rate-limit and accumulate a counter;
+	# at threshold 5, send USR1 to wake the main loop for an immediate
+	# health check.  $$ in a subshell = parent script PID (bash).
+	# ponytail: counter resets only on USR1 fire or monitor restart
+	# (reconnect kills+restarts monitor). No time-window decay; add
+	# if false positives from slow 503 accumulation become a problem.
+	(   _503_count=0
+	    tail -n 0 -F "$PROXY_LOG" 2>/dev/null | while IFS= read -r _line; do
 			echo "$_line" | grep -q 'ERROR' || continue
+			if echo "$_line" | grep -q 'urltest.*503'; then
+				_503_count=$((_503_count + 1))
+				if [ "$_503_count" -ge 5 ]; then
+					logger -t surflare-proxy "503 storm: ${_503_count} urltest 503, requesting health check"
+					kill -USR1 $$ 2>/dev/null || true
+					_503_count=0
+				fi
+				continue
+			fi
 			logger -t surflare-proxy "$_line"
 			sleep "$PROXY_LOG_RATE_SEC"
 		done
