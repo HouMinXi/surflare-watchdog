@@ -48,6 +48,8 @@ NETWORK_WAIT_TIMEOUT=30               # nm-online timeout in seconds
 PROCESS_EXIT_TIMEOUT=20               # seconds to wait for SIGTERM before escalating to SIGKILL
 STORM_MAX=5                           # consecutive unconfirmed reconnects before cooling
 STORM_COOLING=600                     # seconds to cool down after storm protection triggers
+RECONNECT_RATE_WINDOW=600             # sliding window for rate limiter (seconds)
+RECONNECT_RATE_MAX=3                  # max reconnects in window before cooldown
 TOKEN_REFRESH_INTERVAL=1800           # seconds between proactive auth token refreshes (30 min)
 LOGIN_RETRIES=5                       # max login attempts per refresh cycle
 LOGIN_RETRY_DELAY=3                   # seconds between login retries
@@ -60,6 +62,8 @@ BYPASS_LAN_MACS_FILE="/etc/surflare/bypass-macs.conf"
 MIN_RELAY_CONNS=2                     # minimum connections to classify an IP as relay (vs DNS/proxied noise)
 _diag_server_ips=""                   # space-separated VPN relay IPs (filtered by MIN_RELAY_CONNS)
 _diag_connect_time=0                  # epoch seconds of last successful connect
+_reconnect_window_start=0             # epoch when current rate window opened
+_reconnect_window_count=0             # reconnects in current window
 _sess_node=""                         # exit node of current VPN session
 _sess_transit=""                      # transit node of current session
 _sess_exit=""                         # exit country code of current session
@@ -2870,7 +2874,13 @@ connect_vpn() {
 			_use_poll=1
 		fi
 
-		log "Disconnecting cleanly, flushing nftables tproxy rules and policy routing..."
+		# Tombstone FIRST -- before any proxy teardown.  The window between
+		# proxy death and tombstone causes ECONNREFUSED for LAN CN traffic
+		# (tproxy rules still active, :10800 dead).  Tombstoning before
+		# disconnect covers the entire teardown window.
+		_tombstone_tproxy
+
+		log "Tombstoning tproxy, disconnecting, flushing nftables..."
 		if ! surflare disconnect 2>/dev/null; then
 			log "disconnect returned non-zero (may not have been connected), continuing cleanup..."
 		fi
@@ -2900,12 +2910,6 @@ connect_vpn() {
 		done
 		[ "$rule_count" -gt 0 ] && log "Removed ${rule_count} residual ip rule(s) fwmark 0x1 lookup 100"
 		ip route flush table 100 2>/dev/null || true
-
-		# Tombstone LAN tproxy: replace the tproxy redirect with reject so
-		# LAN TCP gets ICMP host-unreachable instead of black-holing into a
-		# dead proxy.  Keeps bypass_devices/auto_bypass sets and DTLS
-		# detection intact so bypass devices are not disrupted by reconnect.
-		_tombstone_tproxy
 
 		# O3 (v3.2): token refresh gated by file timestamp. Runs in
 		# direct-routing window (nft flushed, API reachable via ISP).
@@ -3843,84 +3847,105 @@ while true; do
 	# -- Shared reconnect path -----------------------------------------------
 	# Triggered by: LOCAL_FAIL (immediate), CN failure, or transient escalation
 	if [ "$fail_count" -ge "$FAIL_THRESHOLD" ]; then
-		_rotate_node
-		log "Consecutive failures: ${fail_count}, starting reconnect..."
-		rm -f /run/surflare_auth_fail_signal 2>/dev/null || true
-		connect_vpn
-		rc=$?
-		_block_unreachable_doh
-		# Collect auth-fail signal from connect_vpn subshell (its variables are lost)
-		if [ -f /run/surflare_auth_fail_signal ]; then
-			_signal_type=$(cat /run/surflare_auth_fail_signal 2>/dev/null)
-			rm -f /run/surflare_auth_fail_signal
-			if [ "$_signal_type" = "fatal" ]; then
-				auth_fail_count=$AUTH_FAIL_THRESHOLD
-				log "FATAL auth failure from connect_vpn subshell, forcing reconnect"
-			else
-				auth_fail_count=$((auth_fail_count + 1))
-				log "Auth failure from connect_vpn subshell (${auth_fail_count}/${AUTH_FAIL_THRESHOLD})"
-			fi
+		# Sliding window rate limiter: count all reconnects (success or
+		# failure) in a 10-min window.  >3 = cycling, cool down.
+		# Complements STORM_MAX (which only counts consecutive failures).
+		_now_rc=$(date +%s)
+		if [ "$_reconnect_window_start" -eq 0 ] || \
+		   [ $((_now_rc - _reconnect_window_start)) -ge "$RECONNECT_RATE_WINDOW" ]; then
+			_reconnect_window_start=$_now_rc
+			_reconnect_window_count=0
 		fi
-		if [ "$rc" -eq 2 ]; then
-			# connect_vpn was skipped (another instance holds flock).
-			# Reset fail_count to FAIL_THRESHOLD-1 so we retry once next cycle
-			# instead of re-triggering every 30s and spamming the log.
-			log "Reconnect skipped (flock held), will retry next cycle"
-			fail_count=$((FAIL_THRESHOLD - 1))
-		elif [ "$rc" -eq 0 ]; then
-			new_health=$(check_vpn_health)
-			log "Post-reconnect health: ${new_health:-failed}"
-			if [ "$new_health" = "OK" ] || \
-			   { ! _health_is_failure "$new_health" && [ -n "$new_health" ]; }; then
-				stop_packet_trace >/dev/null 2>&1
-				fail_count=0
-				reconnect_count=0
-				transient_count=0
-				auth_fail_count=0
-				_cn_consecutive=0
-				_transit_fail_count=0
-				_transit_grace_ts=0
-				_remove_dns_fallback
-				_update_server_endpoint
-				if [ "$_killswitch_armed" -eq 0 ]; then
-					if _install_killswitch; then
-						_killswitch_armed=1
-					else
-						log "WARN: Kill switch failed to install -- IP leak protection inactive"
+		# Count ALL reconnects (successful or failed).  The primary target
+		# is successful-but-short-lived reconnects: CGNAT kills relay 30-60s
+		# after connect, health fails, reconnect again.  STORM_MAX only
+		# counts consecutive failures and misses this pattern.
+		_reconnect_window_count=$((_reconnect_window_count + 1))
+		if [ "$_reconnect_window_count" -gt "$RECONNECT_RATE_MAX" ]; then
+			log "Reconnect rate exceeded (${_reconnect_window_count}/${RECONNECT_RATE_MAX} in ${RECONNECT_RATE_WINDOW}s)"
+			_enter_storm_cooldown "reconnect-rate-limit"
+			_reconnect_window_start=0
+			_reconnect_window_count=0
+		else
+			_rotate_node
+			log "Consecutive failures: ${fail_count}, starting reconnect..."
+			rm -f /run/surflare_auth_fail_signal 2>/dev/null || true
+			connect_vpn
+			rc=$?
+			_block_unreachable_doh
+			# Collect auth-fail signal from connect_vpn subshell (its variables are lost)
+			if [ -f /run/surflare_auth_fail_signal ]; then
+				_signal_type=$(cat /run/surflare_auth_fail_signal 2>/dev/null)
+				rm -f /run/surflare_auth_fail_signal
+				if [ "$_signal_type" = "fatal" ]; then
+					auth_fail_count=$AUTH_FAIL_THRESHOLD
+					log "FATAL auth failure from connect_vpn subshell, forcing reconnect"
+				else
+					auth_fail_count=$((auth_fail_count + 1))
+					log "Auth failure from connect_vpn subshell (${auth_fail_count}/${AUTH_FAIL_THRESHOLD})"
+				fi
+			fi
+			if [ "$rc" -eq 2 ]; then
+				# connect_vpn was skipped (another instance holds flock).
+				# Reset fail_count to FAIL_THRESHOLD-1 so we retry once next cycle
+				# instead of re-triggering every 30s and spamming the log.
+				log "Reconnect skipped (flock held), will retry next cycle"
+				fail_count=$((FAIL_THRESHOLD - 1))
+			elif [ "$rc" -eq 0 ]; then
+				new_health=$(check_vpn_health)
+				log "Post-reconnect health: ${new_health:-failed}"
+				if [ "$new_health" = "OK" ] || \
+				   { ! _health_is_failure "$new_health" && [ -n "$new_health" ]; }; then
+					stop_packet_trace >/dev/null 2>&1
+					fail_count=0
+					reconnect_count=0
+					transient_count=0
+					auth_fail_count=0
+					_cn_consecutive=0
+					_transit_fail_count=0
+					_transit_grace_ts=0
+					_remove_dns_fallback
+					_update_server_endpoint
+					if [ "$_killswitch_armed" -eq 0 ]; then
+						if _install_killswitch; then
+							_killswitch_armed=1
+						else
+							log "WARN: Kill switch failed to install -- IP leak protection inactive"
+						fi
+					fi
+					_update_killswitch_server_ips
+					# Restore LAN tproxy now that the new proxy is ready on :10800.
+					_restore_tproxy
+					_block_unreachable_doh
+					_load_tproxy_cn_direct
+					_update_bypass_devices
+					_patch_surflare_icmp_lan
+					_record_connect "${_active_node}" "${new_health}"
+					_start_proxy_log_monitor
+				else
+					reconnect_count=$((reconnect_count + 1))
+					log "Post-reconnect health check anomalous (reconnect_count=${reconnect_count})"
+					maybe_reprobe_transit
+					if [ "$reconnect_count" -ge "$STORM_MAX" ]; then
+						# _enter_storm_cooldown already resets all counters
+						# (reconnect_count, fail_count, transient_count).
+						_enter_storm_cooldown "reconnect-health-anomalous"
 					fi
 				fi
-				_update_killswitch_server_ips
-				# Restore LAN tproxy now that the new proxy is ready on :10800.
-				_restore_tproxy
-				_block_unreachable_doh
-				_load_tproxy_cn_direct
-				_update_bypass_devices
-				_patch_surflare_icmp_lan
-				_record_connect "${_active_node}" "${new_health}"
-				_start_proxy_log_monitor
 			else
 				reconnect_count=$((reconnect_count + 1))
-				log "Post-reconnect health check anomalous (reconnect_count=${reconnect_count})"
+				if [ "$rc" -gt 128 ]; then
+					log "Reconnect killed by signal $((rc - 128)) (reconnect_count=${reconnect_count})"
+				else
+					log "Reconnect attempt failed (reconnect_count=${reconnect_count})"
+				fi
 				maybe_reprobe_transit
 				if [ "$reconnect_count" -ge "$STORM_MAX" ]; then
-					# _enter_storm_cooldown already resets all counters
-					# (reconnect_count, fail_count, transient_count).
-					_enter_storm_cooldown "reconnect-health-anomalous"
+					_enter_storm_cooldown "connect-failure"
+					transient_count=0
 				fi
 			fi
-		else
-			reconnect_count=$((reconnect_count + 1))
-			if [ "$rc" -gt 128 ]; then
-				log "Reconnect killed by signal $((rc - 128)) (reconnect_count=${reconnect_count})"
-			else
-				log "Reconnect attempt failed (reconnect_count=${reconnect_count})"
-			fi
-			maybe_reprobe_transit
-			if [ "$reconnect_count" -ge "$STORM_MAX" ]; then
-				_enter_storm_cooldown "connect-failure"
-				transient_count=0
-			fi
-		fi
+		fi		# closes rate-check else
 	fi
 
 	# Sync auto_bypass IPs to dns_enforce (devices may appear/expire between reconnects)
