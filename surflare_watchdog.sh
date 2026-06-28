@@ -681,9 +681,11 @@ _ks_batch=$(mktemp /tmp/ks_bypass_all.XXXXXX)
 # Called after _restore_tproxy (which empties all sets via destroy+reload)
 # and at the end of _setup_chnroute (initial connect).
 _load_tproxy_cn_direct() {
-	# Called with "force" arg during tombstone to protect CN traffic
-	# regardless of mode. Normal (no arg) call only runs in global mode.
-	[ "${1:-}" = "force" ] || [ "$MODE" = "global" ] || return 0
+	# Belt-and-suspenders CN bypass at nftables layer.  In rule mode
+	# sing-box also does CN split, but its geoip misses cloud CDN APAC
+	# ranges (149.104.x etc.) that cn_ipv4_extra.txt covers.  Loading
+	# cn_direct is strictly additive: hits go direct, misses still
+	# reach sing-box for app-layer split.
 	nft list table inet sw_lan_tproxy >/dev/null 2>&1 || return 0
 
 	local cn_v4_file="/etc/surflare/cn_ipv4.txt"
@@ -745,6 +747,23 @@ _load_tproxy_cn_direct() {
 		fi
 	fi
 	rm -f "$_batch"
+}
+
+# Sync cn_domain_ips from tproxy to killswitch (SmartDNS#1944 workaround).
+# SmartDNS nftset only writes to one table; killswitch needs the same IPs
+# to accept bypassed traffic in the forward chain.  Full replace (flush+add)
+# so expired tproxy entries don't persist in killswitch.
+_sync_cn_domain_ips_to_killswitch() {
+	[ "$PLATFORM" = "router" ] || return 0
+	nft list set inet sw_lan_tproxy cn_domain_ips >/dev/null 2>&1 || return 0
+	nft list set inet killswitch cn_domain_ips >/dev/null 2>&1 || return 0
+	local _sync_ips
+	_sync_ips=$(nft list set inet sw_lan_tproxy cn_domain_ips 2>/dev/null \
+		| grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | tr '\n' ',' | sed 's/,$//')
+	if [ -n "$_sync_ips" ]; then
+		nft flush set inet killswitch cn_domain_ips 2>/dev/null
+		nft add element inet killswitch cn_domain_ips "{ $_sync_ips }" 2>/dev/null
+	fi
 }
 
 # _cleanup_on_startup: called once at the top of the main loop.
@@ -1403,6 +1422,9 @@ _restore_tproxy() {
 		nft add element inet sw_lan_tproxy auto_bypass \
 			"{ $_saved_auto }" 2>/dev/null || true
 	fi
+	# Reload CN CIDRs: destroy+reload above empties cn_direct/cn6_direct.
+	# Without this, all LAN traffic goes through VPN proxy (no CN bypass).
+	_load_tproxy_cn_direct
 }
 
 # Enter storm-protection cooldown. Called from the three storm trigger
@@ -3671,6 +3693,7 @@ while true; do
 				_block_unreachable_doh
 				_update_bypass_devices
 				_patch_surflare_icmp_lan
+				_sync_cn_domain_ips_to_killswitch
 				_record_connect "${_active_node}" "${new_health}"
 				_start_proxy_log_monitor
 			else
@@ -3806,20 +3829,7 @@ while true; do
 		if [ "${HEARTBEAT_INTERVAL:-0}" -gt 0 ] && [ $((now - last_heartbeat)) -ge "$HEARTBEAT_INTERVAL" ]; then
 			log "VPN healthy: exit=${health}"
 			last_heartbeat=$now
-			# Sync cn_domain_ips from tproxy to killswitch.  SmartDNS nftset
-			# can only write to one table (pymumu/smartdns#1944); we target
-			# tproxy and sync to killswitch here.  Runs every HEARTBEAT_INTERVAL
-			# (600s).  Graceful: missing sets or empty set = no-op.
-			if [ "$PLATFORM" = "router" ] && \
-			   nft list set inet sw_lan_tproxy cn_domain_ips >/dev/null 2>&1 && \
-			   nft list set inet killswitch cn_domain_ips >/dev/null 2>&1; then
-				_sync_ips=$(nft list set inet sw_lan_tproxy cn_domain_ips 2>/dev/null \
-					| grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | tr '\n' ',' | sed 's/,$//')
-				if [ -n "$_sync_ips" ]; then
-					nft flush set inet killswitch cn_domain_ips 2>/dev/null
-					nft add element inet killswitch cn_domain_ips "{ $_sync_ips }" 2>/dev/null
-				fi
-			fi
+			_sync_cn_domain_ips_to_killswitch
 		fi
 
 	elif [ "$health" = "CN" ]; then
@@ -3946,20 +3956,9 @@ while true; do
 							killall -HUP dnsmasq 2>/dev/null &&
 							log "DNS cache flushed after reconnect" || true
 					fi
-					_load_tproxy_cn_direct
 					_update_bypass_devices
 					_patch_surflare_icmp_lan
-					# Immediate sync: copy cn_domain_ips from tproxy to killswitch.
-					# _restore_tproxy above wiped the tproxy set; SmartDNS will
-					# refill it as queries arrive, but killswitch needs the same
-					# IPs to accept bypassed traffic.  SmartDNS#1944: nftset can
-					# only target one table, so we sync manually.
-					if [ "$PLATFORM" = "router" ]; then
-						_sync_ips=$(nft list set inet sw_lan_tproxy cn_domain_ips 2>/dev/null \
-							| grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | tr '\n' ',' | sed 's/,$//')
-						[ -n "$_sync_ips" ] && \
-							nft add element inet killswitch cn_domain_ips "{ $_sync_ips }" 2>/dev/null || true
-					fi
+					_sync_cn_domain_ips_to_killswitch
 					_record_connect "${_active_node}" "${new_health}"
 					_start_proxy_log_monitor
 				else
