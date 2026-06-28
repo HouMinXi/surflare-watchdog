@@ -50,6 +50,7 @@ STORM_MAX=5                           # consecutive unconfirmed reconnects befor
 STORM_COOLING=600                     # seconds to cool down after storm protection triggers
 RECONNECT_RATE_WINDOW=600             # sliding window for rate limiter (seconds)
 RECONNECT_RATE_MAX=3                  # max reconnects in window before cooldown
+POST_RECONNECT_DNS_FLUSH=0           # 1=restart SmartDNS after reconnect to clear poisoned cache
 TOKEN_REFRESH_INTERVAL=1800           # seconds between proactive auth token refreshes (30 min)
 LOGIN_RETRIES=5                       # max login attempts per refresh cycle
 LOGIN_RETRY_DELAY=3                   # seconds between login retries
@@ -998,6 +999,13 @@ table inet killswitch {
 	# Their non-CN traffic is forwarded directly; no log noise needed.
 	set bypass_src  { type ipv4_addr; }
 	set bypass_src6 { type ipv6_addr; }
+	# CN domain nftset: SmartDNS adds resolved IPs when a CN domain
+	# resolves to a non-CN CDN IP (Cloudflare/Akamai/etc).  Allows
+	# LAN devices to reach CN content on foreign CDN directly without
+	# routing through the VPN proxy.  Entries expire after 1h;
+	# SmartDNS re-adds on next DNS query.
+	set cn_domain_ips  { type ipv4_addr; flags interval, timeout; timeout 1h; }
+	set cn6_domain_ips { type ipv6_addr; flags interval, timeout; timeout 1h; }
 	set lan_ranges {
 		type ipv4_addr
 		flags interval
@@ -1065,6 +1073,8 @@ table inet killswitch {
 		iifname "br-lan" ip6 daddr @server_ips6 accept
 		iifname "br-lan" ip daddr @bypass_ipv4 accept
 		iifname "br-lan" ip6 daddr @bypass_ipv6 accept
+		iifname "br-lan" ip daddr @cn_domain_ips accept
+		iifname "br-lan" ip6 daddr @cn6_domain_ips accept
 		iifname "br-lan" ip saddr @bypass_src accept
 		iifname "br-lan" ip6 saddr @bypass_src6 accept
 		# Private destinations from LAN (carrier IPs, app-internal VPNs)
@@ -3917,6 +3927,11 @@ while true; do
 					# Restore LAN tproxy now that the new proxy is ready on :10800.
 					_restore_tproxy
 					_block_unreachable_doh
+					if [ "$POST_RECONNECT_DNS_FLUSH" -eq 1 ] && [ "$PLATFORM" = "router" ]; then
+						/etc/init.d/smartdns restart >/dev/null 2>&1 &&
+							killall -HUP dnsmasq 2>/dev/null &&
+							log "DNS cache flushed after reconnect" || true
+					fi
 					_load_tproxy_cn_direct
 					_update_bypass_devices
 					_patch_surflare_icmp_lan

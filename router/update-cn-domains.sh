@@ -37,6 +37,13 @@ mkdir -p "$(dirname "$DEST")"
 mv "$TMP" "$DEST"
 rm -f /tmp/raw.conf
 
+# Generate flat domain list for SmartDNS domain-set (nftset bypass).
+# cn_domain_flat.txt is referenced by custom.conf domain-rules directive
+# to add resolved IPs to nftables cn_domain_ips set.
+FLAT_DEST="/etc/smartdns/domain-set/cn_domain_flat.txt"
+sed 's|nameserver /||;s|/domestic||' "$DEST" > "${FLAT_DEST}.tmp"
+mv "${FLAT_DEST}.tmp" "$FLAT_DEST"
+
 # Reload SmartDNS gracefully
 
 
