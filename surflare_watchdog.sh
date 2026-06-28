@@ -55,6 +55,10 @@ TOKEN_REFRESH_INTERVAL=1800           # seconds between proactive auth token ref
 LOGIN_RETRIES=5                       # max login attempts per refresh cycle
 LOGIN_RETRY_DELAY=3                   # seconds between login retries
 HEARTBEAT_INTERVAL=600                # seconds between periodic "VPN healthy" log entries (0=off)
+STORM_503_STATE="/run/surflare_503_state"  # 503 monitor -> health check evidence channel
+STORM_503_OVERRIDE_COUNT=10           # cumulative 503s to override Probe 7
+STORM_503_OVERRIDE_WINDOW=300         # seconds; fast-storm: first_epoch freshness
+STORM_503_ACTIVE_WINDOW=60            # seconds; active-storm: last_epoch recency
 TRANSIENT_THRESHOLD=6                 # consecutive external timeouts (local state OK) before escalating to fail_count
 AUTH_FAIL_THRESHOLD=3                 # consecutive auth refresh failures before forcing reconnect
 BYPASS_LAN_DEVICES=""                 # space-separated LAN IPs that skip tproxy (e.g. "192.168.100.147 192.168.100.148")
@@ -226,21 +230,26 @@ _start_proxy_log_monitor() {
 	[ -f "$PROXY_LOG" ] || return 0
 	# Background: tail new lines, forward ERRORs to logger.
 	# Rate-limited: after forwarding one ERROR, sleep before the next.
-	# urltest 503 lines bypass rate-limit and accumulate a counter;
-	# at threshold 5, send USR1 to wake the main loop for an immediate
-	# health check.  $$ in a subshell = parent script PID (bash).
-	# ponytail: counter resets only on USR1 fire or monitor restart
-	# (reconnect kills+restarts monitor). No time-window decay; add
-	# if false positives from slow 503 accumulation become a problem.
+	# urltest 503: accumulate count + timestamps into STORM_503_STATE
+	# (ADR-0001 evidence channel).  USR1 fires at every 5th 503 to
+	# wake the main loop.  Count does NOT reset -- accumulates until
+	# monitor restart (reconnect) clears the state file.
+	# $$ in a subshell = parent script PID (bash).
 	(   _503_count=0
+	    _503_first=0
 	    tail -n 0 -F "$PROXY_LOG" 2>/dev/null | while IFS= read -r _line; do
 			echo "$_line" | grep -q 'ERROR' || continue
 			if echo "$_line" | grep -q 'urltest.*503'; then
 				_503_count=$((_503_count + 1))
-				if [ "$_503_count" -ge 5 ]; then
-					logger -t surflare-proxy "503 storm: ${_503_count} urltest 503, requesting health check"
+				_now=$(date +%s)
+				[ "$_503_first" -eq 0 ] && _503_first=$_now
+				echo "$_503_count $_503_first $_now" \
+					> "${STORM_503_STATE}.tmp" && \
+					mv "${STORM_503_STATE}.tmp" "$STORM_503_STATE" 2>/dev/null
+				if [ $((_503_count % 5)) -eq 0 ]; then
+					logger -t surflare-proxy \
+						"503 storm: ${_503_count} urltest 503 since ${_503_first}, requesting health check"
 					kill -USR1 $$ 2>/dev/null || true
-					_503_count=0
 				fi
 				continue
 			fi
@@ -258,6 +267,7 @@ _stop_proxy_log_monitor() {
 		_proxy_log_pid=""
 	fi
 	pkill -f "tail -n 0 -F ${PROXY_LOG//./\\.}" 2>/dev/null || true
+	rm -f "$STORM_503_STATE" "${STORM_503_STATE}.tmp"
 }
 
 PROXY_CPU_SET=""
@@ -2282,6 +2292,26 @@ check_vpn_health() {
 		fi
 	fi
 
+	# G2: 503 storm override -- Probe 7 passed but 503 monitor has
+	# accumulated evidence of sustained exit degradation (ADR-0001).
+	# Two trigger modes (OR):
+	#   fast storm:   count >= 10 AND (now - first) <= 300s
+	#   active storm: count >= 10 AND (now - last)  <= 60s
+	if [ "$result" = "OK" ] || [ "$result" = "TUNNEL_OK" ]; then
+		if [ -f "$STORM_503_STATE" ]; then
+			local _s503_count _s503_first _s503_last _s503_now
+			read _s503_count _s503_first _s503_last < "$STORM_503_STATE" 2>/dev/null
+			_s503_now=$(date +%s)
+			if [ "${_s503_count:-0}" -ge "$STORM_503_OVERRIDE_COUNT" ]; then
+				if [ $((_s503_now - ${_s503_first:-0})) -le "$STORM_503_OVERRIDE_WINDOW" ] || \
+				   [ $((_s503_now - ${_s503_last:-0})) -le "$STORM_503_ACTIVE_WINDOW" ]; then
+					result="PROXY_BROKEN"
+					log "G2: 503 storm override (${_s503_count} in $((_s503_now - _s503_first))s, last $((_s503_now - _s503_last))s ago) -> PROXY_BROKEN"
+				fi
+			fi
+		fi
+	fi
+
 	echo "$result"
 }
 
@@ -3399,6 +3429,7 @@ _full_teardown() {
 	ip -6 rule del fwmark 0x1 lookup 100 2>/dev/null
 	rm -f /run/surflare_watchdog.killswitch_ready
 	rm -f /run/surflare_watchdog.storm_cool_until
+	rm -f "$STORM_503_STATE" "${STORM_503_STATE}.tmp"
 }
 
 trap 'log "watchdog stopped"; cleanup; exit 0' INT TERM
