@@ -3806,6 +3806,20 @@ while true; do
 		if [ "${HEARTBEAT_INTERVAL:-0}" -gt 0 ] && [ $((now - last_heartbeat)) -ge "$HEARTBEAT_INTERVAL" ]; then
 			log "VPN healthy: exit=${health}"
 			last_heartbeat=$now
+			# Sync cn_domain_ips from tproxy to killswitch.  SmartDNS nftset
+			# can only write to one table (pymumu/smartdns#1944); we target
+			# tproxy and sync to killswitch here.  Runs every HEARTBEAT_INTERVAL
+			# (600s).  Graceful: missing sets or empty set = no-op.
+			if [ "$PLATFORM" = "router" ] && \
+			   nft list set inet sw_lan_tproxy cn_domain_ips >/dev/null 2>&1 && \
+			   nft list set inet killswitch cn_domain_ips >/dev/null 2>&1; then
+				_sync_ips=$(nft list set inet sw_lan_tproxy cn_domain_ips 2>/dev/null \
+					| grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | tr '\n' ',' | sed 's/,$//')
+				if [ -n "$_sync_ips" ]; then
+					nft flush set inet killswitch cn_domain_ips 2>/dev/null
+					nft add element inet killswitch cn_domain_ips "{ $_sync_ips }" 2>/dev/null
+				fi
+			fi
 		fi
 
 	elif [ "$health" = "CN" ]; then
@@ -3935,6 +3949,17 @@ while true; do
 					_load_tproxy_cn_direct
 					_update_bypass_devices
 					_patch_surflare_icmp_lan
+					# Immediate sync: copy cn_domain_ips from tproxy to killswitch.
+					# _restore_tproxy above wiped the tproxy set; SmartDNS will
+					# refill it as queries arrive, but killswitch needs the same
+					# IPs to accept bypassed traffic.  SmartDNS#1944: nftset can
+					# only target one table, so we sync manually.
+					if [ "$PLATFORM" = "router" ]; then
+						_sync_ips=$(nft list set inet sw_lan_tproxy cn_domain_ips 2>/dev/null \
+							| grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | tr '\n' ',' | sed 's/,$//')
+						[ -n "$_sync_ips" ] && \
+							nft add element inet killswitch cn_domain_ips "{ $_sync_ips }" 2>/dev/null || true
+					fi
 					_record_connect "${_active_node}" "${new_health}"
 					_start_proxy_log_monitor
 				else
