@@ -109,14 +109,15 @@ differs in which nftables tables are created and how traffic is routed.
 
 | Mode | Target | Value | Traffic path |
 |------|--------|-------|-------------|
-| **Router Rule** | N100 router (default) | `rule` | LAN tproxy + cn_direct EMPTY (all foreign via VPN) |
-| **Router Global** | N100 router (alt) | `global` | LAN tproxy + cn_direct POPULATED (CN bypass) |
+| **Router Rule** | N100 router (default) | `rule` | LAN tproxy + cn_direct POPULATED + sing-box CN split |
+| **Router Global** | N100 router (alt) | `global` | LAN tproxy + cn_direct POPULATED (CN bypass at nft layer) |
 | **Laptop Global** | Z66 laptop | `global` | No tproxy, no dns_enforce; local traffic only |
 
-Router Rule is the default for the N100. It forces all LAN foreign traffic
-through the VPN with no CN bypass sets. Router Global populates cn_direct
-sets so CN-destined LAN traffic goes direct. Laptop Global skips LAN-facing
-tables entirely (no tproxy, no dns_enforce) since there is no downstream LAN.
+cn_direct is loaded in ALL modes (belt-and-suspenders with sing-box geoip,
+which misses some cloud CDN APAC ranges). In rule mode, cn_direct hits go
+direct via ISP; misses still reach sing-box for app-layer CN split. Laptop
+Global skips LAN-facing tables entirely (no tproxy, no dns_enforce) since
+there is no downstream LAN.
 
 ---
 
@@ -142,11 +143,12 @@ matrix shows who creates, manages, and tears down each table.
 |                    |                   | + forward (LAN  |                 |                 |
 |                    |                   | protection)     |                 |                 |
 +--------------------+-------------------+-----------------+-----------------+-----------------+
-| inet sw_lan_tproxy | watchdog          | prerouting (LAN | same but        | same as router  |
-|                    |                   | TCP tproxy      | cn_direct       | global          |
-|                    |                   | :10800, QUIC    | POPULATED       |                 |
+| inet sw_lan_tproxy | watchdog          | prerouting (LAN | same            | same as router  |
+|                    |                   | TCP tproxy      |                 | global          |
+|                    |                   | :10800, QUIC    |                 |                 |
 |                    |                   | reject),        |                 |                 |
-|                    |                   | cn_direct EMPTY |                 |                 |
+|                    |                   | cn_direct       |                 |                 |
+|                    |                   | POPULATED       |                 |                 |
 +--------------------+-------------------+-----------------+-----------------+-----------------+
 | ip dns_enforce     | watchdog          | DNS enforcement | same            | NOT CREATED     |
 |                    |                   | (LAN DNS thru   |                 | (laptop)        |
@@ -395,6 +397,10 @@ below. Crash recovery cleans stale files on startup.
 +-----------------------------+--------------+--------------+-------------------+
 | surflare_watchdog.early_ack | USR1 trap    | early_detect | cleanup()         |
 +-----------------------------+--------------+--------------+-------------------+
+| surflare_503_state          | 503 monitor  | health check | _stop_proxy_log   |
+|                             | (atomic mv)  | G2 override  | _monitor,         |
+|                             |              |              | _full_teardown    |
++-----------------------------+--------------+--------------+-------------------+
 ```
 
 All paths are relative to `/run/`. Files are mode 0600 and live on tmpfs
@@ -408,11 +414,16 @@ All paths are relative to `/run/`. Files are mode 0600 and live on tmpfs
 
 | Feature | Detail |
 |---|---|
-| Health check | Two parallel curl probes; any success = healthy |
+| Health check | 7 parallel probes including Probe 7 (tproxy path through sing-box) |
+| G1 blindspot | Probe 7 detects proxy path failure when direct probes succeed |
+| G2 503 override | 503 monitor writes evidence to state file; health check overrides Probe 7 when count >= 10 within time window (ADR-0001) |
 | Log-based skip | `_node_is_log_healthy()` skips nodes with recent urltest errors |
 | Cascade fast-rotate | `reconnect_count >= 2` triggers rapid try of all candidates |
 | Storm protection | `STORM_COOLDOWN=600s` after all candidates exhausted |
+| Reconnect rate limit | Max 3 reconnects in 600s sliding window |
 | Kill switch | nftables drops non-tunnel traffic while VPN is down |
+| CN bypass | cn_direct (2344 CIDRs) + SmartDNS nftset (111K domains) for domestic traffic |
+| BPF keepalive | Dual BPF programs clamp TCP keepalive to 30s (CGNAT NAT mapping preservation) |
 | Fail-open | After 5 global auth failures, removes kill switch; retries with backoff |
 | Early warn | USR1 trap wakes watchdog for immediate health check |
 
@@ -508,13 +519,16 @@ sudo systemctl start surflare-early-detector
 **`surflare_watchdog.sh`**
 
 ```bash
-NODE="Los Angeles"
-NODE_CANDIDATES=("Los Angeles" "Dallas" "Atlanta" "Seoul" "Chicago" "Miami" "New York")
-MODE="global"
-TRANSIT_CANDIDATES=("Los Angeles" "Taipei" "Seoul" "Hong Kong")
+NODE="Dallas"
+NODE_CANDIDATES=("Dallas" "Los Angeles" "Chicago" "New York" "Atlanta" "Miami")
+MODE="rule"             # externalized to /etc/surflare/mode.conf on router
+TRANSIT="auto"          # surflare picks relay automatically
 CHECK_INTERVAL=30       # seconds between health checks
 FAIL_THRESHOLD=4        # consecutive failures before reconnect
 STORM_COOLDOWN=600      # seconds after all candidates exhausted
+STORM_503_OVERRIDE_COUNT=10   # 503s to override Probe 7 (ADR-0001)
+STORM_503_OVERRIDE_WINDOW=300 # fast-storm window (seconds)
+STORM_503_ACTIVE_WINDOW=60    # active-storm window (seconds)
 ```
 
 **`surflare_early_detector.sh`**
@@ -564,6 +578,9 @@ sudo python3 -m json.tool /run/surflare_probe_results.json
 | `LOG_HEALTH: skipping X via Y (N errors)` | Node skipped due to recent urltest errors |
 | `Storm protection triggered` | All candidates exhausted; cooling down |
 | `Local VPN state lost` | Proxy process or routing rules missing |
+| `G2: 503 storm override` | 503 monitor evidence overrode Probe 7; forcing reconnect |
+| `503 storm: N urltest 503` | 503 monitor accumulated N errors; USR1 sent |
+| `Proxy path broken` | Probe 7 or G1/G2 detected proxy failure |
 | `early_detector_stale` | Detector heartbeat overdue |
 
 ---
@@ -590,7 +607,7 @@ devices** through the VPN without any per-device configuration.
 ```
 LAN device (any IP on br-lan)
   --> PREROUTING priority mangle-10
-      --> tproxy ip to 127.0.0.1:10800  (surflare-proxy)
+      --> tproxy ip to :10800  (surflare-proxy, bare port -- NOT 127.0.0.1)
           --> VPN tunnel    (non-CN traffic)
           --> direct WAN    (CN traffic, per chnroute list)
 ```
