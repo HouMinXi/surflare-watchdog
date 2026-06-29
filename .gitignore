@@ -25,6 +25,9 @@ snapshots/
 # Captured sing-box configs (sensitive: node IPs, transit topology, auth endpoints)
 analysis/*.json
 
+# Built binaries from n100/build-singbox.sh (46MB+, rebuild from patch)
+n100/surflare-proxy-patched
+
 .planning/
 .worktrees
 .worktrees/

@@ -1,0 +1,117 @@
+From 219dbcc7bd0676301d725a2958e1bc7b7c7a57af Mon Sep 17 00:00:00 2001
+From: Minxi Hou <houminxi@gmail.com>
+Date: Mon, 29 Jun 2026 17:12:24 +0800
+Subject: [PATCH] outbound/urltest: fix gateway freeze when relay stops
+ forwarding
+
+When a relay server accepts TCP but stops forwarding application data,
+URL test probe goroutines block in Read() indefinitely. batch.Wait()
+then blocks forever, keeping the checking flag true and suppressing all
+future health checks. selectedOutbound is never updated, so new
+connections keep routing to the dead relay. This creates a triple
+self-locking loop that makes the gateway completely unresponsive.
+
+Fix three issues:
+
+1. Set SetReadDeadline on the URL test connection. Context cancellation
+   does not interrupt net.Conn.Read() when the connection was obtained
+   through a custom DialContext. Use a relative timeout to avoid issues
+   with clock time already consumed by the dial phase.
+
+2. Add a hard timeout (2*TCPTimeout) around batch.Wait(). When the
+   timeout fires, proceed with whatever results are available rather
+   than blocking indefinitely.
+
+3. Propagate batch context to individual probes by deriving testCtx
+   from batchCtx instead of g.ctx, so batch cancellation reaches stuck
+   probes.
+
+4. Clean up stale history entries for probes that did not complete
+   within the timeout, preventing performUpdateCheck from selecting
+   a stuck outbound based on outdated results.
+
+Root cause confirmed by SIGQUIT goroutine dump during a live stall
+event on a tproxy gateway (205 goroutines, 168 blocked in CopyConn,
+1 semacquire in batch.Wait for 3 minutes).
+
+Fixes #4255
+Ref: #4144 #1620
+
+Signed-off-by: Minxi Hou <houminxi@gmail.com>
+---
+ common/urltest/urltest.go |  5 +++++
+ protocol/group/urltest.go | 28 +++++++++++++++++++++++++---
+ 2 files changed, 30 insertions(+), 3 deletions(-)
+
+diff --git a/common/urltest/urltest.go b/common/urltest/urltest.go
+index 11169c6..b4eed82 100644
+--- a/common/urltest/urltest.go
++++ b/common/urltest/urltest.go
+@@ -102,6 +102,11 @@ func URLTest(ctx context.Context, link string, detour N.Dialer) (t uint16, err e
+ 		return
+ 	}
+ 	defer instance.Close()
++	// Set hard read deadline: context cancellation does not interrupt
++	// net.Conn.Read() on connections from custom DialContext.
++	// Use relative timeout (not ctx.Deadline) because the context
++	// deadline includes DialContext time already consumed.
++	instance.SetReadDeadline(time.Now().Add(C.TCPTimeout))
+ 	if N.NeedHandshakeForWrite(instance) {
+ 		start = time.Now()
+ 	}
+diff --git a/protocol/group/urltest.go b/protocol/group/urltest.go
+index bc13b63..8eafe35 100644
+--- a/protocol/group/urltest.go
++++ b/protocol/group/urltest.go
+@@ -364,7 +364,7 @@ func (g *URLTestGroup) urlTest(ctx context.Context, force bool) (map[string]uint
+ 		return result, nil
+ 	}
+ 	defer g.checking.Store(false)
+-	b, _ := batch.New(ctx, batch.WithConcurrencyNum[any](10))
++	b, batchCtx := batch.New(ctx, batch.WithConcurrencyNum[any](10))
+ 	checked := make(map[string]bool)
+ 	var resultAccess sync.Mutex
+ 	for _, detour := range g.outbounds {
+@@ -383,7 +383,7 @@ func (g *URLTestGroup) urlTest(ctx context.Context, force bool) (map[string]uint
+ 			continue
+ 		}
+ 		b.Go(realTag, func() (any, error) {
+-			testCtx, cancel := context.WithTimeout(g.ctx, C.TCPTimeout)
++			testCtx, cancel := context.WithTimeout(batchCtx, C.TCPTimeout)
+ 			defer cancel()
+ 			t, err := urltest.URLTest(testCtx, g.link, p)
+ 			if err != nil {
+@@ -402,7 +402,29 @@ func (g *URLTestGroup) urlTest(ctx context.Context, force bool) (map[string]uint
+ 			return nil, nil
+ 		})
+ 	}
+-	b.Wait()
++	waitDone := make(chan struct{})
++	go func() {
++		b.Wait()
++		close(waitDone)
++	}()
++	timer := time.NewTimer(2 * C.TCPTimeout)
++	defer timer.Stop()
++	var timedOut bool
++	select {
++	case <-waitDone:
++	case <-timer.C:
++		timedOut = true
++		g.logger.Debug("urltest batch timed out, proceeding with available results")
++	}
++	if timedOut {
++		resultAccess.Lock()
++		for tag := range checked {
++			if _, ok := result[tag]; !ok {
++				g.history.DeleteURLTestHistory(tag)
++			}
++		}
++		resultAccess.Unlock()
++	}
+ 	g.performUpdateCheck()
+ 	return result, nil
+ }
+-- 
+2.54.0
+
