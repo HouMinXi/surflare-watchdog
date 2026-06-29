@@ -4,9 +4,15 @@
 # Auto-triggered: by watchdog when Proxy path broken detected (future integration)
 set -e
 
+DIAG_KEEP=10
+
 TS=$(date +%Y%m%d_%H%M%S)
 DIR="/tmp/diag_proxy_${TS}"
 mkdir -p "$DIR"
+
+# Rotate old snapshots: keep only the newest $DIAG_KEEP directories
+_old=$(ls -dt /tmp/diag_proxy_* 2>/dev/null | tail -n +$((DIAG_KEEP + 1)))
+[ -n "$_old" ] && rm -rf $_old
 
 echo "=== diagnostics at $(date) ===" | tee "$DIR/00_summary.txt"
 
