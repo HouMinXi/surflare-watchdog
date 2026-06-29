@@ -57,8 +57,7 @@ LOGIN_RETRY_DELAY=3                   # seconds between login retries
 HEARTBEAT_INTERVAL=600                # seconds between periodic "VPN healthy" log entries (0=off)
 STORM_503_STATE="/run/surflare_503_state"  # 503 monitor -> health check evidence channel
 STORM_503_OVERRIDE_COUNT=10           # cumulative 503s to override Probe 7
-STORM_503_OVERRIDE_WINDOW=300         # seconds; fast-storm: first_epoch freshness
-STORM_503_ACTIVE_WINDOW=60            # seconds; active-storm: last_epoch recency
+STORM_503_OVERRIDE_WINDOW=300         # seconds; all 10 503s must be within this window
 TRANSIENT_THRESHOLD=6                 # consecutive external timeouts (local state OK) before escalating to fail_count
 AUTH_FAIL_THRESHOLD=3                 # consecutive auth refresh failures before forcing reconnect
 BYPASS_LAN_DEVICES=""                 # space-separated LAN IPs that skip tproxy (e.g. "192.168.100.147 192.168.100.148")
@@ -1489,6 +1488,13 @@ _enter_storm_cooldown() {
 	else
 		log "Storm cooldown interrupted early, counters not reset"
 	fi
+	# Restore tproxy after cooldown (normal or interrupted).  Without
+	# this, a passing health check leaves tproxy tombstoned forever
+	# because the probes bypass tproxy and can succeed while LAN
+	# devices are blocked by the REJECT rules.  If routing is also
+	# broken, the next health check detects PROXY_BROKEN and triggers
+	# a proper reconnect with full routing rebuild.
+	_restore_tproxy
 }
 
 # Populate the bypass_devices set in sw_lan_tproxy.
@@ -2294,20 +2300,19 @@ check_vpn_health() {
 
 	# G2: 503 storm override -- Probe 7 passed but 503 monitor has
 	# accumulated evidence of sustained exit degradation (ADR-0001).
-	# Two trigger modes (OR):
-	#   fast storm:   count >= 10 AND (now - first) <= 300s
-	#   active storm: count >= 10 AND (now - last)  <= 60s
+	# Only the fast-storm branch triggers PROXY_BROKEN: count >= 10
+	# AND all within 300s.  A slow trickle of 503s spread over >300s
+	# is random network jitter, not a storm -- Probe 7 (tproxy path
+	# to Google) remains authoritative for actual proxy health.
 	if [ "$result" = "OK" ] || [ "$result" = "TUNNEL_OK" ]; then
 		if [ -f "$STORM_503_STATE" ]; then
 			local _s503_count _s503_first _s503_last _s503_now
 			read _s503_count _s503_first _s503_last < "$STORM_503_STATE" 2>/dev/null
 			_s503_now=$(date +%s)
-			if [ "${_s503_count:-0}" -ge "$STORM_503_OVERRIDE_COUNT" ]; then
-				if [ $((_s503_now - ${_s503_first:-0})) -le "$STORM_503_OVERRIDE_WINDOW" ] || \
-				   [ $((_s503_now - ${_s503_last:-0})) -le "$STORM_503_ACTIVE_WINDOW" ]; then
-					result="PROXY_BROKEN"
-					log "G2: 503 storm override (${_s503_count} in $((_s503_now - _s503_first))s, last $((_s503_now - _s503_last))s ago) -> PROXY_BROKEN"
-				fi
+			if [ "${_s503_count:-0}" -ge "$STORM_503_OVERRIDE_COUNT" ] && \
+			   [ $((_s503_now - ${_s503_first:-0})) -le "$STORM_503_OVERRIDE_WINDOW" ]; then
+				result="PROXY_BROKEN"
+				log "G2: 503 storm override (${_s503_count} in $((_s503_now - _s503_first))s, last $((_s503_now - _s503_last))s ago) -> PROXY_BROKEN"
 			fi
 		fi
 	fi
