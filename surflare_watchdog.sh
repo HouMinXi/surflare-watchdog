@@ -3783,6 +3783,11 @@ while true; do
 		# Tunnel is healthy (direct probes succeed) but surflare-proxy:10800
 		# is not forwarding traffic.  LAN devices would have no connectivity.
 		log "Proxy path broken: surflare-proxy:10800 not forwarding, triggering reconnect"
+		# Capture forensic snapshot BEFORE reconnect tears down proxy
+		# state.  Fire-and-forget background; won't delay reconnect.
+		if [ -x /usr/local/sbin/diag-proxy-broken.sh ]; then
+			/usr/local/sbin/diag-proxy-broken.sh &>/dev/null &
+		fi
 		transient_count=0
 		_cn_consecutive=0
 		fail_count=$FAIL_THRESHOLD
