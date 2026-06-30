@@ -13,7 +13,7 @@
 # View logs    : sudo dmesg | grep surflare_watchdog
 
 NODE="Dallas"                          # Exit node (NA); transit/relay is auto
-NODE_CANDIDATES=("Dallas" "Los Angeles" "Chicago" "Atlanta" "Miami" "Toronto" "San Juan")
+NODE_CANDIDATES=("Chicago" "Toronto" "Miami" "Atlanta" "San Juan" "Los Angeles" "Dallas")
 # Connection mode: loaded from /etc/surflare/mode.conf if present,
 # otherwise resolved from PLATFORM (router->rule, laptop->global).
 # Deploying surflare_watchdog.sh no longer resets the mode setting.
@@ -34,6 +34,8 @@ TRANSIT_PROBE_SETTLE=20              # seconds of quiet time for tunnel handshak
 CHECK_INTERVAL=30                     # Exit IP check interval in seconds
 DEGRADED_INTERVAL=15                  # Shortened interval when degraded (transient/fail > 0)
 FAIL_THRESHOLD=4                      # Consecutive failures before reconnect
+FAIL_THRESHOLD_BASE=4                 # Base value for backoff reset
+FAIL_THRESHOLD_MAX=16                 # Upper bound for adaptive backoff
 LOCK_FILE=/run/surflare_watchdog.lock # Mutex lock to prevent concurrent reconnects
 PIDFILE=/run/surflare_watchdog.pid    # PID file for reliable daemon shutdown
 RESTART_MARKER=/run/surflare_watchdog.restart  # set by main loop before reconnect; cleanup checks it
@@ -1485,6 +1487,7 @@ _enter_storm_cooldown() {
 		transient_count=0
 		_cn_consecutive=0
 		_transit_grace_ts=0
+		FAIL_THRESHOLD=$FAIL_THRESHOLD_BASE
 	else
 		log "Storm cooldown interrupted early, counters not reset"
 	fi
@@ -3808,6 +3811,11 @@ while true; do
 		transient_count=0
 		_cn_consecutive=0
 		_transit_grace_ts=0
+		# Reset backoff on healthy exit -- relay recovered
+		if [ "$FAIL_THRESHOLD" -ne "$FAIL_THRESHOLD_BASE" ]; then
+			log "Backoff reset: threshold ${FAIL_THRESHOLD} -> ${FAIL_THRESHOLD_BASE}"
+			FAIL_THRESHOLD=$FAIL_THRESHOLD_BASE
+		fi
 		_remove_dns_fallback
 		_patch_surflare_icmp_lan
 
@@ -3951,6 +3959,14 @@ while true; do
 			_reconnect_window_count=0
 		else
 			_rotate_node
+			# Adaptive backoff: double threshold after each reconnect so
+			# relay-wide degradation does not churn through nodes every 2min.
+			# Capped at FAIL_THRESHOLD_MAX; reset to base on healthy exit.
+			if [ "$FAIL_THRESHOLD" -lt "$FAIL_THRESHOLD_MAX" ]; then
+				FAIL_THRESHOLD=$((FAIL_THRESHOLD * 2))
+				[ "$FAIL_THRESHOLD" -gt "$FAIL_THRESHOLD_MAX" ] && FAIL_THRESHOLD=$FAIL_THRESHOLD_MAX
+				log "Backoff: next reconnect threshold raised to ${FAIL_THRESHOLD}"
+			fi
 			log "Consecutive failures: ${fail_count}, starting reconnect..."
 			rm -f /run/surflare_auth_fail_signal 2>/dev/null || true
 			connect_vpn
