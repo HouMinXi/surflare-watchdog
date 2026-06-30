@@ -12,8 +12,8 @@
 #                     /etc/systemd/system-sleep/surflare-resume.sh
 # View logs    : sudo dmesg | grep surflare_watchdog
 
-NODE="Dallas"                          # Exit node (US only); transit/relay is auto
-NODE_CANDIDATES=("Dallas" "Los Angeles" "Chicago" "New York" "Atlanta" "Miami")
+NODE="Dallas"                          # Exit node (NA); transit/relay is auto
+NODE_CANDIDATES=("Dallas" "Los Angeles" "Chicago" "Atlanta" "Miami" "Toronto" "San Juan")
 # Connection mode: loaded from /etc/surflare/mode.conf if present,
 # otherwise resolved from PLATFORM (router->rule, laptop->global).
 # Deploying surflare_watchdog.sh no longer resets the mode setting.
@@ -2272,11 +2272,19 @@ check_vpn_health() {
 	# Only override when proxy probe actually finished (non-empty output).
 	# An empty tmp_proxy means the probe was killed before completing (early
 	# exit from polling loop) -- not evidence of tunnel failure.
+	# Probe 7 tests a single target (gstatic.com/generate_204). CDN PoP
+	# routing issues (#19) can make this target unreachable from a specific
+	# exit node while the proxy itself works fine. Confirm with
+	# _check_tunnel_egress (3 targets x 2 retries) before committing to
+	# PROXY_BROKEN -- eliminates CDN-specific false positives that caused
+	# cascade reconnects (Chicago 54s -> Atlanta 58s pattern, 2026-06-30).
 	if [ -n "$result" ] && [ "$result" != "TCP_BLOCK" ] && [ "$result" != "LOCAL_FAIL" ]; then
 		local r_proxy
 		r_proxy=$(cat "$tmp_proxy" 2>/dev/null)
 		if [ -n "$r_proxy" ] && [ "$r_proxy" != "OK" ]; then
-			result="PROXY_BROKEN"
+			if ! _check_tunnel_egress; then
+				result="PROXY_BROKEN"
+			fi
 		fi
 	fi
 
