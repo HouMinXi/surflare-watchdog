@@ -8,36 +8,57 @@ internal urltest results for real-time node health — zero VPN disruption requi
 
 ## System Architecture
 
-```
-+-----------------------------+     SIGUSR1      +----------------------------+
-|   surflare_early_detector   |----------------->|                            |
-|   (TCP degradation sensor)  |  heartbeat file  |   surflare_watchdog.sh     |
-|  - ss cwnd/rto/backoff      |<- - - - - - - - -|   (main daemon)            |
-|  - fires USR1 when score    |                  |                            |
-|    threshold exceeded       |                  |  - health check loop       |
-+-----------------------------+                  |  - node rotation           |
-                                                 |  - storm protection        |
-+-----------------------------+  health JSON     |  - kill switch mgmt        |
-|   surflare_log_health.sh    |----------------->|                            |
-|   (3-min cron, zero disruption)  /run/...json  |  _node_is_log_healthy()    |
-|                              |                 |   skips dead nodes on      |
-|  - parses surflare-proxy.log|                 |   rotation                 |
-|  - extracts urltest errors  |                 |                            |
-|  - errors => unhealthy      |                 +----------------------------+
-+-----------------------------+                           |
-             ^                                            | surflare connect
-             |                                           v
-+-----------------------------+                 +----------------------------+
-|   surflare-proxy (sing-box) |                 |   surflare-proxy (sing-box)|
-|   internal urltest          |                 |   nft tproxy + kill switch |
-|                             |                 +----------------------------+
-|  - tests ALL node/transit   |
-|    combos from CN IP        |
-|  - every ~3 min, concurrent |
-|  - errors logged to         |
-|    /var/log/surflare/       |
-|    surflare-proxy.log       |
-+-----------------------------+
+```mermaid
+graph TB
+    subgraph Internet["External Network"]
+        DEST["Destination"]
+        EXIT["Exit Node<br/>(NA: Atlanta, Chicago,<br/>Miami, Toronto, ...)"]
+        RELAY["Relay Server<br/>(Transit Region)"]
+        ISP_GW["ISP Gateway (CGNAT)"]
+    end
+
+    subgraph N100["N100 iStoreOS Router"]
+        subgraph Kernel["Linux Kernel"]
+            NFT_TPROXY["inet sw_lan_tproxy<br/>(prerouting: tproxy TCP to :10800)<br/>(QUIC UDP/443: REJECT)"]
+            NFT_SURFLARE["inet surflare<br/>(output: mark 0x1/0xff routing)"]
+            NFT_KS["inet killswitch<br/>(output+forward: policy DROP)<br/>(0x1, 0xff, bypass_ipv4 accept)"]
+            NFT_MOAT["inet surflare_moat<br/>(upstream filter detection)"]
+            NFT_DNS["ip dns_enforce<br/>(LAN must use local DNS)"]
+            BPF["BPF cgroup2<br/>(TCP keepalive clamp 30s)"]
+            PPPOE["pppoe-wan"]
+        end
+
+        subgraph Userspace["User Space"]
+            WD["surflare_watchdog.sh<br/>(health check, reconnect,<br/>node rotation, storm protection)"]
+            PROXY["surflare-proxy<br/>(sing-box, :10800)<br/>(urltest: best relay selection)"]
+            CLI["surflare CLI<br/>(auth, connect --daemon)"]
+            DNSMASQ["dnsmasq :53"]
+            SMARTDNS["SmartDNS :6053<br/>(domestic DoT / foreign via VPN)"]
+        end
+
+        BRLAN["br-lan (gateway)"]
+    end
+
+    subgraph LAN["LAN Devices"]
+        PHONE["Phones"]
+        MAC["Laptops"]
+        WIN["Desktops"]
+    end
+
+    PHONE & MAC & WIN -->|TCP/UDP| BRLAN
+    BRLAN -->|TCP| NFT_TPROXY
+    NFT_TPROXY -->|"tproxy :10800<br/>mark 0x1"| PROXY
+    PROXY -->|"mark 0x1"| NFT_SURFLARE
+    NFT_SURFLARE --> NFT_KS
+    NFT_KS --> PPPOE
+    PPPOE --> ISP_GW --> RELAY --> EXIT --> DEST
+
+    WD -->|"start/stop/monitor"| PROXY
+    WD -->|"nft add/delete"| NFT_TPROXY & NFT_KS & NFT_MOAT
+    CLI -->|"config stdin pipe"| PROXY
+    CLI -->|"creates"| NFT_SURFLARE
+    BRLAN -->|DNS :53| DNSMASQ --> SMARTDNS
+    BPF -.->|"clamp keepidle"| PROXY
 ```
 
 **Key insight:** surflare-proxy already runs sing-box urltest outbounds for every
@@ -96,6 +117,38 @@ connects to next healthy candidate
 Before:  detect 120s + try each node serially (8s each)
 After:   detect <30s + skip dead nodes immediately
 ```
+
+---
+
+## DNS Architecture
+
+```mermaid
+flowchart TD
+    QUERY["LAN Device DNS query"] --> DNSMASQ["dnsmasq :53 (cache)"]
+
+    DNSMASQ -->|miss| SMARTDNS["SmartDNS :6053"]
+
+    SMARTDNS --> SPLIT{"Domain in<br/>cn_domains.conf?<br/>(111K domains)"}
+
+    SPLIT -->|"Domestic domain"| DOM["Domestic DoT :853"]
+    DOM -->|"DIRECT via ISP"| RESULT_CN["Domestic IP<br/>-> nftset cn_domain_ips<br/>(bypass tproxy, 1h TTL)"]
+
+    SPLIT -->|"Foreign domain"| FOR["Foreign DNS UDP :53"]
+    FOR -->|"output chain<br/>dport 53 -> mark 0x1"| VPN["VPN tunnel (encrypted)"]
+    VPN --> RESULT_FOR["Foreign IP"]
+
+    SMARTDNS -.->|bootstrap| BOOT["Bootstrap DNS<br/>(plain UDP, DIRECT)"]
+
+    subgraph ENFORCE["ip dns_enforce"]
+        BLOCK["LAN dport 53 to<br/>external: REJECT"]
+    end
+```
+
+LAN devices must use the router as their DNS server. `ip dns_enforce` rejects
+any direct DNS queries to external resolvers. SmartDNS splits domestic and
+foreign domains: domestic queries go direct via ISP (DoT), foreign queries
+are encrypted through the VPN tunnel. Resolved domestic IPs are injected into
+nftsets for tproxy bypass.
 
 ---
 
@@ -176,94 +229,91 @@ matrix shows who creates, manages, and tears down each table.
 The main loop runs every `CHECK_INTERVAL` (default 30s). Each iteration
 follows this decision tree:
 
-```
-                          START cycle
-                              |
-                      +-------v--------+
-                      | _diag_mode=1 ? |
-                      +-------+--------+
-                          /       \
-                        yes        no
-                         |          |
-                    sleep +    +----v-----------+
-                    continue   | node_probe     |
-                    (skip      | active?        |
-                     cycle)    +----+-----------+
-                                  /    \
-                                yes     no
-                                 |       |
-                            skip cycle  +----v-------------------+
-                                        | collect background auth|
-                                        | (from previous cycle)  |
-                                        +----+-------------------+
-                                             |
-                                  +----------v-----------+
-                                  | rc from bg auth:     |
-                                  |  0 = success (reset) |
-                                  |  1 = retryable       |
-                                  |  2 = fatal (force    |
-                                  |       reconnect)     |
-                                  +----------+-----------+
-                                             |
-                                  +----------v-----------+
-                                  | iwlwifi crash        |
-                                  | detected?            |
-                                  +----------+-----------+
-                                         /       \
-                                       yes        no
-                                        |          |
-                                   cooldown +  +---v------------------+
-                                   reconnect  | check_vpn_health()   |
-                                              +---+------------------+
-                                                  |
-                               +------------------+------------------+
-                               |                  |                  |
-                          LOCAL_FAIL         OK/TUNNEL_OK       CN/empty
-                               |             /COUNTRY                 |
-                               |                  |              +----v------+
-                          immediate        +-------v--------+   | CN:       |
-                          reconnect        | stale-token    |   | fail_cnt++|
-                                           | check          |   |           |
-                                           +-------+--------+   | empty:    |
-                                                   |            | transient++|
-                                           +-------v--------+   +-----------+
-                                           | launch bg auth |
-                                           | (if due and    |
-                                           |  none running) |
-                                           +-------+--------+
-                                                   |
-                                           +-------v--------+
-                                           | heartbeat log  |
-                                           | "VPN healthy"  |
-                                           +----------------+
+```mermaid
+stateDiagram-v2
+    [*] --> STOPPED
 
-                               +---------------------------+
-                               | fail_cnt >= threshold?    |
-                               +-----------+---------------+
-                                          / \
-                                        yes   no --> next cycle (sleep 30s)
-                                         |
-                                  +------v----------+
-                                  | connect_vpn()   |
-                                  | (subshell+flock)|
-                                  |  - disconnect   |
-                                  |  - nft flush    |
-                                  |  - tombstone    |
-                                  |    tproxy       |
-                                  |  - refresh_auth |
-                                  |  - connect      |
-                                  |    --daemon     |
-                                  +------+----------+
-                                         |
-                                  +------v----------+
-                                  | post-reconnect  |
-                                  | health check    |
-                                  +------+----------+
-                                         |
-                                  +------v----------+
-                                  | success?        |
-                                  | reset counters  |
-                                  +-----------------+
+    STOPPED --> STARTUP: init start
+
+    STARTUP --> MAIN_LOOP: init complete
+    note right of STARTUP
+        _setup_kernel_moat()
+        _cleanup_on_startup()
+        _ensure_dns_enforce()
+        _install_killswitch()
+    end note
+
+    MAIN_LOOP --> CONNECT_VPN: VPN state lost / first run
+
+    CONNECT_VPN --> HEALTH_MONITOR: data-plane ready
+    note right of CONNECT_VPN
+        1. flush residual nftables
+        2. unarm killswitch (API access)
+        3. refresh_auth() if needed
+        4. surflare connect --daemon
+        5. _install_killswitch() fresh
+        6. Phase 1: local state (20s)
+        7. Phase 2: data-plane ping (60s)
+        8. _setup_chnroute() CN bypass
+        9. _restore_tproxy() LAN proxy
+    end note
+
+    HEALTH_MONITOR --> HEALTH_MONITOR: health=OK (every 30s)
+    HEALTH_MONITOR --> RECONNECT: fail_count >= 4
+    note right of HEALTH_MONITOR
+        7 parallel probes (P1-P6 + P7 proxy path)
+        G1: proxy broken override
+        G2: 503 storm override (10 in 300s)
+        Heartbeat log every 600s
+    end note
+
+    RECONNECT --> CONNECT_VPN: rotate node
+    RECONNECT --> STORM_COOLDOWN: 5 reconnects in window
+    note right of RECONNECT
+        _rotate_node() round-robin
+        NODE_CANDIDATES: 7 NA nodes
+    end note
+
+    STORM_COOLDOWN --> CONNECT_VPN: 600s elapsed
+
+    HEALTH_MONITOR --> STOPPED: SIGTERM
+    note right of STOPPED
+        _full_teardown() nftables
+        kill surflare-proxy
+        rm PIDFILE
+    end note
+```
+
+#### Health check detail
+
+```mermaid
+flowchart TD
+    START["check_vpn_health()"] --> LOCAL["Layer 1: check_vpn_local_state()"]
+
+    LOCAL -->|FAIL| RESULT_FAIL["LOCAL_FAIL"]
+    LOCAL -->|OK| PROBES["Layer 2: 7 parallel probes"]
+
+    PROBES --> P16["P1-P6: Google, CF, ifconfig, ...<br/>(first-success-wins)"]
+    PROBES --> P7["P7: Proxy path<br/>(independent, max 10s)"]
+
+    P16 --> G1{"G1: Proxy<br/>broken?"}
+    P7 --> G1
+
+    G1 -->|"proxy FAIL +<br/>direct OK"| PB["PROXY_BROKEN"]
+    G1 -->|"proxy OK"| G2{"G2: 503 storm?"}
+
+    G2 -->|"storm"| PB
+    G2 -->|"no"| EGRESS["exit country?"]
+
+    EGRESS -->|US/CA| OK["OK / TUNNEL_OK"]
+    EGRESS -->|CN| CN["CN"]
+
+    OK --> RESET["fail_count = 0"]
+    RESULT_FAIL & PB & CN --> INCR["fail_count++"]
+
+    INCR -->|">= 4"| RECONNECT["RECONNECT"]
+    INCR -->|"< 4"| WAIT["sleep 30s -> next cycle"]
+    RESET --> WAIT
 ```
 
 ---
@@ -604,12 +654,29 @@ devices** through the VPN without any per-device configuration.
 
 ### How it works
 
-```
-LAN device (any IP on br-lan)
-  --> PREROUTING priority mangle-10
-      --> tproxy ip to :10800  (surflare-proxy, bare port -- NOT 127.0.0.1)
-          --> VPN tunnel    (non-CN traffic)
-          --> direct WAN    (CN traffic, per chnroute list)
+```mermaid
+flowchart LR
+    APP["LAN Device<br/>:443 TCP"] --> CHK1{"private IP?"}
+
+    CHK1 -->|Yes| RET1["skip proxy"]
+    CHK1 -->|No| CHK2{"bypass_devices?"}
+
+    CHK2 -->|Yes| RET2["own VPN"]
+    CHK2 -->|No| CHK3{"cn_direct?"}
+
+    CHK3 -->|Yes| RET3["ISP direct"]
+    CHK3 -->|No| CHK4{"DTLS 0xfefd?"}
+
+    CHK4 -->|Yes| RET4["AnyConnect"]
+    CHK4 -->|No| CHK5{"UDP/443?"}
+
+    CHK5 -->|"QUIC"| REJECT["REJECT ICMP"]
+    CHK5 -->|"TCP"| TPROXY["tproxy :10800<br/>mark 0x1"]
+
+    TPROXY --> SINGBOX["sing-box urltest"]
+    SINGBOX --> RELAY["Relay (Transit)"]
+    RELAY --> EXIT["Exit (US/CA)"]
+    EXIT --> DEST["Destination"]
 ```
 
 All TCP traffic from `br-lan` that is NOT destined for private addresses
