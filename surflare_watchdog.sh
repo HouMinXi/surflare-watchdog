@@ -875,17 +875,33 @@ _cleanup_on_startup() {
 	# 3. Zombie surflare processes: a hard crash during reconnect leaves
 	#    defunct [surflare] processes that procd does not reap.  Their
 	#    parent is sexpect (the PTY tool used by refresh_auth), which
-	#    survives the watchdog crash in sleeping state.  Kill sexpect
-	#    first (reparents zombies to init for reaping), then surflare.
-	killall sexpect 2>/dev/null || true
+	#    survives the watchdog crash in sleeping state.  Kill surflare
+	#    first (parent sexpect reaps dying children normally), then
+	#    sexpect.  Previous order (kill sexpect first -> reparent to
+	#    init) caused zombies to accumulate because BusyBox init does
+	#    not reliably reap orphaned processes.
+	killall surflare 2>/dev/null || true
+	sleep 0.5
 	killall -9 surflare 2>/dev/null || true
-	sleep 1  # allow reaping
-	local _zombie_count
-	_zombie_count=$(find /proc -maxdepth 2 -name comm -path '/proc/[0-9]*/comm' 2>/dev/null | while read -r _f; do
-		[ "$(cat "$_f" 2>/dev/null)" = "surflare" ] && echo x
-	done | wc -l)
+	sleep 0.5
+	killall sexpect 2>/dev/null || true
+	# Wait for zombie reaping; BusyBox init is slow to reap orphans.
+	# The surflare CLI hangs when API endpoints are unreachable
+	# (no internal connect timeout); each hung login leaves one
+	# zombie when the watchdog restarts.  Without this wait loop,
+	# zombies accumulate across restart cycles (12+ observed).
+	local _zombie_count _w
+	_w=0
+	while [ "$_w" -lt 5 ]; do
+		_zombie_count=$(find /proc -maxdepth 2 -name comm -path '/proc/[0-9]*/comm' 2>/dev/null | while read -r _f; do
+			[ "$(cat "$_f" 2>/dev/null)" = "surflare" ] && echo x
+		done | wc -l)
+		[ "$_zombie_count" -eq 0 ] && break
+		sleep 1
+		_w=$((_w + 1))
+	done
 	if [ "$_zombie_count" -gt 0 ]; then
-		log "Crash recovery: ${_zombie_count} surflare zombie(s) survived SIGKILL (kernel will reap)"
+		log "Crash recovery: ${_zombie_count} surflare zombie(s) survived cleanup (kernel will reap)"
 	else
 		log "Crash recovery: zombie surflare processes cleaned"
 	fi
@@ -2464,7 +2480,7 @@ EXPECT_EOF
 			# stderr from surflare login captured to AUTH_STDERR_FILE for error classification.
 			# sexpect stderr (control messages) suppressed; spawned process stderr captured.
 			if timeout 30 sh -c "
-				sexpect -s '$_sock' spawn -t 25 surflare login -u '$email' >/dev/null 2>&1
+				sexpect -s '$_sock' spawn -t 10 timeout 20 surflare login -u '$email' >/dev/null 2>&1
 				sexpect -s '$_sock' expect -t 15 'Password:' >/dev/null 2>&1 || exit 1
 				sexpect -s '$_sock' send -env _SURFLARE_AUTH_PW -enter >/dev/null 2>&1
 				sexpect -s '$_sock' wait >/dev/null 2>&1
