@@ -3812,6 +3812,7 @@ while true; do
 		fi
 
 		# Periodic heartbeat -- confirms watchdog is alive during long healthy stretches
+		now=$(date +%s)
 		if [ "${HEARTBEAT_INTERVAL:-0}" -gt 0 ] && [ $((now - last_heartbeat)) -ge "$HEARTBEAT_INTERVAL" ]; then
 			log "VPN healthy: exit=${health}"
 			last_heartbeat=$now
