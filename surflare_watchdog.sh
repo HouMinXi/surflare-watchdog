@@ -13,7 +13,7 @@
 # View logs    : sudo dmesg | grep surflare_watchdog
 
 NODE="Dallas"                          # Exit node (NA); transit/relay is auto
-NODE_CANDIDATES=("Chicago" "Toronto" "Miami" "Atlanta" "San Juan" "Los Angeles" "Dallas")
+NODE_CANDIDATES=("Chicago" "Miami" "Atlanta" "San Juan" "Los Angeles" "Dallas")
 # Connection mode: loaded from /etc/surflare/mode.conf if present,
 # otherwise resolved from PLATFORM (router->rule, laptop->global).
 # Deploying surflare_watchdog.sh no longer resets the mode setting.
