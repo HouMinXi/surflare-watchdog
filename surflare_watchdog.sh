@@ -44,7 +44,7 @@ DIAG_SACK_THRESHOLD=20                # % of packets with SACK blocks to flag tr
 DISCONNECT_SETTLE=1                   # seconds after surflare disconnect before killing processes
 CONNECT_SETTLE=20                     # seconds after surflare connect --daemon for VPN to establish
 DATAPLANE_SETTLE=60                       # max seconds to wait for data-plane ping after local state ready
-LAST_REFRESH_FILE="/run/surflare_last_refresh"  # cross-subshell token refresh timestamp
+LAST_REFRESH_FILE="/run/surflare_last_refresh"  # timestamp of last watchdog-initiated auth refresh (debug only)
 NETWORK_WAIT_FALLBACK=15              # seconds to wait for network when nm-online is unavailable
 NETWORK_WAIT_TIMEOUT=30               # nm-online timeout in seconds
 PROCESS_EXIT_TIMEOUT=20               # seconds to wait for SIGTERM before escalating to SIGKILL
@@ -53,7 +53,9 @@ STORM_COOLING=600                     # seconds to cool down after storm protect
 RECONNECT_RATE_WINDOW=600             # sliding window for rate limiter (seconds)
 RECONNECT_RATE_MAX=3                  # max reconnects in window before cooldown
 POST_RECONNECT_DNS_FLUSH=0           # 1=restart SmartDNS after reconnect to clear poisoned cache
-TOKEN_REFRESH_INTERVAL=1800           # seconds between proactive auth token refreshes (30 min)
+                                      # Auth is reactive: binary manages JWT renewal (detour_refresh.go).
+                                      # Watchdog calls refresh_auth only when surflare status
+                                      # reports "not logged in" or "session expired".
 LOGIN_RETRIES=5                       # max login attempts per refresh cycle
 LOGIN_RETRY_DELAY=3                   # seconds between login retries
 HEARTBEAT_INTERVAL=600                # seconds between periodic "VPN healthy" log entries (0=off)
@@ -935,7 +937,6 @@ _cleanup_on_startup() {
 	#    the next instance (parent reads old auth result as current).
 	rm -f /run/surflare_auth_fail_signal 2>/dev/null || true
 	rm -f /run/surflare_stale_warn 2>/dev/null || true
-	rm -f /run/surflare_auth_bg_active 2>/dev/null || true
 	rm -f /run/surflare_urltest_all_unhealthy 2>/dev/null || true
 
 	# 6. Stale pcap and log artifacts: packet trace pcaps, diagnostic
@@ -2940,11 +2941,8 @@ _rotate_node() {
 	if ! _node_is_log_healthy "${NODE_CANDIDATES[$_node_idx]}" "$effective_transit"; then
 		log "WARN: all nodes unhealthy, keeping ${prev} (skipped ${_active_node})"
 		_active_node="$prev"
-		# Signal connect_vpn to force auth refresh: when ALL nodes show
-		# urltest errors (503), the auth token may be stale regardless
-		# of TOKEN_REFRESH_INTERVAL.  The signal file bypasses the
-		# interval gate for one refresh cycle, then self-destructs.
-		touch /run/surflare_urltest_all_unhealthy 2>/dev/null || true
+		# All nodes unhealthy: connect_vpn will check surflare status
+		# for auth need before reconnecting.
 	else
 		_active_node="${NODE_CANDIDATES[$_node_idx]}"
 	fi
@@ -2981,7 +2979,7 @@ connect_vpn() {
 		sleep "$DISCONNECT_SETTLE"
 
 		log "Killing remaining processes..."
-		killall surflare surflare-proxy 2>/dev/null
+		killall surflare surflare-proxy sexpect 2>/dev/null
 		wait_for_exit surflare
 		wait_for_exit surflare-proxy
 
@@ -3009,42 +3007,44 @@ connect_vpn() {
 		# direct-routing window (nft flushed, API reachable via ISP).
 		# File-based because this subshell's variable updates are lost on exit.
 		# Only writes timestamp on success; failure must not suppress retry.
-		local _last_ref=0 _force_refresh=0
-		[ -f "$LAST_REFRESH_FILE" ] && _last_ref=$(cat "$LAST_REFRESH_FILE" 2>/dev/null)
-		_last_ref=${_last_ref:-0}  # defense: empty/corrupt file -> 0
-		# O3b: urltest all-node 503 bypasses the interval gate.
-		# When ALL nodes show urltest errors, the auth token is likely
-		# stale (relay rejects at HTTP layer).  Force refresh if the
-		# last refresh was >5 min ago (avoid double-refresh on
-		# sequential reconnect cycles).  Signal file self-destructs.
-		if [ -f /run/surflare_urltest_all_unhealthy ]; then
-			if [ $(($(date +%s) - _last_ref)) -ge 300 ]; then
-				log "connect_vpn: forcing auth refresh (urltest all nodes unhealthy)"
-				_force_refresh=1
-			fi
-			rm -f /run/surflare_urltest_all_unhealthy
+		# Reactive auth: binary manages JWT renewal (detour_refresh.go).
+		# Watchdog only calls refresh_auth when binary reports auth needed.
+		# Three triggers: (1) not logged in, (2) session expired,
+		# (3) subscription expired (log only, do not refresh).
+		# Known limitation: if binary renewal fails silently (no disconnect),
+		# watchdog has no detection mechanism.  Accepted tradeoff: binary
+		# is observed to disconnect on renewal failure ("Session renewal
+		# failed, disconnecting VPN"), so silent failure is unlikely.
+		rm -f /run/surflare_urltest_all_unhealthy 2>/dev/null  # transitional: previous version created this
+		local _auth_status _status_rc=0 _need_auth=0
+		_auth_status=$(timeout 5 surflare status 2>&1) || _status_rc=$?
+		if [ "$_status_rc" -eq 124 ]; then
+			# timeout: binary hung or not running -- auth likely needed
+			log "connect_vpn: surflare status timed out (rc=124)"
+			_need_auth=1
+		elif [ "$_status_rc" -ne 0 ]; then
+			# non-zero exit: binary errored -- treat as auth needed
+			log "connect_vpn: surflare status failed (rc=${_status_rc})"
+			_need_auth=1
 		fi
-		if [ "$_force_refresh" -eq 1 ] || [ $(($(date +%s) - _last_ref)) -ge "$TOKEN_REFRESH_INTERVAL" ]; then
-			# Skip if a background auth is already running (launched by the
-			# healthy branch in a previous cycle).  Its result will be
-			# collected by the main loop's top-of-cycle collector.
-			# Without this guard, two surflare-login processes run
-			# concurrently, wasting auth server quota.
-			if [ -f /run/surflare_auth_bg_active ]; then
-				log "Background auth in progress, skipping connect_vpn auth"
+		# Check subscription first (do NOT refresh, just log)
+		if echo "$_auth_status" | grep -qiE "subscription.*not active|not active.*subscription"; then
+			log "WARN: subscription expired, manual renewal required"
+			log "Visit https://www.surflare.com to renew"
+			echo "subscription" > /run/surflare_auth_fail_signal 2>/dev/null || true
+		elif [ "$_need_auth" -eq 1 ] \
+		   || echo "$_auth_status" | grep -qiE "not logged in|session expired|not authenticated"; then
+			log "connect_vpn: auth needed (status_rc=${_status_rc})"
+			refresh_auth
+			_auth_rc=$?
+			if [ "$_auth_rc" -eq 0 ]; then
+				date +%s > "$LAST_REFRESH_FILE"
+			elif [ "$_auth_rc" -eq 2 ]; then
+				log "refresh_auth FATAL (rate-limit/creds/expired), signaling parent"
+				echo "fatal" > /run/surflare_auth_fail_signal 2>/dev/null || true
 			else
-				refresh_auth
-				_auth_rc=$?
-				if [ "$_auth_rc" -eq 0 ]; then
-					date +%s > "$LAST_REFRESH_FILE"
-					rm -f /run/surflare_stale_warn
-				elif [ "$_auth_rc" -eq 2 ]; then
-					log "refresh_auth FATAL (rate-limit/creds/expired), signaling parent"
-					echo "fatal" > /run/surflare_auth_fail_signal 2>/dev/null || true
-				else
-					log "refresh_auth failed (retryable), will retry next cycle"
-					echo "retryable" > /run/surflare_auth_fail_signal 2>/dev/null || true
-				fi
+				log "refresh_auth failed (retryable), will retry next cycle"
+				echo "retryable" > /run/surflare_auth_fail_signal 2>/dev/null || true
 			fi
 		fi
 
@@ -3435,18 +3435,6 @@ cleanup() {
 	killall sexpect 2>/dev/null || true
 	killall -9 surflare 2>/dev/null || true
 	killall surflare_route_updater.sh 2>/dev/null || true
-	if [ -n "${_auth_bg_pid:-}" ] && kill -0 "$_auth_bg_pid" 2>/dev/null; then
-		kill "$_auth_bg_pid" 2>/dev/null
-		# wait with timeout: poll with kill -0 for up to 5s, then
-		# SIGKILL.  Plain 'wait' blocks indefinitely if the child
-		# ignores SIGTERM (e.g. surflare login stuck on network).
-		local _auth_wait_start=$SECONDS
-		while kill -0 "$_auth_bg_pid" 2>/dev/null && [ $((SECONDS - _auth_wait_start)) -lt 5 ]; do
-			sleep 1
-		done
-		kill -9 "$_auth_bg_pid" 2>/dev/null || true
-		wait "$_auth_bg_pid" 2>/dev/null  # reap zombie (non-blocking: process is dead)
-	fi
 	rm -f "$PIDFILE"
 	rm -f "$WATCHDOG_ACK_FILE" 2>/dev/null || true
 }
@@ -3605,8 +3593,8 @@ reconnect_count=0
 transient_count=0
 auth_fail_count=0
 _cn_consecutive=0                    # consecutive CN exit detections across node rotations
-_auth_bg_pid=""                      # PID of background refresh_auth, if running
-_auth_force_reconnect=0              # 1 if auth failure threshold reached; healthy branch triggers reconnect
+                                     # Auth is reactive: no background refresh, no periodic timer.
+                                     # Binary manages JWT renewal; watchdog refreshes only on detected need.
 last_heartbeat=$(date +%s)
 _active_node="$NODE"
 _node_idx=0
@@ -3683,32 +3671,6 @@ while true; do
 			log "WARN: early_detector_stale age=${_det_age}s -- P0 coverage degraded"
 		fi
 		unset _det_age
-	fi
-	# Collect background auth refresh result from previous cycle (Fix 2)
-	if [ -n "${_auth_bg_pid:-}" ] && ! kill -0 "$_auth_bg_pid" 2>/dev/null; then
-		wait "$_auth_bg_pid" 2>/dev/null
-		_auth_bg_rc=$?
-		_auth_bg_pid=""
-		rm -f /run/surflare_auth_bg_active
-		if [ "$_auth_bg_rc" -eq 0 ]; then
-			date +%s > "$LAST_REFRESH_FILE"
-			auth_fail_count=0
-			rm -f /run/surflare_stale_warn
-			log "Background auth refresh succeeded"
-		elif [ "$_auth_bg_rc" -eq 2 ]; then
-			# Fatal error (rate-limit, invalid creds, subscription expired) --
-			# force reconnect immediately, no point retrying.
-			auth_fail_count=$AUTH_FAIL_THRESHOLD
-			_auth_force_reconnect=1
-			log "Background auth refresh FATAL (rc=2), forcing reconnect"
-		else
-			auth_fail_count=$((auth_fail_count + 1))
-			log "Background auth refresh failed (${auth_fail_count}/${AUTH_FAIL_THRESHOLD})"
-			if [ "$auth_fail_count" -ge "$AUTH_FAIL_THRESHOLD" ]; then
-				log "Auth failure threshold reached (${auth_fail_count}/${AUTH_FAIL_THRESHOLD}), will force reconnect"
-				_auth_force_reconnect=1
-			fi
-		fi
 	fi
 	if recent_wifi_crash 120; then
 		record_crash
@@ -3849,55 +3811,6 @@ while true; do
 			fi
 		fi
 
-		# Fix 3: stale-token detection -- if VPN reports healthy but auth token has not
-		# been refreshed in 2x the normal interval, the auth session is likely dead while
-		# the tunnel survives on the existing connection.  This catches the "TUNNEL_OK +
-		# auth failed" paradox before it silently persists.
-		# Rate-limited to once per TOKEN_REFRESH_INTERVAL to avoid double-counting with
-		# background auth failures (stale check would otherwise fire every 30s cycle).
-		now=$(date +%s)
-		_stale_ref=0
-		[ -f "$LAST_REFRESH_FILE" ] && _stale_ref=$(cat "$LAST_REFRESH_FILE" 2>/dev/null)
-		_stale_ref=${_stale_ref:-0}
-		_last_stale_warn=0
-		[ -f /run/surflare_stale_warn ] && _last_stale_warn=$(cat /run/surflare_stale_warn 2>/dev/null)
-		_last_stale_warn=${_last_stale_warn:-0}
-		if [ "$_stale_ref" -gt 0 ] && \
-		   [ $((now - _stale_ref)) -ge $((TOKEN_REFRESH_INTERVAL * 2)) ] && \
-		   [ $((now - _last_stale_warn)) -ge "$TOKEN_REFRESH_INTERVAL" ]; then
-			auth_fail_count=$((auth_fail_count + 1))
-			date +%s > /run/surflare_stale_warn
-			log "WARN: auth token stale ($(( (now - _stale_ref) / 60 ))min, threshold $(( TOKEN_REFRESH_INTERVAL * 2 / 60 ))min), counting as auth failure (${auth_fail_count}/${AUTH_FAIL_THRESHOLD})"
-			if [ "$auth_fail_count" -ge "$AUTH_FAIL_THRESHOLD" ]; then
-				log "Auth failure threshold reached via stale-token detection, forcing reconnect"
-				fail_count=$FAIL_THRESHOLD
-			fi
-		fi
-
-		# Proactive token refresh -- runs whenever VPN is confirmed healthy so tokens stay
-		# fresh for reconnects. Uses same file as connect_vpn O3 for cross-subshell sync.
-		# Fix 2: runs in background to avoid 194s auth retry blocking health monitoring.
-		now=$(date +%s)
-
-		# Check if background auth failure threshold was reached (set by top-of-loop collector)
-		if [ "${_auth_force_reconnect:-0}" -eq 1 ]; then
-			_auth_force_reconnect=0
-			log "Auth failure threshold reached, forcing reconnect"
-			fail_count=$FAIL_THRESHOLD
-		else
-			_last_ref=0
-			[ -f "$LAST_REFRESH_FILE" ] && _last_ref=$(cat "$LAST_REFRESH_FILE" 2>/dev/null)
-			_last_ref=${_last_ref:-0}
-			if [ $((now - _last_ref)) -ge "$TOKEN_REFRESH_INTERVAL" ] && \
-			   [ -z "${_auth_bg_pid:-}" ]; then
-				# Launch auth refresh in background; result collected at top of next cycle
-				refresh_auth </dev/null &
-				_auth_bg_pid=$!
-				echo "$_auth_bg_pid" > /run/surflare_auth_bg_active
-				log "Background auth refresh started (PID=${_auth_bg_pid})"
-			fi
-		fi
-
 		# Periodic heartbeat -- confirms watchdog is alive during long healthy stretches
 		if [ "${HEARTBEAT_INTERVAL:-0}" -gt 0 ] && [ $((now - last_heartbeat)) -ge "$HEARTBEAT_INTERVAL" ]; then
 			log "VPN healthy: exit=${health}"
@@ -3992,12 +3905,21 @@ while true; do
 			if [ -f /run/surflare_auth_fail_signal ]; then
 				_signal_type=$(cat /run/surflare_auth_fail_signal 2>/dev/null)
 				rm -f /run/surflare_auth_fail_signal
-				if [ "$_signal_type" = "fatal" ]; then
+				if [ "$_signal_type" = "subscription" ]; then
+					log "Subscription expired, entering 1h cooldown (reconnect will not help)"
+					sleep 3600 &
+					storm_sleep_pid=$!; wait "$storm_sleep_pid" || true; storm_sleep_pid=""
+					continue
+				elif [ "$_signal_type" = "fatal" ]; then
 					auth_fail_count=$AUTH_FAIL_THRESHOLD
-					log "FATAL auth failure from connect_vpn subshell, forcing reconnect"
+					log "FATAL auth failure from connect_vpn subshell"
 				else
 					auth_fail_count=$((auth_fail_count + 1))
 					log "Auth failure from connect_vpn subshell (${auth_fail_count}/${AUTH_FAIL_THRESHOLD})"
+				fi
+				if [ "$auth_fail_count" -ge "$AUTH_FAIL_THRESHOLD" ]; then
+					log "Auth failure threshold reached (${auth_fail_count}/${AUTH_FAIL_THRESHOLD}), forcing reconnect"
+					fail_count=$FAIL_THRESHOLD
 				fi
 			fi
 			if [ "$rc" -eq 2 ]; then
