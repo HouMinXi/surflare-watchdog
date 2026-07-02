@@ -24,9 +24,16 @@ restart() {
         logger -t surflare-watchdog "WARN: failed to create restart marker"
         return 1
     }
-    stop "$@"
+    stop_service
     start "$@"
     rm -f /run/surflare_restarting
+}
+
+# Override rc.common's stop(): rc.common calls procd_kill which fails
+# with "Not found" when procd has no instance record (manual start, crash
+# recovery, or stale state).  Call stop_service() directly instead.
+stop() {
+    stop_service
 }
 
 stop_service() {
