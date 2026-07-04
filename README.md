@@ -10,55 +10,66 @@ internal urltest results for real-time node health — zero VPN disruption requi
 
 ```mermaid
 graph TB
-    subgraph Internet["External Network"]
-        DEST["Destination"]
-        EXIT["Exit Node<br/>(NA: Atlanta, Chicago,<br/>Miami, Toronto, ...)"]
-        RELAY["Relay Server<br/>(Transit Region)"]
-        ISP_GW["ISP Gateway (CGNAT)"]
+    subgraph Internet["Internet"]
+        ISP["ISP<br/>(CGNAT)"]
+        Relay["Surflare Relay<br/>(Transit)"]
+        Exit["Surflare Exit<br/>(6 NA Nodes)"]
+        CDN["CDN Targets"]
     end
 
-    subgraph N100["N100 iStoreOS Router"]
-        subgraph Kernel["Linux Kernel"]
-            NFT_TPROXY["inet sw_lan_tproxy<br/>(prerouting: tproxy TCP to :10800)<br/>(QUIC UDP/443: REJECT)"]
-            NFT_SURFLARE["inet surflare<br/>(output: mark 0x1/0xff routing)"]
-            NFT_KS["inet killswitch<br/>(output+forward: policy DROP)<br/>(0x1, 0xff, bypass_ipv4 accept)"]
-            NFT_MOAT["inet surflare_moat<br/>(upstream filter detection)"]
-            NFT_DNS["ip dns_enforce<br/>(LAN must use local DNS)"]
-            BPF["BPF cgroup2<br/>(TCP keepalive clamp 30s)"]
-            PPPOE["pppoe-wan"]
+    subgraph N100["iStoreOS Router (x86_64, 8GB)"]
+        subgraph KernelSpace["Kernel Space"]
+            PPPoE["pppoe-wan"]
+            NFT_KS["inet killswitch<br/>filter +20, policy DROP<br/>0x1/0xff accept"]
+            NFT_SF["inet surflare<br/>route mangle -150<br/>mark 0x1 catchall"]
+            NFT_TP["inet sw_lan_tproxy<br/>prerouting TCP tproxy<br/>UDP/443 REJECT"]
+            NFT_DNS["ip dns_enforce<br/>LAN dport 53 redirect"]
+            NFT_MOAT["inet surflare_moat<br/>SYN injection detect"]
+            IPRULE["ip rule fwmark 0x1<br/>lookup table 100"]
+            BPF["BPF cgroup2<br/>KEEPIDLE clamp 30s"]
         end
 
-        subgraph Userspace["User Space"]
-            WD["surflare_watchdog.sh<br/>(health check, reconnect,<br/>node rotation, storm protection)"]
-            PROXY["surflare-proxy<br/>(sing-box, :10800)<br/>(urltest: best relay selection)"]
+        subgraph UserSpace["User Space"]
+            WD["surflare_watchdog.sh<br/>(lifecycle, health, reconnect)"]
+            PROXY["surflare-proxy<br/>(sing-box, tproxy inbound)<br/>SO_MARK=0xff"]
             CLI["surflare CLI<br/>(auth, connect --daemon)"]
-            DNSMASQ["dnsmasq :53"]
-            SMARTDNS["SmartDNS :6053<br/>(domestic DoT / foreign via VPN)"]
+            SDNS["SmartDNS<br/>(domestic/foreign split)"]
+            DNSMASQ["dnsmasq"]
         end
-
-        BRLAN["br-lan (gateway)"]
     end
 
     subgraph LAN["LAN Devices"]
-        PHONE["Phones"]
-        MAC["Laptops"]
-        WIN["Desktops"]
+        BRLAN["br-lan"]
+        Phones["Phones"]
+        Laptops["Laptops"]
+        Desktop["Desktops"]
+        APs["Access Points"]
     end
 
-    PHONE & MAC & WIN -->|TCP/UDP| BRLAN
-    BRLAN -->|TCP| NFT_TPROXY
-    NFT_TPROXY -->|"tproxy :10800<br/>mark 0x1"| PROXY
-    PROXY -->|"mark 0x1"| NFT_SURFLARE
-    NFT_SURFLARE --> NFT_KS
-    NFT_KS --> PPPOE
-    PPPOE --> ISP_GW --> RELAY --> EXIT --> DEST
+    Phones & Laptops & Desktop --> BRLAN
+    BRLAN --> NFT_TP
+    NFT_TP -->|"TCP tproxy<br/>mark 0x1"| PROXY
+    NFT_TP -->|"UDP/443 REJECT<br/>(force HTTP/2)"| BRLAN
+    PROXY -->|"0xff direct"| NFT_SF
+    PROXY -->|"0x1 VPN"| NFT_SF
+    NFT_SF --> NFT_KS
+    NFT_KS -->|"accept"| PPPoE
+    PPPoE --> ISP
+    ISP --> Relay
+    Relay --> Exit
+    Exit --> CDN
 
-    WD -->|"start/stop/monitor"| PROXY
-    WD -->|"nft add/delete"| NFT_TPROXY & NFT_KS & NFT_MOAT
-    CLI -->|"config stdin pipe"| PROXY
-    CLI -->|"creates"| NFT_SURFLARE
-    BRLAN -->|DNS :53| DNSMASQ --> SMARTDNS
-    BPF -.->|"clamp keepidle"| PROXY
+    WD -->|"manages"| CLI
+    WD -->|"monitors"| PROXY
+    WD -->|"installs"| NFT_KS
+    WD -->|"restores"| NFT_TP
+    CLI -->|"creates"| NFT_SF
+    CLI -->|"spawns"| PROXY
+
+    BRLAN --> NFT_DNS
+    NFT_DNS --> DNSMASQ
+    DNSMASQ --> SDNS
+    BPF -.->|"socket layer"| PROXY
 ```
 
 **Key insight:** surflare-proxy already runs sing-box urltest outbounds for every
@@ -123,25 +134,82 @@ After:   detect <30s + skip dead nodes immediately
 ## DNS Architecture
 
 ```mermaid
-flowchart TD
-    QUERY["LAN Device DNS query"] --> DNSMASQ["dnsmasq :53 (cache)"]
+flowchart TB
+    LAN["LAN Device<br/>DNS query :53"]
 
-    DNSMASQ -->|miss| SMARTDNS["SmartDNS :6053"]
-
-    SMARTDNS --> SPLIT{"Domain in<br/>cn_domains.conf?<br/>(111K domains)"}
-
-    SPLIT -->|"Domestic domain"| DOM["Domestic DoT :853"]
-    DOM -->|"DIRECT via ISP"| RESULT_CN["Domestic IP<br/>-> nftset cn_domain_ips<br/>(bypass tproxy, 1h TTL)"]
-
-    SPLIT -->|"Foreign domain"| FOR["Foreign DNS UDP :53"]
-    FOR -->|"output chain<br/>dport 53 -> mark 0x1"| VPN["VPN tunnel (encrypted)"]
-    VPN --> RESULT_FOR["Foreign IP"]
-
-    SMARTDNS -.->|bootstrap| BOOT["Bootstrap DNS<br/>(plain UDP, DIRECT)"]
-
-    subgraph ENFORCE["ip dns_enforce"]
-        BLOCK["LAN dport 53 to<br/>external: REJECT"]
+    subgraph DNSEnforce["ip dns_enforce"]
+        ENF_CHK{"src in<br/>bypass_devices?"}
+        ENF_REDIR["redirect dport 53<br/>to local resolver"]
+        ENF_PASS["pass through<br/>(device manages own DNS)"]
     end
+
+    LAN --> ENF_CHK
+    ENF_CHK -->|no| ENF_REDIR
+    ENF_CHK -->|yes| ENF_PASS
+
+    subgraph LocalDNS["Local DNS Stack"]
+        DNSMASQ["dnsmasq :53<br/>(cache, LAN relay)"]
+
+        subgraph SmartDNS["SmartDNS :6053"]
+            SDNS_ROUTE{"Domain<br/>classification"}
+
+            subgraph DomGroup["Domestic Group"]
+                DOM_DOT["DoT/DoH to domestic<br/>DNS providers"]
+                DOM_DIRECT["DIRECT via ISP<br/>(no VPN, no mark)"]
+            end
+
+            subgraph ForGroup["Foreign Group"]
+                FOR_UDP["UDP :53 to<br/>public resolvers"]
+                FOR_MARK["OUTPUT chain<br/>dport 53 mark 0x1"]
+                FOR_VPN["via VPN tunnel<br/>(encrypted)"]
+            end
+
+            subgraph Bootstrap["Bootstrap DNS"]
+                BOOT["domestic plain UDP<br/>-exclude-default-group<br/>(resolves upstream hostnames)"]
+            end
+        end
+
+        subgraph DoHProxy["https-dns-proxy (3 instances)"]
+            DOH_ALI[":5053 domestic DoH"]
+            DOH_CF[":5054 CDN DoH"]
+            DOH_PUB[":5055 domestic DoH"]
+            DOH_MARK["OUTPUT chain<br/>dport 443 mark 0x1<br/>via VPN tunnel"]
+        end
+    end
+
+    ENF_REDIR --> DNSMASQ
+    DNSMASQ --> SDNS_ROUTE
+    DNSMASQ --> DOH_ALI & DOH_CF & DOH_PUB
+
+    SDNS_ROUTE -->|"domestic<br/>domains"| DOM_DOT
+    SDNS_ROUTE -->|"foreign<br/>domains"| FOR_UDP
+    SDNS_ROUTE -->|"bootstrap"| BOOT
+
+    DOM_DOT --> DOM_DIRECT
+    FOR_UDP --> FOR_MARK --> FOR_VPN
+    DOH_ALI & DOH_CF & DOH_PUB --> DOH_MARK
+
+    subgraph ProxyDNS["sing-box Internal DNS (SO_MARK=0xff)"]
+        SB_DNS_ROUTE{"Query type"}
+        SB_DIRECT_DNS["domestic resolvers<br/>DoT/DoH DIRECT<br/>(0xff accept, via ISP)"]
+        SB_REMOTE_DNS["foreign DoH<br/>via urltest outbound<br/>(through relay tunnel)"]
+        SB_REJECT["blocked endpoints<br/>tcp 443 REJECT<br/>(nft rule at chain head)"]
+    end
+
+    SB_DNS_ROUTE -->|"internal domains<br/>captive portal"| SB_DIRECT_DNS
+    SB_DNS_ROUTE -->|"tproxy-in foreign"| SB_REMOTE_DNS
+    SB_DNS_ROUTE -->|"blocked DoH<br/>endpoints"| SB_REJECT
+    SB_REJECT -->|"ECONNREFUSED<br/>instant fallback"| SB_DIRECT_DNS
+
+    subgraph NftSet["SmartDNS nftset Integration"]
+        NFTSET_RESOLVE["domestic domains on<br/>foreign CDN resolved"]
+        NFTSET_ADD["resolved IPs added to<br/>domestic_domain_ips set<br/>(1h timeout)"]
+        NFTSET_SYNC["watchdog syncs set<br/>tproxy -> killswitch<br/>(every 600s)"]
+        NFTSET_BYPASS["killswitch accepts<br/>these IPs as domestic"]
+    end
+
+    SDNS_ROUTE -.->|"nftset<br/>trigger"| NFTSET_RESOLVE
+    NFTSET_RESOLVE --> NFTSET_ADD --> NFTSET_SYNC --> NFTSET_BYPASS
 ```
 
 LAN devices must use the router as their DNS server. `ip dns_enforce` rejects
@@ -233,87 +301,168 @@ follows this decision tree:
 stateDiagram-v2
     [*] --> STOPPED
 
-    STOPPED --> STARTUP: init start
+    STOPPED --> STARTUP: init script start
 
-    STARTUP --> MAIN_LOOP: init complete
-    note right of STARTUP
-        _setup_kernel_moat()
-        _cleanup_on_startup()
-        _ensure_dns_enforce()
-        _install_killswitch()
-    end note
+    state STARTUP {
+        [*] --> setup_moat: _setup_kernel_moat()
+        setup_moat --> cleanup: _cleanup_on_startup()
+        cleanup --> dns_enforce: _ensure_dns_enforce()
+        dns_enforce --> install_ks: _install_killswitch()\nfresh 0x1+0xff permanent
+        install_ks --> get_isp: _get_isp_ip()
+        get_isp --> [*]
+    }
 
-    MAIN_LOOP --> CONNECT_VPN: VPN state lost / first run
+    STARTUP --> MAIN_LOOP
 
-    CONNECT_VPN --> HEALTH_MONITOR: data-plane ready
-    note right of CONNECT_VPN
-        1. flush residual nftables
-        2. unarm killswitch (API access)
-        3. refresh_auth() if needed
-        4. surflare connect --daemon
-        5. _install_killswitch() fresh
-        6. Phase 1: local state (20s)
-        7. Phase 2: data-plane ping (60s)
-        8. _setup_chnroute() CN bypass
-        9. _restore_tproxy() LAN proxy
-    end note
+    state MAIN_LOOP {
+        [*] --> check_local: detect local VPN state
+        check_local --> connect: state lost
+        check_local --> health_cycle: state OK
+        health_cycle --> check_local: sleep CHECK_INTERVAL\n30s normal / 15s degraded
+    }
 
-    HEALTH_MONITOR --> HEALTH_MONITOR: health=OK (every 30s)
-    HEALTH_MONITOR --> RECONNECT: fail_count >= 4
-    note right of HEALTH_MONITOR
-        7 parallel probes (P1-P6 + P7 proxy path)
-        G1: proxy broken override
-        G2: 503 storm override (10 in 300s)
-        Heartbeat log every 600s
-    end note
+    state CONNECT_VPN {
+        [*] --> flush_surflare: 1. flush inet surflare
+        flush_surflare --> unarm_ks: 2. delete killswitch\n(API access)
+        unarm_ks --> auth: 3. refresh_auth()\nreactive, event-driven
+        auth --> daemon: 4. surflare connect\n--daemon
+        daemon --> rearm_ks: 5. _install_killswitch()\nfresh
+        rearm_ks --> phase1: 6. Phase 1\nlocal state check\n20s timeout
+        phase1 --> phase2: 7. Phase 2\ndata-plane ping\n60s timeout
+        phase2 --> chnroute: 8. _setup_chnroute()
+        chnroute --> tproxy: 9. _restore_tproxy()
+        tproxy --> [*]
+    }
 
-    RECONNECT --> CONNECT_VPN: rotate node
-    RECONNECT --> STORM_COOLDOWN: 5 reconnects in window
-    note right of RECONNECT
-        _rotate_node() round-robin
-        NODE_CANDIDATES: 7 NA nodes
-    end note
+    MAIN_LOOP --> CONNECT_VPN: state lost / fail_count >= 4
 
-    STORM_COOLDOWN --> CONNECT_VPN: 600s elapsed
+    state HEALTH_MONITOR {
+        [*] --> local_check: Layer 1\nlocal state
+        local_check --> probes: Layer 2\n7 parallel probes
+        probes --> proxy_path: proxy path check\nvia tproxy
+        proxy_path --> egress: tunnel egress check\n3 targets x 2 retries
+        egress --> evaluate
+        evaluate --> healthy: OK / TUNNEL_OK\nreset counters
+        evaluate --> degraded: FAIL\nfail_count++
+        degraded --> threshold: fail_count >= 4?
+        threshold --> [*]: no, continue
+    }
 
-    HEALTH_MONITOR --> STOPPED: SIGTERM
-    note right of STOPPED
-        _full_teardown() nftables
-        kill surflare-proxy
-        rm PIDFILE
-    end note
+    CONNECT_VPN --> HEALTH_MONITOR: connected
+
+    HEALTH_MONITOR --> RECONNECT: fail_count >= FAIL_THRESHOLD(4)
+
+    state RECONNECT {
+        [*] --> rotate: _rotate_node()\nround-robin candidates
+        rotate --> storm_check: storm protection
+        storm_check --> cooldown: 5 reconnects\nin window
+        storm_check --> reconnect_vpn: under threshold
+        cooldown --> reconnect_vpn: 600s cooldown\nrestore tproxy domestic bypass
+        reconnect_vpn --> [*]
+    }
+
+    RECONNECT --> CONNECT_VPN: retry connection
+
+    MAIN_LOOP --> STOP: SIGTERM / SIGINT
+
+    state STOP {
+        [*] --> stop_trace: stop_packet_trace()
+        stop_trace --> teardown_nft: nftables teardown FIRST\n_full_teardown() or modular
+        teardown_nft --> kill_procs: killall proxy\nsexpect, route_updater
+        kill_procs --> wait_auth: auth wait\n5s timeout then SIGKILL
+        wait_auth --> rm_pid: rm PIDFILE
+        rm_pid --> [*]
+    }
+
+    STOP --> STOPPED: all clean
 ```
 
 #### Health check detail
 
 ```mermaid
-flowchart TD
-    START["check_vpn_health()"] --> LOCAL["Layer 1: check_vpn_local_state()"]
+flowchart TB
+    START["check_vpn_health()<br/>every 30s normal / 15s degraded"]
 
-    LOCAL -->|FAIL| RESULT_FAIL["LOCAL_FAIL"]
-    LOCAL -->|OK| PROBES["Layer 2: 7 parallel probes"]
+    subgraph L1["Layer 1: Local State Check"]
+        LOCAL["check_vpn_local_state()"]
+        L1_PROC{"proxy process<br/>alive?"}
+        L1_NFT{"inet surflare<br/>table exists?"}
+        L1_ROUTE{"fwmark ip rule<br/>exists?"}
+        L1_OK["LOCAL OK"]
+        L1_FAIL["LOCAL_FAIL"]
+    end
 
-    PROBES --> P16["P1-P6: Google, CF, ifconfig, ...<br/>(first-success-wins)"]
-    PROBES --> P7["P7: Proxy path<br/>(independent, max 10s)"]
+    START --> LOCAL
+    LOCAL --> L1_PROC
+    L1_PROC -->|no| L1_FAIL
+    L1_PROC -->|yes| L1_NFT
+    L1_NFT -->|no| L1_FAIL
+    L1_NFT -->|yes| L1_ROUTE
+    L1_ROUTE -->|no| L1_FAIL
+    L1_ROUTE -->|yes| L1_OK
 
-    P16 --> G1{"G1: Proxy<br/>broken?"}
-    P7 --> G1
+    subgraph L2["Layer 2: Remote Probes (parallel)"]
+        direction TB
+        subgraph AllPids["all_pids group (first-success-wins kill)"]
+            P1["Probe 1: Search Engine"]
+            P2["Probe 2: CDN Trace"]
+            P3["Probe 3: CDN Trace Alt"]
+            P4["Probe 4: IP Echo A"]
+            P5["Probe 5: IP Echo B"]
+            P6["Probe 6: IP Echo C"]
+        end
+        subgraph Independent["Independent (G1 blindspot fix)"]
+            P7["Probe 7: Proxy Path<br/>curl via OUTPUT chain<br/>fwmark 0x1 -> tproxy<br/>-> sing-box -> VPN"]
+        end
+    end
 
-    G1 -->|"proxy FAIL +<br/>direct OK"| PB["PROXY_BROKEN"]
-    G1 -->|"proxy OK"| G2{"G2: 503 storm?"}
+    L1_OK --> P1 & P2 & P3 & P4 & P5 & P6 & P7
 
-    G2 -->|"storm"| PB
-    G2 -->|"no"| EGRESS["exit country?"]
+    FIRST_WIN["First success from<br/>all_pids kills others"]
+    P1 & P2 & P3 & P4 & P5 & P6 --> FIRST_WIN
 
-    EGRESS -->|US/CA| OK["OK / TUNNEL_OK"]
-    EGRESS -->|CN| CN["CN"]
+    subgraph Evaluate["Result Evaluation"]
+        CHK_EXIT["Check exit IP"]
+        IS_DOM{"Exit IP is<br/>domestic?"}
+        IS_OK["health=TUNNEL_OK"]
+        IS_DOM_RESULT["health=DOMESTIC_EXIT<br/>deferred confirm<br/>(wait 3s for other probes)"]
 
-    OK --> RESET["fail_count = 0"]
-    RESULT_FAIL & PB & CN --> INCR["fail_count++"]
+        P7_CHK["Probe 7 result"]
+        P7_FAIL{"Probe 7<br/>FAIL?"}
+        EGRESS["_check_tunnel_egress()<br/>3 targets x 2 retries"]
+        PROXY_BROKEN["health=PROXY_BROKEN"]
+        EGRESS_OK["Single-target issue<br/>(CDN PoP routing)"]
+    end
 
-    INCR -->|">= 4"| RECONNECT["RECONNECT"]
-    INCR -->|"< 4"| WAIT["sleep 30s -> next cycle"]
-    RESET --> WAIT
+    FIRST_WIN --> CHK_EXIT
+    CHK_EXIT --> IS_DOM
+    IS_DOM -->|no| IS_OK
+    IS_DOM -->|yes| IS_DOM_RESULT
+
+    P7 --> P7_CHK
+    P7_CHK --> P7_FAIL
+    P7_FAIL -->|yes| EGRESS
+    P7_FAIL -->|no| IS_OK
+    EGRESS -->|all fail| PROXY_BROKEN
+    EGRESS -->|some pass| EGRESS_OK
+
+    subgraph Counters["Counter Logic"]
+        HEALTHY["OK / TUNNEL_OK<br/>reset fail_count=0<br/>heartbeat log every 600s"]
+        DEGRADED["DOMESTIC_EXIT<br/>LOCAL_FAIL<br/>PROXY_BROKEN<br/>fail_count++"]
+        THRESH{"fail_count >=<br/>FAIL_THRESHOLD(4)?"}
+        RECONNECT["Trigger RECONNECT"]
+        CONTINUE["Continue monitoring"]
+    end
+
+    IS_OK --> HEALTHY
+    EGRESS_OK --> HEALTHY
+    IS_DOM_RESULT --> DEGRADED
+    L1_FAIL --> DEGRADED
+    PROXY_BROKEN --> DEGRADED
+
+    DEGRADED --> THRESH
+    THRESH -->|yes| RECONNECT
+    THRESH -->|no| CONTINUE
 ```
 
 ---
@@ -325,41 +474,42 @@ loop. Errors are classified into three categories with different retry
 strategies.
 
 ```
-Background auth (healthy branch):
+Reactive auth (event-driven, no periodic timer):
 
-  Launch:   refresh_auth & --> PID --> marker file (/run/surflare_auth_bg_active)
-  Result:   collected at top of NEXT cycle (30s later)
-  Success:  update /run/surflare_last_refresh, reset auth_fail_count, remove stale_warn
-  Fatal:    auth_fail_count = threshold, force reconnect (skip retries)
-  Retryable: auth_fail_count++, check threshold for reconnect
+  The surflare binary manages JWT renewal internally (detour_refresh.go).
+  Watchdog only calls refresh_auth when surflare status reports auth needed.
+
+  Triggers (in connect_vpn, before surflare connect --daemon):
+
+    1. surflare status: "not logged in" / "session expired"
+       --> refresh_auth (up to LOGIN_RETRIES=5 with backoff)
+    2. surflare status: "subscription not active"
+       --> log warning, 1h cooldown, do NOT refresh
+    3. surflare status timeout (rc=124) or error (rc!=0)
+       --> treat as auth needed, attempt refresh_auth
+
+  Signal file IPC (connect_vpn subshell -> main loop):
+
+    /run/surflare_auth_fail_signal: "fatal" | "retryable" | "subscription"
+      "subscription" --> 1h cooldown (reconnect won't help)
+      "fatal"        --> auth_fail_count = threshold
+      "retryable"    --> auth_fail_count++
+      threshold hit  --> force reconnect
 
 Error classification (_classify_auth_error):
 
-  Reads stderr from surflare login. Patterns:
   +---------------------------+-----------+----------------------------------+
   | Pattern                   | Class     | Action                           |
   +---------------------------+-----------+----------------------------------+
-  | Too Many Requests         | FATAL     | immediate break, rc=2            |
-  | HTTP 429                  | FATAL     | immediate break, rc=2            |
+  | Too Many Requests / 429   | FATAL     | immediate break, rc=2            |
   | invalid username/password | FATAL     | immediate break, rc=2            |
   | Subscription expired      | FATAL     | immediate break, rc=2            |
   | Device limit              | FATAL     | immediate break, rc=2            |
   | Account check failed      | FATAL     | immediate break, rc=2            |
   | timeout / network error   | RETRYABLE | auth_fail_count++, retry         |
-  | (anything else)           | RETRYABLE | auth_fail_count++, retry         |
   +---------------------------+-----------+----------------------------------+
 
-Exponential backoff:
-
-  3s --> 6s --> 12s --> 24s --> 48s (cap 60s)
-  Fatal error: immediate break, return rc=2
-
-Stale-token detection (healthy branch):
-
-  If /run/surflare_last_refresh age > 2x CHECK_INTERVAL:
-    auth_fail_count++
-    Log warning (rate-limited via /run/surflare_stale_warn)
-    At threshold: force reconnect
+  Backoff: 3s --> 6s --> 12s --> 24s --> 48s (cap 60s)
 ```
 
 ---
