@@ -24,16 +24,31 @@ restart() {
         logger -t surflare-watchdog "WARN: failed to create restart marker"
         return 1
     }
-    stop_service
+    stop "$@"
+    # wait for watchdog to fully exit before starting the new instance.
+    # stop() calls procd_kill which synchronously tells procd to send
+    # SIGTERM; the watchdog's cleanup() trap then runs modular teardown.
+    # without this wait, start() may register the new instance before the
+    # old process exits, leaving orphans that hold the lock file and block
+    # the new watchdog -- procd reports "running" but old code executes.
+    local _waited=0
+    while [ $_waited -lt 20 ]; do
+        pgrep -f "surflare_watchdog.sh$" >/dev/null 2>&1 || break
+        sleep 1
+        _waited=$((_waited + 1))
+    done
     start "$@"
     rm -f /run/surflare_restarting
 }
 
-# Override rc.common's stop(): rc.common calls procd_kill which fails
-# with "Not found" when procd has no instance record (manual start, crash
-# recovery, or stale state).  Call stop_service() directly instead.
+# Override rc.common's stop(): call stop_service for cleanup, then
+# procd_kill to notify procd.  procd_kill may fail ("Not found") when
+# procd has no instance record (manual start, crash recovery, stale
+# state); the error is silenced since stop_service already handled
+# cleanup in that case.
 stop() {
     stop_service
+    procd_kill "$(basename "$(readlink "$initscript")")" "$1" 2>/dev/null || true
 }
 
 stop_service() {
