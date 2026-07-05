@@ -1030,6 +1030,106 @@ DNS_EOF
 # new connections -> tunnel degradation.  0xff is now permanent (like 0x1) in
 # the _install_killswitch() heredoc.
 
+# Remove only the output chain from killswitch table, leaving forward chain
+# and all sets intact.  Used by connect_vpn() to escape self-lock without
+# destroying the forward chain's LAN protection.
+_unarm_killswitch_output() {
+	# Guard: table must exist
+	nft list table inet killswitch >/dev/null 2>&1 || return 0
+	# Guard: output chain must exist (handles double-call)
+	nft list chain inet killswitch output >/dev/null 2>&1 || return 0
+
+	nft flush chain inet killswitch output 2>/dev/null || true
+	nft delete chain inet killswitch output 2>/dev/null || true
+
+	# Flush stale conntrack entries that used the old output chain rules.
+	# Scoped flush first (mark 1 = tproxy-marked flows only); unscoped
+	# fallback for older conntrack that lacks -m.
+	if conntrack -D -m mark 1 >/dev/null 2>&1; then
+		: # scoped flush ok
+	elif conntrack -F >/dev/null 2>&1; then
+		log "WARN: conntrack scoped flush unavailable; ran unscoped -F"
+	else
+		log "WARN: conntrack flush failed"
+	fi
+
+	log "killswitch output chain removed, forward chain intact"
+}
+
+# Recreate only the output chain inside the existing killswitch table.
+# Sets and forward chain already exist and are not touched.  Used by
+# connect_vpn() after surflare connect succeeds/fails/times out.
+# Falls back to full _install_killswitch() if the table or forward
+# chain is missing (covers concurrent teardown or corruption).
+# MAINTENANCE: output chain rules below must stay in sync with
+# the output chain section inside _install_killswitch().
+_reinstall_killswitch_output() {
+	# Guard: if table or forward chain missing, do full install
+	if ! nft list chain inet killswitch forward >/dev/null 2>&1; then
+		_install_killswitch
+		return
+	fi
+
+	# Safety: if output chain exists (double-call), flush+delete first
+	if nft list chain inet killswitch output >/dev/null 2>&1; then
+		nft flush chain inet killswitch output 2>/dev/null || true
+		nft delete chain inet killswitch output 2>/dev/null || true
+	fi
+
+	local _ks_tmp="/tmp/ks_output_$$.nft"
+	cat > "$_ks_tmp" << 'NFTEOF'
+add chain inet killswitch output { type filter hook output priority filter + 20 ; policy drop ; }
+add rule inet killswitch output ct state invalid drop
+add rule inet killswitch output oif "lo" accept
+add rule inet killswitch output ip daddr @server_ips accept
+add rule inet killswitch output ip6 daddr @server_ips6 accept
+add rule inet killswitch output meta mark == 0x1 accept
+add rule inet killswitch output meta mark == 0xff accept
+add rule inet killswitch output ip daddr @bypass_ipv4 accept
+add rule inet killswitch output ip6 daddr @bypass_ipv6 accept
+add rule inet killswitch output ip daddr @lan_ranges accept
+add rule inet killswitch output ip6 daddr @lan6_ranges accept
+add rule inet killswitch output ip daddr 255.255.255.255 accept
+add rule inet killswitch output ip daddr 224.0.0.0/4 accept
+add rule inet killswitch output ip6 daddr ff00::/8 accept
+add rule inet killswitch output udp sport 68 udp dport 67 accept
+add rule inet killswitch output udp sport 546 udp dport 547 accept
+add rule inet killswitch output meta skuid "root" udp dport 123 accept
+add rule inet killswitch output meta l4proto udp reject with icmp port-unreachable
+add rule inet killswitch output meta nfproto ipv6 reject with icmpv6 addr-unreachable
+add rule inet killswitch output tcp flags syn / fin,syn,rst,ack limit rate 5/second burst 10 packets log prefix "ks-drop: "
+add rule inet killswitch output counter drop
+NFTEOF
+
+	# Adjust NTP skuid: chrony on systemd distros, root on OpenWrt
+	local _ntp_user
+	_ntp_user=$(id -u chrony >/dev/null 2>&1 && echo chrony || echo root)
+	sed -i "s/meta skuid \"root\"/meta skuid \"$_ntp_user\"/" "$_ks_tmp"
+
+	if ! nft -f "$_ks_tmp"; then
+		log "ERROR: output chain reinstall failed, falling back to full install"
+		rm -f "$_ks_tmp"
+		_install_killswitch
+		return
+	fi
+
+	# Verify output chain exists after load
+	if ! nft list chain inet killswitch output >/dev/null 2>&1; then
+		log "ERROR: output chain missing after nft -f, falling back to full install"
+		rm -f "$_ks_tmp"
+		_install_killswitch
+		return
+	fi
+
+	rm -f "$_ks_tmp"
+
+	# Remove boot-time lockdown if still present
+	if nft list table inet surflare_boot_lock >/dev/null 2>&1; then
+		nft destroy table inet surflare_boot_lock 2>/dev/null || true
+		log "Boot lock removed: killswitch output reinstalled"
+	fi
+}
+
 _install_killswitch() {
 	local _ks_tmp="/tmp/ks_install_$$.nft"
 	# Atomic table replacement: destroy + create in a single nft -f transaction.
@@ -3065,19 +3165,17 @@ connect_vpn() {
 			effective_transit=""
 		fi
 		printf '%s\n' "${effective_transit:-off}" > /run/surflare_last_transit 2>/dev/null || true
-		# killswitch self-lock workaround: when server_ips is empty
-		# (fresh install) or stale (from a previous node's relay),
-		# the killswitch output policy-drop blocks all non-CN outbound
-		# traffic -- including surflare connect's API calls to US relay
-		# servers.  Temporarily unarm the killswitch so surflare connect
-		# can reach its API, then re-install a fresh killswitch with the
-		# bootstrap 0xff accept rule so non-CN traffic is not blocked
-		# while the watchdog populates server_ips.
+		# Unarm killswitch output chain for API access, forward chain
+		# stays intact.  Only the output chain (policy drop) is removed
+		# so surflare connect can reach its API.  The forward chain
+		# continues blocking non-whitelisted LAN forwarding throughout.
+		# After connect, _reinstall_killswitch_output recreates the
+		# output chain without touching sets or forward chain.
 		local _ks_was_armed=0
 		if nft list table inet killswitch >/dev/null 2>&1; then
-			nft delete table inet killswitch 2>/dev/null || true
+			_unarm_killswitch_output
 			_ks_was_armed=1
-			log "connect_vpn: killswitch unarmed for API access"
+			log "connect_vpn: killswitch output unarmed for API access"
 		fi
 		log "Connecting to ${use_node} mode=${MODE:-global} transit=${effective_transit:-off} (daemon mode)..."
 		if ! surflare connect --node "$use_node" \
@@ -3085,17 +3183,12 @@ connect_vpn() {
 			${effective_transit:+--transit "$effective_transit"} \
 			--daemon 9>&-; then
 			log "Connection failed, will retry on next check cycle"
-			# Re-install fresh killswitch with bootstrap 0xff on failure
-			[ "$_ks_was_armed" -eq 1 ] && _install_killswitch
+			[ "$_ks_was_armed" -eq 1 ] && _reinstall_killswitch_output
 			exit 1
 		fi
-		# Re-install fresh killswitch with bootstrap 0xff immediately after
-		# surflare connect succeeds.  The proxy's inet surflare table now
-		# handles output routing; the fresh killswitch protects against
-		# inet surflare deletion and provides forward-chain LAN blocking.
 		if [ "$_ks_was_armed" -eq 1 ]; then
-			_install_killswitch
-			log "connect_vpn: killswitch re-installed after connect"
+			_reinstall_killswitch_output
+			log "connect_vpn: killswitch output reinstalled after connect"
 		fi
 		# Load CN output bypass immediately after Phase 1 table creation.
 		# surflare connect has already created inet surflare with the output
@@ -3123,7 +3216,7 @@ connect_vpn() {
 			done
 			if [ "$_ready_wait" -ge "$CONNECT_SETTLE" ]; then
 				log "VPN establishment timed out: not ready after ${CONNECT_SETTLE}s"
-				[ "$_ks_was_armed" -eq 1 ] && _install_killswitch
+				[ "$_ks_was_armed" -eq 1 ] && _reinstall_killswitch_output
 				exit 1
 			fi
 			# Phase 2: verify data-plane forwarding with surflare ping.
@@ -3163,7 +3256,7 @@ connect_vpn() {
 			sleep "$CONNECT_SETTLE"
 			if ! _proc_alive surflare-proxy >/dev/null 2>&1; then
 				log "VPN establishment timed out: surflare-proxy not running after ${CONNECT_SETTLE}s"
-				[ "$_ks_was_armed" -eq 1 ] && _install_killswitch
+				[ "$_ks_was_armed" -eq 1 ] && _reinstall_killswitch_output
 				exit 1
 			fi
 		fi
