@@ -181,7 +181,15 @@ _proc_alive() {
 	for _pid in /proc/[0-9]*; do
 		[ -r "$_pid/comm" ] || continue
 		_comm=$(cat "$_pid/comm" 2>/dev/null) || continue
-		[ "$_comm" = "$_name" ] && return 0
+		# Prefix match: /proc/pid/comm truncates to 15 chars.
+		# "surflare-proxy.real" -> comm="surflare-proxy."
+		# "surflare-proxy"       -> comm="surflare-proxy"
+		# The dot-suffix pattern catches truncated variants (.real,
+		# .orig, .bak) without matching unrelated programs
+		# (surflare-proxy2 or surflare-proxy-debug).
+		case "$_comm" in
+			"$_name"|"$_name."*) return 0 ;;
+		esac
 	done
 	return 1
 }
@@ -198,7 +206,9 @@ _pids_by_comm() {
 	for _pid in /proc/[0-9]*; do
 		[ -r "$_pid/comm" ] || continue
 		_comm=$(cat "$_pid/comm" 2>/dev/null) || continue
-		[ "$_comm" = "$_name" ] && echo "${_pid##*/}"
+		case "$_comm" in
+			"$_name"|"$_name."*) echo "${_pid##*/}" ;;
+		esac
 	done
 }
 
