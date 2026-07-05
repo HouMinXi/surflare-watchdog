@@ -75,6 +75,7 @@ _reconnect_window_count=0             # reconnects in current window
 _sess_node=""                         # exit node of current VPN session
 _sess_transit=""                      # transit node of current session
 _sess_exit=""                         # exit country code of current session
+_exit_country_blocked=0               # set by _record_connect when exit not in allowed set
 _sess_connect_s=0                     # epoch of current session start
 _sess_prev_node=""                    # previous session's exit node
 _sess_prev_s=0                        # previous session's lifetime in seconds
@@ -2787,10 +2788,20 @@ _diagnose_tunnel_failure() {
 # Captures the transit node that was actually used, updates session state.
 _record_connect() {
 	local node="$1" exit_country="$2" now
+	_exit_country_blocked=0  # reset every call to prevent stale flag
 	# Normalize health-check codes that are not ISO country codes
 	case "$exit_country" in
 		OK|TUNNEL_OK) exit_country="?" ;;
 	esac
+	# Enforce allowed exit countries (US/PR/CA)
+	if [ "${#exit_country}" -eq 2 ] && [ "$exit_country" != "?" ]; then
+		case "$exit_country" in
+			US|PR|CA) ;;
+			*) _exit_country_blocked=1
+			   log "EXIT_COUNTRY_BLOCKED: exit=$exit_country, expected US/PR/CA"
+			   ;;
+		esac
+	fi
 	now=$(date +%s)
 	_sess_prev_node="$_sess_node"
 	_sess_prev_s=$(( _sess_connect_s > 0 ? now - _sess_connect_s : 0 ))
@@ -2809,7 +2820,21 @@ _record_connect() {
 	log "Session: node=${_sess_node} transit=${_sess_transit} exit=${_sess_exit} prev=${_sess_prev_node:-none}(${_sess_prev_s}s)"
 	if [ "$_sess_prev_s" -gt 0 ] && [ "$_sess_prev_s" -lt 300 ]; then
 		log "NODE_DEGRADED: ${_sess_prev_node} survived ${_sess_prev_s}s (threshold 300s)"
+		_stats_degraded="${_stats_degraded:+$_stats_degraded }${_sess_prev_node}"
 	fi
+}
+
+# _report_stats: aggregate operational stats to dmesg.
+# Called every STATS_REPORT_INTERVAL (6h) from main loop, and on SIGUSR1.
+_report_stats() {
+	local _now _uptime_s _uptime_h _s503_count
+	_now=$(date +%s)
+	_uptime_s=$((_now - _stats_start_ts))
+	_uptime_h=$((_uptime_s / 3600))
+	read _s503_count _ _ < "$STORM_503_STATE" 2>/dev/null || _s503_count=0
+	log "STATS: up=${_uptime_h}h reconn=${_stats_reconnects} rot=${_stats_rotations} 503=${_s503_count} degraded=${_stats_degraded:-none} node=${_sess_node:-?} exit=${_sess_exit:-?}"
+	_stats_degraded=""
+	_stats_last_report=$_now
 }
 
 # _record_disconnect: call after _diagnose_tunnel_failure when TCP_BLOCK fires.
@@ -3060,6 +3085,7 @@ _rotate_node() {
 		_active_node="${NODE_CANDIDATES[$_node_idx]}"
 	fi
 	log "Node rotation: ${prev} -> ${_active_node} ($((_node_idx + 1))/${n})"
+	_stats_rotations=$((_stats_rotations + 1))
 	printf '%s\t%d\n' "$_active_node" "$_node_idx" > "$ROTATION_STATE" 2>/dev/null || true
 }
 
@@ -3652,6 +3678,7 @@ trap '
     [[ -n "${storm_sleep_pid:-}" ]] && { kill "$storm_sleep_pid" 2>/dev/null || true; }
     touch "$WATCHDOG_ACK_FILE" 2>/dev/null || true
     log "EARLY_WARN_TRIGGERED: detector requested immediate health check"
+    _report_stats 2>/dev/null || true
 ' USR1
 
 # USR2: diagnostic mode -- pause the main loop WITHOUT tearing down
@@ -3702,6 +3729,12 @@ _cn_consecutive=0                    # consecutive CN exit detections across nod
                                      # Auth is reactive: no background refresh, no periodic timer.
                                      # Binary manages JWT renewal; watchdog refreshes only on detected need.
 last_heartbeat=$(date +%s)
+_stats_reconnects=0
+_stats_rotations=0
+_stats_degraded=""
+_stats_start_ts=$(date +%s)
+_stats_last_report=$(date +%s)
+STATS_REPORT_INTERVAL=21600  # 6h
 _active_node="$NODE"
 _node_idx=0
 if [ -f "$ROTATION_STATE" ]; then
@@ -3724,6 +3757,14 @@ if [ -f "$ROTATION_STATE" ]; then
 	fi
 fi
 log "watchdog started: node=${_active_node} candidates=${#NODE_CANDIDATES[@]} interval=${CHECK_INTERVAL}s threshold=${FAIL_THRESHOLD} transient=${TRANSIENT_THRESHOLD}"
+
+# Binary hash verification (warn-only, md5-gate in wrapper provides functional protection)
+_real_md5=$(md5sum /usr/bin/surflare-proxy.real 2>/dev/null | awk '{print $1}')
+_expected_md5=$(grep '^EXPECTED_MD5=' /usr/bin/surflare-proxy 2>/dev/null | cut -d'"' -f2)
+log "STARTUP: surflare-proxy.real md5=${_real_md5:-MISSING}"
+if [ -n "$_real_md5" ] && [ -n "$_expected_md5" ] && [ "$_real_md5" != "$_expected_md5" ]; then
+	log "WARN: binary hash mismatch (expected=$_expected_md5, got=$_real_md5)"
+fi
 
 # Fetch ISP public IP BEFORE killswitch/VPN setup.
 # Used to distinguish CN exit: tunnel broken (IP == ISP) vs tunnel working (IP != ISP).
@@ -3907,6 +3948,12 @@ while true; do
 		transient_count=0
 		_cn_consecutive=0
 		_transit_grace_ts=0
+		# Exit country enforcement: non-allowed exit forces immediate reconnect
+		if [ "$_exit_country_blocked" -eq 1 ]; then
+			_exit_country_blocked=0
+			fail_count=$FAIL_THRESHOLD
+			log "Exit country enforcement: non-allowed exit, forcing reconnect"
+		fi
 		# Reset backoff on healthy exit -- relay recovered
 		if [ "$FAIL_THRESHOLD" -ne "$FAIL_THRESHOLD_BASE" ]; then
 			log "Backoff reset: threshold ${FAIL_THRESHOLD} -> ${FAIL_THRESHOLD_BASE}"
@@ -3980,6 +4027,12 @@ while true; do
 		fi
 	fi
 
+	# Periodic stats summary (every 6h, independent of health state)
+	_now_stats=${now:-$(date +%s)}
+	if [ $((_now_stats - ${_stats_last_report:-0})) -ge "$STATS_REPORT_INTERVAL" ]; then
+		_report_stats
+	fi
+
 	_manage_trace "$health"
 	_check_trace_alive
 
@@ -4016,6 +4069,7 @@ while true; do
 				log "Backoff: next reconnect threshold raised to ${FAIL_THRESHOLD}"
 			fi
 			log "Consecutive failures: ${fail_count}, starting reconnect..."
+			_stats_reconnects=$((_stats_reconnects + 1))
 			rm -f /run/surflare_auth_fail_signal 2>/dev/null || true
 			connect_vpn
 			rc=$?
