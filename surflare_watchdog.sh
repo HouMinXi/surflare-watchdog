@@ -3768,6 +3768,18 @@ while true; do
 		storm_sleep_pid=""
 		continue
 	fi
+	# Wrapper integrity: surflare auto-update can overwrite the wrapper
+	# script at /usr/bin/surflare-proxy with an ELF binary, bypassing
+	# md5-gate. Restore from backup if replaced.
+	if [ -f /usr/bin/surflare-proxy ] && \
+	   [ "$(head -c2 /usr/bin/surflare-proxy 2>/dev/null)" != "#!" ]; then
+		if [ -x /usr/local/lib/surflare-proxy-wrapper ]; then
+			cp /usr/local/lib/surflare-proxy-wrapper /usr/bin/surflare-proxy
+			log "WRAPPER_REPLACED: restored from /usr/local/lib/surflare-proxy-wrapper"
+		else
+			log "WRAPPER_REPLACED: no backup available"
+		fi
+	fi
 	# Detector liveness: warn if heartbeat file is stale.
 	# Skip on router: early_detector requires nm-online (laptop only),
 	# so the heartbeat file never updates on procd/OpenWrt.
