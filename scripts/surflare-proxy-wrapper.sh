@@ -17,7 +17,9 @@ _md5=$(md5sum "$REAL_BIN" 2>/dev/null | cut -d" " -f1)
 if [ "$_md5" != "$EXPECTED_MD5" ] && [ -x "$FALLBACK_BIN" ]; then
 	_fb_md5=$(md5sum "$FALLBACK_BIN" 2>/dev/null | cut -d" " -f1)
 	if [ "$_fb_md5" = "$EXPECTED_MD5" ]; then
-		logger -t surflare-proxy "auto-update rolled back"
+		# Capture new binary before rollback for diff analysis
+		cp "$REAL_BIN" "/tmp/surflare-proxy-autoupdate-$(date +%Y%m%d_%H%M%S)"
+		logger -t surflare-proxy "auto-update rolled back (new binary saved to /tmp)"
 		cp "$FALLBACK_BIN" "$REAL_BIN"
 	fi
 fi
