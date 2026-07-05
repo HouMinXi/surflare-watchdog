@@ -2797,6 +2797,9 @@ _record_connect() {
 	# Read the transit written by connect_vpn for every connection (not just after reprobe)
 	_sess_transit=$(cat /run/surflare_last_transit 2>/dev/null || echo "unknown")
 	log "Session: node=${_sess_node} transit=${_sess_transit} exit=${_sess_exit} prev=${_sess_prev_node:-none}(${_sess_prev_s}s)"
+	if [ "$_sess_prev_s" -gt 0 ] && [ "$_sess_prev_s" -lt 300 ]; then
+		log "NODE_DEGRADED: ${_sess_prev_node} survived ${_sess_prev_s}s (threshold 300s)"
+	fi
 }
 
 # _record_disconnect: call after _diagnose_tunnel_failure when TCP_BLOCK fires.
