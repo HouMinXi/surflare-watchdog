@@ -7,6 +7,7 @@
 # If IPv6 is enabled in the future, add IPv6 CIDR matching here.
 [ -f /var/log/smartdns-audit.csv ] || exit 0
 [ -f /etc/surflare/cn_ipv4.txt ] || exit 0
+pidof surflare-proxy.real >/dev/null 2>&1 || { logger -t cn-learn "VPN not running, skipping"; exit 0; }
 
 python3 << 'PYEOF'
 import ipaddress, os, re
