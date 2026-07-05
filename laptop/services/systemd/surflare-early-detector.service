@@ -1,7 +1,7 @@
 [Unit]
 Description=Surflare Early TCP Degradation Detector
 After=surflare-watchdog.service
-BindsTo=surflare-watchdog.service
+PartOf=surflare-watchdog.service
 
 [Service]
 Type=simple
