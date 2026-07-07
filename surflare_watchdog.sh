@@ -327,6 +327,7 @@ _start_proxy_log_monitor() {
 	[ -f "$PROXY_LOG" ] || return 0
 	# Background: tail new lines, forward ERRORs to logger.
 	# Rate-limited: after forwarding one ERROR, sleep before the next.
+	# urltest: sing-box subscription auto-rotation (picks best node); NOT watchdog deploy count
 	# urltest 503: accumulate count + timestamps into STORM_503_STATE
 	# (ADR-0001 evidence channel).  USR1 fires at every 5th 503 to
 	# wake the main loop.  Count does NOT reset -- accumulates until
@@ -1596,11 +1597,6 @@ EOF
 # Case (c): table exists with live tproxy -> reload is idempotent
 #           (destroy + recreate with same content).
 _restore_tproxy() {
-	# Guard: skip if connect_vpn is running (it manages tproxy lifecycle)
-	if [ "${_connect_vpn_active:-0}" -eq 1 ]; then
-		log "Skipping _restore_tproxy: connect_vpn active"
-		return 0
-	fi
 	local _lan_tproxy_nft="/etc/surflare-lan-tproxy.nft"
 	if [ ! -f "$_lan_tproxy_nft" ]; then
 		log "WARN: $_lan_tproxy_nft not found, cannot restore tproxy"
@@ -1629,6 +1625,11 @@ _restore_tproxy() {
 		log "WARN: LAN tproxy restore failed: ${_nft_err}"
 	fi
 	rm -f "$_restore_tmp"
+	# Sentinel: verify tproxy table exists after load
+	if ! nft list table inet sw_lan_tproxy >/dev/null 2>&1; then
+		log "CRITICAL: tproxy restore failed -- table missing after nft -f"
+		return 1
+	fi
 	# Restore saved bypass IPs immediately to close the rebuild gap.
 	# _update_bypass_devices will overwrite these on the next connect,
 	# but until then bypass devices keep their exemption.
@@ -3685,6 +3686,8 @@ _full_teardown() {
 
 trap 'log "watchdog stopped"; cleanup; exit 0' INT TERM
 trap 'cleanup' EXIT
+trap 'log "received SIGHUP (terminal hangup), ignoring"' HUP
+trap ':' PIPE  # no-op handler for SIGPIPE (prevents bash exit on broken pipe)
 
 # Phase 1: Clean up ALL orphan watchdog processes (PPid=1)
 # Restart cycles can accumulate multiple orphan processes that PID file
@@ -3784,7 +3787,6 @@ trap '
 # nftables protections.  Allows manual surflare CLI diagnosis while
 # killswitch/tproxy/moat stay active.  Send SIGUSR2 again to resume.
 _diag_mode=0
-_connect_vpn_active=0  # 1 while connect_vpn subshell is running
 trap '
     if [ "$_diag_mode" -eq 0 ]; then
         _diag_mode=1
