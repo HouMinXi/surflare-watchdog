@@ -254,7 +254,7 @@ _send_alert() {
 	_last=${_alert_last_ts:-0}
 	local _diff=$((_now - _last))
 	if [ "$_diff" -ge 0 ] && [ "$_diff" -lt 600 ]; then
-		log "Alert rate-limited (last sent ${_last})"
+		log "Alert rate-limited (${_diff}s since last, need 600s): ${_title}"
 		return 0
 	fi
 	_alert_last_ts=$_now
@@ -4117,11 +4117,11 @@ while true; do
 				_transit_grace_ts=0
 				_healthy_consecutive=0
 			fi
-		fi
-		# Reset backoff on healthy exit -- relay recovered
-		if [ "$FAIL_THRESHOLD" -ne "$FAIL_THRESHOLD_BASE" ]; then
-			log "Backoff reset: threshold ${FAIL_THRESHOLD} -> ${FAIL_THRESHOLD_BASE}"
-			FAIL_THRESHOLD=$FAIL_THRESHOLD_BASE
+			# Reset backoff only on genuine recovery, not blocked-exit
+			if [ "$FAIL_THRESHOLD" -ne "$FAIL_THRESHOLD_BASE" ]; then
+				log "Backoff reset: threshold ${FAIL_THRESHOLD} -> ${FAIL_THRESHOLD_BASE}"
+				FAIL_THRESHOLD=$FAIL_THRESHOLD_BASE
+			fi
 		fi
 		_remove_dns_fallback
 		_patch_surflare_icmp_lan
@@ -4355,6 +4355,7 @@ while true; do
 		# Full check_vpn_health runs at loop top; this only cuts sleep short
 		# when local state is definitively dead (process gone, socket closed).
 		_dg_elapsed=0
+		storm_sleep_pid=""
 		while [ "$_dg_elapsed" -lt "$DEGRADED_INTERVAL" ]; do
 			sleep 2 & storm_sleep_pid=$!
 			wait "$storm_sleep_pid" || true
