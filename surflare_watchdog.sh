@@ -252,7 +252,8 @@ _send_alert() {
 	local _now _last
 	_now=$(date +%s)
 	_last=${_alert_last_ts:-0}
-	if [ $((_now - _last)) -lt 600 ]; then
+	local _diff=$((_now - _last))
+	if [ "$_diff" -ge 0 ] && [ "$_diff" -lt 600 ]; then
 		log "Alert rate-limited (last sent ${_last})"
 		return 0
 	fi
