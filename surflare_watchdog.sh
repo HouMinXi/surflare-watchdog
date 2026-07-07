@@ -2199,7 +2199,8 @@ _exempt_cn_output() {
 }
 # _check_tunnel_egress: test whether the VPN tunnel can reach external endpoints.
 # Tests OUTPUT -> mark 0x1 -> VPN path (locally originated traffic).
-# Does NOT test surflare-proxy:10800 tproxy path (kernel tproxy is LAN-only).
+# Does NOT test surflare-proxy:10800 tproxy path (port 10800 is a tproxy
+# listener, not SOCKS5; localhost connections trigger sing-box loopback reject).
 # Returns 0 if tunnel works, 1 if broken.  Called after primary health check
 # succeeds to detect the blind spot where the tunnel is up but egress is dead.
 _check_tunnel_egress() {
@@ -2565,11 +2566,9 @@ check_vpn_health() {
 	      "$tmp_gt" "$tmp_cft" "$tmp_cf2t" "$tmp_ifct" "$tmp_icht" "$tmp_myt" "$tmp_proxyt"
 	_hc_tmp=""
 
-	# Proxy path check: the primary probes test tunnel connectivity from N100
-	# itself (direct curl).  But LAN devices go through surflare-proxy:10800
-	# via tproxy.  If the tunnel is healthy but the proxy is dead (503, hang),
-	# LAN traffic breaks while the watchdog reports "healthy".  Run a dedicated
-	# tunnel egress test after a positive primary result to catch this blind spot.
+	# Tunnel egress check after primary probes pass.  Tests N100 OUTPUT
+	# chain path (mark 0x1 -> VPN).  Relay-side 503 degradation is caught
+	# separately by the 503 storm monitor below.
 	if [ -n "$result" ] && [ "$result" != "TCP_BLOCK" ] && \
 	   [ "$result" != "LOCAL_FAIL" ] && [ "$result" != "CN" ] && \
 	   [ "$result" != "PROXY_BROKEN" ]; then
@@ -2579,21 +2578,22 @@ check_vpn_health() {
 		fi
 	fi
 
-	# G2: 503 storm override -- Probe 7 passed but 503 monitor has
-	# accumulated evidence of sustained exit degradation (ADR-0001).
-	# Only the fast-storm branch triggers PROXY_BROKEN: count >= 10
-	# AND all within 300s.  A slow trickle of 503s spread over >300s
-	# is random network jitter, not a storm -- Probe 7 (tproxy path
-	# to Google) remains authoritative for actual proxy health.
+	# 503 storm override.  Health check passed but 503 monitor has
+	# accumulated evidence of sustained relay degradation (ADR-0001).
+	# Triggers PROXY_BROKEN when count >= 10 AND the most recent 503
+	# was within 300s (storm is still active).  Previous design used
+	# _s503_first (storm start) which made chronic storms (hours of
+	# steady 503) invisible because elapsed always exceeded the window.
+	# Using _s503_last detects both fast bursts and chronic storms.
 	if [ "$result" = "OK" ] || [ "$result" = "TUNNEL_OK" ]; then
 		if [ -f "$STORM_503_STATE" ]; then
 			local _s503_count _s503_first _s503_last _s503_now
 			read _s503_count _s503_first _s503_last < "$STORM_503_STATE" 2>/dev/null
 			_s503_now=$(date +%s)
 			if [ "${_s503_count:-0}" -ge "$STORM_503_OVERRIDE_COUNT" ] && \
-			   [ $((_s503_now - ${_s503_first:-0})) -le "$STORM_503_OVERRIDE_WINDOW" ]; then
+			   [ $((_s503_now - ${_s503_last:-0})) -le "$STORM_503_OVERRIDE_WINDOW" ]; then
 				result="PROXY_BROKEN"
-				log "G2: 503 storm override (${_s503_count} in $((_s503_now - _s503_first))s, last $((_s503_now - _s503_last))s ago) -> PROXY_BROKEN"
+				log "503 storm override (${_s503_count} total, last $((_s503_now - _s503_last))s ago, storm age $((_s503_now - _s503_first))s) -> PROXY_BROKEN"
 			fi
 		fi
 	fi
