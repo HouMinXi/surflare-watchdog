@@ -85,6 +85,11 @@ Plans:
 **Goal**: Reduce VPN recovery time and add alerting
 **Requirements**: REC-01 through REC-06
 **Depends on**: Phase 1 (observability probes provide data for tuning)
+**Plans:** 3 plans
+Plans:
+- [ ] 03-01-PLAN.md -- Recovery tuning: DEGRADED_INTERVAL 10s, local-state fast-path, failback gate
+- [ ] 03-02-PLAN.md -- Connect optimization: server_ips pre-population, CONNECT_SETTLE instrumentation, killswitch smoke test
+- [ ] 03-03-PLAN.md -- Alerting: _send_alert + Server Chan + VPN-down domestic fallback
 **Success Criteria**:
   1. DEGRADED_INTERVAL=10s (was 15s)
   2. check_vpn_local_state fast-path in DEGRADED reduces detection to <1ms for definitive failures
