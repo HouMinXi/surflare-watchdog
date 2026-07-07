@@ -32,7 +32,8 @@ TRANSIT_CONNECT_TIMEOUT=12             # max seconds for surflare connect per ca
 TRANSIT_ROUTE_READY_TIMEOUT=15        # max seconds to poll for routing readiness after connect
 TRANSIT_PROBE_SETTLE=20              # seconds of quiet time for tunnel handshake after routing ready
 CHECK_INTERVAL=30                     # Exit IP check interval in seconds
-DEGRADED_INTERVAL=15                  # Shortened interval when degraded (transient/fail > 0)
+DEGRADED_INTERVAL=10                  # Shortened interval when degraded (transient/fail > 0)
+FAILBACK_THRESHOLD=3                  # Consecutive OK checks before leaving DEGRADED
 FAIL_THRESHOLD=4                      # Consecutive failures before reconnect
 FAIL_THRESHOLD_BASE=4                 # Base value for backoff reset
 FAIL_THRESHOLD_MAX=16                 # Upper bound for adaptive backoff
@@ -231,6 +232,42 @@ check_vpn_local_state() {
 	nft list table inet surflare >/dev/null 2>&1 || return 1
 	ip rule show | grep -q 'fwmark 0x1 lookup 100' || return 1
 	return 0
+}
+
+# _send_alert: post notification to Server Chan (WeChat).
+# VPN-down safe: sctapi.ftqq.com is CN domestic, reachable via ISP direct.
+# N100 curl lacks c-ares (--dns-servers unavailable); SmartDNS resolves CN
+# domains directly. Backgrounded to avoid blocking the reconnect path.
+_send_alert() {
+	local _title="${1:-surflare alert}"
+	local _body="${2:-}"
+	local _conf="/etc/surflare/wechat.conf"
+	local _sendkey
+
+	[ -f "$_conf" ] || { log "WARN: alert skipped, $_conf not found"; return 1; }
+	_sendkey=$(grep '^SENDKEY=' "$_conf" | cut -d= -f2-)
+	[ -n "$_sendkey" ] || { log "WARN: alert skipped, SENDKEY empty"; return 1; }
+
+	# Rate limiter: max 1 alert per 10 minutes
+	local _now _last
+	_now=$(date +%s)
+	_last=${_alert_last_ts:-0}
+	if [ $((_now - _last)) -lt 600 ]; then
+		log "Alert rate-limited (last sent ${_last})"
+		return 0
+	fi
+	_alert_last_ts=$_now
+
+	(
+		curl -sSf --noproxy '*' \
+			--max-time 10 \
+			--data-urlencode "title=${_title}" \
+			--data-urlencode "desp=${_body}" \
+			"https://sctapi.ftqq.com/${_sendkey}.send" \
+			>/dev/null 2>&1 \
+		&& log "Alert sent: ${_title}" \
+		|| log "WARN: alert delivery failed: ${_title}"
+	) &
 }
 
 # Ecosystem health probes: DNS, tmpfs, crond, memory/OOM, BPF.
@@ -1656,9 +1693,11 @@ _restore_tproxy() {
 # clarity -- it identifies which storm path actually triggered.
 _enter_storm_cooldown() {
 	local _reason="$1"
+	_healthy_consecutive=0
 	stop_packet_trace >/dev/null 2>&1
 	_remove_dns_fallback
 	log "Storm protection triggered (${_reason}): cooling for ${STORM_COOLING}s"
+	_send_alert "VPN storm cooldown" "reason=${_reason} reconnects=${reconnect_count}"
 	# Phase 2A: Tombstone mode -- keep killswitch alive (CN bypass stays),
 	# replace tproxy with REJECT (no TCP black-hole, no IP leak), flush
 	# server_ips so VPN server traffic is also blocked.
@@ -3390,14 +3429,16 @@ connect_vpn() {
 			if [ "$_ping_ready" -eq 0 ]; then
 				log "WARN: data-plane not ready after ${_ping_elapsed}s (limit ${DATAPLANE_SETTLE}s), proceeding anyway"
 			fi
-			log "VPN routing ready: local=${_ready_wait}s + data-plane=${_ping_elapsed}s"
+			log "VPN ready after ${_ready_wait}s (CONNECT_SETTLE ceiling: ${CONNECT_SETTLE}s, data-plane: ${_ping_elapsed}s)"
 		else
+			local _settle_start=$SECONDS
 			sleep "$CONNECT_SETTLE"
 			if ! _proc_alive surflare-proxy >/dev/null 2>&1; then
 				log "VPN establishment timed out: surflare-proxy not running after ${CONNECT_SETTLE}s"
 				[ "$_ks_was_armed" -eq 1 ] && _reinstall_killswitch_output
 				exit 1
 			fi
+			log "VPN settle wait: ${CONNECT_SETTLE}s (actual: $(( SECONDS - _settle_start ))s)"
 		fi
 
 		compute_proxy_affinity
@@ -3828,6 +3869,8 @@ transient_count=0
 _DNS_RESTART_TIMES=""                 # space-separated epoch timestamps for rate limiter
 auth_fail_count=0
 _cn_consecutive=0                    # consecutive CN exit detections across node rotations
+_healthy_consecutive=0               # consecutive OK checks for failback gate
+_alert_last_ts=0                     # rate limiter for _send_alert (epoch)
                                      # Auth is reactive: no background refresh, no periodic timer.
                                      # Binary manages JWT renewal; watchdog refreshes only on detected need.
 last_heartbeat=$(date +%s)
@@ -3983,9 +4026,11 @@ while true; do
 				_record_connect "${_active_node}" "${new_health}"
 				_start_proxy_log_monitor
 			else
+				_healthy_consecutive=0
 				fail_count=$((fail_count + 1))
 			fi
 		else
+			_healthy_consecutive=0
 			reconnect_count=$((reconnect_count + 1))
 			log "Post-crash reconnect failed (reconnect_count=${reconnect_count})"
 			if [ "$reconnect_count" -ge "$STORM_MAX" ]; then
@@ -4014,6 +4059,7 @@ while true; do
 		fi
 		transient_count=0
 		_cn_consecutive=0
+		_healthy_consecutive=0
 		fail_count=$FAIL_THRESHOLD
 
 	elif [ "$health" = "TCP_BLOCK" ]; then
@@ -4023,9 +4069,11 @@ while true; do
 			log "Health check TCP block (tunnel confirmed, local network OK), triggering reconnect"
 			transient_count=0
 			_cn_consecutive=0
+			_healthy_consecutive=0
 			fail_count=$FAIL_THRESHOLD
 		else
 			transient_count=$((transient_count + 1))
+			_healthy_consecutive=0
 			log "Health check TCP block but local network also down, treating as transient ${transient_count}/${TRANSIENT_THRESHOLD}"
 		fi
 
@@ -4040,21 +4088,32 @@ while true; do
 		fi
 		transient_count=0
 		_cn_consecutive=0
+		_healthy_consecutive=0
 		fail_count=$FAIL_THRESHOLD
 
 	elif [ "$health" = "OK" ] || \
 	     { ! _health_is_failure "$health" && [ -n "$health" ]; }; then
 		# VPN healthy -- Google 200/30x (tunnel working) OR country probe returned non-CN country
-		fail_count=0
-		reconnect_count=0
-		transient_count=0
-		_cn_consecutive=0
-		_transit_grace_ts=0
-		# Exit country enforcement: non-allowed exit forces immediate reconnect
+
+		# Exit country enforcement BEFORE failback gate -- a blocked exit
+		# is NOT a healthy check and must not accumulate toward the gate.
 		if [ "$_exit_country_blocked" -eq 1 ]; then
 			_exit_country_blocked=0
+			_healthy_consecutive=0
 			fail_count=$FAIL_THRESHOLD
 			log "Exit country enforcement: non-allowed exit, forcing reconnect"
+		else
+			_healthy_consecutive=$((_healthy_consecutive + 1))
+			if [ "$_healthy_consecutive" -ge "$FAILBACK_THRESHOLD" ] || \
+			   { [ "${fail_count:-0}" -eq 0 ] && [ "${transient_count:-0}" -eq 0 ]; }; then
+				# Gate passed or was never degraded -- reset all counters
+				fail_count=0
+				reconnect_count=0
+				transient_count=0
+				_cn_consecutive=0
+				_transit_grace_ts=0
+				_healthy_consecutive=0
+			fi
 		fi
 		# Reset backoff on healthy exit -- relay recovered
 		if [ "$FAIL_THRESHOLD" -ne "$FAIL_THRESHOLD_BASE" ]; then
@@ -4093,6 +4152,7 @@ while true; do
 		# tried (one full rotation), the relay infrastructure is down and
 		# further reconnects only add downtime.  Enter storm cooldown instead.
 		transient_count=0
+		_healthy_consecutive=0
 		_cn_consecutive=$((_cn_consecutive + 1))
 		if [ "$_cn_consecutive" -ge "${#NODE_CANDIDATES[@]}" ]; then
 			_enter_storm_cooldown "cn-exit-all-nodes"
@@ -4107,6 +4167,7 @@ while true; do
 		# returns LOCAL_FAIL if local state is bad, so here local is confirmed healthy).
 		# This is a transient network spike, not a definitive VPN failure.
 		transient_count=$((transient_count + 1))
+		_healthy_consecutive=0
 		log "Health check transient timeout (local state OK), transient ${transient_count}/${TRANSIENT_THRESHOLD}"
 		if [ "$transient_count" -ge 2 ] && [ "$(cat "$DNS_STUCK_FILE" 2>/dev/null || echo 0)" -ge 4 ]; then
 			_insert_dns_fallback
@@ -4172,6 +4233,7 @@ while true; do
 				log "Backoff: next reconnect threshold raised to ${FAIL_THRESHOLD}"
 			fi
 			log "Consecutive failures: ${fail_count}, starting reconnect..."
+			_send_alert "VPN reconnecting" "fail=${fail_count} node=${NODE} health=${health}"
 			_stats_reconnects=$((_stats_reconnects + 1))
 			rm -f /run/surflare_auth_fail_signal 2>/dev/null || true
 			connect_vpn
@@ -4203,6 +4265,7 @@ while true; do
 				# Reset fail_count to FAIL_THRESHOLD-1 so we retry once next cycle
 				# instead of re-triggering every 30s and spamming the log.
 				log "Reconnect skipped (flock held), will retry next cycle"
+				_healthy_consecutive=0
 				fail_count=$((FAIL_THRESHOLD - 1))
 			elif [ "$rc" -eq 0 ]; then
 				new_health=$(check_vpn_health)
@@ -4217,6 +4280,7 @@ while true; do
 					_cn_consecutive=0
 					_transit_fail_count=0
 					_transit_grace_ts=0
+					_healthy_consecutive=0
 					_remove_dns_fallback
 					_update_server_endpoint
 					if [ "$_killswitch_armed" -eq 0 ]; then
@@ -4241,6 +4305,7 @@ while true; do
 					_record_connect "${_active_node}" "${new_health}"
 					_start_proxy_log_monitor
 				else
+					_healthy_consecutive=0
 					reconnect_count=$((reconnect_count + 1))
 					log "Post-reconnect health check anomalous (reconnect_count=${reconnect_count})"
 					maybe_reprobe_transit
@@ -4251,6 +4316,7 @@ while true; do
 					fi
 				fi
 			else
+				_healthy_consecutive=0
 				reconnect_count=$((reconnect_count + 1))
 				if [ "$rc" -gt 128 ]; then
 					log "Reconnect killed by signal $((rc - 128)) (reconnect_count=${reconnect_count})"
@@ -4279,14 +4345,29 @@ while true; do
 	fi
 
 	# Adaptive interval -- shorter poll when degraded for faster recovery.
-	# 15s floor (not lower): 7 probes x 12s max-time overlap at <14s interval.
-	_interval="$CHECK_INTERVAL"
+	# 10s floor: probe overlap possible (7 x 12s max-time) but each cycle
+	# uses independent temp files and PIDs -- no correctness issue.
 	if [ "${transient_count:-0}" -gt 0 ] || [ "${fail_count:-0}" -gt 0 ]; then
-		_interval="$DEGRADED_INTERVAL"
+		# DEGRADED: poll local state every 2s for fast failure detection.
+		# Full check_vpn_health runs at loop top; this only cuts sleep short
+		# when local state is definitively dead (process gone, socket closed).
+		_dg_elapsed=0
+		while [ "$_dg_elapsed" -lt "$DEGRADED_INTERVAL" ]; do
+			sleep 2 & storm_sleep_pid=$!
+			wait "$storm_sleep_pid" || true
+			storm_sleep_pid=""
+			_dg_elapsed=$((_dg_elapsed + 2))
+			if (( run_health_check_now )); then break; fi
+			if ! check_vpn_local_state; then
+				log "DEGRADED fast-path: local state failed, skipping remaining wait"
+				break
+			fi
+		done
+	else
+		sleep "$CHECK_INTERVAL" & storm_sleep_pid=$!
+		wait "$storm_sleep_pid" || true
+		storm_sleep_pid=""
 	fi
-	sleep "$_interval" & storm_sleep_pid=$!
-	wait "$storm_sleep_pid" || true
-	storm_sleep_pid=""
 	if (( run_health_check_now )); then
 		run_health_check_now=0
 		log "EARLY_WARN: running immediate health check (detector USR1)"
