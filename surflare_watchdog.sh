@@ -67,6 +67,8 @@ AUTH_FAIL_THRESHOLD=3                 # consecutive auth refresh failures before
 BYPASS_LAN_DEVICES=""                 # space-separated LAN IPs that skip tproxy (e.g. "192.168.100.147 192.168.100.148")
 # One MAC per line; current IP resolved from /tmp/dhcp.leases at connect time
 BYPASS_LAN_MACS_FILE="/etc/surflare/bypass-macs.conf"
+_DNS_RESTART_MAX=3                    # max SmartDNS restarts per window
+_DNS_RESTART_WINDOW=600               # rate limiter window (seconds)
 MIN_RELAY_CONNS=2                     # minimum connections to classify an IP as relay (vs DNS/proxied noise)
 _diag_server_ips=""                   # space-separated VPN relay IPs (filtered by MIN_RELAY_CONNS)
 _diag_connect_time=0                  # epoch seconds of last successful connect
@@ -229,6 +231,87 @@ check_vpn_local_state() {
 	nft list table inet surflare >/dev/null 2>&1 || return 1
 	ip rule show | grep -q 'fwmark 0x1 lookup 100' || return 1
 	return 0
+}
+
+# Ecosystem health probes: DNS, tmpfs, crond, memory/OOM, BPF.
+# Called once per main loop iteration after health classify.
+# All variables local EXCEPT _DNS_RESTART_TIMES (global, persists
+# across calls for rate limiting).
+_run_observability_probes() {
+	local _obs_start=$SECONDS
+	local _dns_restarted=0
+	local _new_times _t _count _now_dns
+	local _tmpfs_pct
+	local _mem _pid
+	local _bp_count
+
+	# Probe 1 -- DNS liveness (router-only)
+	if [ "$PLATFORM" = "router" ]; then
+		# Step A -- SmartDNS
+		if ! _proc_alive smartdns; then
+			_now_dns=$(date +%s)
+			_new_times=""
+			for _t in $_DNS_RESTART_TIMES; do
+				[ $((_now_dns - _t)) -lt "$_DNS_RESTART_WINDOW" ] && \
+					_new_times="$_new_times $_t"
+			done
+			_DNS_RESTART_TIMES="$_new_times"
+			_count=$(echo "$_DNS_RESTART_TIMES" | wc -w)
+			if [ "$_count" -lt "$_DNS_RESTART_MAX" ]; then
+				/etc/init.d/smartdns restart
+				_dns_restarted=1
+				log "SmartDNS was dead, restarted"
+			else
+				log "SmartDNS dead but restart rate-limited ($_count/$_DNS_RESTART_MAX in ${_DNS_RESTART_WINDOW}s)"
+			fi
+		fi
+		# Step B -- dnsmasq (independent of SmartDNS)
+		if ! _proc_alive dnsmasq; then
+			/etc/init.d/dnsmasq restart
+			log "dnsmasq was dead, restart attempted"
+		elif [ "$_dns_restarted" = 1 ]; then
+			killall -HUP dnsmasq 2>/dev/null
+		fi
+		# Step C -- verify (only after SmartDNS restart)
+		if [ "$_dns_restarted" = 1 ]; then
+			if timeout 10 nslookup baidu.com 127.0.0.1 >/dev/null 2>&1; then
+				_DNS_RESTART_TIMES="$_DNS_RESTART_TIMES $(date +%s)"
+				log "DNS restart verified (nslookup OK)"
+			else
+				log "DNS restart failed verification (nslookup failed)"
+			fi
+		fi
+	fi
+
+	# Probe 2 -- tmpfs usage
+	_tmpfs_pct=$(df -P /tmp | awk 'NR==2 {print $5}' | tr -d '%')
+	if [ "${_tmpfs_pct:-0}" -ge 70 ]; then
+		log "CRITICAL: tmpfs usage at ${_tmpfs_pct}%"
+	elif [ "${_tmpfs_pct:-0}" -ge 50 ]; then
+		log "WARN: tmpfs usage at ${_tmpfs_pct}%"
+	fi
+
+	# Probe 3 -- crond
+	_proc_alive crond || log "WARN: crond not running"
+
+	# Probe 4 -- memory + OOM protection (every cycle, idempotent)
+	_mem=$(awk '/MemAvailable/{print $2}' /proc/meminfo)
+	[ "${_mem:-0}" -lt 500000 ] && log "WARN: low memory: ${_mem}kB available"
+	_pid=$(_pids_by_comm "surflare-proxy" | tail -1)
+	[ -n "$_pid" ] && echo -1000 > /proc/$_pid/oom_score_adj 2>/dev/null
+
+	# Probe 5 -- BPF keepalive (router-only)
+	if [ "$PLATFORM" = "router" ]; then
+		_bp_count=$(timeout 3 bpftool prog show 2>/dev/null | grep -c "loaded_at" || echo 0)
+		if [ "${_bp_count:-0}" -eq 0 ] && [ "$SECONDS" -gt 60 ]; then
+			log "WARN: BPF: no programs loaded"
+		fi
+	fi
+
+	# Timing guard (logging-only)
+	if [ $(( SECONDS - _obs_start )) -gt 5 ]; then
+		log "WARN: observability probes took $(( SECONDS - _obs_start ))s (>5s budget)"
+	fi
 }
 
 # --- Proxy log monitor: forward critical errors to dmesg/kmsg ---
@@ -1596,16 +1679,32 @@ _enter_storm_cooldown() {
 	# the remaining window.
 	_cool_target=$(( $(date +%s) + STORM_COOLING ))
 	echo "$_cool_target" > /run/surflare_watchdog.storm_cool_until
-	sleep "$STORM_COOLING" &
-	# STORM_COOLING is a recovery bound, not a forced pause. The
-	# `wait` below returns early if the background sleep is killed
-	# (e.g. cleanup() on SIGTERM). For an operator override during
-	# a long cool window: `kill -USR1 <watchdog_pid>` will also kill
-	# this sleep (cleanup trap only fires on SIGTERM/SIGINT; SIGUSR1
-	# falls through to default action which is to terminate the
-	# process -- but a foreground trap is not required for the
-	# background sleep, which receives the signal directly).
-	storm_sleep_pid=$!; wait "$storm_sleep_pid"; storm_sleep_pid=""
+	# Sub-loop: run lightweight probes every 60s during cooldown.
+	# storm_sleep_pid set per iteration so cleanup() can SIGTERM the
+	# current sleep. USR1 breaks out via run_health_check_now flag.
+	local _storm_probe_interval=60
+	local _storm_remaining=$STORM_COOLING
+	local _storm_sleep _storm_dup _spid _storm_mem
+	while [ "$_storm_remaining" -gt 0 ]; do
+		_storm_sleep=$(( _storm_remaining < _storm_probe_interval ? _storm_remaining : _storm_probe_interval ))
+		sleep "$_storm_sleep" &
+		storm_sleep_pid=$!; wait "$storm_sleep_pid"; storm_sleep_pid=""
+		_storm_remaining=$(( _storm_remaining - _storm_sleep ))
+		[ "$run_health_check_now" = 1 ] && break
+		if [ "$_storm_remaining" -gt 0 ]; then
+			_storm_dup=0
+			for _spid in $(pgrep -f 'surflare_watchdog\.sh$' 2>/dev/null); do
+				[ "$_spid" -eq "$$" ] && continue
+				# Only count procd-started instances (PPid=1), not
+				# our own child subshells (PPid=$$)
+				grep -q "PPid:.*1$" /proc/$_spid/status 2>/dev/null || continue
+				_storm_dup=$((_storm_dup + 1))
+			done
+			[ "$_storm_dup" -gt 0 ] && log "WARN: ${_storm_dup} duplicate watchdog(s) during storm cooldown"
+			_storm_mem=$(awk '/MemAvailable/{print $2}' /proc/meminfo)
+			[ "${_storm_mem:-0}" -lt 500000 ] && log "WARN: low memory during storm cooldown: ${_storm_mem}kB available"
+		fi
+	done
 	# Only reset counters if cooldown actually elapsed (not interrupted by USR1)
 	local _now
 	_now=$(date +%s)
@@ -3724,6 +3823,7 @@ _patch_surflare_icmp_lan
 fail_count=0
 reconnect_count=0
 transient_count=0
+_DNS_RESTART_TIMES=""                 # space-separated epoch timestamps for rate limiter
 auth_fail_count=0
 _cn_consecutive=0                    # consecutive CN exit detections across node rotations
                                      # Auth is reactive: no background refresh, no periodic timer.
@@ -4035,6 +4135,7 @@ while true; do
 
 	_manage_trace "$health"
 	_check_trace_alive
+	_run_observability_probes
 
 	# -- Shared reconnect path -----------------------------------------------
 	# Triggered by: LOCAL_FAIL (immediate), CN failure, or transient escalation
