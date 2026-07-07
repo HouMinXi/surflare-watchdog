@@ -48,11 +48,11 @@ check "nft list set inet killswitch bypass_ipv4 2>/dev/null | grep -qE '[0-9]+\.
 
 # 6. output chain mark 0x1 accept (VPN-routed traffic)
 # nft may zero-pad marks (0x00000001) or truncate (0x1) depending on version.
-check "nft list chain inet killswitch output 2>/dev/null | grep -qE 'mark 0x0*1 '" \
+check "nft list chain inet killswitch output 2>/dev/null | grep -qE 'mark 0x0*1[[:space:]]'" \
 	"output mark 0x1 accept"
 
 # 7. output chain mark 0xff accept (direct outbound: relay, DNS)
-check "nft list chain inet killswitch output 2>/dev/null | grep -qE 'mark 0x0*ff '" \
+check "nft list chain inet killswitch output 2>/dev/null | grep -qE 'mark 0x0*ff[[:space:]]'" \
 	"output mark 0xff accept"
 
 echo "=== Done: $((7 - FAIL))/7 passed ==="
