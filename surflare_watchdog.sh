@@ -245,7 +245,7 @@ _send_alert() {
 	local _sendkey
 
 	[ -f "$_conf" ] || { log "WARN: alert skipped, $_conf not found"; return 1; }
-	_sendkey=$(grep '^SENDKEY=' "$_conf" | cut -d= -f2-)
+	_sendkey=$(grep -m1 '^SENDKEY=' "$_conf" | cut -d= -f2- | tr -d '"\r ')
 	[ -n "$_sendkey" ] || { log "WARN: alert skipped, SENDKEY empty"; return 1; }
 
 	# Rate limiter: max 1 alert per 10 minutes
@@ -260,14 +260,16 @@ _send_alert() {
 	_alert_last_ts=$_now
 
 	(
-		curl -sSf --noproxy '*' \
+		if curl -sSf --noproxy '*' \
 			--max-time 10 \
 			--data-urlencode "title=${_title}" \
 			--data-urlencode "desp=${_body}" \
 			"https://sctapi.ftqq.com/${_sendkey}.send" \
-			>/dev/null 2>&1 \
-		&& log "Alert sent: ${_title}" \
-		|| log "WARN: alert delivery failed: ${_title}"
+			>/dev/null 2>&1; then
+			log "Alert sent: ${_title}"
+		else
+			log "WARN: alert delivery failed: ${_title}"
+		fi
 	) &
 }
 
