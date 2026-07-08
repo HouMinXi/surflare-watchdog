@@ -946,11 +946,24 @@ _cleanup_on_startup() {
 	fi
 	rm -f /tmp/.surflare_probe 2>/dev/null
 
-	# Always kill any existing surflare-proxy: orphans from a previous
-	# watchdog instance (crash or unclean restart) hold port 10800 and
-	# block the new connection cycle.  The previous "keep healthy proxy"
-	# shortcut caused orphans the new watchdog could not manage.
-	if _proc_alive surflare-proxy >/dev/null 2>&1; then
+	# Crash-safe marker cleanup: if SIGKILL/OOM killed the old watchdog
+	# after init.d created the marker but before cleanup() ran, a stale
+	# marker would cause a future stop to skip proxy teardown.
+	rm -f "$RESTART_MARKER"
+
+	# Zero-kill adopt decision: check whether a healthy proxy is running
+	# BEFORE any kill site.  If all conditions pass, set the adopt flag
+	# so downstream kill sites are skipped.
+	local _adopt_proxy=0
+	if _proc_alive surflare-proxy >/dev/null 2>&1 \
+	   && ss -ltn 2>/dev/null | grep -qE ':10800(\s|$)' \
+	   && nft list table inet surflare >/dev/null 2>&1 \
+	   && timeout 8 surflare ping google.com -p 443 >/dev/null 2>&1; then
+		_adopt_proxy=1
+	fi
+
+	# Kill inherited proxy only when NOT adopting.
+	if _proc_alive surflare-proxy >/dev/null 2>&1 && [ "$_adopt_proxy" -eq 0 ]; then
 		log "Startup: killing inherited surflare-proxy"
 		killall surflare-proxy 2>/dev/null
 		_stop_proxy_log_monitor
@@ -986,8 +999,8 @@ _cleanup_on_startup() {
 		kill -9 "$_opid" 2>/dev/null
 	done
 	fi
-	# Port-based cleanup: ensure 10800 is free
-	if ss -ltn 2>/dev/null | grep -qE ':10800(\s|$)'; then
+	# Port-based cleanup: ensure 10800 is free (skip when adopting)
+	if [ "$_adopt_proxy" -eq 0 ] && ss -ltn 2>/dev/null | grep -qE ':10800(\s|$)'; then
 		if command -v fuser >/dev/null 2>&1; then
 			fuser -k -9 10800/tcp 2>/dev/null || true
 		else
@@ -1096,6 +1109,24 @@ _cleanup_on_startup() {
 	rm -f /tmp/surflare_watchdog_*.pcap.err 2>/dev/null || true
 	# Clean pre-timestamp-rotation .old artifact (23MB observed)
 	rm -f /var/log/surflare/surflare-proxy.log.old 2>/dev/null || true
+
+	# Adopt completion: proxy is alive, healthy, and all zombie/orphan
+	# cleanup is done.  Start log monitor and skip nft/fwmark teardown.
+	if [ "$_adopt_proxy" -eq 1 ]; then
+		local _proxy_pid
+		_proxy_pid=$(_pids_by_comm surflare-proxy | head -1)
+		log "Startup: adopting running proxy (PID=${_proxy_pid:-unknown})"
+		_start_proxy_log_monitor
+		# Skip nft delete and ip rule del -- proxy needs them intact.
+		# Killswitch is already armed from the previous instance;
+		# refresh server_ips in case relay IPs changed between restarts.
+		if nft list table inet killswitch >/dev/null 2>&1; then
+			_killswitch_armed=1
+			_update_killswitch_server_ips
+		fi
+		_ensure_dns_enforce
+		return 0
+	fi
 
 	log "Startup cleanup: surflare-proxy not running, flushing stale watchdog state"
 	nft delete table inet surflare 2>/dev/null || true
@@ -3721,25 +3752,23 @@ cleanup() {
 	# idempotent and do not need nftables protection at this point.
 	if [ -f "$RESTART_MARKER" ]; then
 		rm -f "$RESTART_MARKER"
-		# Disconnect before killing proxy so the relay receives a clean
-		# session teardown.  Without this, the server-side session stays
-		# active and rejects new connections from the same account.
-		timeout 8 surflare disconnect >/dev/null 2>&1 || true
-		nft delete table inet surflare_moat 2>/dev/null || true
-		_tombstone_tproxy
-		nft flush set inet killswitch server_ips 2>/dev/null || true
-		nft flush set inet killswitch server_ips6 2>/dev/null || true
-		nft delete table inet surflare 2>/dev/null || true
-		rm -f /run/surflare_watchdog.killswitch_ready
-		log "Restart: modular teardown (killswitch preserved)"
+		log "Restart: watchdog exiting, proxy preserved"
+		# Zero-kill restart: proxy stays alive with :10800 listening,
+		# nft tables intact, relay connection active, tproxy rules in
+		# place.  New watchdog instance adopts via _cleanup_on_startup().
+		# Kill non-proxy auxiliaries that could conflict with the new
+		# watchdog's process management.  surflare-proxy is NOT killed.
+		killall sexpect 2>/dev/null || true
+		killall -9 surflare 2>/dev/null || true
+		killall surflare_route_updater.sh 2>/dev/null || true
 	else
 		_full_teardown
 		log "Stop: full teardown"
+		killall surflare-proxy 2>/dev/null || true
+		killall sexpect 2>/dev/null || true
+		killall -9 surflare 2>/dev/null || true
+		killall surflare_route_updater.sh 2>/dev/null || true
 	fi
-	killall surflare-proxy 2>/dev/null || true
-	killall sexpect 2>/dev/null || true
-	killall -9 surflare 2>/dev/null || true
-	killall surflare_route_updater.sh 2>/dev/null || true
 	rm -f "$PIDFILE"
 	rm -f "$WATCHDOG_ACK_FILE" 2>/dev/null || true
 }
@@ -3972,6 +4001,12 @@ fi
 
 log "Startup nftables: killswitch=$(_table_exists killswitch) dns_enforce=$(_table_exists dns_enforce) surflare_moat=$(_table_exists surflare_moat)"
 
+# Track CIDR file mtimes so the main loop can reload cn_direct
+# when surflare_route_updater.sh updates the files (cron 02:30 daily).
+# Max of all three files: cn_ipv4.txt, cn_ipv4_extra.txt, cn_ipv6.txt.
+_cn_direct_mtime=$(stat -c %Y /etc/surflare/cn_ipv4.txt /etc/surflare/cn_ipv4_extra.txt /etc/surflare/cn_ipv6.txt 2>/dev/null | sort -rn | head -1)
+: "${_cn_direct_mtime:=0}"
+
 while true; do
 	# Diagnostic mode: pause without tearing down protections.
 	# SIGUSR2 toggles _diag_mode; while active, the loop sleeps
@@ -4012,6 +4047,15 @@ while true; do
 		fi
 		unset _det_age
 	fi
+	# Reload cn_direct when surflare_route_updater updates any CIDR file.
+	# All nft operations stay in the watchdog process (no cross-process race).
+	_cn_cur=$(stat -c %Y /etc/surflare/cn_ipv4.txt /etc/surflare/cn_ipv4_extra.txt /etc/surflare/cn_ipv6.txt 2>/dev/null | sort -rn | head -1)
+	: "${_cn_cur:=0}"
+	if [ "$_cn_cur" -gt "$_cn_direct_mtime" ] \
+	   && nft list set inet sw_lan_tproxy cn_direct >/dev/null 2>&1; then
+		_load_tproxy_cn_direct && _cn_direct_mtime=$_cn_cur
+	fi
+	unset _cn_cur
 	if recent_wifi_crash 120; then
 		record_crash
 		if crash_rate_exceeded; then
