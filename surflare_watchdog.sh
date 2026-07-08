@@ -64,6 +64,7 @@ STORM_503_STATE="/run/surflare_503_state"  # 503 monitor -> health check evidenc
 STORM_503_OVERRIDE_COUNT=10           # cumulative 503s to override Probe 7
 STORM_503_OVERRIDE_WINDOW=300         # seconds; all 10 503s must be within this window
 TPROXY_503_ROTATE_THRESHOLD=5         # tproxy 503 count in health window to trigger rotation
+TPROXY_503_COOLDOWN=660                 # 600s health window + 60s margin for 2 cron refreshes (cron runs every 3 min)
 NODE_HEALTH_FILE="/var/run/surflare_node_health.json"
 OBS_HEARTBEAT_EVERY=20                # log heartbeat every N observability probe runs (~10 min)
 TRANSIENT_THRESHOLD=6                 # consecutive external timeouts (local state OK) before escalating to fail_count
@@ -3906,6 +3907,8 @@ _stats_rotations=0
 _stats_degraded=""
 _stats_start_ts=$(date +%s)
 _stats_last_report=$(date +%s)
+_tproxy_503_cooldown_until=0
+_tproxy_503_rotate_ts=0
 STATS_REPORT_INTERVAL=21600  # 6h
 _active_node="$NODE"
 _node_idx=0
@@ -4170,13 +4173,22 @@ while true; do
 		# node_health.json (written by surflare_log_health.sh every 3 min) tracks
 		# tproxy 503 count in a 10-min window.  High 503 rate means relay is
 		# returning errors even though the tunnel itself is healthy.
-		if [ -f "$NODE_HEALTH_FILE" ]; then
-			_nh_age=$(( $(date +%s) - $(stat -c %Y "$NODE_HEALTH_FILE" 2>/dev/null || echo 0) ))
-			if [ "$_nh_age" -le 600 ]; then
+		# Cooldown after rotation: node_health.json is global (not per-node),
+		# so stale data from the previous node persists until the cron refreshes.
+		# Without cooldown, every rotation immediately re-triggers on stale data.
+		_now=$(date +%s)
+		if [ "$_now" -ge "${_tproxy_503_cooldown_until:-0}" ] && [ -f "$NODE_HEALTH_FILE" ]; then
+			_nh_mtime=$(stat -c %Y "$NODE_HEALTH_FILE" 2>/dev/null || echo 0)
+			_nh_age=$(( _now - _nh_mtime ))
+			# Skip if file is stale (>600s) or was written before cooldown started
+			# (stale data from previous node that the cron hasn't refreshed yet)
+			if [ "$_nh_age" -le 600 ] && [ "$_nh_mtime" -ge "${_tproxy_503_rotate_ts:-0}" ]; then
 				_tproxy_503=$(grep -o '"http_503": *[0-9]*' "$NODE_HEALTH_FILE" | awk -F': *' '{print $2}')
 				if [ "${_tproxy_503:-0}" -ge "$TPROXY_503_ROTATE_THRESHOLD" ]; then
 					log "Relay degraded: ${_tproxy_503} tproxy 503 in health window, rotating"
 					fail_count=$FAIL_THRESHOLD
+					_tproxy_503_cooldown_until=$(( _now + TPROXY_503_COOLDOWN ))
+					_tproxy_503_rotate_ts=$_now
 				fi
 			fi
 		fi
