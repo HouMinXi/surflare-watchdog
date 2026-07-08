@@ -4001,6 +4001,12 @@ fi
 
 log "Startup nftables: killswitch=$(_table_exists killswitch) dns_enforce=$(_table_exists dns_enforce) surflare_moat=$(_table_exists surflare_moat)"
 
+# Track CIDR file mtimes so the main loop can reload cn_direct
+# when surflare_route_updater.sh updates the files (cron 02:30 daily).
+# Max of all three files: cn_ipv4.txt, cn_ipv4_extra.txt, cn_ipv6.txt.
+_cn_direct_mtime=$(stat -c %Y /etc/surflare/cn_ipv4.txt /etc/surflare/cn_ipv4_extra.txt /etc/surflare/cn_ipv6.txt 2>/dev/null | sort -rn | head -1)
+: "${_cn_direct_mtime:=0}"
+
 while true; do
 	# Diagnostic mode: pause without tearing down protections.
 	# SIGUSR2 toggles _diag_mode; while active, the loop sleeps
@@ -4041,6 +4047,15 @@ while true; do
 		fi
 		unset _det_age
 	fi
+	# Reload cn_direct when surflare_route_updater updates any CIDR file.
+	# All nft operations stay in the watchdog process (no cross-process race).
+	_cn_cur=$(stat -c %Y /etc/surflare/cn_ipv4.txt /etc/surflare/cn_ipv4_extra.txt /etc/surflare/cn_ipv6.txt 2>/dev/null | sort -rn | head -1)
+	: "${_cn_cur:=0}"
+	if [ "$_cn_cur" -gt "$_cn_direct_mtime" ] \
+	   && nft list set inet sw_lan_tproxy cn_direct >/dev/null 2>&1; then
+		_load_tproxy_cn_direct && _cn_direct_mtime=$_cn_cur
+	fi
+	unset _cn_cur
 	if recent_wifi_crash 120; then
 		record_crash
 		if crash_rate_exceeded; then
