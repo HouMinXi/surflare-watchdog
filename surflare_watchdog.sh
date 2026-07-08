@@ -3721,6 +3721,10 @@ cleanup() {
 	# idempotent and do not need nftables protection at this point.
 	if [ -f "$RESTART_MARKER" ]; then
 		rm -f "$RESTART_MARKER"
+		# Disconnect before killing proxy so the relay receives a clean
+		# session teardown.  Without this, the server-side session stays
+		# active and rejects new connections from the same account.
+		surflare disconnect >/dev/null 2>&1 || true
 		nft delete table inet surflare_moat 2>/dev/null || true
 		_tombstone_tproxy
 		nft flush set inet killswitch server_ips 2>/dev/null || true
