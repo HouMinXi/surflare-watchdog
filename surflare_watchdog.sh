@@ -63,6 +63,9 @@ HEARTBEAT_INTERVAL=600                # seconds between periodic "VPN healthy" l
 STORM_503_STATE="/run/surflare_503_state"  # 503 monitor -> health check evidence channel
 STORM_503_OVERRIDE_COUNT=10           # cumulative 503s to override Probe 7
 STORM_503_OVERRIDE_WINDOW=300         # seconds; all 10 503s must be within this window
+TPROXY_503_ROTATE_THRESHOLD=5         # tproxy 503 count in health window to trigger rotation
+NODE_HEALTH_FILE="/var/run/surflare_node_health.json"
+OBS_HEARTBEAT_EVERY=20                # log heartbeat every N observability probe runs (~10 min)
 TRANSIENT_THRESHOLD=6                 # consecutive external timeouts (local state OK) before escalating to fail_count
 AUTH_FAIL_THRESHOLD=3                 # consecutive auth refresh failures before forcing reconnect
 BYPASS_LAN_DEVICES=""                 # space-separated LAN IPs that skip tproxy (e.g. "192.168.100.147 192.168.100.148")
@@ -84,6 +87,7 @@ _sess_prev_node=""                    # previous session's exit node
 _sess_prev_s=0                        # previous session's lifetime in seconds
 _diag_conclusion=""                   # set by _diagnose_tunnel_failure for _record_disconnect
 _diag_out=0                           # physical capture outbound packet count
+_obs_run_count=0                      # observability probe invocation counter (heartbeat)
 _diag_in=0                            # physical capture inbound packet count
 _diag_syn_out=0                       # SYN packets sent (new connection attempts)
 _diag_syn_ack=0                       # SYN-ACK received (successful handshakes)
@@ -351,6 +355,13 @@ _run_observability_probes() {
 	# Timing guard (logging-only)
 	if [ $(( SECONDS - _obs_start )) -gt 5 ]; then
 		log "WARN: observability probes took $(( SECONDS - _obs_start ))s (>5s budget)"
+	fi
+
+	# Heartbeat: confirm probes are running (silent probes are indistinguishable
+	# from dead probes).  Log every OBS_HEARTBEAT_EVERY invocations.
+	_obs_run_count=$((_obs_run_count + 1))
+	if [ $((_obs_run_count % OBS_HEARTBEAT_EVERY)) -eq 0 ]; then
+		log "OBS probes OK (${_obs_run_count} runs)"
 	fi
 }
 
@@ -3011,8 +3022,10 @@ _record_disconnect() {
 
 TRANSIT_CACHE_FILE="/run/surflare_transit_cache"
 TRANSIT_REPROBE_AFTER=3
+TRANSIT_ALLDOWN_WAIT=300                # cooldown when all transit candidates unreachable
 
 _transit_fail_count=0
+_transit_cooldown_until=0               # epoch: skip reprobe until this time
 
 get_cached_transit() {
 	if [ -f "$TRANSIT_CACHE_FILE" ]; then
@@ -3033,6 +3046,11 @@ save_transit_cache() {
 # Increment _transit_fail_count and reprobe if threshold reached.
 # Call this after any reconnect failure or anomalous post-reconnect health check.
 maybe_reprobe_transit() {
+	# Skip if in all-down cooldown (timestamp-based, non-blocking)
+	if [ "${_transit_cooldown_until:-0}" -gt 0 ] && [ "$(date +%s)" -lt "$_transit_cooldown_until" ]; then
+		return
+	fi
+	_transit_cooldown_until=0
 	_transit_fail_count=$((_transit_fail_count + 1))
 	if [ "$_transit_fail_count" -ge "$TRANSIT_REPROBE_AFTER" ]; then
 		# Transit grace: skip one reprobe when a recent SERVER_APP_FAILURE
@@ -3056,6 +3074,12 @@ maybe_reprobe_transit() {
 		if [ -n "$new_transit" ]; then
 			save_transit_cache "$new_transit"
 			log "Transit cache updated: ${new_transit}"
+		else
+			# All transit candidates unreachable (relay infrastructure down).
+			# Set timestamp-based cooldown instead of blocking sleep so the
+			# main loop continues health checks and signal handling.
+			_transit_cooldown_until=$(( $(date +%s) + TRANSIT_ALLDOWN_WAIT ))
+			log "All transits unreachable, cooldown until $(date -d @${_transit_cooldown_until} +%H:%M:%S 2>/dev/null || echo +${TRANSIT_ALLDOWN_WAIT}s)"
 		fi
 		_transit_fail_count=0
 	fi
@@ -3904,7 +3928,9 @@ if [ -f "$ROTATION_STATE" ]; then
 		fi
 	fi
 fi
-log "watchdog started: node=${_active_node} candidates=${#NODE_CANDIDATES[@]} interval=${CHECK_INTERVAL}s threshold=${FAIL_THRESHOLD} transient=${TRANSIENT_THRESHOLD}"
+_ppid=$(awk '/^PPid/{print $2}' /proc/$$/status 2>/dev/null)
+_parent=$(cat /proc/"${_ppid:-0}"/comm 2>/dev/null || echo "?")
+log "watchdog started: ppid=${_ppid}(${_parent}) node=${_active_node} candidates=${#NODE_CANDIDATES[@]} interval=${CHECK_INTERVAL}s threshold=${FAIL_THRESHOLD} transient=${TRANSIENT_THRESHOLD}"
 
 # Binary hash verification (warn-only, md5-gate in wrapper provides functional protection)
 _real_md5=$(md5sum /usr/bin/surflare-proxy.real 2>/dev/null | awk '{print $1}')
@@ -4137,6 +4163,21 @@ while true; do
 				_killswitch_armed=1
 			else
 				log "WARN: killswitch install failed -- IP leak protection inactive"
+			fi
+		fi
+
+		# Tproxy health check: detect relay degradation invisible to tunnel probes.
+		# node_health.json (written by surflare_log_health.sh every 3 min) tracks
+		# tproxy 503 count in a 10-min window.  High 503 rate means relay is
+		# returning errors even though the tunnel itself is healthy.
+		if [ -f "$NODE_HEALTH_FILE" ]; then
+			_nh_age=$(( $(date +%s) - $(stat -c %Y "$NODE_HEALTH_FILE" 2>/dev/null || echo 0) ))
+			if [ "$_nh_age" -le 600 ]; then
+				_tproxy_503=$(grep -o '"http_503": *[0-9]*' "$NODE_HEALTH_FILE" | awk -F': *' '{print $2}')
+				if [ "${_tproxy_503:-0}" -ge "$TPROXY_503_ROTATE_THRESHOLD" ]; then
+					log "Relay degraded: ${_tproxy_503} tproxy 503 in health window, rotating"
+					fail_count=$FAIL_THRESHOLD
+				fi
 			fi
 		fi
 

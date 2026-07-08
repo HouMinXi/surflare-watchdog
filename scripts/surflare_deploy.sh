@@ -13,7 +13,21 @@ set -euo pipefail
 N100="root@192.168.100.1"
 REMOTE_WATCHDOG="/usr/local/sbin/surflare_watchdog.sh"
 DEPLOY_WAIT=30
-LOCAL_WATCHDOG="${1:-surflare_watchdog.sh}"
+NO_RESTART=0
+
+# Parse flags
+for arg in "$@"; do
+    case "$arg" in
+        --no-restart) NO_RESTART=1 ;;
+    esac
+done
+
+# Positional: first non-flag argument is the local file
+LOCAL_WATCHDOG=""
+for arg in "$@"; do
+    case "$arg" in --*) ;; *) LOCAL_WATCHDOG="$arg"; break ;; esac
+done
+LOCAL_WATCHDOG="${LOCAL_WATCHDOG:-surflare_watchdog.sh}"
 
 if [ ! -f "$LOCAL_WATCHDOG" ]; then
     echo "FATAL: $LOCAL_WATCHDOG not found"
@@ -50,7 +64,13 @@ DEPLOY
 echo "Deployed.  Showing diff (first 50 lines):"
 ssh "$N100" "diff '${REMOTE_WATCHDOG}.prev' '$REMOTE_WATCHDOG' 2>/dev/null | head -50" || true
 
-# Step 3: User gate (local prompt)
+# Step 3: Restart gate
+if [ "$NO_RESTART" -eq 1 ]; then
+    echo "Deploy complete (--no-restart).  File on N100 updated, .prev backup kept."
+    echo "To restart manually:  ssh $N100 /etc/init.d/surflare-watchdog restart"
+    exit 0
+fi
+
 read -r -p "Restart watchdog on N100? [y/N] " _confirm
 if [ "${_confirm,,}" != "y" ]; then
     echo "Aborted by user."
