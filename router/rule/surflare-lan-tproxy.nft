@@ -98,7 +98,7 @@ table inet sw_lan_tproxy {
         # limit is 4095; burst 120 passes normal tab-open bursts while
         # drop triggers TCP exponential backoff, suppressing the herd.
         iifname "br-lan" meta l4proto tcp ct state new \
-            not limit rate 60/second burst 120 packets drop
+            limit rate over 60/second burst 120 packets drop
 
         # TCP tproxy: all remaining LAN TCP to surflare-proxy (IPv4)
         # Use bare port (:10800) to preserve the original destination IP.

@@ -65,6 +65,7 @@ STORM_503_OVERRIDE_COUNT=10           # cumulative 503s to override Probe 7
 STORM_503_OVERRIDE_WINDOW=300         # seconds; all 10 503s must be within this window
 TPROXY_503_ROTATE_THRESHOLD=5         # tproxy 503 count in health window to trigger rotation
 TPROXY_503_COOLDOWN=660                 # 600s health window + 60s margin for 2 cron refreshes (cron runs every 3 min)
+TPROXY_NFT_STAMP="/run/surflare_tproxy_nft.stamp"  # md5 of /etc/surflare-lan-tproxy.nft at last _restore_tproxy
 NODE_HEALTH_FILE="/var/run/surflare_node_health.json"
 OBS_HEARTBEAT_EVERY=20                # log heartbeat every N observability probe runs (~10 min)
 TRANSIENT_THRESHOLD=6                 # consecutive external timeouts (local state OK) before escalating to fail_count
@@ -1070,15 +1071,17 @@ _cleanup_on_startup() {
 
 	# 4. Tombstoned tproxy: the previous watchdog tombstoned the tproxy
 	#    rules (replaced tproxy with REJECT) before crashing.  LAN TCP
-	#    gets ICMP host-unreachable instead of being proxied.  Don't
-	#    restore live tproxy here: surflare-proxy is not running yet
-	#    (:10800 has no listener -> ECONNREFUSED).  Just load cn_direct
-	#    so CN traffic bypasses the REJECT rules via ISP direct routing
-	#    during the startup window.  connect_vpn will restore live
-	#    tproxy after surflare-proxy is ready.
-	if nft list table inet sw_lan_tproxy >/dev/null 2>&1; then
-		if nft list chain inet sw_lan_tproxy prerouting 2>/dev/null | \
-		   grep -q 'reject.*icmp\|reject.*icmpv6'; then
+	#    gets TCP reset instead of being proxied.  Don't restore live
+	#    tproxy here: surflare-proxy is not running yet (:10800 has no
+	#    listener -> ECONNREFUSED).  Just load cn_direct so CN traffic
+	#    bypasses the REJECT rules via ISP direct routing during the
+	#    startup window.  connect_vpn will restore live tproxy after
+	#    surflare-proxy is ready.  SKIPPED when adopting -- adopt path
+	#    handles restore (proxy is alive, table rebuild is safe).
+	if [ "$_adopt_proxy" -eq 0 ] && \
+	   nft list table inet sw_lan_tproxy >/dev/null 2>&1; then
+		if ! nft list chain inet sw_lan_tproxy prerouting 2>/dev/null | \
+		   grep -q 'tproxy.*10800'; then
 			_load_tproxy_cn_direct force
 			# _block_unreachable_doh not called here: inet surflare does
 			# not exist yet (deleted in modular teardown, recreated by
@@ -1125,6 +1128,36 @@ _cleanup_on_startup() {
 			_update_killswitch_server_ips
 		fi
 		_ensure_dns_enforce
+		# Unified tproxy restore guard (Problem A + Problem B):
+		#   B: table exists but no live tproxy rules (tombstoned) -- restore
+		#      so LAN traffic is not silently rejected while watchdog
+		#      reports "healthy" (livelock).
+		#   A: nft file changed since last restore (stale rules) -- restore
+		#      so rate-limit and other rule updates take effect without
+		#      killing the proxy (zero-kill invariant).
+		# Stamp absent (first restart post-deploy) = treat as changed.
+		# Proxy is verified healthy (alive + port + ping at L958-961);
+		# table rebuild via _restore_tproxy is safe (atomic nft -f).
+		local _tproxy_needs_restore=0
+		if nft list table inet sw_lan_tproxy >/dev/null 2>&1; then
+			if ! nft list chain inet sw_lan_tproxy prerouting 2>/dev/null | \
+			   grep -q 'tproxy.*10800'; then
+				_tproxy_needs_restore=1
+				log "Startup: tproxy tombstoned, will restore (proxy healthy)"
+			elif command -v md5sum >/dev/null 2>&1; then
+				local _cur_md5 _saved_md5
+				_cur_md5=$(md5sum /etc/surflare-lan-tproxy.nft 2>/dev/null | awk '{print $1}')
+				_saved_md5=$(cat "$TPROXY_NFT_STAMP" 2>/dev/null | awk '{print $1}')
+				if [ -n "$_cur_md5" ] && [ "$_cur_md5" != "$_saved_md5" ]; then
+					_tproxy_needs_restore=1
+					log "Startup: nft file changed (md5 mismatch), will restore"
+				fi
+			fi
+		fi
+		if [ "$_tproxy_needs_restore" -eq 1 ]; then
+			_restore_tproxy
+			_update_bypass_devices
+		fi
 		return 0
 	fi
 
@@ -1731,6 +1764,12 @@ _restore_tproxy() {
 	# Reload CN CIDRs: destroy+reload above empties cn_direct/cn6_direct.
 	# Without this, all LAN traffic goes through VPN proxy (no CN bypass).
 	_load_tproxy_cn_direct
+	# Stamp the nft file hash so adopt can detect stale rules without
+	# rebuilding the table every restart.  Written inside _restore_tproxy
+	# (single loader) so every caller keeps the stamp current for free.
+	if command -v md5sum >/dev/null 2>&1; then
+		md5sum "$_lan_tproxy_nft" > "$TPROXY_NFT_STAMP" 2>/dev/null
+	fi
 }
 
 # Enter storm-protection cooldown. Called from the three storm trigger
