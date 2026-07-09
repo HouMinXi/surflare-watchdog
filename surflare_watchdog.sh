@@ -1734,9 +1734,10 @@ _restore_tproxy() {
 		printf 'destroy table inet sw_lan_tproxy\n'
 		cat "$_lan_tproxy_nft"
 	} > "$_restore_tmp"
-	local _nft_err
+	local _nft_err _load_ok=0
 	if _nft_err=$(nft -f "$_restore_tmp" 2>&1); then
 		log "LAN tproxy restored (fresh load from ${_lan_tproxy_nft})"
+		_load_ok=1
 	else
 		log "WARN: LAN tproxy restore failed: ${_nft_err}"
 	fi
@@ -1765,9 +1766,10 @@ _restore_tproxy() {
 	# Without this, all LAN traffic goes through VPN proxy (no CN bypass).
 	_load_tproxy_cn_direct
 	# Stamp the nft file hash so adopt can detect stale rules without
-	# rebuilding the table every restart.  Written inside _restore_tproxy
-	# (single loader) so every caller keeps the stamp current for free.
-	if command -v md5sum >/dev/null 2>&1; then
+	# rebuilding the table every restart.  Only stamp on successful
+	# load (_load_ok): a failed nft -f leaves stale rules, and stamping
+	# would make the adopt guard think rules are current.
+	if [ "$_load_ok" -eq 1 ] && command -v md5sum >/dev/null 2>&1; then
 		md5sum "$_lan_tproxy_nft" > "$TPROXY_NFT_STAMP" 2>/dev/null
 	fi
 }
