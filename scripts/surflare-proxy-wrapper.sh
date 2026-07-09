@@ -2,6 +2,16 @@
 # surflare-proxy wrapper: patches urltest tolerance/interval before
 # forwarding stdin JSON to the real binary.
 # md5-gate: auto-restores patched binary if surflare auto-update replaces it.
+
+# Raise fd limit before exec'ing the real binary.  procd_set_param
+# limits in init.d sets rlimit on the watchdog script, but surflare
+# connect --daemon daemonizes (fork+setsid) and reparents the proxy
+# to PID 1, breaking rlimit inheritance.  Setting ulimit here
+# (inside the wrapper, closest to exec) guarantees the proxy gets
+# 65535 regardless of daemonize behavior.  PM-approved fallback
+# (fd-rootcause-PM-verdict Ask 2).
+ulimit -n 65535 2>/dev/null || true
+
 REAL_BIN="/usr/bin/surflare-proxy.real"
 FALLBACK_BIN="/usr/local/lib/surflare-proxy-patched"
 EXPECTED_MD5="8e18ab1e9b5aa9d9de8bbe91d4d6245b"
