@@ -3320,6 +3320,20 @@ connect_vpn() {
 		wait_for_exit surflare
 		wait_for_exit surflare-proxy
 
+		# Flush ALL conntrack entries after proxy death.  The scoped
+		# flush (mark 1) in _unarm_killswitch_output only clears
+		# tproxy-marked flows, but proxy upstream connections via
+		# loopback (src=127.0.0.1) carry no mark and persist for
+		# tcp_timeout_established=7440s, eventually saturating the
+		# table and causing "too many open files" on the next proxy.
+		# Tombstone (REJECT) is active so no LAN traffic is flowing;
+		# the flush is safe and the table rebuilds on reconnect.
+		if conntrack -F >/dev/null 2>&1; then
+			log "conntrack flushed (full table, proxy dead, tombstone active)"
+		else
+			log "WARN: conntrack flush failed; stale entries may persist"
+		fi
+
 		# Flush residual nftables/routing rules that surflare disconnect may have missed.
 		# Without this, all TCP/UDP traffic stays fwmark'd -> routed to table 100 -> loopback
 		# -> ECONNREFUSED, causing "Account check failed" on the next connect attempt.

@@ -92,6 +92,14 @@ table inet sw_lan_tproxy {
         # QUIC reject below.  QUIC versions never have 0xFEFD at this offset.
         iifname "br-lan" meta nfproto ipv4 udp dport 443 @th,72,16 0xfefd return
 
+        # Throttle burst of new TCP connections to prevent fd exhaustion.
+        # After _restore_tproxy() brings tproxy live post-reconnect, LAN
+        # clients flood :10800 simultaneously (thundering herd). fd soft
+        # limit is 4095; burst 120 passes normal tab-open bursts while
+        # drop triggers TCP exponential backoff, suppressing the herd.
+        iifname "br-lan" meta l4proto tcp ct state new \
+            not limit rate 60/second burst 120 packets drop
+
         # TCP tproxy: all remaining LAN TCP to surflare-proxy (IPv4)
         # Use bare port (:10800) to preserve the original destination IP.
         # Explicit 127.0.0.1:10800 causes sing-box to reject the connection
