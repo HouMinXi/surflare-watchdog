@@ -15,7 +15,7 @@ start_service() {
     procd_set_param respawn 3600 5 10
     procd_set_param term_timeout 15
     # Raise fd limit for the watchdog script.  Note: on iStoreOS 24.10.7
-    # (procd 2026.03.14) this parameter is silently ignored — the actual
+    # (procd 2026.03.14) this parameter is silently ignored; the actual
     # fix for surflare-proxy is the ulimit in the wrapper script
     # (scripts/surflare-proxy-wrapper.sh).  Kept as forward-compat for
     # future OpenWrt versions that support procd limits.

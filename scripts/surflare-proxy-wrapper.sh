@@ -8,8 +8,8 @@
 # connect --daemon daemonizes (fork+setsid) and reparents the proxy
 # to PID 1, breaking rlimit inheritance.  Setting ulimit here
 # (inside the wrapper, closest to exec) guarantees the proxy gets
-# 65535 regardless of daemonize behavior.  PM-approved fallback
-# (fd-rootcause-PM-verdict Ask 2).
+# 65535 regardless of daemonize behavior.
+# shellcheck disable=SC3045  # busybox ash supports ulimit -n (verified: proxy runs at 65535)
 ulimit -n 65535 2>/dev/null || true
 
 REAL_BIN="/usr/bin/surflare-proxy.real"

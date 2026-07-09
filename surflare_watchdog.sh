@@ -3473,8 +3473,8 @@ connect_vpn() {
 		# Raise fd limit before spawning the proxy process.  procd_set_param
 		# limits in init.d sets rlimit on the watchdog script, but
 		# surflare connect --daemon daemonizes and may break fork inheritance.
-		# Setting ulimit here (closest to the proxy spawn) guarantees the
-		# proxy gets 65535 regardless of daemonize behavior.
+		# So this best-effort bump is NOT sufficient alone; the real
+		# guarantee is the ulimit in the wrapper, run in the proxy exec.
 		ulimit -n 65535 2>/dev/null || true
 		if ! surflare connect --node "$use_node" \
 			${MODE:+--mode "$MODE"} \
