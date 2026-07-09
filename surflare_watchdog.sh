@@ -3470,6 +3470,12 @@ connect_vpn() {
 			log "connect_vpn: killswitch output unarmed for API access"
 		fi
 		log "Connecting to ${use_node} mode=${MODE:-global} transit=${effective_transit:-off} (daemon mode)..."
+		# Raise fd limit before spawning the proxy process.  procd_set_param
+		# limits in init.d sets rlimit on the watchdog script, but
+		# surflare connect --daemon daemonizes and may break fork inheritance.
+		# Setting ulimit here (closest to the proxy spawn) guarantees the
+		# proxy gets 65535 regardless of daemonize behavior.
+		ulimit -n 65535 2>/dev/null || true
 		if ! surflare connect --node "$use_node" \
 			${MODE:+--mode "$MODE"} \
 			${effective_transit:+--transit "$effective_transit"} \
