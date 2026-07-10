@@ -985,17 +985,20 @@ _cleanup_on_startup() {
 			sleep 1
 			kill -0 "$_old_pid" 2>/dev/null && kill -9 "$_old_pid" 2>/dev/null
 		fi
-	# Kill any OTHER orphan watchdogs (PPid=1, stdin=pipe).
-	# procd starts services with piped stdout/stderr, so orphan
-	# watchdogs have stdin=pipe.  New instance has stdin=/dev/null.
+	# Kill any OTHER orphan watchdogs (PPid=1).
+	# procd reparents exiting services to init, so orphaned watchdog
+	# mains have PPid=1. We do NOT filter on stdin: procd starts services
+	# with stdin=/dev/null (not a pipe), so a stdin=pipe filter misses
+	# every real orphan and lets duplicates accumulate during respawn
+	# storms. Legitimate children of this process have PPid=$$, never 1,
+	# so the PPid=1 check alone is enough to avoid hitting connect_vpn
+	# subshells or other children of $$.
 	local _opid
 	for _opid in $(pgrep -f surflare_watchdog.sh 2>/dev/null); do
 		[ "$_opid" = "$$" ] && continue
-		local _oppid _ofd0
+		local _oppid
 		_oppid=$(awk '/^PPid/{print $2}' /proc/"$_opid"/status 2>/dev/null)
 		[ "$_oppid" != "1" ] && continue
-		_ofd0=$(readlink /proc/"$_opid"/fd/0 2>/dev/null)
-		case "$_ofd0" in pipe:*) ;; *) continue ;; esac
 		log "Startup: killing orphan watchdog PID $_opid"
 		kill -9 "$_opid" 2>/dev/null
 	done
@@ -3482,7 +3485,7 @@ connect_vpn() {
 			--daemon 9>&-; then
 			log "Connection failed, will retry on next check cycle"
 			[ "$_ks_was_armed" -eq 1 ] && _reinstall_killswitch_output
-			exit 1
+			return 1
 		fi
 		if [ "$_ks_was_armed" -eq 1 ]; then
 			_reinstall_killswitch_output
@@ -3515,7 +3518,7 @@ connect_vpn() {
 			if [ "$_ready_wait" -ge "$CONNECT_SETTLE" ]; then
 				log "VPN establishment timed out: not ready after ${CONNECT_SETTLE}s"
 				[ "$_ks_was_armed" -eq 1 ] && _reinstall_killswitch_output
-				exit 1
+				return 1
 			fi
 			# Phase 2: verify data-plane forwarding with surflare ping.
 			# Replaces relay connection counting (ss), which only checks TCP
@@ -3556,7 +3559,7 @@ connect_vpn() {
 			if ! _proc_alive surflare-proxy >/dev/null 2>&1; then
 				log "VPN establishment timed out: surflare-proxy not running after ${CONNECT_SETTLE}s"
 				[ "$_ks_was_armed" -eq 1 ] && _reinstall_killswitch_output
-				exit 1
+				return 1
 			fi
 			log "VPN settle wait: ${CONNECT_SETTLE}s (actual: $(( SECONDS - _settle_start ))s)"
 		fi
@@ -3966,16 +3969,15 @@ taskset -pc 0 $$ >/dev/null 2>&1 || true
 # Self-heal: kill duplicate watchdog instances from procd respawn race.
 # procd respawn can start a new instance between init stop and start,
 # creating two parallel main loops.  Wait 3s for any late spawns to
-# initialise, then kill orphans (PPid=1 + stdin=pipe from procd).
-# Same filters as _cleanup_on_startup to avoid hitting connect_vpn
-# subshells or other legitimate children of $$.
+# initialise, then kill orphans (PPid=1). No stdin filter: procd starts
+# services with stdin=/dev/null, so a stdin=pipe filter would miss every
+# real orphan. Legitimate children of $$ have PPid=$$, never 1, so PPid=1
+# alone avoids hitting connect_vpn subshells.
 sleep 3
 for _dup in $(pgrep -f surflare_watchdog.sh 2>/dev/null); do
 	[ "$_dup" = "$$" ] && continue
 	_dup_ppid=$(awk '/^PPid/{print $2}' /proc/"$_dup"/status 2>/dev/null)
 	[ "$_dup_ppid" != "1" ] && continue
-	_dup_fd0=$(readlink /proc/"$_dup"/fd/0 2>/dev/null)
-	case "$_dup_fd0" in pipe:*) ;; *) continue ;; esac
 	kill -9 "$_dup" 2>/dev/null && \
 		log "Startup: killed duplicate watchdog PID $_dup"
 done
