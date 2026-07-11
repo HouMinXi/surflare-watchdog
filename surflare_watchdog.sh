@@ -290,6 +290,7 @@ _run_observability_probes() {
 	local _tmpfs_pct
 	local _mem _pid
 	local _bp_count
+	local _fd_count _fd_limit _fd_pct _ct_count _ct_max _ct_pct
 
 	# Probe 1 -- DNS liveness (router-only)
 	if [ "$PLATFORM" = "router" ]; then
@@ -351,6 +352,41 @@ _run_observability_probes() {
 		_bp_count=$(timeout 3 bpftool prog show 2>/dev/null | grep -c "loaded_at" || echo 0)
 		if [ "${_bp_count:-0}" -eq 0 ] && [ "$SECONDS" -gt 60 ]; then
 			log "WARN: BPF: no programs loaded"
+		fi
+	fi
+
+	# Probe 6 -- proxy fd count (fd leak early warning)
+	if [ -n "$_pid" ]; then
+		_fd_count=$(ls /proc/$_pid/fd 2>/dev/null | wc -l)
+		_fd_limit=$(awk '/Max open files/{print $4}' /proc/$_pid/limits 2>/dev/null)
+		_fd_limit=${_fd_limit:-65535}
+		if [ "$_fd_limit" -gt 0 ] 2>/dev/null; then
+			_fd_pct=$((_fd_count * 100 / _fd_limit))
+			if [ "$_fd_pct" -ge 80 ]; then
+				log "CRITICAL: proxy fd usage ${_fd_pct}% (${_fd_count}/${_fd_limit})"
+			elif [ "$_fd_pct" -ge 50 ]; then
+				log "WARN: proxy fd usage ${_fd_pct}% (${_fd_count}/${_fd_limit})"
+			fi
+		fi
+	fi
+
+	# Probe 7 -- nftables table existence + conntrack (router-only)
+	if [ "$PLATFORM" = "router" ]; then
+		nft list table inet sw_lan_tproxy >/dev/null 2>&1 || \
+			log "WARN: sw_lan_tproxy table missing (LAN clients lose VPN)"
+		nft list table inet killswitch >/dev/null 2>&1 || \
+			log "WARN: killswitch table missing"
+		nft list table inet surflare_moat >/dev/null 2>&1 || \
+			log "WARN: surflare_moat table missing"
+		_ct_count=$(cat /proc/sys/net/netfilter/nf_conntrack_count 2>/dev/null)
+		_ct_max=$(cat /proc/sys/net/netfilter/nf_conntrack_max 2>/dev/null)
+		if [ "${_ct_max:-0}" -gt 0 ] 2>/dev/null && [ -n "$_ct_count" ]; then
+			_ct_pct=$((_ct_count * 100 / _ct_max))
+			if [ "$_ct_pct" -ge 80 ]; then
+				log "CRITICAL: conntrack usage ${_ct_pct}% (${_ct_count}/${_ct_max})"
+			elif [ "$_ct_pct" -ge 50 ]; then
+				log "WARN: conntrack usage ${_ct_pct}% (${_ct_count}/${_ct_max})"
+			fi
 		fi
 	fi
 
