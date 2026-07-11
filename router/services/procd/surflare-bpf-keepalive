@@ -1,0 +1,47 @@
+#!/bin/sh /etc/rc.common
+
+# BPF keepalive override: clamp TCP_KEEPIDLE to 30s system-wide.
+# Fixes CGNAT NAT eviction (60-180s idle timeout) killing sing-box
+# relay connections with hardcoded 600s keepalive (sing-box 1.10.7).
+# Two programs: CGROUP_SETSOCKOPT (primary, intercepts setsockopt)
+#               SOCK_OPS (fallback, sets keepalive on new connections)
+
+USE_PROCD=1
+START=17
+STOP=99
+
+BPF_DIR=/usr/local/lib/bpf
+PIN_DIR=/sys/fs/bpf
+CGROUP=/sys/fs/cgroup
+
+start_service() {
+    # Primary: clamp setsockopt(TCP_KEEPIDLE) values > 30 to 30
+    if [ -f "$BPF_DIR/clamp_keepalive.bpf.o" ]; then
+        bpftool prog load "$BPF_DIR/clamp_keepalive.bpf.o" \
+            "$PIN_DIR/surflare_clamp_keepalive" 2>/dev/null && \
+        bpftool cgroup attach "$CGROUP" setsockopt pinned \
+            "$PIN_DIR/surflare_clamp_keepalive" 2>/dev/null && \
+        logger -t surflare-bpf "Loaded clamp_keepalive (CGROUP_SETSOCKOPT)" || \
+        logger -t surflare-bpf "WARN: clamp_keepalive load failed"
+    fi
+
+    # Fallback: set keepalive=30s on new outgoing connections
+    if [ -f "$BPF_DIR/test_keepalive.bpf.o" ]; then
+        bpftool prog load "$BPF_DIR/test_keepalive.bpf.o" \
+            "$PIN_DIR/surflare_force_keepalive" 2>/dev/null && \
+        bpftool cgroup attach "$CGROUP" sock_ops pinned \
+            "$PIN_DIR/surflare_force_keepalive" 2>/dev/null && \
+        logger -t surflare-bpf "Loaded force_keepalive (SOCK_OPS)" || \
+        logger -t surflare-bpf "WARN: force_keepalive load failed"
+    fi
+}
+
+stop_service() {
+    bpftool cgroup detach "$CGROUP" setsockopt pinned \
+        "$PIN_DIR/surflare_clamp_keepalive" 2>/dev/null
+    bpftool cgroup detach "$CGROUP" sock_ops pinned \
+        "$PIN_DIR/surflare_force_keepalive" 2>/dev/null
+    rm -f "$PIN_DIR/surflare_clamp_keepalive" \
+          "$PIN_DIR/surflare_force_keepalive"
+    logger -t surflare-bpf "BPF keepalive programs detached"
+}

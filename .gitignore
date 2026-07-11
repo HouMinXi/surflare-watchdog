@@ -31,3 +31,11 @@ n100/surflare-proxy-patched
 .planning/
 .worktrees
 .worktrees/
+
+# N100 sensitive configs (auth tokens, credentials, node IPs -- never commit)
+n100/config/auth.dat
+n100/config/credentials
+n100/config/nodedata.dat
+n100/config/server_ips
+n100/config/settings.dat
+n100/config/wechat.conf
