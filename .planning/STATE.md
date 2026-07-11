@@ -1,17 +1,17 @@
 ---
 gsd_state_version: 1.0
-milestone: v67
-milestone_name: Operational Maturity + Recovery Acceleration
-status: executing
-stopped_at: v66 milestone complete
-last_updated: "2026-07-07T04:30:00.000Z"
-last_activity: 2026-07-07 -- Phase 2 COMPLETE (16ba465), Phase 3 not yet planned
+milestone: v68
+milestone_name: Diagnostic Foundation + Stability Hardening
+status: planning
+stopped_at: milestone initialized
+last_updated: "2026-07-11T09:00:00.000Z"
+last_activity: 2026-07-11 -- v68 milestone created (post-v67 incident-driven hardening)
 progress:
   total_phases: 3
-  completed_phases: 2
-  total_plans: 4
-  completed_plans: 4
-  percent: 66
+  completed_phases: 0
+  total_plans: 0
+  completed_plans: 0
+  percent: 0
 ---
 
 ## Project Reference
@@ -19,51 +19,45 @@ progress:
 See: .planning/PROJECT.md (updated 2026-07-05)
 
 **Core value:** Transparent, always-on VPN with zero-leak killswitch and automatic failure recovery
-**Current focus:** v67 Phase 2 COMPLETE, Phase 3 next
+**Current focus:** v68 -- diagnostic foundation + stability hardening
 
 ## Current Position
 
-Phase: Phase 3 (Recovery Acceleration + Alerting) -- planned, ready for review
-Plan: 03-01 (recovery tuning), 03-02 (connect optimization), 03-03 (alerting)
-Status: Plans created, ready for CP1 internal review
-Last activity: 2026-07-07 -- Phase 3 planning complete
+Phase: Not started (milestone in planning)
+Status: v68 milestone designed, awaiting /gsd:plan-phase 1
+Last activity: 2026-07-11 -- v68 milestone created
 
-## Performance Metrics
+## Previous Milestone
 
-**Velocity:**
-
-- Total plans completed: 4 (1 Phase 1 + 3 Phase 2)
-- Average duration: ~15 min/plan
-- Total execution time: ~1 hour
-
-## Completed Phases (v64)
-
-- Phase 0: procd respawn fix (8f954cb)
-- Phase 0.5: reconnect optimization v3.2 (9567b58)
-- Phase 1: REJECT protocol feedback (9ba8e42)
-- Phase 2: tombstone storm + server_ips resilience (0a7cde2)
-- Phase 3: proxy-path SOCKS5 probe (03ab7fa)
-- Phase 4: stale proxy detection + port cleanup (1bf3d69)
-- Phase 5: boot-time lockdown S18 (9ba8e42)
-- Boot defects + bugfixes (4c90e3f, 6480ce7, 5f8416b)
+v67 "Operational Maturity + Recovery Acceleration" -- COMPLETE (2026-07-09)
+3 phases, 7 plans, 100%. Post-v67 incident-driven work (2026-07-11):
+instance-lock crash-loop fix, fd inheritance fix, fw4 reload fix,
+3 new observability probes (fd/nft/conntrack), Issue B (proxy_rule_set
+whitelist routing) root cause + fix, architecture diagram update,
+wrapper backport to repo. All committed and deployed to N100.
 
 ## Accumulated Context
 
-### Decisions
+### Decisions (carried from v67 + this session)
 
-- Chain-level reinstall over table split (MiMo proposal: ~15 lines vs ~80-120 lines, gap <100ms vs 5.3s)
-- conntrack flush immediately after output chain removal (not deferred)
-- urltest tolerance 300ms (validated by 4-way review for 2-7s TTFB chains)
-- Hash verification warn-only (not block, to avoid bricking on legitimate updates)
+- Zero-kill restart: proxy preserved across init.d restart (v67, validated)
+- fw4 reload not restart: reload preserves surflare nftables table (v68 finding)
+- Instance lock: _instance_lock_acquired flag gates cleanup (v68 fix)
+- fd inheritance: 200>&- on surflare connect prevents proxy holding lock (v68 fix)
+- sing-box rule mode: whitelist routing, catch-all (rule 10) goes direct (v68 finding)
+- INJECT_DOMAINS: wrapper injects domains into proxy_rule_set (v68: grokipedia.com, ipinfo.io)
+- Config dump: wrapper saves pre-patch config to /tmp/singbox-config-dump.json (v68 addition)
 
-### Blockers/Concerns
+### Open Items (v68 scope)
 
-- (resolved) urltest/interval: wrapper stdin-inject approach bypasses surflare-managed config
-- (resolved) sing-box config: jq patch in wrapper before exec to .real binary
-- nf_conntrack_snmp still loaded (refcount=1), will clear after next reboot
+- fd limit 1024: wrapper ulimit -n 65535 not inherited by surflare connect --daemon
+- api.ipify.org mystery: not in proxy_rule_set but exits VPN (contradicts routing rules)
+- 72h fd telemetry: connectionCopy fix deployed but no long-term monitoring
+- Remaining 200>&- leaks: tcpdump, diag-proxy-broken.sh fire-and-forget
+- Domain whitelist: manual INJECT_DOMAINS, no auto-discovery
 
 ## Session Continuity
 
-Last session: 2026-07-07
-Stopped at: Phase 2 complete (16ba465)
-Resume: /gsd-plan-phase 3 for Recovery Acceleration + Alerting
+Last session: 2026-07-11
+Stopped at: v68 milestone initialized
+Resume: /gsd:plan-phase 1
