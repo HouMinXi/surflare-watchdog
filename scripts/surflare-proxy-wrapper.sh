@@ -14,13 +14,13 @@ ulimit -n 65535 2>/dev/null || true
 
 REAL_BIN="/usr/bin/surflare-proxy.real"
 FALLBACK_BIN="/usr/local/lib/surflare-proxy-patched"
-EXPECTED_MD5="8e18ab1e9b5aa9d9de8bbe91d4d6245b"
+EXPECTED_MD5="e9ca7744c979a7214ed12ced1ade703a"
 TOLERANCE=300
 INTERVAL="60s"
 # Domains missing from surflare's proxy_rule_set that must go through VPN.
-# Without this, sing-box catch-all routes them direct -> CN IP exposed.
-# Incident: platform.claude.com OAuth callback -> app-unavailable-in-region.
-INJECT_DOMAINS="claude.com"
+# Without this, sing-box catch-all (rule 10: tproxy-in -> direct) routes
+# them direct -> CN IP exposed or TLS handshake reset on direct route.
+INJECT_DOMAINS="claude.com,grokipedia.com,ipinfo.io"
 
 # md5-gate: detect and rollback surflare auto-update
 _md5=$(md5sum "$REAL_BIN" 2>/dev/null | cut -d" " -f1)
@@ -52,6 +52,10 @@ _patched=$(mktemp)
 trap 'rm -f "$_tmp" "$_patched"' EXIT
 
 cat > "$_tmp"
+# Dump pre-patch config for debugging (routing rules, DNS, outbounds).
+# Overwritten on each proxy restart.  chmod 600: contains server IPs.
+cp "$_tmp" /tmp/singbox-config-dump.json
+chmod 600 /tmp/singbox-config-dump.json
 
 if jq --argjson T "$TOLERANCE" --arg I "$INTERVAL" --arg D "$INJECT_DOMAINS" '
   .outbounds |= map(if .type == "urltest" then .tolerance = $T | .interval = $I else . end)
