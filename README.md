@@ -31,8 +31,8 @@ graph TB
         end
 
         subgraph UserSpace["User Space"]
-            WD["surflare_watchdog.sh<br/>(lifecycle, health, reconnect)"]
-            PROXY["surflare-proxy<br/>(sing-box, tproxy inbound)<br/>SO_MARK=0xff"]
+            WD["surflare_watchdog.sh<br/>lifecycle, health, reconnect<br/>fw4 monitor, instance lock, obs: fd/nft/ct"]
+            PROXY["surflare-proxy<br/>sing-box, tproxy inbound<br/>SO_MARK=0xff, proxy_rule_set"]
             CLI["surflare CLI<br/>(auth, connect --daemon)"]
             SDNS["SmartDNS<br/>(domestic/foreign split)"]
             DNSMASQ["dnsmasq"]
@@ -75,6 +75,8 @@ graph TB
     DNSMASQ --> SDNS
     BPF -.->|"socket layer"| PROXY
 ```
+
+> **[High-resolution SVG](docs/architecture.svg)** -- full architecture diagram with traffic flow.
 
 **Key insight:** surflare-proxy already runs sing-box urltest outbounds for every
 node and transit combination, using the local CN IP as the probe source. Errors
