@@ -25,6 +25,7 @@ graph TB
             NFT_TP["inet sw_lan_tproxy<br/>prerouting TCP tproxy<br/>UDP/443 REJECT"]
             NFT_DNS["ip dns_enforce<br/>LAN dport 53 redirect"]
             NFT_MOAT["inet surflare_moat<br/>SYN injection detect"]
+            NFT_FW4["inet fw4<br/>masquerade srcnat_wan<br/>forward + input rules"]
             IPRULE["ip rule fwmark 0x1<br/>lookup table 100"]
             BPF["BPF cgroup2<br/>KEEPIDLE clamp 30s"]
         end
@@ -50,10 +51,12 @@ graph TB
     BRLAN --> NFT_TP
     NFT_TP -->|"TCP tproxy<br/>mark 0x1"| PROXY
     NFT_TP -->|"UDP/443 REJECT<br/>(force HTTP/2)"| BRLAN
+    NFT_TP -->|"CN direct<br/>(return)"| NFT_FW4
     PROXY -->|"0xff direct"| NFT_SF
     PROXY -->|"0x1 VPN"| NFT_SF
     NFT_SF --> NFT_KS
     NFT_KS -->|"accept"| PPPoE
+    NFT_FW4 -->|"masquerade"| PPPoE
     PPPoE --> ISP
     ISP --> Relay
     Relay --> Exit
@@ -63,6 +66,7 @@ graph TB
     WD -->|"monitors"| PROXY
     WD -->|"installs"| NFT_KS
     WD -->|"restores"| NFT_TP
+    WD -->|"monitors fw4"| NFT_FW4
     CLI -->|"creates"| NFT_SF
     CLI -->|"spawns"| PROXY
 
@@ -277,6 +281,12 @@ matrix shows who creates, manages, and tears down each table.
 +--------------------+-------------------+-----------------+-----------------+-----------------+
 | inet surflare_moat | watchdog          | FIN/RST window  | same            | same            |
 |                    |                   | detection       |                 |                 |
++--------------------+-------------------+-----------------+-----------------+-----------------+
+| inet fw4           | OpenWrt fw4       | masquerade +    | same            | NOT CREATED     |
+|                    | service           | forward rules;  |                 | (laptop)        |
+|                    |                   | watchdog        |                 |                 |
+|                    |                   | monitors +      |                 |                 |
+|                    |                   | auto-recovers   |                 |                 |
 +--------------------+-------------------+-----------------+-----------------+-----------------+
 | inet watchdog_trace| watchdog          | packet trace    | same            | same            |
 |                    |                   | diagnostics     |                 |                 |
@@ -626,6 +636,8 @@ All paths are relative to `/run/`. Files are mode 0600 and live on tmpfs
 | BPF keepalive | Dual BPF programs clamp TCP keepalive to 30s (CGNAT NAT mapping preservation) |
 | Fail-open | After 5 global auth failures, removes kill switch; retries with backoff |
 | Early warn | USR1 trap wakes watchdog for immediate health check |
+| fw4 health | `_check_fw4_health` every 300s, auto-recovery via `firewall reload` (preserves surflare table; restart would flush entire ruleset) |
+| Instance lock | flock fd 200 prevents duplicate instances; cleanup gated on `_instance_lock_acquired` flag |
 
 ### `surflare_early_detector.sh` -- TCP degradation sensor
 
@@ -874,6 +886,14 @@ LAN device -> br-lan
   -> fw4 forward: forward_lan -> accept_to_wan
   -> NAT masquerade -> pppoe-wan -> WAN (direct, no VPN)
 ```
+
+**fw4 masquerade dependency**: CN-direct traffic (bypassed by `sw_lan_tproxy`
+`return` rules) depends on fw4's `srcnat_wan` masquerade to NAT the source IP.
+Without it, replies from the CN destination route to the private LAN IP and
+never arrive. The watchdog monitors this every 300s via `_check_fw4_health`
+and auto-recovers using `firewall reload` (not `restart` -- `fw4 restart`
+flushes the entire nftables ruleset, deleting the surflare and
+`sw_lan_tproxy` tables).
 
 **What bypass covers**: all protocols (TCP, UDP, ICMP), all destinations.
 Bypassed devices are synced to killswitch `bypass_src` (forward accept) and
