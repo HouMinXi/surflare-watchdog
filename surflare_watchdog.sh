@@ -276,7 +276,7 @@ _send_alert() {
 		else
 			log "WARN: alert delivery failed: ${_title}"
 		fi
-	) &
+	) 200>&- &
 }
 
 # Ecosystem health probes: DNS, tmpfs, crond, memory/OOM, BPF.
@@ -407,7 +407,7 @@ _start_proxy_log_monitor() {
 			logger -t surflare-proxy "$_line"
 			sleep "$PROXY_LOG_RATE_SEC"
 		done
-	) &
+	) 200>&- &
 	_proxy_log_pid=$!
 }
 
@@ -2212,6 +2212,74 @@ _table_exists() {
 	echo "no"
 }
 
+# _check_fw4_health: verify the OpenWrt fw4/firewall service is providing
+# masquerade for pppoe-wan egress. LAN-client traffic that gets correctly
+# CN-bypassed in sw_lan_tproxy (skips tproxy/sing-box entirely, by design)
+# is forwarded via the kernel's normal routing path with its source address
+# unchanged. It depends on fw4's masquerade to rewrite that to N100's own
+# WAN address. Without it, replies from the CN destination route to the
+# private LAN source IP and never arrive; every such connection times out,
+# while VPN-routed traffic (which sing-box originates itself) is unaffected.
+# fw4 restarts are a normal, hotplug-triggered event on this router (see
+# the bypass_devices repopulation comment elsewhere in this script) that
+# this watchdog otherwise has no visibility into, so a failed restart can
+# leave NAT silently missing until someone notices manually.
+# Router-only: a laptop deployment does not gateway/forward for other
+# devices, so masquerade does not apply.
+# Coupled to fw4's internal srcnat_wan chain name (current fw4 generates
+# this from the standard `oifname {...} jump srcnat_wan` wan-zone rule,
+# verified live on N100). Accepted tradeoff: a future fw4 rename of this
+# chain would need this check updated too, same as any other place in
+# this script that names an fw4/nft chain directly.
+# No separate existence check before the grep: if the table/chain is
+# missing entirely, `nft list` fails and the pipeline sees empty input,
+# so `grep -q masquerade` correctly returns 1 (unhealthy), which is the
+# intended result since a router deployment always expects fw4 present.
+_check_fw4_health() {
+	[ "$PLATFORM" = "laptop" ] && return 0
+	nft list chain inet fw4 srcnat_wan 2>/dev/null | grep -q masquerade
+}
+
+# _recover_fw4: restart fw4 when _check_fw4_health fails. Rate-limited via
+# FW4_RESTART_COOLDOWN so a persistently broken fw4 (or a restart that
+# itself fails) cannot retry every check interval. This cooldown gates the
+# restart ACTION; _send_alert has its own separate 600s throttle on the
+# alert itself.
+_recover_fw4() {
+	local _now _diff
+	_now=$(date +%s)
+	_diff=$((_now - ${_fw4_last_restart_ts:-0}))
+	# _diff can go negative if the clock jumps backward (no RTC, pre-NTP
+	# boot); treat that the same as "cooldown expired" rather than let a
+	# negative number satisfy -lt and block the first restart forever.
+	# Matches the same guard in _send_alert's own rate limiter.
+	if [ "$_diff" -ge 0 ] && [ "$_diff" -lt "$FW4_RESTART_COOLDOWN" ]; then
+		log "fw4 unhealthy but restart cooldown active, skipping"
+		return 1
+	fi
+	_fw4_last_restart_ts=$_now
+	log "WARN: fw4 masquerade missing, attempting reload"
+	# Reload refreshes fw4's own table without flushing the entire
+	# nftables ruleset. A full restart flushes surflare/sw_lan_tproxy
+	# tables, breaking VPN until the watchdog reconnects (~60s outage).
+	if timeout 20 /etc/init.d/firewall reload >/dev/null 2>&1 && _check_fw4_health; then
+		log "fw4 reload recovered masquerade"
+		_send_alert "surflare: fw4 auto-recovered" "fw4/masquerade was missing and has been reloaded automatically."
+		return 0
+	fi
+	# Fallback: full restart if reload failed (e.g. fw4 table gone).
+	# This flushes the entire ruleset; watchdog self-healing recovers VPN.
+	log "fw4 reload did not recover masquerade, attempting full restart"
+	if timeout 20 /etc/init.d/firewall restart >/dev/null 2>&1 && _check_fw4_health; then
+		log "fw4 restart recovered masquerade"
+		_send_alert "surflare: fw4 auto-recovered" "fw4/masquerade was missing and has been restarted automatically."
+		return 0
+	fi
+	log "ERROR: fw4 restart did not recover masquerade"
+	_send_alert "surflare: fw4 DOWN" "fw4/masquerade missing and automatic restart failed. Manual check needed: /etc/init.d/firewall restart"
+	return 1
+}
+
 # _block_unreachable_doh: reject DoH to servers unreachable from this network.
 # N100 CGNAT: 1.1.1.1/8.8.8.8 are GFW-blocked (SYN blackholed, 10s timeout).
 # surflare-proxy tries DoH in order 1.1.1.1 -> 8.8.8.8 -> 223.5.5.5; the
@@ -2361,7 +2429,7 @@ check_vpn_health() {
 		local code
 		code=$(echo "$_raw" | head -1)
 		case "$code" in 200|301|302) echo "OK" ;; esac
-	) >"$tmp_g" 2>/dev/null &
+	) >"$tmp_g" 2>/dev/null 200>&- &
 	pid_g=$!
 
 	# Probe 2: Cloudflare trace via domain (parse loc= field, no rate limit)
@@ -2372,7 +2440,7 @@ check_vpn_health() {
 		     'https://cloudflare.com/cdn-cgi/trace' 2>/dev/null)
 		echo "$_body" | tail -1 >"$tmp_cft"
 		echo "$_body" | head -n -1 | awk -F= '/^loc=/{print $2}' | tr -d '[:space:]'
-	) >"$tmp_cf" 2>/dev/null &
+	) >"$tmp_cf" 2>/dev/null 200>&- &
 	pid_cf=$!
 
 	# Probe 3: Cloudflare trace via IP 1.0.0.1 (skips DNS for cloudflare.com,
@@ -2384,7 +2452,7 @@ check_vpn_health() {
 		     'https://1.0.0.1/cdn-cgi/trace' 2>/dev/null)
 		echo "$_body" | tail -1 >"$tmp_cf2t"
 		echo "$_body" | head -n -1 | awk -F= '/^loc=/{print $2}' | tr -d '[:space:]'
-	) >"$tmp_cf2" 2>/dev/null &
+	) >"$tmp_cf2" 2>/dev/null 200>&- &
 	pid_cf2=$!
 
 	# Probe 4: ifconfig.co ISO country code (degrades gracefully on rate limit)
@@ -2395,7 +2463,7 @@ check_vpn_health() {
 		     'https://ifconfig.co/country-iso' 2>/dev/null)
 		echo "$_body" | tail -1 >"$tmp_ifct"
 		echo "$_body" | head -n -1 | tr -d '[:space:]'
-	) >"$tmp_ifc" 2>/dev/null &
+	) >"$tmp_ifc" 2>/dev/null 200>&- &
 	pid_ifc=$!
 
 	# Probe 5: icanhazip.com (Cloudflare-backed, tiny response -- returns raw IP only).
@@ -2412,7 +2480,7 @@ check_vpn_health() {
 		if [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || [[ "$ip" =~ :.*: ]]; then
 			echo "IP:${ip}"
 		fi
-	) >"$tmp_ich" 2>/dev/null &
+	) >"$tmp_ich" 2>/dev/null 200>&- &
 	pid_ich=$!
 
 	# Probe 6: myip.wtf (returns raw IP, lightweight)
@@ -2426,7 +2494,7 @@ check_vpn_health() {
 		if [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || [[ "$ip" =~ :.*: ]]; then
 			echo "IP:${ip}"
 		fi
-	) >"$tmp_myip" 2>/dev/null &
+	) >"$tmp_myip" 2>/dev/null 200>&- &
 	pid_myip=$!
 
 	# Probe 7: tproxy path -- detects G1 blindspot (tunnel dead but external
@@ -2450,7 +2518,7 @@ check_vpn_health() {
 		local code
 		code=$(echo "$_raw" | head -1)
 		case "$code" in 204|200) echo "OK" ;; *) echo "FAIL" ;; esac
-	) >"$tmp_proxy" 2>/dev/null &
+	) >"$tmp_proxy" 2>/dev/null 200>&- &
 	pid_proxy=$!
 
 	# --- Early-exit polling loop ---
@@ -2942,7 +3010,7 @@ _diagnose_tunnel_failure() {
 	find /tmp -name 'surflare_phys_*.pcap' -mmin +30 -delete 2>/dev/null || true
 	local pcap
 	pcap="/tmp/surflare_phys_$(date +%Y%m%d_%H%M%S).pcap"
-	tcpdump -i "$phys_if" -nn -w "$pcap" "$filter" 2>/dev/null &
+	tcpdump -i "$phys_if" -nn -w "$pcap" "$filter" 2>/dev/null 200>&- &
 	local td_pid=$!
 	# Verify tcpdump started successfully
 	if ! kill -0 "$td_pid" 2>/dev/null; then
@@ -3191,7 +3259,7 @@ probe_best_transit() {
 		log "Probing transit candidate: ${node} (${_probe_idx}/${_probe_total})"
 		if ! timeout "$TRANSIT_CONNECT_TIMEOUT" surflare connect \
 			--node "${_active_node:-$NODE}" --mode "${MODE:-global}" \
-			--transit "$node" --daemon >/dev/null 2>&1; then
+			--transit "$node" --daemon >/dev/null 2>&1 200>&-; then
 			log "Probe ${node}: connect failed"
 			cleanup_probe_state
 			continue
@@ -3482,7 +3550,7 @@ connect_vpn() {
 		if ! surflare connect --node "$use_node" \
 			${MODE:+--mode "$MODE"} \
 			${effective_transit:+--transit "$effective_transit"} \
-			--daemon 9>&-; then
+			--daemon 9>&- 200>&-; then
 			log "Connection failed, will retry on next check cycle"
 			[ "$_ks_was_armed" -eq 1 ] && _reinstall_killswitch_output
 			return 1
@@ -3799,9 +3867,19 @@ fi
 storm_sleep_pid=""
 _hc_tmp=""
 _cleanup_done=0
+# Set to 1 only after this process actually acquires the instance lock
+# (see the INSTANCE_LOCK block below). A process that loses the race for
+# the lock never starts the proxy, never touches nftables, and owns
+# nothing that needs tearing down; without this guard cleanup() cannot
+# tell that case apart from a real instance stopping, and destroys the
+# real instance's live state instead of just exiting quietly.
+_instance_lock_acquired=0
 cleanup() {
 	[ "$_cleanup_done" -eq 1 ] && return 0
 	_cleanup_done=1
+	if [ "$_instance_lock_acquired" -ne 1 ]; then
+		return 0
+	fi
 	stop_packet_trace >/dev/null 2>&1
 	_stop_proxy_log_monitor
 	[ -n "$storm_sleep_pid" ] && kill "$storm_sleep_pid" 2>/dev/null
@@ -3854,6 +3932,22 @@ trap 'log "watchdog stopped"; cleanup; exit 0' INT TERM
 trap 'cleanup' EXIT
 trap 'log "received SIGHUP (terminal hangup), ignoring"' HUP
 trap ':' PIPE  # no-op handler for SIGPIPE (prevents bash exit on broken pipe)
+
+# Single-instance guard (root fix for duplicate-watchdog storms).
+# procd respawn (exit on connect) and the cron restart can spawn a second
+# watchdog while the first is still alive -- e.g. mid storm-cooldown sleep.
+# Without this guard both run concurrent main loops ("N duplicate
+# watchdog(s)"), racing nftables/connect and amplifying the storm. A new
+# instance that cannot acquire the lock exits immediately, so at most one
+# watchdog process is ever active. Separate fd/lockfile from the
+# connect_vpn reconnect-mutex (LOCK_FILE / fd 9) so that guard still works.
+INSTANCE_LOCK=/run/surflare_watchdog.instance.lock
+exec 200>"$INSTANCE_LOCK"
+if ! flock -n 200; then
+	log "another watchdog instance holds the instance lock, exiting to prevent duplicate"
+	exit 1
+fi
+_instance_lock_acquired=1
 
 # Phase 1: Clean up ALL orphan watchdog processes (PPid=1)
 # Restart cycles can accumulate multiple orphan processes that PID file
@@ -4006,6 +4100,10 @@ _stats_last_report=$(date +%s)
 _tproxy_503_cooldown_until=0
 _tproxy_503_rotate_ts=0
 STATS_REPORT_INTERVAL=21600  # 6h
+_fw4_last_check=$(date +%s)
+FW4_CHECK_INTERVAL=300        # 5 min
+_fw4_last_restart_ts=0
+FW4_RESTART_COOLDOWN=900      # 15 min, avoid thrashing repeated restarts
 _active_node="$NODE"
 _node_idx=0
 if [ -f "$ROTATION_STATE" ]; then
@@ -4227,7 +4325,7 @@ while true; do
 		# Capture forensic snapshot BEFORE reconnect tears down proxy
 		# state.  Fire-and-forget background; won't delay reconnect.
 		if [ -x /usr/local/sbin/diag-proxy-broken.sh ]; then
-			/usr/local/sbin/diag-proxy-broken.sh &>/dev/null &
+			/usr/local/sbin/diag-proxy-broken.sh &>/dev/null 200>&- &
 		fi
 		transient_count=0
 		_cn_consecutive=0
@@ -4361,6 +4459,15 @@ while true; do
 	_now_stats=${now:-$(date +%s)}
 	if [ $((_now_stats - ${_stats_last_report:-0})) -ge "$STATS_REPORT_INTERVAL" ]; then
 		_report_stats
+	fi
+
+	# Periodic fw4/masquerade health check. LAN-client CN-direct traffic
+	# depends on it (see _check_fw4_health); fw4 restarts happen from
+	# hotplug events this watchdog has no other visibility into.
+	_now_fw4=$(date +%s)
+	if [ $((_now_fw4 - ${_fw4_last_check:-0})) -ge "$FW4_CHECK_INTERVAL" ]; then
+		_fw4_last_check=$_now_fw4
+		_check_fw4_health || _recover_fw4
 	fi
 
 	_manage_trace "$health"
