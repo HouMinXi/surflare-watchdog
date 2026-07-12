@@ -1157,6 +1157,13 @@ _cleanup_on_startup() {
 	if [ "$_adopt_proxy" -eq 1 ]; then
 		local _proxy_pid
 		_proxy_pid=$(_pids_by_comm surflare-proxy | head -1)
+		local _fd_soft
+		if [ -n "$_proxy_pid" ]; then
+			_fd_soft=$(awk '/Max open files/{print $4}' /proc/"$_proxy_pid"/limits 2>/dev/null)
+			if [ "${_fd_soft:-0}" -lt 65535 ] 2>/dev/null && command -v prlimit >/dev/null 2>&1; then
+				prlimit --pid "$_proxy_pid" --nofile=65535:65535 2>/dev/null && log "proxy fd limit raised to 65535 (was ${_fd_soft:-unknown})"
+			fi
+		fi
 		log "Startup: adopting running proxy (PID=${_proxy_pid:-unknown})"
 		_start_proxy_log_monitor
 		# Skip nft delete and ip rule del -- proxy needs them intact.
@@ -1228,7 +1235,7 @@ _cleanup_on_startup() {
 		if [ -n "$_cool_target" ] && [ "$_cool_target" -gt "$_now" ] 2>/dev/null; then
 			_remaining=$((_cool_target - _now))
 			log "Storm cool in progress; sleeping ${_remaining}s before main loop"
-			sleep "$_remaining" &
+			sleep "$_remaining" 200>&- &
 			storm_sleep_pid=$!; wait "$storm_sleep_pid" || true
 			storm_sleep_pid=""
 		fi
@@ -1853,7 +1860,7 @@ _enter_storm_cooldown() {
 	local _storm_sleep _storm_dup _spid _storm_mem
 	while [ "$_storm_remaining" -gt 0 ]; do
 		_storm_sleep=$(( _storm_remaining < _storm_probe_interval ? _storm_remaining : _storm_probe_interval ))
-		sleep "$_storm_sleep" &
+		sleep "$_storm_sleep" 200>&- &
 		storm_sleep_pid=$!; wait "$storm_sleep_pid"; storm_sleep_pid=""
 		_storm_remaining=$(( _storm_remaining - _storm_sleep ))
 		[ "$run_health_check_now" = 1 ] && break
@@ -3777,7 +3784,7 @@ EOF
 	fi
 
 	tcpdump -i "nflog:$_trace_group" -w "$_trace_pcap" \
-		2>"${_trace_pcap}.err" &
+		2>"${_trace_pcap}.err" 200>&- &
 	_trace_tcpdump_pid=$!
 
 	local ready=0 _si=0
@@ -4210,7 +4217,7 @@ while true; do
 	# SIGUSR2 toggles _diag_mode; while active, the loop sleeps
 	# and skips all health checks/reconnects.  nft tables stay up.
 	if [ "${_diag_mode:-0}" -eq 1 ]; then
-		sleep "$CHECK_INTERVAL" & storm_sleep_pid=$!
+		sleep "$CHECK_INTERVAL" 200>&- & storm_sleep_pid=$!
 		wait "$storm_sleep_pid" || true
 		storm_sleep_pid=""
 		continue
@@ -4218,7 +4225,7 @@ while true; do
 	# Change 6: probe defer guard -- skip entire cycle when node_probe holds the session
 	if _probe_active; then
 		log "node_probe active; deferring health check + reactions this cycle"
-		sleep "$CHECK_INTERVAL" & storm_sleep_pid=$!
+		sleep "$CHECK_INTERVAL" 200>&- & storm_sleep_pid=$!
 		wait "$storm_sleep_pid" || true
 		storm_sleep_pid=""
 		continue
@@ -4258,17 +4265,17 @@ while true; do
 		record_crash
 		if crash_rate_exceeded; then
 			log "Crash cascade: ${CRASH_MAX_PER_WINDOW} crashes in ${CRASH_WINDOW}s, cooldown ${CRASH_EXTENDED_COOLDOWN}s"
-			sleep "$CRASH_EXTENDED_COOLDOWN" &
+			sleep "$CRASH_EXTENDED_COOLDOWN" 200>&- &
 			storm_sleep_pid=$!; wait "$storm_sleep_pid"; storm_sleep_pid=""
 			_crash_timestamps=""
 			continue
 		fi
 		log "iwlwifi crash detected, waiting ${CRASH_COOLDOWN}s for stabilization"
-		sleep "$CRASH_COOLDOWN" &
+		sleep "$CRASH_COOLDOWN" 200>&- &
 		storm_sleep_pid=$!; wait "$storm_sleep_pid"; storm_sleep_pid=""
 		if recent_wifi_crash 10; then
 			log "Firmware still crashing after cooldown, deferring reconnect"
-			sleep "$CHECK_INTERVAL" & storm_sleep_pid=$!; wait "$storm_sleep_pid"; storm_sleep_pid=""
+			sleep "$CHECK_INTERVAL" 200>&- & storm_sleep_pid=$!; wait "$storm_sleep_pid"; storm_sleep_pid=""
 			continue
 		fi
 		log "Firmware stable, triggering VPN reconnect"
@@ -4315,7 +4322,7 @@ while true; do
 				_enter_storm_cooldown "post-crash"
 			fi
 		fi
-		sleep "$CHECK_INTERVAL" & storm_sleep_pid=$!; wait "$storm_sleep_pid"; storm_sleep_pid=""
+		sleep "$CHECK_INTERVAL" 200>&- & storm_sleep_pid=$!; wait "$storm_sleep_pid"; storm_sleep_pid=""
 		continue
 	fi
 
@@ -4556,7 +4563,7 @@ while true; do
 				rm -f /run/surflare_auth_fail_signal
 				if [ "$_signal_type" = "subscription" ]; then
 					log "Subscription expired, entering 1h cooldown (reconnect will not help)"
-					sleep 3600 &
+					sleep 3600 200>&- &
 					storm_sleep_pid=$!; wait "$storm_sleep_pid" || true; storm_sleep_pid=""
 					continue
 				elif [ "$_signal_type" = "fatal" ]; then
@@ -4665,7 +4672,7 @@ while true; do
 		_dg_elapsed=0
 		storm_sleep_pid=""
 		while [ "$_dg_elapsed" -lt "$DEGRADED_INTERVAL" ]; do
-			sleep 2 & storm_sleep_pid=$!
+			sleep 2 200>&- & storm_sleep_pid=$!
 			wait "$storm_sleep_pid" || true
 			storm_sleep_pid=""
 			_dg_elapsed=$((_dg_elapsed + 2))
@@ -4676,7 +4683,7 @@ while true; do
 			fi
 		done
 	else
-		sleep "$CHECK_INTERVAL" & storm_sleep_pid=$!
+		sleep "$CHECK_INTERVAL" 200>&- & storm_sleep_pid=$!
 		wait "$storm_sleep_pid" || true
 		storm_sleep_pid=""
 	fi
