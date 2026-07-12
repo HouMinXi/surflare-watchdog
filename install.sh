@@ -193,6 +193,18 @@ procd)
     ;;
 
 runit)
+
+    # SmartDNS: deploy patched init.d (auto_set_dnsmasq guard)
+    # Fixes: crash loop when redirect='redirect' + auto_set_dnsmasq=0
+    # (init.d unconditionally sets port=53, conflicts with dnsmasq)
+    if [ -f "$SVC_ROUTER/procd/smartdns" ]; then
+        cp "$SVC_ROUTER/procd/smartdns" /etc/init.d/smartdns
+        chmod 755 /etc/init.d/smartdns
+        /etc/init.d/smartdns enable || true
+    fi
+    # Remove redundant smartdns-custom (tries to start 2nd instance, crash loop)
+    rm -f /etc/init.d/smartdns-custom
+    rm -f /etc/rc.d/*smartdns-custom*
     for svc in surflare-watchdog surflare-early-detector; do
         cp -r "$SVC_LAPTOP/runit/$svc" /etc/sv/
         ln -sf "/etc/sv/$svc" /service/ || true
