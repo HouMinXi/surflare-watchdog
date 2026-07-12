@@ -87,18 +87,10 @@ _exit_country_blocked=0               # set by _record_connect when exit not in 
 _sess_connect_s=0                     # epoch of current session start
 _sess_prev_node=""                    # previous session's exit node
 _sess_prev_s=0                        # previous session's lifetime in seconds
+_export_diag_pending=0                 # SIGUSR1 flag for deferred diag state export
 _diag_conclusion=""                   # set by _diagnose_tunnel_failure for _record_disconnect
 _diag_out=0                           # physical capture outbound packet count
 _obs_run_count=0                      # observability probe invocation counter (heartbeat)
-# FD trend tracking: 72h ring buffer at ~30s intervals
-_FD_RING_MAX=8640
-_FD_RING_ALERT_AVG=50
-_FD_RING_SUSTAINED=120  # 120 samples at 30s = 1 hour
-_fd_ring=()
-_fd_ring_idx=0
-_fd_ring_count=0
-_fd_ring_last_alert=0  # intentional: global, persists across probe calls
-_fd_last_pid=""         # intentional: global, tracks PID across calls
 _diag_in=0                            # physical capture inbound packet count
 _diag_syn_out=0                       # SYN packets sent (new connection attempts)
 _diag_syn_ack=0                       # SYN-ACK received (successful handshakes)
@@ -300,7 +292,6 @@ _run_observability_probes() {
 	local _mem _pid
 	local _bp_count
 	local _fd_count _fd_limit _fd_pct _ct_count _ct_max _ct_pct
-	local _fd_sum _fd_walk_start _fd_i _fd_samples _fd_avg
 
 	# Probe 1 -- DNS liveness (router-only)
 	if [ "$PLATFORM" = "router" ]; then
@@ -355,7 +346,7 @@ _run_observability_probes() {
 	_mem=$(awk '/MemAvailable/{print $2}' /proc/meminfo)
 	[ "${_mem:-0}" -lt 500000 ] && log "WARN: low memory: ${_mem}kB available"
 	_pid=$(_pids_by_comm "surflare-proxy" | tail -1)
-	[ -n "$_pid" ] && echo -1000 > "/proc/$_pid/oom_score_adj" 2>/dev/null
+	[ -n "$_pid" ] && echo -1000 > /proc/$_pid/oom_score_adj 2>/dev/null
 
 	# Probe 5 -- BPF keepalive (router-only)
 	if [ "$PLATFORM" = "router" ]; then
@@ -367,54 +358,11 @@ _run_observability_probes() {
 
 	# Probe 6 -- proxy fd count (fd leak early warning)
 	if [ -n "$_pid" ]; then
-		# shellcheck disable=SC2012  # ls is correct for counting /proc/PID/fd entries
-			_fd_count=$(ls "/proc/$_pid/fd" 2>/dev/null | wc -l)
-		_fd_limit=$(awk '/Max open files/{print $4}' "/proc/$_pid/limits" 2>/dev/null)
+		_fd_count=$(ls /proc/$_pid/fd 2>/dev/null | wc -l)
+		_fd_limit=$(awk '/Max open files/{print $4}' /proc/$_pid/limits 2>/dev/null)
 		_fd_limit=${_fd_limit:-65535}
 		if [ "$_fd_limit" -gt 0 ] 2>/dev/null; then
 			_fd_pct=$((_fd_count * 100 / _fd_limit))
-
-			# Reset ring buffer if proxy PID changed (reconnect)
-			# Intentional: resets _fd_ring_last_alert so first alert fires after 1h
-			# on new PID (even if previous PID just alerted). Reconnect = new proxy
-			# session, new fd baseline.
-			if [ "${_fd_last_pid:-}" != "$_pid" ]; then
-				[ -n "${_fd_last_pid:-}" ] && \
-					log "FD ring reset (proxy PID changed: $_fd_last_pid -> $_pid)"
-				_fd_ring=(); _fd_ring_idx=0; _fd_ring_count=0
-				_fd_ring_last_alert=0; _fd_last_pid=$_pid
-			fi
-
-			# Defensive guard: _fd_pct is always set when _pid is non-empty because
-			# existing code defaults _fd_limit to 65535 and guards with
-			# `if [ "$_fd_limit" -gt 0 ]`. This if-wrap protects against
-			# hypothetical future code changes.
-			if [ -n "$_fd_pct" ]; then
-				# Append to ring buffer
-				_fd_ring[$_fd_ring_idx]=$_fd_pct
-				_fd_ring_idx=$(( (_fd_ring_idx + 1) % _FD_RING_MAX ))
-				_fd_ring_count=$((_fd_ring_count + 1))
-
-				# Sustained alert: 1h moving average
-				if [ "$_fd_ring_count" -ge "$_FD_RING_SUSTAINED" ]; then
-					_fd_sum=0; _fd_samples=0
-					_fd_walk_start=$(( (_fd_ring_idx - _FD_RING_SUSTAINED + _FD_RING_MAX) % _FD_RING_MAX ))
-					_fd_i=$_fd_walk_start
-					while [ "$_fd_samples" -lt "$_FD_RING_SUSTAINED" ]; do
-						_fd_sum=$((_fd_sum + ${_fd_ring[$_fd_i]:-0}))
-						_fd_i=$(( (_fd_i + 1) % _FD_RING_MAX ))
-						_fd_samples=$((_fd_samples + 1))
-					done
-					_fd_avg=$((_fd_sum / _FD_RING_SUSTAINED))
-					if [ "$_fd_avg" -ge "$_FD_RING_ALERT_AVG" ] && \
-					   [ $(( $(date +%s) - _fd_ring_last_alert )) -ge 3600 ]; then
-						log "ALERT: proxy fd sustained high -- 1h avg ${_fd_avg}%"
-						_send_alert "FD Sustained High" "1h avg: ${_fd_avg}%"
-						_fd_ring_last_alert=$(date +%s)
-					fi
-				fi
-			fi
-
 			if [ "$_fd_pct" -ge 80 ]; then
 				log "CRITICAL: proxy fd usage ${_fd_pct}% (${_fd_count}/${_fd_limit})"
 			elif [ "$_fd_pct" -ge 50 ]; then
@@ -463,9 +411,6 @@ _run_observability_probes() {
 _proxy_log_pid=""
 PROXY_LOG="/var/log/surflare/surflare-proxy.log"
 PROXY_LOG_RATE_SEC=60
-PROXY_ERR_STATE="/run/surflare_proxy_err_count"
-PROXY_ERR_THRESHOLD=10  # higher than 503's 5: general errors are noisier
-_err_last_logged=0      # track last logged count to avoid repeated messages
 
 _start_proxy_log_monitor() {
 	_stop_proxy_log_monitor
@@ -480,7 +425,6 @@ _start_proxy_log_monitor() {
 	# $$ in a subshell = parent script PID (bash).
 	(   _503_count=0
 	    _503_first=0
-	    _err_count=0
 	    tail -n 0 -F "$PROXY_LOG" 2>/dev/null | while IFS= read -r _line; do
 			echo "$_line" | grep -q 'ERROR' || continue
 			if echo "$_line" | grep -q 'urltest.*503'; then
@@ -496,20 +440,6 @@ _start_proxy_log_monitor() {
 					kill -USR1 $$ 2>/dev/null || true
 				fi
 				continue
-			elif echo "$_line" | grep -qi "authentication required"; then
-				if [ ! -f /run/surflare_auth_expired ]; then
-					touch /run/surflare_auth_expired
-					kill -USR1 $$ 2>/dev/null || true
-				fi
-				continue
-			fi
-			# Count all ERROR lines (not 503 -- those handled above)
-			# $$ = parent PID in bash subshell (same pattern as 503 handler)
-			_err_count=$((_err_count + 1))
-			echo "$_err_count $(date +%s)" > "${PROXY_ERR_STATE}.tmp" && \
-				mv "${PROXY_ERR_STATE}.tmp" "$PROXY_ERR_STATE" 2>/dev/null
-			if [ $((_err_count % PROXY_ERR_THRESHOLD)) -eq 0 ]; then
-				kill -USR1 $$ 2>/dev/null || true
 			fi
 			logger -t surflare-proxy "$_line"
 			sleep "$PROXY_LOG_RATE_SEC"
@@ -526,7 +456,6 @@ _stop_proxy_log_monitor() {
 	fi
 	pkill -f "tail -n 0 -F ${PROXY_LOG//./\\.}" 2>/dev/null || true
 	rm -f "$STORM_503_STATE" "${STORM_503_STATE}.tmp"
-	rm -f "$PROXY_ERR_STATE" "${PROXY_ERR_STATE}.tmp"
 }
 
 PROXY_CPU_SET=""
@@ -1060,10 +989,6 @@ _cleanup_on_startup() {
 	# marker would cause a future stop to skip proxy teardown.
 	rm -f "$RESTART_MARKER"
 
-	# Clean up stale config dumps (older than 7 days)
-	find /var/log/surflare/ -name "config_dump_*.json" -mtime +6 \
-		-exec rm -f {} \; 2>/dev/null || true
-
 	# Zero-kill adopt decision: check whether a healthy proxy is running
 	# BEFORE any kill site.  If all conditions pass, set the adopt flag
 	# so downstream kill sites are skipped.
@@ -1233,13 +1158,6 @@ _cleanup_on_startup() {
 	if [ "$_adopt_proxy" -eq 1 ]; then
 		local _proxy_pid
 		_proxy_pid=$(_pids_by_comm surflare-proxy | head -1)
-		local _fd_soft
-		if [ -n "$_proxy_pid" ]; then
-			_fd_soft=$(awk '/Max open files/{print $4}' /proc/"$_proxy_pid"/limits 2>/dev/null)
-			if [ "${_fd_soft:-0}" -lt 65535 ] 2>/dev/null && command -v prlimit >/dev/null 2>&1; then
-				prlimit --pid "$_proxy_pid" --nofile=65535:65535 2>/dev/null && log "proxy fd limit raised to 65535 (was ${_fd_soft:-unknown})"
-			fi
-		fi
 		log "Startup: adopting running proxy (PID=${_proxy_pid:-unknown})"
 		_start_proxy_log_monitor
 		# Skip nft delete and ip rule del -- proxy needs them intact.
@@ -1311,7 +1229,7 @@ _cleanup_on_startup() {
 		if [ -n "$_cool_target" ] && [ "$_cool_target" -gt "$_now" ] 2>/dev/null; then
 			_remaining=$((_cool_target - _now))
 			log "Storm cool in progress; sleeping ${_remaining}s before main loop"
-			sleep "$_remaining" 200>&- &
+			sleep "$_remaining" &
 			storm_sleep_pid=$!; wait "$storm_sleep_pid" || true
 			storm_sleep_pid=""
 		fi
@@ -1936,7 +1854,7 @@ _enter_storm_cooldown() {
 	local _storm_sleep _storm_dup _spid _storm_mem
 	while [ "$_storm_remaining" -gt 0 ]; do
 		_storm_sleep=$(( _storm_remaining < _storm_probe_interval ? _storm_remaining : _storm_probe_interval ))
-		sleep "$_storm_sleep" 200>&- &
+		sleep "$_storm_sleep" &
 		storm_sleep_pid=$!; wait "$storm_sleep_pid"; storm_sleep_pid=""
 		_storm_remaining=$(( _storm_remaining - _storm_sleep ))
 		[ "$run_health_check_now" = 1 ] && break
@@ -1946,7 +1864,7 @@ _enter_storm_cooldown() {
 				[ "$_spid" -eq "$$" ] && continue
 				# Only count procd-started instances (PPid=1), not
 				# our own child subshells (PPid=$$)
-				grep -q "PPid:.*1$" "/proc/$_spid/status" 2>/dev/null || continue
+				grep -q "PPid:.*1$" /proc/$_spid/status 2>/dev/null || continue
 				_storm_dup=$((_storm_dup + 1))
 			done
 			[ "$_storm_dup" -gt 0 ] && log "WARN: ${_storm_dup} duplicate watchdog(s) during storm cooldown"
@@ -2000,7 +1918,6 @@ _update_bypass_devices() {
 			mac=$(echo "$line" | awk '{print tolower($1)}' | tr -d '\r')
 			case "$mac" in '#'*|'') continue ;; esac
 			ip=$(awk -v m="$mac" 'tolower($2)==m{print $3;exit}' /tmp/dhcp.leases)
-			[ -z "$ip" ] && ip=$(awk -v m="$mac" 'tolower($4)==m{print $1;exit}' /proc/net/arp)
 			[ -n "$ip" ] && all_ips="${all_ips:+$all_ips,}$ip"
 		done < "$BYPASS_LAN_MACS_FILE"
 	fi
@@ -2438,9 +2355,7 @@ _exempt_cn_output() {
 	local cn_v4_file="/etc/surflare/cn_ipv4.txt"
 	local _batch="/tmp/surflare_cn_output_$$.nft"
 
-	# shellcheck disable=SC1083  # nft set syntax uses escaped semicolons
 	# Create the interval set (idempotent)
-	# shellcheck disable=SC1083  # nft set syntax uses escaped semicolons
 	nft add set inet surflare cn_output { type ipv4_addr\; flags interval\; } \
 		2>/dev/null || true
 
@@ -2865,7 +2780,7 @@ check_vpn_health() {
 	if [ "$result" = "OK" ] || [ "$result" = "TUNNEL_OK" ]; then
 		if [ -f "$STORM_503_STATE" ]; then
 			local _s503_count _s503_first _s503_last _s503_now
-			read -r _s503_count _s503_first _s503_last < "$STORM_503_STATE" 2>/dev/null
+			read _s503_count _s503_first _s503_last < "$STORM_503_STATE" 2>/dev/null
 			_s503_now=$(date +%s)
 			if [ "${_s503_count:-0}" -ge "$STORM_503_OVERRIDE_COUNT" ] && \
 			   [ $((_s503_now - ${_s503_last:-0})) -le "$STORM_503_OVERRIDE_WINDOW" ]; then
@@ -3097,42 +3012,6 @@ _update_server_endpoint() {
 #
 # ICMP ping is intentionally omitted: surflare servers block ICMP, so ping
 # always times out regardless of server health, making it useless as a probe.
-
-# _dump_singbox_config: capture sing-box runtime config on health failure.
-# Primary: curl admin API (runtime config). Fallback: wrapper pre-patch snapshot.
-# Best-effort: logs warning on failure, never blocks caller.
-_dump_singbox_config() {
-	local _dump_dir="/var/log/surflare"
-	local _ts _dump_file _dump_count
-	_ts=$(date +%Y%m%d_%H%M%S)
-	_dump_file="${_dump_dir}/config_dump_${_ts}.json"
-	mkdir -p "$_dump_dir" 2>/dev/null || { log "WARN: cannot create $_dump_dir"; return 1; }
-
-	# Primary: sing-box admin API (runtime config)
-	# Fallback: wrapper pre-patch snapshot
-	if curl -sf --max-time 3 "http://127.0.0.1:9090/configs" \
-		-o "$_dump_file" 2>/dev/null && [ -s "$_dump_file" ]; then
-		log "Config dumped (API) to $_dump_file"
-	elif [ -f /tmp/singbox-config-dump.json ] && \
-		cp /tmp/singbox-config-dump.json "$_dump_file" 2>/dev/null; then
-		log "Config dumped (wrapper snapshot) to $_dump_file"
-	else
-		log "WARN: config dump failed (API and snapshot unavailable)"
-		rm -f "$_dump_file"
-		return 1
-	fi
-
-	# Keep only last 10 dumps (count-based rotation)
-	# Age-based cleanup in _cleanup_on_startup (complements: count caps live
-	# files, age caps stale files from long-ago crashes)
-	# shellcheck disable=SC2012  # ls for counting is fine; busybox find -maxdepth unreliable
-	_dump_count=$(ls "${_dump_dir}"/config_dump_*.json 2>/dev/null | wc -l)
-	if [ "$_dump_count" -gt 10 ]; then
-		ls -t "${_dump_dir}"/config_dump_*.json 2>/dev/null | \
-			tail -n +11 | while IFS= read -r _old; do rm -f "$_old"; done
-	fi
-}
-
 _diagnose_tunnel_failure() {
 	local now lifetime first_ip phys_if local_ip filter
 	now=$(date +%s)
@@ -3286,7 +3165,7 @@ _report_stats() {
 	_now=$(date +%s)
 	_uptime_s=$((_now - _stats_start_ts))
 	_uptime_h=$((_uptime_s / 3600))
-	read -r _s503_count _ _ < "$STORM_503_STATE" 2>/dev/null || _s503_count=0
+	read _s503_count _ _ < "$STORM_503_STATE" 2>/dev/null || _s503_count=0
 	log "STATS: up=${_uptime_h}h reconn=${_stats_reconnects} rot=${_stats_rotations} 503=${_s503_count} degraded=${_stats_degraded:-none} node=${_sess_node:-?} exit=${_sess_exit:-?}"
 	_stats_degraded=""
 	_stats_last_report=$_now
@@ -3320,6 +3199,155 @@ _record_disconnect() {
 		"$_diag_sack_pct" "$_diag_rst_in" \
 		>> "$EVENT_LOG" 2>/dev/null || true
 	log "Event recorded: node=${_sess_node} lifetime=${lifetime}s transit=${_sess_transit:-?}"
+}
+
+# _detect_blocked_domains: identify domains blocked by GFW.
+# Called after TCP_BLOCK confirmed (tunnel broken, local network OK).
+# conntrack SYN_SENT to port 443 finds stuck handshakes; dnsmasq reply
+# log maps IPs to domains; cn_domain_ips nft set filters CN-bypassed IPs.
+# Advisory only -- logs CANDIDATE_INJECT, never modifies INJECT_DOMAINS.
+_detect_blocked_domains() {
+	[ "$PLATFORM" = "router" ] || return 0
+	command -v conntrack >/dev/null 2>&1 || \
+		{ log "WARN: conntrack not installed, domain detection skipped"; return 0; }
+
+	local _ip _domain _dns_log _now _last_detect _proxy_config
+
+	# Rate-limit: 5-minute cooldown
+	_now=$(date +%s)
+	_last_detect=$(cat /run/surflare_last_domain_detect 2>/dev/null || echo 0)
+	if [ $((_now - _last_detect)) -lt 300 ]; then
+		return 0
+	fi
+	echo "$_now" > /run/surflare_last_domain_detect
+
+	# Cache dnsmasq log to temp file (single logread call, not per-IP)
+	_dns_log="/tmp/.surflare_dns_$$"
+	_proxy_config="/tmp/.surflare_proxy_cfg_$$"
+	trap 'rm -f "$_dns_log" "$_proxy_config"' RETURN
+	logread 2>/dev/null > "$_dns_log"
+	[ -s "$_dns_log" ] || return 0
+
+	# Cache sing-box proxy config for domain matching
+	# Primary: admin API (runtime config, may not be configured)
+	# Fallback: wrapper pre-patch snapshot (stale but contains full rule set)
+	if ! curl -sf --max-time 3 "http://127.0.0.1:9090/configs" \
+		-o "$_proxy_config" 2>/dev/null || [ ! -s "$_proxy_config" ]; then
+		cp /tmp/singbox-config-dump.json "$_proxy_config" 2>/dev/null || true
+	fi
+
+	# conntrack: SYN_SENT to port 443 = stuck TCP handshake
+	conntrack -L -p tcp --dport 443 --state SYN_SENT 2>/dev/null | \
+		grep -o 'dst=[0-9.]*' | sed 's/dst=//' | sort -u | head -20 | \
+		while IFS= read -r _ip; do
+		[ -n "$_ip" ] || continue
+
+		# Step 1: Reverse lookup FIRST (must be before cn_domain_ips check)
+		# logread format: "<timestamp> <host> dnsmasq[<pid>]: reply <domain> is <ip>"
+		# $ anchor prevents 1.2.3.4 matching 1.2.3.40
+		_domain=$(grep "reply.* is ${_ip}$" "$_dns_log" | tail -1 | \
+			sed -n 's/.*reply \([^ ]*\) is .*/\1/p')
+		[ -z "$_domain" ] && _domain="unknown"
+
+		# Step 2: Skip if in cn_domain_ips (CN bypass, allowed direct)
+		# nft get element (NOT grep -- cn_domain_ips is interval set)
+		nft get element inet sw_lan_tproxy cn_domain_ips \
+			"{ $_ip }" >/dev/null 2>&1 && continue
+
+		# Step 3: Skip if domain is in cached proxy config
+		# KNOWN LIMITATION: grep on full config may match dns.server entries
+		# (false negative). Acceptable for advisory output.
+		if [ "$_domain" != "unknown" ] && [ -s "$_proxy_config" ]; then
+			grep -q "\"$_domain\"" "$_proxy_config" && continue
+		fi
+
+		log "CANDIDATE_INJECT: ${_domain} (${_ip}) -- TCP stuck on direct route"
+	done
+}
+
+# _export_diag_state: write structured JSON diagnostic snapshot.
+# Called on health failures, every STATS_REPORT_INTERVAL, and on SIGUSR1 (deferred).
+# $1 = health result string (OK, CN, LOCAL_FAIL, TCP_BLOCK, PROXY_BROKEN)
+_export_diag_state() {
+	local _health="${1:-unknown}"
+	local _now _uptime_s _s503_count _err_count
+	local _ct_count _ct_max _ct_pct
+	local _fd_count=0 _fd_limit=0 _fd_pct=0 _pid
+	local _nft_sw _nft_ks _nft_moat
+	local _san_node _san_exit _san_transit _san_health
+	local _diag_file="/var/log/surflare/diag_state.json"
+
+	_now=$(date +%s)
+	_uptime_s=$((_now - _stats_start_ts))
+
+	# Independent fd reading (not dependent on observability probes' local vars)
+	# tail -1 matches existing pattern (line 357) in case of multiple PIDs
+	_pid=$(_pids_by_comm surflare-proxy | tail -1)
+	if [ -n "$_pid" ]; then
+		# shellcheck disable=SC2012
+		_fd_count=$(ls "/proc/$_pid/fd" 2>/dev/null | wc -l)
+		_fd_limit=$(awk '/Max open files/{print $4}' "/proc/$_pid/limits" 2>/dev/null)
+		_fd_limit=${_fd_limit:-65535}
+		[ "${_fd_limit:-0}" -gt 0 ] 2>/dev/null && \
+			_fd_pct=$((_fd_count * 100 / _fd_limit))
+	fi
+
+	# Read 503 state (3 fields: count first_epoch last_epoch)
+	read -r _s503_count _ _ < "$STORM_503_STATE" 2>/dev/null || _s503_count=0
+
+	# Read proxy error rate (2 fields: count epoch)
+	# Plan 02-01 must be merged first; without it, file absent -> _err_count=0
+	_err_count=0
+	if [ -f "${PROXY_ERR_STATE:-/run/surflare_proxy_err_count}" ]; then
+		read -r _err_count _ < \
+			"${PROXY_ERR_STATE:-/run/surflare_proxy_err_count}" 2>/dev/null || _err_count=0
+	fi
+
+	# Conntrack (guard against empty/nonexistent files, same as Probe 7)
+	_ct_count=$(cat /proc/sys/net/netfilter/nf_conntrack_count 2>/dev/null || echo 0)
+	_ct_max=$(cat /proc/sys/net/netfilter/nf_conntrack_max 2>/dev/null || echo 1)
+	_ct_max=${_ct_max:-1}  # prevent division by zero if file empty
+	if [ "${_ct_max:-0}" -gt 0 ] 2>/dev/null && [ -n "$_ct_count" ]; then
+		_ct_pct=$((_ct_count * 100 / _ct_max))
+	else
+		_ct_pct=0
+	fi
+
+	# nft tables (PLATFORM=router only)
+	if [ "$PLATFORM" = "router" ]; then
+		nft list table inet sw_lan_tproxy >/dev/null 2>&1 && _nft_sw=true || _nft_sw=false
+		nft list table inet killswitch >/dev/null 2>&1 && _nft_ks=true || _nft_ks=false
+		nft list table inet surflare_moat >/dev/null 2>&1 && _nft_moat=true || _nft_moat=false
+	else
+		_nft_sw=false; _nft_ks=false; _nft_moat=false
+	fi
+
+	# Sanitize node/exit/transit (same as _record_disconnect)
+	# shellcheck disable=SC1003
+	_san_node=$(echo "${_sess_node:-?}" | tr -d '"\')
+	# shellcheck disable=SC1003
+	_san_exit=$(echo "${_sess_exit:-?}" | tr -d '"\')
+	# shellcheck disable=SC1003
+	_san_transit=$(echo "${_sess_transit:-?}" | tr -d '"\')
+	# shellcheck disable=SC1003
+	_san_health=$(echo "$_health" | tr -d '"\')
+
+	# Write JSON
+	mkdir -p "$(dirname "$_diag_file")" 2>/dev/null
+	printf '{"ts":"%s","uptime_s":%d,"fd":{"count":%d,"limit":%d,"pct":%d},"conntrack":{"count":%d,"max":%d,"pct":%d},"nftables":{"sw_lan_tproxy":%s,"killswitch":%s,"surflare_moat":%s},"vpn":{"node":"%s","exit":"%s","transit":"%s","health":"%s"},"stats":{"reconnects":%d,"rotations":%d,"503s":%d,"proxy_errors":%d,"degraded":"%s"}}\n' \
+		"$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+		"$_uptime_s" \
+		"$_fd_count" "$_fd_limit" "$_fd_pct" \
+		"$_ct_count" "$_ct_max" "$_ct_pct" \
+		"$_nft_sw" "$_nft_ks" "$_nft_moat" \
+		"$_san_node" "$_san_exit" "$_san_transit" \
+		"$_san_health" \
+		"${_stats_reconnects:-0}" "${_stats_rotations:-0}" \
+		"$_s503_count" "${_err_count:-0}" \
+		"${_stats_degraded:-none}" \
+		> "$_diag_file" 2>/dev/null || \
+		{ log "WARN: diag state export failed"; return 1; }
+	log "diag_state.json updated ($(wc -c < "$_diag_file" 2>/dev/null || echo 0) bytes)"
 }
 
 TRANSIT_CACHE_FILE="/run/surflare_transit_cache"
@@ -3648,14 +3676,6 @@ connect_vpn() {
 			log "connect_vpn: surflare status failed (rc=${_status_rc})"
 			_need_auth=1
 		fi
-		# Auth expired flag: proxy log detected "authentication required".
-		# Forces _need_auth=1 even if surflare status reports OK.
-		# Flag cleared HERE (single clear point, no race with main loop).
-		if [ -f /run/surflare_auth_expired ]; then
-			log "connect_vpn: auth expired (proxy reported authentication required)"
-			_need_auth=1
-			rm -f /run/surflare_auth_expired
-		fi
 		# Check subscription first (do NOT refresh, just log)
 		if echo "$_auth_status" | grep -qiE "subscription.*not active|not active.*subscription"; then
 			log "WARN: subscription expired, manual renewal required"
@@ -3906,7 +3926,7 @@ EOF
 	fi
 
 	tcpdump -i "nflog:$_trace_group" -w "$_trace_pcap" \
-		2>"${_trace_pcap}.err" 200>&- &
+		2>"${_trace_pcap}.err" &
 	_trace_tcpdump_pid=$!
 
 	local ready=0 _si=0
@@ -4203,6 +4223,7 @@ run_health_check_now=0
 # read the PID and signal us before the trap is in place.
 trap '
     run_health_check_now=1
+    _export_diag_pending=1
     [[ -n "${storm_sleep_pid:-}" ]] && { kill "$storm_sleep_pid" 2>/dev/null || true; }
     touch "$WATCHDOG_ACK_FILE" 2>/dev/null || true
     log "EARLY_WARN_TRIGGERED: detector requested immediate health check"
@@ -4339,7 +4360,7 @@ while true; do
 	# SIGUSR2 toggles _diag_mode; while active, the loop sleeps
 	# and skips all health checks/reconnects.  nft tables stay up.
 	if [ "${_diag_mode:-0}" -eq 1 ]; then
-		sleep "$CHECK_INTERVAL" 200>&- & storm_sleep_pid=$!
+		sleep "$CHECK_INTERVAL" & storm_sleep_pid=$!
 		wait "$storm_sleep_pid" || true
 		storm_sleep_pid=""
 		continue
@@ -4347,7 +4368,7 @@ while true; do
 	# Change 6: probe defer guard -- skip entire cycle when node_probe holds the session
 	if _probe_active; then
 		log "node_probe active; deferring health check + reactions this cycle"
-		sleep "$CHECK_INTERVAL" 200>&- & storm_sleep_pid=$!
+		sleep "$CHECK_INTERVAL" & storm_sleep_pid=$!
 		wait "$storm_sleep_pid" || true
 		storm_sleep_pid=""
 		continue
@@ -4387,17 +4408,17 @@ while true; do
 		record_crash
 		if crash_rate_exceeded; then
 			log "Crash cascade: ${CRASH_MAX_PER_WINDOW} crashes in ${CRASH_WINDOW}s, cooldown ${CRASH_EXTENDED_COOLDOWN}s"
-			sleep "$CRASH_EXTENDED_COOLDOWN" 200>&- &
+			sleep "$CRASH_EXTENDED_COOLDOWN" &
 			storm_sleep_pid=$!; wait "$storm_sleep_pid"; storm_sleep_pid=""
 			_crash_timestamps=""
 			continue
 		fi
 		log "iwlwifi crash detected, waiting ${CRASH_COOLDOWN}s for stabilization"
-		sleep "$CRASH_COOLDOWN" 200>&- &
+		sleep "$CRASH_COOLDOWN" &
 		storm_sleep_pid=$!; wait "$storm_sleep_pid"; storm_sleep_pid=""
 		if recent_wifi_crash 10; then
 			log "Firmware still crashing after cooldown, deferring reconnect"
-			sleep "$CHECK_INTERVAL" 200>&- & storm_sleep_pid=$!; wait "$storm_sleep_pid"; storm_sleep_pid=""
+			sleep "$CHECK_INTERVAL" & storm_sleep_pid=$!; wait "$storm_sleep_pid"; storm_sleep_pid=""
 			continue
 		fi
 		log "Firmware stable, triggering VPN reconnect"
@@ -4444,32 +4465,11 @@ while true; do
 				_enter_storm_cooldown "post-crash"
 			fi
 		fi
-		sleep "$CHECK_INTERVAL" 200>&- & storm_sleep_pid=$!; wait "$storm_sleep_pid"; storm_sleep_pid=""
-		continue
-	fi
-
-	# Auth expired flag: short-circuit to connect_vpn with auth refresh.
-	# connect_vpn clears the flag (single clear point). sleep 1 prevents
-	# busy-loop if connect_vpn returns rc=2 (flock busy).
-	if [ -f /run/surflare_auth_expired ]; then
-		log "Auth expired signal detected, forcing reconnect with auth refresh"
-		connect_vpn
-		sleep 1
+		sleep "$CHECK_INTERVAL" & storm_sleep_pid=$!; wait "$storm_sleep_pid"; storm_sleep_pid=""
 		continue
 	fi
 
 	health=$(check_vpn_health)
-
-	# Read proxy error rate (from log monitor subshell)
-	# Only log when count changes (avoid repeated messages every 30s)
-	if [ -f "$PROXY_ERR_STATE" ]; then
-		read -r _err_count _ < "$PROXY_ERR_STATE" 2>/dev/null || _err_count=0
-		if [ "${_err_count:-0}" -ge "$PROXY_ERR_THRESHOLD" ] && \
-		   [ "${_err_count:-0}" -ne "${_err_last_logged:-0}" ]; then
-			log "Proxy errors: ${_err_count} since monitor start"
-			_err_last_logged=$_err_count
-		fi
-	fi
 
 	# -- Classify health result ----------------------------------------------
 	if [ "$health" = "LOCAL_FAIL" ]; then
@@ -4485,6 +4485,7 @@ while true; do
 			ip route flush table 100 2>/dev/null || true
 			log "Flushed stale nftables/routing (${_stale} rule(s))"
 		fi
+		_export_diag_state "$health"
 		transient_count=0
 		_cn_consecutive=0
 		_healthy_consecutive=0
@@ -4493,8 +4494,9 @@ while true; do
 	elif [ "$health" = "TCP_BLOCK" ]; then
 		if _control_probe; then
 			_diagnose_tunnel_failure
-			_dump_singbox_config
 			_record_disconnect
+			_detect_blocked_domains
+			_export_diag_state "$health"
 			log "Health check TCP block (tunnel confirmed, local network OK), triggering reconnect"
 			transient_count=0
 			_cn_consecutive=0
@@ -4510,8 +4512,7 @@ while true; do
 		# Tunnel is healthy (direct probes succeed) but surflare-proxy:10800
 		# is not forwarding traffic.  LAN devices would have no connectivity.
 		log "Proxy path broken: surflare-proxy:10800 not forwarding, triggering reconnect"
-		# Capture sing-box config BEFORE reconnect tears down proxy state
-		_dump_singbox_config
+		_export_diag_state "$health"
 		# Capture forensic snapshot BEFORE reconnect tears down proxy
 		# state.  Fire-and-forget background; won't delay reconnect.
 		if [ -x /usr/local/sbin/diag-proxy-broken.sh ]; then
@@ -4606,6 +4607,7 @@ while true; do
 		# Track consecutive CN across rotations: if every candidate has been
 		# tried (one full rotation), the relay infrastructure is down and
 		# further reconnects only add downtime.  Enter storm cooldown instead.
+		_export_diag_state "$health"
 		transient_count=0
 		_healthy_consecutive=0
 		_cn_consecutive=$((_cn_consecutive + 1))
@@ -4649,6 +4651,13 @@ while true; do
 	_now_stats=${now:-$(date +%s)}
 	if [ $((_now_stats - ${_stats_last_report:-0})) -ge "$STATS_REPORT_INTERVAL" ]; then
 		_report_stats
+		_export_diag_state "${health:-unknown}"
+	fi
+
+	# Deferred diag state export (SIGUSR1 sets flag; nft may block in trap)
+	if [ "${_export_diag_pending:-0}" -eq 1 ]; then
+		_export_diag_state "${health:-unknown}"
+		_export_diag_pending=0
 	fi
 
 	# Periodic fw4/masquerade health check. LAN-client CN-direct traffic
@@ -4709,7 +4718,7 @@ while true; do
 				rm -f /run/surflare_auth_fail_signal
 				if [ "$_signal_type" = "subscription" ]; then
 					log "Subscription expired, entering 1h cooldown (reconnect will not help)"
-					sleep 3600 200>&- &
+					sleep 3600 &
 					storm_sleep_pid=$!; wait "$storm_sleep_pid" || true; storm_sleep_pid=""
 					continue
 				elif [ "$_signal_type" = "fatal" ]; then
@@ -4818,7 +4827,7 @@ while true; do
 		_dg_elapsed=0
 		storm_sleep_pid=""
 		while [ "$_dg_elapsed" -lt "$DEGRADED_INTERVAL" ]; do
-			sleep 2 200>&- & storm_sleep_pid=$!
+			sleep 2 & storm_sleep_pid=$!
 			wait "$storm_sleep_pid" || true
 			storm_sleep_pid=""
 			_dg_elapsed=$((_dg_elapsed + 2))
@@ -4829,7 +4838,7 @@ while true; do
 			fi
 		done
 	else
-		sleep "$CHECK_INTERVAL" 200>&- & storm_sleep_pid=$!
+		sleep "$CHECK_INTERVAL" & storm_sleep_pid=$!
 		wait "$storm_sleep_pid" || true
 		storm_sleep_pid=""
 	fi
