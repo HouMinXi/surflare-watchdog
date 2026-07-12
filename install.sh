@@ -237,18 +237,30 @@ LOGROTATE_CRON="30 4 * * * /usr/sbin/logrotate /etc/logrotate.conf >> /var/log/l
 # no /etc/init.d/surflare-watchdog, so skip the cron to avoid errors.
 if [ "$INIT" = "procd" ]; then
     DEADMAN_CRON="* * * * * /etc/init.d/surflare-watchdog deadman"
+    # Watchdog-of-watchdog: resurrect dead watchdog if procd gives up.
+    # Checks stop marker first (maintenance mode), then pgrep, then starts.
+    # pgrep -f with $ anchor prevents self-matching (cron sh -c cmdline ends with "start").
+    # /proc/pid/comm is "surflare_watchd" (15-char truncated) but pgrep -f is preferred
+    # for consistency with codebase convention (5 existing pgrep -f sites).
+    # KNOWN LIMITATION: orphan subshells share cmdline, so pgrep reports "alive"
+    # after main-loop death (L3893 incident class); accepted because orphan holds
+    # no lock and procd retry=10 handles restart.
+    WATCHDOG_RESURRECT_CRON='*/5 * * * * [ -f /run/surflare_watchdog.stopped ] || pgrep -f "surflare_watchdog\\.sh$" >/dev/null 2>&1 || /etc/init.d/surflare-watchdog start'
 else
     DEADMAN_CRON=""
+    WATCHDOG_RESURRECT_CRON=""
 fi
 ( crontab -l 2>/dev/null \
     | grep -v surflare_node_probe | grep -v surflare_l4_probe \
     | grep -v surflare_log_health | grep -v surflare_route_updater \
     | grep -v 'logrotate /etc/logrotate.conf' \
-    | grep -v 'surflare-watchdog deadman'
+    | grep -v 'surflare-watchdog deadman' \
+    | grep -v 'surflare_watchdog.stopped.*surflare-watchdog start'
   echo "$LOG_HEALTH_CRON"
   echo "$ROUTE_UPDATE_CRON"
   echo "$LOGROTATE_CRON"
-  if [ -n "$DEADMAN_CRON" ]; then echo "$DEADMAN_CRON"; fi ) | crontab -
+  if [ -n "$DEADMAN_CRON" ]; then echo "$DEADMAN_CRON"; fi
+  if [ -n "$WATCHDOG_RESURRECT_CRON" ]; then echo "$WATCHDOG_RESURRECT_CRON"; fi ) | crontab -
 # Note: surflare_node_probe.sh is available as a manual diagnostic tool only.
 
 echo ""
