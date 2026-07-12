@@ -411,6 +411,8 @@ _run_observability_probes() {
 _proxy_log_pid=""
 PROXY_LOG="/var/log/surflare/surflare-proxy.log"
 PROXY_LOG_RATE_SEC=60
+PROXY_ERR_STATE="/run/surflare_proxy_err_count"
+PROXY_ERR_THRESHOLD=10  # higher than 503's 5: general errors are noisier
 
 _start_proxy_log_monitor() {
 	_stop_proxy_log_monitor
@@ -425,6 +427,7 @@ _start_proxy_log_monitor() {
 	# $$ in a subshell = parent script PID (bash).
 	(   _503_count=0
 	    _503_first=0
+	    _err_count=0
 	    tail -n 0 -F "$PROXY_LOG" 2>/dev/null | while IFS= read -r _line; do
 			echo "$_line" | grep -q 'ERROR' || continue
 			if echo "$_line" | grep -q 'urltest.*503'; then
@@ -440,6 +443,19 @@ _start_proxy_log_monitor() {
 					kill -USR1 $$ 2>/dev/null || true
 				fi
 				continue
+			elif echo "$_line" | grep -qi "authentication required"; then
+				if [ ! -f /run/surflare_auth_expired ]; then
+					touch /run/surflare_auth_expired
+					kill -USR1 $$ 2>/dev/null || true
+				fi
+				continue
+			fi
+			# Count all remaining ERROR lines (not 503/auth)
+			_err_count=$((_err_count + 1))
+			echo "$_err_count $(date +%s)" > "${PROXY_ERR_STATE}.tmp" && \
+				mv "${PROXY_ERR_STATE}.tmp" "$PROXY_ERR_STATE" 2>/dev/null
+			if [ $((_err_count % PROXY_ERR_THRESHOLD)) -eq 0 ]; then
+				kill -USR1 $$ 2>/dev/null || true
 			fi
 			logger -t surflare-proxy "$_line"
 			sleep "$PROXY_LOG_RATE_SEC"
@@ -2780,7 +2796,7 @@ check_vpn_health() {
 	if [ "$result" = "OK" ] || [ "$result" = "TUNNEL_OK" ]; then
 		if [ -f "$STORM_503_STATE" ]; then
 			local _s503_count _s503_first _s503_last _s503_now
-			read _s503_count _s503_first _s503_last < "$STORM_503_STATE" 2>/dev/null
+			read -r _s503_count _s503_first _s503_last < "$STORM_503_STATE" 2>/dev/null
 			_s503_now=$(date +%s)
 			if [ "${_s503_count:-0}" -ge "$STORM_503_OVERRIDE_COUNT" ] && \
 			   [ $((_s503_now - ${_s503_last:-0})) -le "$STORM_503_OVERRIDE_WINDOW" ]; then
@@ -3165,7 +3181,7 @@ _report_stats() {
 	_now=$(date +%s)
 	_uptime_s=$((_now - _stats_start_ts))
 	_uptime_h=$((_uptime_s / 3600))
-	read _s503_count _ _ < "$STORM_503_STATE" 2>/dev/null || _s503_count=0
+	read -r _s503_count _ _ < "$STORM_503_STATE" 2>/dev/null || _s503_count=0
 	log "STATS: up=${_uptime_h}h reconn=${_stats_reconnects} rot=${_stats_rotations} 503=${_s503_count} degraded=${_stats_degraded:-none} node=${_sess_node:-?} exit=${_sess_exit:-?}"
 	_stats_degraded=""
 	_stats_last_report=$_now
