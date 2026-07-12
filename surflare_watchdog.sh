@@ -357,7 +357,8 @@ _run_observability_probes() {
 
 	# Probe 6 -- proxy fd count (fd leak early warning)
 	if [ -n "$_pid" ]; then
-		_fd_count=$(ls "/proc/$_pid/fd" 2>/dev/null | wc -l)
+		# shellcheck disable=SC2012  # ls is correct for counting /proc/PID/fd entries
+			_fd_count=$(ls "/proc/$_pid/fd" 2>/dev/null | wc -l)
 		_fd_limit=$(awk '/Max open files/{print $4}' "/proc/$_pid/limits" 2>/dev/null)
 		_fd_limit=${_fd_limit:-65535}
 		if [ "$_fd_limit" -gt 0 ] 2>/dev/null; then
