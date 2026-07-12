@@ -75,7 +75,7 @@ BPF=$(ls /sys/fs/bpf/surflare_* 2>/dev/null | wc -l)
 [ "$BPF" -ge 2 ] && CHECK PASS "13. BPF keepalive ($BPF programs)" || CHECK FAIL "13. BPF" "only $BPF"
 
 # 14. SmartDNS init.d fix preserved (auto_set_dnsmasq guard)
-grep -q "auto_set_dnsmasq.*=.*0.*return" /etc/init.d/smartdns 2>/dev/null && CHECK PASS "14. SmartDNS init.d fix present" || CHECK FAIL "14. init.d fix" "guard not found"
+grep -q "_auto_set.*return 0" /etc/init.d/smartdns 2>/dev/null && CHECK PASS "14. SmartDNS init.d fix present" || CHECK FAIL "14. init.d fix" "guard not found"
 
 echo ""
 echo "=== Result: $PASS passed, $FAIL failed ==="
