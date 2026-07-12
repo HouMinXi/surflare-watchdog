@@ -90,6 +90,15 @@ _sess_prev_s=0                        # previous session's lifetime in seconds
 _diag_conclusion=""                   # set by _diagnose_tunnel_failure for _record_disconnect
 _diag_out=0                           # physical capture outbound packet count
 _obs_run_count=0                      # observability probe invocation counter (heartbeat)
+# FD trend tracking: 72h ring buffer at ~30s intervals
+_FD_RING_MAX=8640
+_FD_RING_ALERT_AVG=50
+_FD_RING_SUSTAINED=120  # 120 samples at 30s = 1 hour
+_fd_ring=()
+_fd_ring_idx=0
+_fd_ring_count=0
+_fd_ring_last_alert=0  # intentional: global, persists across probe calls
+_fd_last_pid=""         # intentional: global, tracks PID across calls
 _diag_in=0                            # physical capture inbound packet count
 _diag_syn_out=0                       # SYN packets sent (new connection attempts)
 _diag_syn_ack=0                       # SYN-ACK received (successful handshakes)
@@ -291,6 +300,7 @@ _run_observability_probes() {
 	local _mem _pid
 	local _bp_count
 	local _fd_count _fd_limit _fd_pct _ct_count _ct_max _ct_pct
+	local _fd_sum _fd_walk_start _fd_i _fd_samples _fd_avg
 
 	# Probe 1 -- DNS liveness (router-only)
 	if [ "$PLATFORM" = "router" ]; then
@@ -363,6 +373,48 @@ _run_observability_probes() {
 		_fd_limit=${_fd_limit:-65535}
 		if [ "$_fd_limit" -gt 0 ] 2>/dev/null; then
 			_fd_pct=$((_fd_count * 100 / _fd_limit))
+
+			# Reset ring buffer if proxy PID changed (reconnect)
+			# Intentional: resets _fd_ring_last_alert so first alert fires after 1h
+			# on new PID (even if previous PID just alerted). Reconnect = new proxy
+			# session, new fd baseline.
+			if [ "${_fd_last_pid:-}" != "$_pid" ]; then
+				[ -n "${_fd_last_pid:-}" ] && \
+					log "FD ring reset (proxy PID changed: $_fd_last_pid -> $_pid)"
+				_fd_ring=(); _fd_ring_idx=0; _fd_ring_count=0
+				_fd_ring_last_alert=0; _fd_last_pid=$_pid
+			fi
+
+			# Defensive guard: _fd_pct is always set when _pid is non-empty because
+			# existing code defaults _fd_limit to 65535 and guards with
+			# `if [ "$_fd_limit" -gt 0 ]`. This if-wrap protects against
+			# hypothetical future code changes.
+			if [ -n "$_fd_pct" ]; then
+				# Append to ring buffer
+				_fd_ring[$_fd_ring_idx]=$_fd_pct
+				_fd_ring_idx=$(( (_fd_ring_idx + 1) % _FD_RING_MAX ))
+				_fd_ring_count=$((_fd_ring_count + 1))
+
+				# Sustained alert: 1h moving average
+				if [ "$_fd_ring_count" -ge "$_FD_RING_SUSTAINED" ]; then
+					_fd_sum=0; _fd_samples=0
+					_fd_walk_start=$(( (_fd_ring_idx - _FD_RING_SUSTAINED + _FD_RING_MAX) % _FD_RING_MAX ))
+					_fd_i=$_fd_walk_start
+					while [ "$_fd_samples" -lt "$_FD_RING_SUSTAINED" ]; do
+						_fd_sum=$((_fd_sum + ${_fd_ring[$_fd_i]:-0}))
+						_fd_i=$(( (_fd_i + 1) % _FD_RING_MAX ))
+						_fd_samples=$((_fd_samples + 1))
+					done
+					_fd_avg=$((_fd_sum / _FD_RING_SUSTAINED))
+					if [ "$_fd_avg" -ge "$_FD_RING_ALERT_AVG" ] && \
+					   [ $(( $(date +%s) - _fd_ring_last_alert )) -ge 3600 ]; then
+						log "ALERT: proxy fd sustained high -- 1h avg ${_fd_avg}%"
+						_send_alert "FD Sustained High" "1h avg: ${_fd_avg}%"
+						_fd_ring_last_alert=$(date +%s)
+					fi
+				fi
+			fi
+
 			if [ "$_fd_pct" -ge 80 ]; then
 				log "CRITICAL: proxy fd usage ${_fd_pct}% (${_fd_count}/${_fd_limit})"
 			elif [ "$_fd_pct" -ge 50 ]; then
@@ -411,6 +463,9 @@ _run_observability_probes() {
 _proxy_log_pid=""
 PROXY_LOG="/var/log/surflare/surflare-proxy.log"
 PROXY_LOG_RATE_SEC=60
+PROXY_ERR_STATE="/run/surflare_proxy_err_count"
+PROXY_ERR_THRESHOLD=10  # higher than 503's 5: general errors are noisier
+_err_last_logged=0      # track last logged count to avoid repeated messages
 
 _start_proxy_log_monitor() {
 	_stop_proxy_log_monitor
@@ -425,6 +480,7 @@ _start_proxy_log_monitor() {
 	# $$ in a subshell = parent script PID (bash).
 	(   _503_count=0
 	    _503_first=0
+	    _err_count=0
 	    tail -n 0 -F "$PROXY_LOG" 2>/dev/null | while IFS= read -r _line; do
 			echo "$_line" | grep -q 'ERROR' || continue
 			if echo "$_line" | grep -q 'urltest.*503'; then
@@ -447,6 +503,14 @@ _start_proxy_log_monitor() {
 				fi
 				continue
 			fi
+			# Count all ERROR lines (not 503 -- those handled above)
+			# $$ = parent PID in bash subshell (same pattern as 503 handler)
+			_err_count=$((_err_count + 1))
+			echo "$_err_count $(date +%s)" > "${PROXY_ERR_STATE}.tmp" && \
+				mv "${PROXY_ERR_STATE}.tmp" "$PROXY_ERR_STATE" 2>/dev/null
+			if [ $((_err_count % PROXY_ERR_THRESHOLD)) -eq 0 ]; then
+				kill -USR1 $$ 2>/dev/null || true
+			fi
 			logger -t surflare-proxy "$_line"
 			sleep "$PROXY_LOG_RATE_SEC"
 		done
@@ -462,6 +526,7 @@ _stop_proxy_log_monitor() {
 	fi
 	pkill -f "tail -n 0 -F ${PROXY_LOG//./\\.}" 2>/dev/null || true
 	rm -f "$STORM_503_STATE" "${STORM_503_STATE}.tmp"
+	rm -f "$PROXY_ERR_STATE" "${PROXY_ERR_STATE}.tmp"
 }
 
 PROXY_CPU_SET=""
@@ -994,6 +1059,10 @@ _cleanup_on_startup() {
 	# after init.d created the marker but before cleanup() ran, a stale
 	# marker would cause a future stop to skip proxy teardown.
 	rm -f "$RESTART_MARKER"
+
+	# Clean up stale config dumps (older than 7 days)
+	find /var/log/surflare/ -name "config_dump_*.json" -mtime +6 \
+		-exec rm -f {} \; 2>/dev/null || true
 
 	# Zero-kill adopt decision: check whether a healthy proxy is running
 	# BEFORE any kill site.  If all conditions pass, set the adopt flag
@@ -3028,6 +3097,42 @@ _update_server_endpoint() {
 #
 # ICMP ping is intentionally omitted: surflare servers block ICMP, so ping
 # always times out regardless of server health, making it useless as a probe.
+
+# _dump_singbox_config: capture sing-box runtime config on health failure.
+# Primary: curl admin API (runtime config). Fallback: wrapper pre-patch snapshot.
+# Best-effort: logs warning on failure, never blocks caller.
+_dump_singbox_config() {
+	local _dump_dir="/var/log/surflare"
+	local _ts _dump_file _dump_count
+	_ts=$(date +%Y%m%d_%H%M%S)
+	_dump_file="${_dump_dir}/config_dump_${_ts}.json"
+	mkdir -p "$_dump_dir" 2>/dev/null || { log "WARN: cannot create $_dump_dir"; return 1; }
+
+	# Primary: sing-box admin API (runtime config)
+	# Fallback: wrapper pre-patch snapshot
+	if curl -sf --max-time 3 "http://127.0.0.1:9090/configs" \
+		-o "$_dump_file" 2>/dev/null && [ -s "$_dump_file" ]; then
+		log "Config dumped (API) to $_dump_file"
+	elif [ -f /tmp/singbox-config-dump.json ] && \
+		cp /tmp/singbox-config-dump.json "$_dump_file" 2>/dev/null; then
+		log "Config dumped (wrapper snapshot) to $_dump_file"
+	else
+		log "WARN: config dump failed (API and snapshot unavailable)"
+		rm -f "$_dump_file"
+		return 1
+	fi
+
+	# Keep only last 10 dumps (count-based rotation)
+	# Age-based cleanup in _cleanup_on_startup (complements: count caps live
+	# files, age caps stale files from long-ago crashes)
+	# shellcheck disable=SC2012  # ls for counting is fine; busybox find -maxdepth unreliable
+	_dump_count=$(ls "${_dump_dir}"/config_dump_*.json 2>/dev/null | wc -l)
+	if [ "$_dump_count" -gt 10 ]; then
+		ls -t "${_dump_dir}"/config_dump_*.json 2>/dev/null | \
+			tail -n +11 | while IFS= read -r _old; do rm -f "$_old"; done
+	fi
+}
+
 _diagnose_tunnel_failure() {
 	local now lifetime first_ip phys_if local_ip filter
 	now=$(date +%s)
@@ -4355,6 +4460,17 @@ while true; do
 
 	health=$(check_vpn_health)
 
+	# Read proxy error rate (from log monitor subshell)
+	# Only log when count changes (avoid repeated messages every 30s)
+	if [ -f "$PROXY_ERR_STATE" ]; then
+		read -r _err_count _ < "$PROXY_ERR_STATE" 2>/dev/null || _err_count=0
+		if [ "${_err_count:-0}" -ge "$PROXY_ERR_THRESHOLD" ] && \
+		   [ "${_err_count:-0}" -ne "${_err_last_logged:-0}" ]; then
+			log "Proxy errors: ${_err_count} since monitor start"
+			_err_last_logged=$_err_count
+		fi
+	fi
+
 	# -- Classify health result ----------------------------------------------
 	if [ "$health" = "LOCAL_FAIL" ]; then
 		# Local VPN state lost (process/nftables/routing gone) -- definitive failure,
@@ -4377,6 +4493,7 @@ while true; do
 	elif [ "$health" = "TCP_BLOCK" ]; then
 		if _control_probe; then
 			_diagnose_tunnel_failure
+			_dump_singbox_config
 			_record_disconnect
 			log "Health check TCP block (tunnel confirmed, local network OK), triggering reconnect"
 			transient_count=0
@@ -4393,6 +4510,8 @@ while true; do
 		# Tunnel is healthy (direct probes succeed) but surflare-proxy:10800
 		# is not forwarding traffic.  LAN devices would have no connectivity.
 		log "Proxy path broken: surflare-proxy:10800 not forwarding, triggering reconnect"
+		# Capture sing-box config BEFORE reconnect tears down proxy state
+		_dump_singbox_config
 		# Capture forensic snapshot BEFORE reconnect tears down proxy
 		# state.  Fire-and-forget background; won't delay reconnect.
 		if [ -x /usr/local/sbin/diag-proxy-broken.sh ]; then
