@@ -345,7 +345,7 @@ _run_observability_probes() {
 	_mem=$(awk '/MemAvailable/{print $2}' /proc/meminfo)
 	[ "${_mem:-0}" -lt 500000 ] && log "WARN: low memory: ${_mem}kB available"
 	_pid=$(_pids_by_comm "surflare-proxy" | tail -1)
-	[ -n "$_pid" ] && echo -1000 > /proc/$_pid/oom_score_adj 2>/dev/null
+	[ -n "$_pid" ] && echo -1000 > "/proc/$_pid/oom_score_adj" 2>/dev/null
 
 	# Probe 5 -- BPF keepalive (router-only)
 	if [ "$PLATFORM" = "router" ]; then
@@ -357,8 +357,8 @@ _run_observability_probes() {
 
 	# Probe 6 -- proxy fd count (fd leak early warning)
 	if [ -n "$_pid" ]; then
-		_fd_count=$(ls /proc/$_pid/fd 2>/dev/null | wc -l)
-		_fd_limit=$(awk '/Max open files/{print $4}' /proc/$_pid/limits 2>/dev/null)
+		_fd_count=$(ls "/proc/$_pid/fd" 2>/dev/null | wc -l)
+		_fd_limit=$(awk '/Max open files/{print $4}' "/proc/$_pid/limits" 2>/dev/null)
 		_fd_limit=${_fd_limit:-65535}
 		if [ "$_fd_limit" -gt 0 ] 2>/dev/null; then
 			_fd_pct=$((_fd_count * 100 / _fd_limit))
@@ -1876,7 +1876,7 @@ _enter_storm_cooldown() {
 				[ "$_spid" -eq "$$" ] && continue
 				# Only count procd-started instances (PPid=1), not
 				# our own child subshells (PPid=$$)
-				grep -q "PPid:.*1$" /proc/$_spid/status 2>/dev/null || continue
+				grep -q "PPid:.*1$" "/proc/$_spid/status" 2>/dev/null || continue
 				_storm_dup=$((_storm_dup + 1))
 			done
 			[ "$_storm_dup" -gt 0 ] && log "WARN: ${_storm_dup} duplicate watchdog(s) during storm cooldown"
@@ -2368,7 +2368,9 @@ _exempt_cn_output() {
 	local cn_v4_file="/etc/surflare/cn_ipv4.txt"
 	local _batch="/tmp/surflare_cn_output_$$.nft"
 
+	# shellcheck disable=SC1083  # nft set syntax uses escaped semicolons
 	# Create the interval set (idempotent)
+	# shellcheck disable=SC1083  # nft set syntax uses escaped semicolons
 	nft add set inet surflare cn_output { type ipv4_addr\; flags interval\; } \
 		2>/dev/null || true
 
@@ -2793,7 +2795,7 @@ check_vpn_health() {
 	if [ "$result" = "OK" ] || [ "$result" = "TUNNEL_OK" ]; then
 		if [ -f "$STORM_503_STATE" ]; then
 			local _s503_count _s503_first _s503_last _s503_now
-			read _s503_count _s503_first _s503_last < "$STORM_503_STATE" 2>/dev/null
+			read -r _s503_count _s503_first _s503_last < "$STORM_503_STATE" 2>/dev/null
 			_s503_now=$(date +%s)
 			if [ "${_s503_count:-0}" -ge "$STORM_503_OVERRIDE_COUNT" ] && \
 			   [ $((_s503_now - ${_s503_last:-0})) -le "$STORM_503_OVERRIDE_WINDOW" ]; then
@@ -3178,7 +3180,7 @@ _report_stats() {
 	_now=$(date +%s)
 	_uptime_s=$((_now - _stats_start_ts))
 	_uptime_h=$((_uptime_s / 3600))
-	read _s503_count _ _ < "$STORM_503_STATE" 2>/dev/null || _s503_count=0
+	read -r _s503_count _ _ < "$STORM_503_STATE" 2>/dev/null || _s503_count=0
 	log "STATS: up=${_uptime_h}h reconn=${_stats_reconnects} rot=${_stats_rotations} 503=${_s503_count} degraded=${_stats_degraded:-none} node=${_sess_node:-?} exit=${_sess_exit:-?}"
 	_stats_degraded=""
 	_stats_last_report=$_now
