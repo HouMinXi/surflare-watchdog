@@ -1917,6 +1917,7 @@ _update_bypass_devices() {
 			mac=$(echo "$line" | awk '{print tolower($1)}' | tr -d '\r')
 			case "$mac" in '#'*|'') continue ;; esac
 			ip=$(awk -v m="$mac" 'tolower($2)==m{print $3;exit}' /tmp/dhcp.leases)
+			[ -z "$ip" ] && ip=$(awk -v m="$mac" 'tolower($4)==m{print $1;exit}' /proc/net/arp)
 			[ -n "$ip" ] && all_ips="${all_ips:+$all_ips,}$ip"
 		done < "$BYPASS_LAN_MACS_FILE"
 	fi
