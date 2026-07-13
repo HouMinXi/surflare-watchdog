@@ -1,0 +1,17 @@
+[Unit]
+Description=Surflare Alert Bridge (HTTP -> iLink -> WeChat)
+After=network.target
+
+[Service]
+Type=simple
+# NOTE: If send_weixin_direct has venv-only deps (requests, websocket),
+# replace /usr/bin/python3 with the venv python path from pre-flight.
+# Example: ExecStart=/home/houminxi/code/hermes-agent/venv/bin/python3 %h/alert-bridge.py
+ExecStart=/usr/bin/python3 %h/alert-bridge.py
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

@@ -1,4 +1,11 @@
 #!/bin/bash
+# --source-only: define functions but do not enter main loop.
+# Used by test harnesses to source this file without triggering
+# root checks, dependency checks, or the main loop.
+if [ "${1:-}" = "--source-only" ]; then
+	_SOURCE_ONLY=1
+fi
+
 # Surflare VPN watchdog + resume auto-reconnect
 #
 # Usage:
@@ -88,6 +95,7 @@ _sess_connect_s=0                     # epoch of current session start
 _sess_prev_node=""                    # previous session's exit node
 _sess_prev_s=0                        # previous session's lifetime in seconds
 _export_diag_pending=0                 # SIGUSR1 flag for deferred diag state export
+_ADVISORY_DIAGNOSIS_RUNNING=0          # re-entrancy guard for _run_advisory_diagnosis
 _diag_conclusion=""                   # set by _diagnose_tunnel_failure for _record_disconnect
 _diag_out=0                           # physical capture outbound packet count
 _obs_run_count=0                      # observability probe invocation counter (heartbeat)
@@ -139,7 +147,7 @@ if [ "$NODE" = "your_node_tag" ]; then
 fi
 
 # Must run as root (avoids sudo ticket expiry blocking in background)
-if [ "$EUID" -ne 0 ]; then
+if [ "${_SOURCE_ONLY:-0}" -ne 1 ] && [ "$EUID" -ne 0 ]; then
 	echo "Must run as root: sudo $0" >&2
 	exit 1
 fi
@@ -147,6 +155,12 @@ fi
 umask 0177
 # Restrict new file permissions to 600 (root-only) -- prevents non-root users from
 # opening the lock file for reading and holding flock to block reconnects
+
+# Skip dependency checks and system initialization when sourcing for tests.
+if [ "${_SOURCE_ONLY:-0}" -eq 1 ]; then
+	# Define minimal log() for test context (no /dev/kmsg)
+	log() { echo "surflare_watchdog: $*" >&2; }
+else
 
 # Dependency check
 # Package reference (if missing, install the corresponding package):
@@ -176,6 +190,8 @@ log() {
 	# echo builtin does a single write() and works correctly.
 	echo "<6>surflare_watchdog: $*" >/dev/kmsg
 }
+
+fi  # end of _SOURCE_ONLY guard (skip dependency checks and system init)
 
 # _proc_alive: returns 0 if any process has /proc/<pid>/comm == _name.
 # Replaces pgrep -f / pgrep -x which are unreliable on busybox (known
@@ -241,21 +257,73 @@ check_vpn_local_state() {
 	return 0
 }
 
-# _send_alert: post notification to Server Chan (WeChat).
-# VPN-down safe: sctapi.ftqq.com is CN domestic, reachable via ISP direct.
-# N100 curl lacks c-ares (--dns-servers unavailable); SmartDNS resolves CN
-# domains directly. Backgrounded to avoid blocking the reconnect path.
-_send_alert() {
+# Alert bridge globals: X500 bridge (LAN, fast) is primary; Server Chan (WAN) is fallback.
+_ALERT_BRIDGE_URL="http://192.168.100.10:8377/alert"
+_ALERT_BRIDGE_TIMEOUT=5
+_ALERT_BRIDGE_TOKEN_FILE="/root/.surflare-bridge-token"
+
+# _deliver_alert: send notification via X500 bridge first, Server Chan fallback.
+# No rate limiting, no backgrounding -- caller decides both.
+# Called by _send_alert (rate-limited, backgrounded) and _send_diagnosis_alert
+# follow-up (no rate limit, already in background subshell).
+_deliver_alert() {
 	local _title="${1:-surflare alert}"
 	local _body="${2:-}"
 	local _conf="/etc/surflare/wechat.conf"
 	local _sendkey
 
-	[ -f "$_conf" ] || { log "WARN: alert skipped, $_conf not found"; return 1; }
-	_sendkey=$(grep -m1 '^SENDKEY=' "$_conf" | cut -d= -f2- | tr -d '"\r ')
-	[ -n "$_sendkey" ] || { log "WARN: alert skipped, SENDKEY empty"; return 1; }
+	local _j_title _j_body _bridge_rc _bridge_token
+	_j_title=$(printf '%s' "$_title" | sed 's/\\/\\\\/g; s/"/\\"/g' | tr '\t\n' ' ')
+	_j_body=$(printf '%s' "$_body" | sed 's/\\/\\\\/g; s/"/\\"/g' | tr '\t\n' ' ')
 
-	# Rate limiter: max 1 alert per 10 minutes
+	_bridge_token=""
+	[ -f "$_ALERT_BRIDGE_TOKEN_FILE" ] && \
+		_bridge_token=$(cat "$_ALERT_BRIDGE_TOKEN_FILE" | tr -d '\r\n')
+
+	_bridge_rc=0
+	if [ -n "$_bridge_token" ]; then
+		curl -sf --max-time "$_ALERT_BRIDGE_TIMEOUT" \
+			-X POST "$_ALERT_BRIDGE_URL" \
+			-H 'Content-Type: application/json' \
+			-H "X-Bridge-Token: ${_bridge_token}" \
+			-d "{\"title\":\"${_j_title}\",\"body\":\"${_j_body}\"}" \
+			>/dev/null 2>&1 || _bridge_rc=$?
+	else
+		log "WARN: bridge token missing, skipping bridge"
+		_bridge_rc=1
+	fi
+
+	if [ "$_bridge_rc" -eq 0 ]; then
+		log "Alert sent via bridge: ${_title}"
+		return 0
+	fi
+
+	# Server Chan fallback (WAN, CN direct)
+	[ -f "$_conf" ] || { log "WARN: alert skipped, bridge failed + $_conf not found"; return 1; }
+	_sendkey=$(grep -m1 '^SENDKEY=' "$_conf" | cut -d= -f2- | tr -d '"\r ')
+	[ -n "$_sendkey" ] || { log "WARN: alert skipped, bridge failed + SENDKEY empty"; return 1; }
+	if curl -sSf --noproxy '*' \
+		--max-time 10 \
+		--data-urlencode "title=${_title}" \
+		--data-urlencode "desp=${_body}" \
+		"https://sctapi.ftqq.com/${_sendkey}.send" \
+		>/dev/null 2>&1; then
+		log "Alert sent via Server Chan (bridge fallback): ${_title}"
+		return 0
+	else
+		log "WARN: alert delivery failed (bridge + Server Chan): ${_title}"
+		return 1
+	fi
+}
+
+# _send_alert: rate-limited wrapper around _deliver_alert.
+# Rate limit: max 1 alert per 10 minutes (600s). Backgrounded to avoid
+# blocking the reconnect path. VPN-down safe: bridge is LAN (no VPN
+# needed); sctapi.ftqq.com is CN domestic.
+_send_alert() {
+	local _title="${1:-surflare alert}"
+	local _body="${2:-}"
+
 	local _now _last
 	_now=$(date +%s)
 	_last=${_alert_last_ts:-0}
@@ -266,18 +334,7 @@ _send_alert() {
 	fi
 	_alert_last_ts=$_now
 
-	(
-		if curl -sSf --noproxy '*' \
-			--max-time 10 \
-			--data-urlencode "title=${_title}" \
-			--data-urlencode "desp=${_body}" \
-			"https://sctapi.ftqq.com/${_sendkey}.send" \
-			>/dev/null 2>&1; then
-			log "Alert sent: ${_title}"
-		else
-			log "WARN: alert delivery failed: ${_title}"
-		fi
-	) 200>&- &
+	( _deliver_alert "$_title" "$_body" ) 200>&- &
 }
 
 # Ecosystem health probes: DNS, tmpfs, crond, memory/OOM, BPF.
@@ -3395,6 +3452,535 @@ _export_diag_state() {
 	log "diag_state.json updated ($(wc -c < "$_diag_file" 2>/dev/null || echo 0) bytes)"
 }
 
+# _run_advisory_diagnosis: rule engine mapping signals to diagnosis.
+#
+# ADVISORY ONLY -- this function MUST NOT:
+#   - Execute nft commands
+#   - Modify INJECT_DOMAINS or surflare-proxy config
+#   - Restart any service
+#   - Change routing or firewall rules
+#
+# It reads diagnostic data and writes a structured JSON report.
+# Violation of advisory-only is a P0 bug.
+_run_advisory_diagnosis() {
+	local _health="${1:-unknown}"
+	local _auth_expired="${3:-0}"
+	local _diag="${2:-}"
+	local _diag_file="/var/log/surflare/diagnosis.json"
+
+	# Recursion guard (defense-in-depth).
+	# Prevents nested calls if _run_advisory_diagnosis is ever invoked
+	# from within a signal handler or callback. Currently unreachable
+	# in the single-threaded main loop -- placed for future safety.
+	if [ "${_ADVISORY_DIAGNOSIS_RUNNING:-0}" -eq 1 ]; then
+		log "BUG: recursive _run_advisory_diagnosis call"
+		return 1
+	fi
+	_ADVISORY_DIAGNOSIS_RUNNING=1
+
+	# Fault injection: create synthetic data when _INJECT_FAULT is set.
+	# Zero overhead when unset (single -n check).
+	# Guard MUST be after re-entrancy check (so recursive calls during
+	# injection are caught) and before all signal-reading code (so
+	# synthetic data overrides real data).
+	if [ -n "${_INJECT_FAULT:-}" ]; then
+		_inject_diag_state "$_INJECT_FAULT" || { _ADVISORY_DIAGNOSIS_RUNNING=0; return 1; }
+		# Override health and diag from env if provided
+		_health="${_INJECT_HEALTH:-$_health}"
+		_diag="${_INJECT_DIAG:-$_diag}"
+	fi
+
+	local _now _conclusion _confidence _signals _recommendation
+	local _fd_pct=0 _proxy_err=0 _503_count=0 _ct_pct=0
+	local _candidate_count=0 _uptime_s=0
+	local _num_candidates=${#NODE_CANDIDATES[@]}
+	: "${_num_candidates:=0}"  # default to 0 if array is unset
+	local _node _exit _transit
+	local _san_conclusion _san_signals _san_recommendation
+	local _san_node _san_exit _san_transit
+
+	# busybox date -u works identically to GNU date for +%s and +%Y-%m-%dT%H:%M:%SZ formats
+	_now=$(date +%s)
+
+	# Read diag_state.json fields (Plan 02-02 must be merged)
+	if [ -f /var/log/surflare/diag_state.json ]; then
+		# Extract fields using grep + sed (no python3 on N100)
+		# Each field read is independent; missing field -> default
+		# Extract pct from specific parent keys (not position-based)
+		# Whitespace-tolerant: diag_state.json may have spaces around
+		# colons if pretty-printed or if printf format changes.
+		_fd_pct=$(grep -o '"fd"[[:space:]]*:[[:space:]]*{[^}]*}' /var/log/surflare/diag_state.json | \
+			grep -o '"pct"[[:space:]]*:[[:space:]]*[0-9]*' | sed 's/[^0-9]//g')
+		_ct_pct=$(grep -o '"conntrack"[[:space:]]*:[[:space:]]*{[^}]*}' /var/log/surflare/diag_state.json | \
+			grep -o '"pct"[[:space:]]*:[[:space:]]*[0-9]*' | sed 's/[^0-9]//g')
+		_uptime_s=$(grep -o '"uptime_s":[0-9]*' /var/log/surflare/diag_state.json | \
+			sed 's/"uptime_s"://')
+		_node=$(grep -o '"node":"[^"]*"' /var/log/surflare/diag_state.json | \
+			sed 's/"node":"//; s/"//')
+		_exit=$(grep -o '"exit":"[^"]*"' /var/log/surflare/diag_state.json | \
+			sed 's/"exit":"//; s/"//')
+		_transit=$(grep -o '"transit":"[^"]*"' /var/log/surflare/diag_state.json | \
+			sed 's/"transit":"//; s/"//')
+	fi
+	_fd_pct=${_fd_pct:-0}
+	_ct_pct=${_ct_pct:-0}
+	_uptime_s=${_uptime_s:-0}
+
+	# Read proxy error count (Plan 02-01)
+	if [ -f /run/surflare_proxy_err_count ]; then
+		read -r _proxy_err _ < /run/surflare_proxy_err_count 2>/dev/null || _proxy_err=0
+	fi
+	_proxy_err=${_proxy_err:-0}
+
+	# Read 503 count
+	if [ -f /run/surflare_503_state ]; then
+		read -r _503_count _ _ < /run/surflare_503_state 2>/dev/null || _503_count=0
+	fi
+	_503_count=${_503_count:-0}
+
+	# Count CANDIDATE_INJECT from watchdog log (logread).
+	# _detect_blocked_domains (Plan 02-02) logs "CANDIDATE_INJECT:" to syslog,
+	# but does NOT write a persisted file at /run/surflare_candidate_inject_count.
+	# If a future change adds file persistence, add the file path as primary
+	# source here with logread as fallback.
+	_candidate_count=$(logread 2>/dev/null | tail -100 | \
+		grep -c 'CANDIDATE_INJECT' 2>/dev/null || echo 0)
+
+	# --- Rule engine: priority-ordered, first match wins ---
+	_conclusion="UNKNOWN"
+	_confidence="low"
+	_signals=""
+	_recommendation="Unable to determine cause. Check logs manually."
+
+	# Rule 0: AUTH_EXPIRED -- auth token expired (flag set by proxy log monitor)
+	if [ "$_auth_expired" = "1" ] && [ "$_health" != "LOCAL_FAIL" ]; then
+		_conclusion="AUTH_TOKEN_EXPIRED"
+		_confidence="high"
+		_signals="auth_expired=1"
+		_recommendation="Auth token expired. Run surflare login to refresh."
+
+
+	# Rule 1: LOCAL_FAIL
+	elif [ "$_health" = "LOCAL_FAIL" ]; then
+		_conclusion="LOCAL_STATE_LOST"
+		_confidence="high"
+		_signals="health=LOCAL_FAIL"
+		_recommendation="VPN state lost, reconnect forced. Check procd/surflare status."
+
+	# Rule 2: CN_EXIT_INFRA_DOWN -- all candidate nodes tried (consecutive CN exits >= total candidates)
+	elif [ "$_health" = "CN" ] && \
+	     [ "${_cn_consecutive:-0}" -ge "${_num_candidates}" ]; then
+		_conclusion="CN_EXIT_INFRA_DOWN"
+		_confidence="high"
+		_signals="health=CN,all_nodes_tried=${_cn_consecutive}"
+		_recommendation="All exit nodes route via CN. Relay infrastructure may be down."
+
+	# Rule 3: CN exit, single node
+	elif [ "$_health" = "CN" ]; then
+		_conclusion="CN_EXIT_SINGLE_NODE"
+		_confidence="medium"
+		_signals="health=CN,node=${_node:-?}"
+		_recommendation="Exit via CN on current node. Rotate node."
+
+	# Rule 4: UPSTREAM_UNREACHABLE + fd high
+	elif [ "$_diag" = "UPSTREAM_UNREACHABLE" ] && [ "$_fd_pct" -gt 80 ] 2>/dev/null; then
+		_conclusion="UPSTREAM_UNREACHABLE_RESOURCE"
+		_confidence="high"
+		_signals="diag=UPSTREAM_UNREACHABLE,fd_pct=${_fd_pct}"
+		_recommendation="Upstream unreachable + fd exhaustion. Proxy likely stuck."
+
+	# Rule 5: UPSTREAM_UNREACHABLE
+	elif [ "$_diag" = "UPSTREAM_UNREACHABLE" ]; then
+		_conclusion="UPSTREAM_UNREACHABLE"
+		_confidence="medium"
+		_signals="diag=UPSTREAM_UNREACHABLE,fd_pct=${_fd_pct}"
+		_recommendation="Cannot reach upstream server. Check relay availability."
+
+	# Rule 6: SERVER_REFUSED + 503 storm
+	elif [ "$_diag" = "SERVER_REFUSED" ] && [ "$_503_count" -gt 10 ] 2>/dev/null; then
+		_conclusion="SERVER_REFUSED_503_STORM"
+		_confidence="high"
+		_signals="diag=SERVER_REFUSED,503s=${_503_count}"
+		_recommendation="Server refusing connections + 503 storm. Subscription expired?"
+
+	# Rule 7: SERVER_REFUSED
+	elif [ "$_diag" = "SERVER_REFUSED" ]; then
+		_conclusion="SERVER_REFUSED"
+		_confidence="medium"
+		_signals="diag=SERVER_REFUSED"
+		_recommendation="Server refusing connections. Check auth token."
+
+	# Rule 8: TARGETED_SYN_BLOCK
+	elif [ "$_diag" = "TARGETED_SYN_BLOCK" ]; then
+		_conclusion="TARGETED_SYN_BLOCK"
+		_confidence="high"
+		_signals="diag=TARGETED_SYN_BLOCK,syn_out=${_diag_syn_out:-?},syn_ack=${_diag_syn_ack:-?}"
+		_recommendation="GFW blocking SYN to relay IP. Node burned."
+
+	# Rule 9: TRANSIT_DEGRADATION
+	elif [ "$_diag" = "TRANSIT_DEGRADATION" ]; then
+		_conclusion="TRANSIT_DEGRADATION"
+		_confidence="medium"
+		_signals="diag=TRANSIT_DEGRADATION,sack_pct=${_diag_sack_pct:-?}"
+		_recommendation="Transit path degraded. High packet loss detected."
+
+	# Rule 10: PROXY_BROKEN + fd high
+	elif [ "$_health" = "PROXY_BROKEN" ] && [ "$_fd_pct" -gt 80 ] 2>/dev/null; then
+		_conclusion="PROXY_BROKEN_RESOURCE"
+		_confidence="high"
+		_signals="health=PROXY_BROKEN,fd_pct=${_fd_pct}"
+		_recommendation="Proxy not forwarding + fd exhaustion. Leak likely."
+
+	# Rule 11: PROXY_BROKEN + 503 storm
+	elif [ "$_health" = "PROXY_BROKEN" ] && [ "$_503_count" -gt 10 ] 2>/dev/null; then
+		_conclusion="PROXY_BROKEN_503"
+		_confidence="high"
+		_signals="health=PROXY_BROKEN,503s=${_503_count}"
+		_recommendation="Proxy not forwarding + 503 storm. Backend issue."
+
+	# Rule 12: PROXY_BROKEN
+	elif [ "$_health" = "PROXY_BROKEN" ]; then
+		_conclusion="PROXY_BROKEN"
+		_confidence="medium"
+		_signals="health=PROXY_BROKEN,proxy_errors=${_proxy_err}"
+		_recommendation="Proxy path broken. Check surflare-proxy process."
+
+	# Rule 13: SERVER_APP_FAILURE
+	elif [ "$_diag" = "SERVER_APP_FAILURE" ]; then
+		_conclusion="SERVER_APP_FAILURE"
+		_confidence="medium"
+		_signals="diag=SERVER_APP_FAILURE"
+		_recommendation="Server application error. Transient, retry may help."
+
+	# Rule 14: BLOCKED_DOMAINS (TCP_BLOCK + candidates found)
+	elif [ "$_health" = "TCP_BLOCK" ] && [ "$_candidate_count" -gt 0 ] 2>/dev/null; then
+		_conclusion="BLOCKED_DOMAINS"
+		_confidence="medium"
+		_signals="health=TCP_BLOCK,candidate_inject=${_candidate_count}"
+		_recommendation="Domains blocked on direct route. Consider INJECT_DOMAINS."
+
+	# Rule 15: MIXED_SIGNALS
+	elif [ "$_diag" = "MIXED_SIGNALS" ]; then
+		_conclusion="MIXED_SIGNALS"
+		_confidence="low"
+		_signals="diag=MIXED_SIGNALS"
+		_recommendation="Multiple conflicting signals. Manual investigation needed."
+
+	# Rule 16: UNKNOWN (fallback)
+	else
+		_conclusion="UNKNOWN"
+		_confidence="low"
+		_signals="health=${_health},diag=${_diag:-none}"
+		_recommendation="Unable to determine cause. Check logs manually."
+	fi
+
+	# Sanitize for JSON (same pattern as _export_diag_state)
+	# shellcheck disable=SC1003
+	_san_conclusion=$(printf '%s' "$_conclusion" | tr -d '"\')
+	# shellcheck disable=SC1003
+	_san_signals=$(printf '%s' "$_signals" | tr -d '"\')
+	# shellcheck disable=SC1003
+	_san_recommendation=$(printf '%s' "$_recommendation" | tr -d '"\')
+	# shellcheck disable=SC1003
+	_san_node=$(printf '%s' "${_node:-?}" | tr -d '"\')
+	# shellcheck disable=SC1003
+	_san_exit=$(printf '%s' "${_exit:-?}" | tr -d '"\')
+	# shellcheck disable=SC1003
+	_san_transit=$(printf '%s' "${_transit:-?}" | tr -d '"\')
+
+	# Write diagnosis JSON
+	# busybox printf: %d with non-numeric args defaults to 0 (safe fallback)
+	mkdir -p "$(dirname "$_diag_file")" 2>/dev/null
+	printf '{"version":1,"ts":"%s","health":"%s","tier1":{"conclusion":"%s","confidence":"%s","signals":"%s","recommendation":"%s"},"context":{"node":"%s","exit":"%s","transit":"%s","uptime_s":%d,"reconnects":%d,"fd_pct":%d,"proxy_errors":%d,"503s":%d,"candidate_inject":%d}}\n' \
+		"$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+		"$_health" \
+		"$_san_conclusion" "$_confidence" "$_san_signals" "$_san_recommendation" \
+		"$_san_node" "$_san_exit" "$_san_transit" \
+		"$_uptime_s" "${_stats_reconnects:-0}" \
+		"$_fd_pct" "$_proxy_err" "$_503_count" "$_candidate_count" \
+		> "$_diag_file" 2>/dev/null || \
+		{ log "WARN: diagnosis export failed"; _ADVISORY_DIAGNOSIS_RUNNING=0; return 1; }
+
+	log "Diagnosis: ${_conclusion} (${_confidence}) -- ${_recommendation}"
+	_ADVISORY_DIAGNOSIS_RUNNING=0
+}
+
+# _inject_diag_state: create synthetic diagnostic data for testing.
+# Called ONLY when _INJECT_FAULT is set.
+# NEVER called in production (guarded by _INJECT_FAULT check in caller).
+#
+# Backs up original files on first call; _inject_restore_state restores them.
+_inject_diag_state() {
+	local _scenario="${1:?scenario required}"
+	local _diag_dir="/var/log/surflare"
+	local _diag_file="${_diag_dir}/diag_state.json"
+	local _err_file="/run/surflare_proxy_err_count"
+	local _503_file="/run/surflare_503_state"
+
+	mkdir -p "$_diag_dir" 2>/dev/null
+
+	# Backup originals on first call (not subsequent scenarios in same run)
+	if [ -z "${_INJECT_BACKUP_DONE:-}" ]; then
+		[ -f "$_diag_file" ] && cp "$_diag_file" "${_diag_file}.inject-backup"
+		[ -f "$_err_file" ] && cp "$_err_file" "${_err_file}.inject-backup"
+		[ -f "$_503_file" ] && cp "$_503_file" "${_503_file}.inject-backup"
+		_INJECT_BACKUP_DONE=1
+	fi
+
+	case "$_scenario" in
+		UPSTREAM_UNREACHABLE_FD)
+			# fd_pct=85, proxy_errors=0, 503s=0, conntrack_pct=30
+			printf '{"ts":"%s","uptime_s":3600,"fd":{"count":5570,"limit":65535,"pct":85},"conntrack":{"count":900,"max":3000,"pct":30},"nftables":{"sw_lan_tproxy":true,"killswitch":true,"surflare_moat":true},"vpn":{"node":"de-fra-01","exit":"de-fra-01","transit":"de-fra-01","health":"TCP_BLOCK"},"stats":{"reconnects":3,"rotations":1,"503s":0,"proxy_errors":0,"degraded":"none"}}\n' \
+				"$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$_diag_file"
+			echo "0 $(date +%s)" > "$_err_file"
+			echo "0 0 0" > "$_503_file"
+			;;
+		SERVER_REFUSED_503)
+			# fd_pct=20, proxy_errors=0, 503s=15, conntrack_pct=10
+			printf '{"ts":"%s","uptime_s":7200,"fd":{"count":1310,"limit":65535,"pct":20},"conntrack":{"count":300,"max":3000,"pct":10},"nftables":{"sw_lan_tproxy":true,"killswitch":true,"surflare_moat":true},"vpn":{"node":"us-east-01","exit":"us-east-01","transit":"us-east-01","health":"TCP_BLOCK"},"stats":{"reconnects":5,"rotations":2,"503s":15,"proxy_errors":0,"degraded":"none"}}\n' \
+				"$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$_diag_file"
+			echo "0 $(date +%s)" > "$_err_file"
+			echo "15 $(($(date +%s) - 600)) $(date +%s)" > "$_503_file"
+			;;
+		TARGETED_SYN_BLOCK)
+			# fd_pct=15, proxy_errors=0, 503s=0, conntrack_pct=5
+			printf '{"ts":"%s","uptime_s":1800,"fd":{"count":983,"limit":65535,"pct":15},"conntrack":{"count":150,"max":3000,"pct":5},"nftables":{"sw_lan_tproxy":true,"killswitch":true,"surflare_moat":true},"vpn":{"node":"jp-tok-01","exit":"jp-tok-01","transit":"jp-tok-01","health":"TCP_BLOCK"},"stats":{"reconnects":2,"rotations":0,"503s":0,"proxy_errors":0,"degraded":"none"}}\n' \
+				"$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$_diag_file"
+			echo "0 $(date +%s)" > "$_err_file"
+			echo "0 0 0" > "$_503_file"
+			;;
+		TRANSIT_DEGRADATION)
+			# fd_pct=25, proxy_errors=2, 503s=0, conntrack_pct=40
+			printf '{"ts":"%s","uptime_s":5400,"fd":{"count":1638,"limit":65535,"pct":25},"conntrack":{"count":1200,"max":3000,"pct":40},"nftables":{"sw_lan_tproxy":true,"killswitch":true,"surflare_moat":true},"vpn":{"node":"sg-sin-01","exit":"sg-sin-01","transit":"sg-sin-01","health":"TCP_BLOCK"},"stats":{"reconnects":1,"rotations":0,"503s":0,"proxy_errors":2,"degraded":"none"}}\n' \
+				"$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$_diag_file"
+			echo "2 $(date +%s)" > "$_err_file"
+			echo "0 0 0" > "$_503_file"
+			;;
+		PROXY_BROKEN_FD)
+			# fd_pct=88, proxy_errors=12, 503s=0, conntrack_pct=20
+			printf '{"ts":"%s","uptime_s":10800,"fd":{"count":5766,"limit":65535,"pct":88},"conntrack":{"count":600,"max":3000,"pct":20},"nftables":{"sw_lan_tproxy":true,"killswitch":true,"surflare_moat":true},"vpn":{"node":"de-fra-01","exit":"de-fra-01","transit":"de-fra-01","health":"PROXY_BROKEN"},"stats":{"reconnects":8,"rotations":3,"503s":0,"proxy_errors":12,"degraded":"none"}}\n' \
+				"$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$_diag_file"
+			echo "12 $(date +%s)" > "$_err_file"
+			echo "0 0 0" > "$_503_file"
+			;;
+		CN_EXIT)
+			# fd_pct=10, proxy_errors=0, 503s=0, conntrack_pct=8
+			printf '{"ts":"%s","uptime_s":900,"fd":{"count":655,"limit":65535,"pct":10},"conntrack":{"count":240,"max":3000,"pct":8},"nftables":{"sw_lan_tproxy":true,"killswitch":true,"surflare_moat":true},"vpn":{"node":"us-east-01","exit":"cn-beijing-01","transit":"us-east-01","health":"CN"},"stats":{"reconnects":1,"rotations":0,"503s":0,"proxy_errors":0,"degraded":"none"}}\n' \
+				"$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$_diag_file"
+			echo "0 $(date +%s)" > "$_err_file"
+			echo "0 0 0" > "$_503_file"
+			;;
+		*)
+			log "WARN: unknown inject scenario: $_scenario"
+			return 1
+			;;
+	esac
+}
+
+# _inject_restore_state: restore original files after fault injection.
+# Called from test harness trap on EXIT.
+# Restores backups created by _inject_diag_state; removes synthetic
+# files that had no original.
+_inject_restore_state() {
+	local _diag_file="/var/log/surflare/diag_state.json"
+	local _err_file="/run/surflare_proxy_err_count"
+	local _503_file="/run/surflare_503_state"
+	for _f in "$_diag_file" "$_err_file" "$_503_file"; do
+		if [ -f "${_f}.inject-backup" ]; then
+			mv "${_f}.inject-backup" "$_f"
+		else
+			rm -f "$_f"  # didn't exist before, remove synthetic
+		fi
+	done
+	_INJECT_BACKUP_DONE=""
+}
+
+# _llm_enrich_diagnosis: call LLM API for diagnosis enrichment.
+#
+# Reads /var/log/surflare/diagnosis.json (from _run_advisory_diagnosis),
+# sends tier1 context to LLM, prints analysis to stdout.
+#
+# 3-tier fallback: DeepSeek CN -> Agnes -> give up.
+# Each tier is OpenAI-compatible; tried in order until one succeeds.
+#
+# ADVISORY ONLY -- no system state modification.
+# Returns 1 on any failure; caller must handle empty output.
+_llm_enrich_diagnosis() {
+	local _conf="/etc/surflare/llm.conf"
+	local _diag_file="/var/log/surflare/diagnosis.json"
+	local _llm_out="/var/log/surflare/diagnosis_llm.json"
+	local _enabled _timeout _max_tokens
+	local _tier1_context _prompt _esc_prompt
+	local _response _analysis _rc
+
+	# Config check (grep-based, same pattern as wechat.conf -- no source)
+	[ -f "$_conf" ] || return 1
+	_enabled=$(grep -m1 '^ENABLED=' "$_conf" | cut -d= -f2- | tr -d '"\r ')
+	[ "$_enabled" = "true" ] || return 1
+	_timeout=$(grep -m1 '^TIMEOUT=' "$_conf" | cut -d= -f2- | tr -d '"\r ')
+	_timeout="${_timeout:-15}"
+	_max_tokens=$(grep -m1 '^MAX_TOKENS=' "$_conf" | cut -d= -f2- | tr -d '"\r ')
+	_max_tokens="${_max_tokens:-256}"
+
+	# Read tier1 diagnosis context
+	[ -f "$_diag_file" ] || return 1
+	_tier1_context=$(cat "$_diag_file" 2>/dev/null)
+	[ -n "$_tier1_context" ] || return 1
+
+	# Build prompt: ask for concise analysis (WeChat message length)
+	_prompt="You are a VPN network diagnosis assistant. Analyze this diagnosis data and provide a brief (3-5 sentence) analysis with the most likely root cause and one specific action to take. Be direct, no pleasantries. Diagnosis data: ${_tier1_context}"
+
+	# Escape prompt for JSON: backslash and double-quote
+	_esc_prompt=$(printf '%s' "$_prompt" | sed 's/\\/\\\\/g; s/"/\\"/g; s/\n/\\n/g')
+
+	# --- Helper: try one LLM tier ---
+	# _try_llm_tier API_KEY MODEL BASE_URL
+	# Returns 0 on success (prints analysis), 1 on failure.
+	# NOTE: _try_llm_tier is a nested function (bash 4+ feature).
+	# N100 runs bash (confirmed in Task 0 pre-flight of 03-04). Not POSIX sh compatible.
+	_try_llm_tier() {
+		local _key="$1" _mdl="$2" _url="$3"
+		[ -n "$_key" ] || return 1
+
+		_response=$(curl -sf --max-time "$_timeout" \
+			-X POST "$_url" \
+			-H "Content-Type: application/json" \
+			-H "Authorization: Bearer ${_key}" \
+			-d "{\"model\":\"${_mdl}\",\"messages\":[{\"role\":\"user\",\"content\":\"${_esc_prompt}\"}],\"max_tokens\":${_max_tokens},\"temperature\":0.3}" \
+			2>/dev/null)
+		_rc=$?
+
+		if [ "$_rc" -ne 0 ] || [ -z "$_response" ]; then
+			return 1
+		fi
+
+		# Save full response for debugging (non-fatal)
+		printf '%s\n' "$_response" > "$_llm_out" 2>/dev/null || true
+
+		# Two-pass content extraction:
+		# Pass 1: extract raw content between "content":" and "}}]
+		#   Cannot use [^"]* -- breaks on JSON-escaped quotes (\").
+		#   Match from "content":" to the message-object closing "}}]
+		#   which is unique in OpenAI response structure.
+		_analysis=$(printf '%s' "$_response" | \
+			sed 's/.*"content":"//; s/"}].*//')
+
+		# Fallback: if two-pass extraction failed (edge case: content contains "}] sequence)
+		if [ -z "$_analysis" ]; then
+			_analysis=$(printf '%s' "$_response" | \
+				sed 's/.*"content":"//; s/".*//' | head -c 500)
+		fi
+
+		if [ -z "$_analysis" ]; then
+			return 1
+		fi
+
+		# Pass 2: unescape JSON string literals in correct order.
+		# Order matters: \" must be unescaped BEFORE \\ to avoid
+		# mangling \\" (escaped backslash + quote).
+		# \n -> space (not real newline) for single-line alert body.
+		_analysis=$(printf '%s' "$_analysis" | \
+			sed 's/\\"/"/g; s/\\n/ /g; s/\\\\/\\/g')
+
+		printf '%s' "$_analysis"
+		return 0
+	}
+
+	# --- Tier 1: DeepSeek CN (primary, ~0.24s) ---
+	local _ds_key _ds_model _ds_url
+	_ds_key=$(grep -m1 '^DEEPSEEK_API_KEY=' "$_conf" | cut -d= -f2- | tr -d '"\r ')
+	_ds_model=$(grep -m1 '^DEEPSEEK_MODEL=' "$_conf" | cut -d= -f2- | tr -d '"\r ')
+	_ds_model="${_ds_model:-deepseek-chat}"
+	_ds_url=$(grep -m1 '^DEEPSEEK_URL=' "$_conf" | cut -d= -f2- | tr -d '"\r ')
+	_ds_url="${_ds_url:-https://api.deepseek.com/v1/chat/completions}"
+
+	if _try_llm_tier "$_ds_key" "$_ds_model" "$_ds_url"; then
+		log "LLM: DeepSeek tier succeeded"
+		return 0
+	fi
+	log "WARN: DeepSeek tier failed, trying Agnes fallback"
+
+	# --- Tier 2: Agnes (fallback, ~1.65s, free) ---
+	local _ag_key _ag_model _ag_url
+	_ag_key=$(grep -m1 '^AGNES_API_KEY=' "$_conf" | cut -d= -f2- | tr -d '"\r ')
+	_ag_model=$(grep -m1 '^AGNES_MODEL=' "$_conf" | cut -d= -f2- | tr -d '"\r ')
+	_ag_model="${_ag_model:-agnes-2.0-flash}"
+	_ag_url=$(grep -m1 '^AGNES_URL=' "$_conf" | cut -d= -f2- | tr -d '"\r ')
+	_ag_url="${_ag_url:-https://apihub.agnes-ai.com/v1/chat/completions}"
+
+	if _try_llm_tier "$_ag_key" "$_ag_model" "$_ag_url"; then
+		log "LLM: Agnes fallback tier succeeded"
+		return 0
+	fi
+	log "WARN: all LLM tiers failed (DeepSeek + Agnes)"
+
+	# --- Tier 3: qwen LAN (future, gated on H0b) ---
+	# Placeholder: uncomment when H0b certification is complete.
+	# local _qw_url
+	# _qw_url=$(grep -m1 '^QWEN_LAN_URL=' "$_conf" | cut -d= -f2- | tr -d '"\r ')
+	# _qw_url="${_qw_url:-http://192.168.100.11:11434/v1/chat/completions}"
+	# if _try_llm_tier "not-needed" "qwen3.5" "$_qw_url"; then
+	#     log "LLM: qwen LAN tier succeeded"
+	#     return 0
+	# fi
+
+	return 1
+}
+
+# _send_diagnosis_alert: send structured diagnosis via alert bridge.
+#
+# Reads diagnosis.json (tier1) and fires _llm_enrich_diagnosis (tier2)
+# in background. Main loop sends tier1-only alert immediately and
+# continues. LLM follow-up uses _deliver_alert (no rate limiter) so it
+# is not blocked by tier1 consuming the 600s window. Follow-up is gated
+# on tier1 actually being delivered -- if tier1 is rate-limited, the
+# LLM subshell is not spawned (saves API calls).
+#
+# ADVISORY ONLY -- no system state modification.
+_send_diagnosis_alert() {
+	local _health="${1:-unknown}"
+	local _diag_file="/var/log/surflare/diagnosis.json"
+	local _conclusion _confidence _signals _recommendation
+	local _alert_body _alert_title
+
+	# Read tier1 from diagnosis.json
+	[ -f "$_diag_file" ] || return 0
+	_conclusion=$(grep -o '"conclusion":"[^"]*"' "$_diag_file" | \
+		sed 's/"conclusion":"//; s/"//')
+	_confidence=$(grep -o '"confidence":"[^"]*"' "$_diag_file" | \
+		sed 's/"confidence":"//; s/"//')
+	_signals=$(grep -o '"signals":"[^"]*"' "$_diag_file" | \
+		sed 's/"signals":"//; s/"//')
+	_recommendation=$(grep -o '"recommendation":"[^"]*"' "$_diag_file" | \
+		sed 's/"recommendation":"//; s/"//')
+
+	[ -n "$_conclusion" ] || return 0
+
+	# Compose tier1 alert (sent immediately, no LLM wait)
+	_alert_title="[Diagnosis] ${_conclusion} (${_confidence:-?})"
+	_alert_body="${_recommendation:-check logs}"
+	[ -n "$_signals" ] && _alert_body="Signals: ${_signals}\n${_alert_body}"
+
+	# Only spawn LLM follow-up if tier1 was actually delivered (not rate-limited).
+	# Follow-up uses _deliver_alert directly -- the subshell's variable changes
+	# don't propagate back, so the main shell's _alert_last_ts is unaffected.
+	# This means the follow-up bypasses the 600s limiter without enabling spam:
+	# each failure produces at most 2 alerts (tier1 + follow-up), and tier1
+	# itself is still rate-limited at 600s.
+	local _prev_ts=${_alert_last_ts:-0}
+	_send_alert "$_alert_title" "$(printf '%b' "$_alert_body")"
+
+	if [ "$_alert_last_ts" != "$_prev_ts" ]; then
+		(
+			_llm_analysis=$(_llm_enrich_diagnosis) || exit 0
+			[ -n "$_llm_analysis" ] || exit 0
+			_deliver_alert "[LLM Analysis] ${_conclusion}" "$_llm_analysis"
+		) 200>&- &
+	fi
+
+	return 0
+}
+
 TRANSIT_CACHE_FILE="/run/surflare_transit_cache"
 TRANSIT_REPROBE_AFTER=3
 TRANSIT_ALLDOWN_WAIT=300                # cooldown when all transit candidates unreachable
@@ -4409,6 +4995,12 @@ log "Startup nftables: killswitch=$(_table_exists killswitch) dns_enforce=$(_tab
 _cn_direct_mtime=$(stat -c %Y /etc/surflare/cn_ipv4.txt /etc/surflare/cn_ipv4_extra.txt /etc/surflare/cn_ipv6.txt 2>/dev/null | sort -rn | head -1)
 : "${_cn_direct_mtime:=0}"
 
+# --source-only: define functions but do not enter main loop.
+# Used by test harnesses (Plan 03-04) to source this file.
+if [ "${_SOURCE_ONLY:-0}" -eq 1 ]; then
+	return 0 2>/dev/null || exit 0
+fi
+
 while true; do
 	# Diagnostic mode: pause without tearing down protections.
 	# SIGUSR2 toggles _diag_mode; while active, the loop sleeps
@@ -4522,10 +5114,15 @@ while true; do
 		continue
 	fi
 
+	_auth_expired_this_cycle=0
 	# Auth expired flag: short-circuit to connect_vpn with auth refresh.
 	# connect_vpn clears the flag (single clear point). sleep 1 prevents
 	# busy-loop if connect_vpn returns rc=2 (flock busy).
+	# Do NOT reset _auth_expired_this_cycle here -- the diagnosis engine
+	# needs to see it if health is still bad after the refresh attempt.
+	# The variable is re-initialized to 0 at the top of each loop iteration.
 	if [ -f /run/surflare_auth_expired ]; then
+		_auth_expired_this_cycle=1
 		log "Auth expired signal detected, forcing reconnect with auth refresh"
 		connect_vpn
 		sleep 1
@@ -4548,6 +5145,8 @@ while true; do
 			log "Flushed stale nftables/routing (${_stale} rule(s))"
 		fi
 		_export_diag_state "$health"
+		_run_advisory_diagnosis "$health" "" "$_auth_expired_this_cycle"
+		_send_diagnosis_alert "$health"
 		transient_count=0
 		_cn_consecutive=0
 		_healthy_consecutive=0
@@ -4559,6 +5158,8 @@ while true; do
 			_record_disconnect
 			_detect_blocked_domains
 			_export_diag_state "$health"
+			_run_advisory_diagnosis "$health" "${_diag_conclusion:-}" "$_auth_expired_this_cycle"
+			_send_diagnosis_alert "$health"
 			log "Health check TCP block (tunnel confirmed, local network OK), triggering reconnect"
 			transient_count=0
 			_cn_consecutive=0
@@ -4575,6 +5176,8 @@ while true; do
 		# is not forwarding traffic.  LAN devices would have no connectivity.
 		log "Proxy path broken: surflare-proxy:10800 not forwarding, triggering reconnect"
 		_export_diag_state "$health"
+		_run_advisory_diagnosis "$health" "" "$_auth_expired_this_cycle"
+		_send_diagnosis_alert "$health"
 		# Capture forensic snapshot BEFORE reconnect tears down proxy
 		# state.  Fire-and-forget background; won't delay reconnect.
 		if [ -x /usr/local/sbin/diag-proxy-broken.sh ]; then
@@ -4672,6 +5275,8 @@ while true; do
 		transient_count=0
 		_healthy_consecutive=0
 		_cn_consecutive=$((_cn_consecutive + 1))
+		_run_advisory_diagnosis "$health" "" "$_auth_expired_this_cycle"
+		_send_diagnosis_alert "$health"
 		if [ "$_cn_consecutive" -ge "${#NODE_CANDIDATES[@]}" ]; then
 			_enter_storm_cooldown "cn-exit-all-nodes"
 			_cn_consecutive=0
