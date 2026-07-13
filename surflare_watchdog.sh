@@ -156,7 +156,7 @@ umask 0177
 #   flock         -> util-linux   (all major distros)
 #   surflare/surflare-proxy -> from surflare installation
 # Note: nm-online is optional (NetworkManager package); falls back to sleep 15s.
-for cmd in curl killall pgrep flock surflare surflare-proxy python3; do
+for cmd in curl killall pgrep flock surflare surflare-proxy python3 ss; do
 	if ! command -v "$cmd" >/dev/null 2>&1; then
 		echo "<3>surflare_watchdog: missing dependency: ${cmd}, exiting" >/dev/kmsg
 		exit 1
@@ -346,7 +346,7 @@ _run_observability_probes() {
 	_mem=$(awk '/MemAvailable/{print $2}' /proc/meminfo)
 	[ "${_mem:-0}" -lt 500000 ] && log "WARN: low memory: ${_mem}kB available"
 	_pid=$(_pids_by_comm "surflare-proxy" | tail -1)
-	[ -n "$_pid" ] && echo -1000 > /proc/$_pid/oom_score_adj 2>/dev/null
+	[ -n "$_pid" ] && echo -1000 > "/proc/$_pid/oom_score_adj" 2>/dev/null
 
 	# Probe 5 -- BPF keepalive (router-only)
 	if [ "$PLATFORM" = "router" ]; then
@@ -358,8 +358,9 @@ _run_observability_probes() {
 
 	# Probe 6 -- proxy fd count (fd leak early warning)
 	if [ -n "$_pid" ]; then
-		_fd_count=$(ls /proc/$_pid/fd 2>/dev/null | wc -l)
-		_fd_limit=$(awk '/Max open files/{print $4}' /proc/$_pid/limits 2>/dev/null)
+		# shellcheck disable=SC2012  # ls is correct for counting /proc/PID/fd entries
+		_fd_count=$(ls "/proc/$_pid/fd" 2>/dev/null | wc -l)
+		_fd_limit=$(awk '/Max open files/{print $4}' "/proc/$_pid/limits" 2>/dev/null)
 		_fd_limit=${_fd_limit:-65535}
 		if [ "$_fd_limit" -gt 0 ] 2>/dev/null; then
 			_fd_pct=$((_fd_count * 100 / _fd_limit))
@@ -1881,7 +1882,7 @@ _enter_storm_cooldown() {
 				[ "$_spid" -eq "$$" ] && continue
 				# Only count procd-started instances (PPid=1), not
 				# our own child subshells (PPid=$$)
-				grep -q "PPid:.*1$" /proc/$_spid/status 2>/dev/null || continue
+				grep -q "PPid:.*1$" "/proc/$_spid/status" 2>/dev/null || continue
 				_storm_dup=$((_storm_dup + 1))
 			done
 			[ "$_storm_dup" -gt 0 ] && log "WARN: ${_storm_dup} duplicate watchdog(s) during storm cooldown"
@@ -2373,6 +2374,7 @@ _exempt_cn_output() {
 	local _batch="/tmp/surflare_cn_output_$$.nft"
 
 	# Create the interval set (idempotent)
+	# shellcheck disable=SC1083  # { } is nft syntax, not shell group
 	nft add set inet surflare cn_output { type ipv4_addr\; flags interval\; } \
 		2>/dev/null || true
 
@@ -2938,7 +2940,6 @@ EXPECT_EOF
 			local _sock
 			_sock=$(mktemp /tmp/.surflare_auth.XXXXXX)
 			rm -f "$_sock"  # mktemp creates the file; sexpect needs the path free
-			trap 'rm -f "'"$_sock"'"' EXIT
 			export _SURFLARE_AUTH_PW="$password"
 			# stderr from surflare login captured to AUTH_STDERR_FILE for error classification.
 			# sexpect stderr (control messages) suppressed; spawned process stderr captured.
@@ -2952,7 +2953,6 @@ EXPECT_EOF
 			fi
 			unset _SURFLARE_AUTH_PW
 			rm -f "$_sock"
-			trap - EXIT
 		else
 			log "WARN: neither expect nor sexpect installed; cannot refresh auth"
 			unset password

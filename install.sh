@@ -197,6 +197,8 @@ runit)
     # SmartDNS: deploy patched init.d (auto_set_dnsmasq guard)
     # Fixes: crash loop when redirect='redirect' + auto_set_dnsmasq=0
     # (init.d unconditionally sets port=53, conflicts with dnsmasq)
+    # NOTE: this copies a procd init script; runit deployments would need
+    # a runit service definition instead (not implemented -- N100 is procd-only)
     if [ -f "$SVC_ROUTER/procd/smartdns" ]; then
         cp "$SVC_ROUTER/procd/smartdns" /etc/init.d/smartdns
         chmod 755 /etc/init.d/smartdns
