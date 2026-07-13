@@ -472,6 +472,7 @@ _stop_proxy_log_monitor() {
 	fi
 	pkill -f "tail -n 0 -F ${PROXY_LOG//./\\.}" 2>/dev/null || true
 	rm -f "$STORM_503_STATE" "${STORM_503_STATE}.tmp"
+	rm -f "$PROXY_ERR_STATE" "${PROXY_ERR_STATE}.tmp"
 }
 
 PROXY_CPU_SET=""
