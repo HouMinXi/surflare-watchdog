@@ -965,6 +965,30 @@ _load_tproxy_cn_direct() {
 	rm -f "$_batch"
 }
 
+# _ensure_smartdns_loader_fix: the nightly SmartDNS package bundles a
+# musl dynamic loader but ships with a broken symlink (ld-musl-x86_64.so.1
+# missing from the bundled lib dir).  The wrapper script also needs to
+# invoke the loader explicitly because the binary's PT_INTERP is a
+# relative path that the kernel cannot resolve.  opkg reinstall overwrites
+# both files, so verify and repair on every startup.
+_ensure_smartdns_loader_fix() {
+	[ -x /usr/local/lib/smartdns/smartdns ] || return 0
+	local _lib_dir=/usr/local/lib/smartdns/lib
+	local _wrapper=/usr/local/lib/smartdns/run-smartdns
+	if [ ! -e "$_lib_dir/ld-linux.so" ] || \
+		[ "$(readlink "$_lib_dir/ld-linux.so" 2>/dev/null)" != "/lib/ld-musl-x86_64.so.1" ]; then
+		mkdir -p "$_lib_dir" 2>/dev/null
+		ln -sf /lib/ld-musl-x86_64.so.1 "$_lib_dir/ld-linux.so" 2>/dev/null \
+			&& log "SmartDNS loader fix: repaired ld-linux.so symlink" \
+			|| log "WARN: SmartDNS loader fix: failed to repair ld-linux.so"
+	fi
+	if grep -q 'exec "${SMARTDNS_BIN}" $@' "$_wrapper" 2>/dev/null; then
+		sed -i 's|SMARTDNS_WORKDIR="$CWD" exec "${SMARTDNS_BIN}" $@|SMARTDNS_WORKDIR="$CWD" exec "${INTERPRETER}" "${SMARTDNS_BIN}" $@|' "$_wrapper" 2>/dev/null \
+			&& log "SmartDNS loader fix: repaired wrapper exec line" \
+			|| log "WARN: SmartDNS loader fix: failed to repair wrapper"
+	fi
+}
+
 # _cleanup_on_startup: called once at the top of the main loop.
 # Unconditionally kill any inherited surflare-proxy and nuke stale
 # watchdog-managed nftables state.  This prevents ghost rules from a
@@ -4360,6 +4384,7 @@ _get_isp_ip || log "WARN: ISP IP unavailable, CN exit will be treated as failure
 _killswitch_armed=0
 _setup_kernel_moat
 _cleanup_on_startup
+_ensure_smartdns_loader_fix
 
 # Load dns_enforce + killswitch at startup (neither depends on proxy).
 # dns_enforce FIRST: without it, killswitch forward policy-drop silently
