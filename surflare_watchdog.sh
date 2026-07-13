@@ -3693,6 +3693,14 @@ connect_vpn() {
 			log "connect_vpn: surflare status failed (rc=${_status_rc})"
 			_need_auth=1
 		fi
+		# Auth expired flag: proxy log detected "authentication required".
+		# Forces _need_auth=1 even if surflare status reports OK.
+		# Flag cleared HERE (single clear point, no race with main loop).
+		if [ -f /run/surflare_auth_expired ]; then
+			log "connect_vpn: auth expired (proxy reported authentication required)"
+			_need_auth=1
+			rm -f /run/surflare_auth_expired
+		fi
 		# Check subscription first (do NOT refresh, just log)
 		if echo "$_auth_status" | grep -qiE "subscription.*not active|not active.*subscription"; then
 			log "WARN: subscription expired, manual renewal required"
@@ -4484,6 +4492,15 @@ while true; do
 		fi
 		sleep "$CHECK_INTERVAL" & storm_sleep_pid=$!; wait "$storm_sleep_pid"; storm_sleep_pid=""
 		continue
+	fi
+
+	# Auth expired flag: short-circuit to connect_vpn with auth refresh.
+	# connect_vpn clears the flag (single clear point). sleep 1 prevents
+	# busy-loop if connect_vpn returns rc=2 (flock busy).
+	if [ -f /run/surflare_auth_expired ]; then
+		log "Auth expired signal detected, forcing reconnect with auth refresh"
+		connect_vpn
+		sleep 1
 	fi
 
 	health=$(check_vpn_health)
