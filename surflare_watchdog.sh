@@ -296,7 +296,7 @@ _run_observability_probes() {
 	# Probe 1 -- DNS liveness (router-only)
 	if [ "$PLATFORM" = "router" ]; then
 		# Step A -- SmartDNS
-		if ! _proc_alive smartdns; then
+		if ! _proc_alive smartdns && ! pgrep -f '/usr/local/lib/smartdns/smartdns' >/dev/null 2>&1; then
 			_now_dns=$(date +%s)
 			_new_times=""
 			for _t in $_DNS_RESTART_TIMES; do
