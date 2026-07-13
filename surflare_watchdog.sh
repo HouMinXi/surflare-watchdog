@@ -2348,9 +2348,8 @@ _block_unreachable_doh() {
 	# Dedup: skip if reject rule already present (multiple call sites)
 	nft list chain inet surflare output 2>/dev/null | \
 		grep -q '1.1.1.1.*reject' && return 0
-	# shellcheck disable=SC1083  # braces are nft set syntax, not bash
 	nft insert rule inet surflare output \
-		ip daddr { 1.1.1.1, 1.0.0.1, 8.8.8.8, 8.8.4.4 } tcp dport 443 reject \
+		ip daddr '{ 1.1.1.1, 1.0.0.1, 8.8.8.8, 8.8.4.4 }' tcp dport 443 reject \
 		2>/dev/null || true
 }
 # _exempt_cn_output: load all CN IPv4 CIDRs into an nftables set and insert
@@ -2374,8 +2373,7 @@ _exempt_cn_output() {
 	local _batch="/tmp/surflare_cn_output_$$.nft"
 
 	# Create the interval set (idempotent)
-	# shellcheck disable=SC1083  # { } is nft syntax, not shell group
-	nft add set inet surflare cn_output { type ipv4_addr\; flags interval\; } \
+	nft add set inet surflare cn_output '{ type ipv4_addr; flags interval; }' \
 		2>/dev/null || true
 
 	# Batch-load all CIDRs from cn_ipv4.txt
