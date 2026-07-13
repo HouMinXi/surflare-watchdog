@@ -965,23 +965,6 @@ _load_tproxy_cn_direct() {
 	rm -f "$_batch"
 }
 
-# Sync cn_domain_ips from tproxy to killswitch (SmartDNS#1944 workaround).
-# SmartDNS nftset only writes to one table; killswitch needs the same IPs
-# to accept bypassed traffic in the forward chain.  Full replace (flush+add)
-# so expired tproxy entries don't persist in killswitch.
-_sync_cn_domain_ips_to_killswitch() {
-	[ "$PLATFORM" = "router" ] || return 0
-	nft list set inet sw_lan_tproxy cn_domain_ips >/dev/null 2>&1 || return 0
-	nft list set inet killswitch cn_domain_ips >/dev/null 2>&1 || return 0
-	local _sync_ips
-	_sync_ips=$(nft list set inet sw_lan_tproxy cn_domain_ips 2>/dev/null \
-		| grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | tr '\n' ',' | sed 's/,$//')
-	if [ -n "$_sync_ips" ]; then
-		nft flush set inet killswitch cn_domain_ips 2>/dev/null
-		nft add element inet killswitch cn_domain_ips "{ $_sync_ips }" 2>/dev/null
-	fi
-}
-
 # _cleanup_on_startup: called once at the top of the main loop.
 # Unconditionally kill any inherited surflare-proxy and nuke stale
 # watchdog-managed nftables state.  This prevents ghost rules from a
@@ -4496,7 +4479,6 @@ while true; do
 				_block_unreachable_doh
 				_update_bypass_devices
 				_patch_surflare_icmp_lan
-				_sync_cn_domain_ips_to_killswitch
 				_record_connect "${_active_node}" "${new_health}"
 				_start_proxy_log_monitor
 			else
@@ -4653,7 +4635,6 @@ while true; do
 		if [ "${HEARTBEAT_INTERVAL:-0}" -gt 0 ] && [ $((now - last_heartbeat)) -ge "$HEARTBEAT_INTERVAL" ]; then
 			log "VPN healthy: exit=${health}"
 			last_heartbeat=$now
-			_sync_cn_domain_ips_to_killswitch
 		fi
 
 	elif [ "$health" = "CN" ]; then
@@ -4829,7 +4810,6 @@ while true; do
 					fi
 					_update_bypass_devices
 					_patch_surflare_icmp_lan
-					_sync_cn_domain_ips_to_killswitch
 					_record_connect "${_active_node}" "${new_health}"
 					_start_proxy_log_monitor
 				else
