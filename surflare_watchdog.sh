@@ -2446,6 +2446,13 @@ _check_tunnel_egress() {
 # max-time when at least one probe succeeds quickly.
 check_vpn_health() {
 	echo 0 > "$DNS_STUCK_FILE" 2>/dev/null || true
+	# Check bypass_ipv4 set health: if empty, CN exit detection degrades
+	# to ISP IP comparison only (all IPs treated as non-CN by nft set).
+	local _bypass_empty=0
+	if ! nft list set inet killswitch bypass_ipv4 2>/dev/null | grep -q 'elements'; then
+		_bypass_empty=1
+		log "WARN: bypass_ipv4 set empty, CN exit detection using ISP IP fallback"
+	fi
 	# Layer 1: local state -- deterministic, milliseconds, no network dependency
 	if ! check_vpn_local_state; then
 		echo "LOCAL_FAIL"
@@ -2624,12 +2631,23 @@ check_vpn_health() {
 			r_ip=$(cat "$tmp_file" 2>/dev/null)
 			if [ -n "$r_ip" ]; then
 				_bare_ip="${r_ip#IP:}"
-				if nft get element inet killswitch bypass_ipv4 "{ $_bare_ip }" >/dev/null 2>&1; then
+				if [ "$_bypass_empty" -eq 0 ] && nft get element inet killswitch bypass_ipv4 "{ $_bare_ip }" >/dev/null 2>&1; then
 					if [ -n "$ISP_IP" ] && [ "$_bare_ip" != "$ISP_IP" ]; then
 						result="TUNNEL_OK"
 						break 2
 					else
 						# CN: defer confirmation, keep polling for non-CN
+						if [ -z "$_cn_candidate" ]; then
+							_cn_candidate="CN"
+							_cn_wait_start=$SECONDS
+						fi
+					fi
+				elif [ "$_bypass_empty" -eq 1 ]; then
+					# bypass_ipv4 empty: use ISP IP comparison only
+					if [ -n "$ISP_IP" ] && [ "$_bare_ip" != "$ISP_IP" ]; then
+						result="TUNNEL_OK"
+						break 2
+					else
 						if [ -z "$_cn_candidate" ]; then
 							_cn_candidate="CN"
 							_cn_wait_start=$SECONDS
@@ -2702,13 +2720,18 @@ check_vpn_health() {
 				r_ip=$(cat "$tmp_file" 2>/dev/null)
 				if [ -n "$r_ip" ]; then
 					_bare_ip="${r_ip#IP:}"
-					if nft get element inet killswitch bypass_ipv4 "{ $_bare_ip }" >/dev/null 2>&1; then
+					if [ "$_bypass_empty" -eq 0 ] && nft get element inet killswitch bypass_ipv4 "{ $_bare_ip }" >/dev/null 2>&1; then
 						# IP in CN range: check if tunnel broken or just CN exit
 						if [ -n "$ISP_IP" ] && [ "$_bare_ip" != "$ISP_IP" ]; then
-							# Exit IP != ISP IP: tunnel working, just exiting via CN
 							result="TUNNEL_OK"
 						else
-							# Either ISP IP unknown, or exit IP == ISP IP (tunnel broken)
+							result="CN"
+						fi
+					elif [ "$_bypass_empty" -eq 1 ]; then
+						# bypass_ipv4 empty: ISP IP comparison only
+						if [ -n "$ISP_IP" ] && [ "$_bare_ip" != "$ISP_IP" ]; then
+							result="TUNNEL_OK"
+						else
 							result="CN"
 						fi
 					else
