@@ -238,14 +238,18 @@ LOGROTATE_CRON="30 4 * * * /usr/sbin/logrotate /etc/logrotate.conf >> /var/log/l
 if [ "$INIT" = "procd" ]; then
     DEADMAN_CRON="* * * * * /etc/init.d/surflare-watchdog deadman"
     # Watchdog-of-watchdog: resurrect dead watchdog if procd gives up.
-    # Checks stop marker first (maintenance mode), then pgrep, then starts.
-    # pgrep -f with $ anchor prevents self-matching (cron sh -c cmdline ends with "start").
-    # /proc/pid/comm is "surflare_watchd" (15-char truncated) but pgrep -f is preferred
-    # for consistency with codebase convention (5 existing pgrep -f sites).
-    # KNOWN LIMITATION: orphan subshells share cmdline, so pgrep reports "alive"
-    # after main-loop death (L3893 incident class); accepted because orphan holds
-    # no lock and procd retry=10 handles restart.
-    WATCHDOG_RESURRECT_CRON='*/5 * * * * [ -f /run/surflare_watchdog.stopped ] || pgrep -f "surflare_watchdog\\.sh$" >/dev/null 2>&1 || /etc/init.d/surflare-watchdog start'
+    # Checks (in order): stop marker, storm cooldown, pgrep, then starts.
+    # Storm cooldown: skip start if /run/surflare_watchdog.storm_cool_until
+    # is in the future. Prevents duplicate watchdog during 600s cooldown
+    # (kernel log incident: 85332 WARN duplicate during storm cooldown).
+    # If watchdog died during cooldown, the file persists but timestamp
+    # expires -> cron starts new instance after cooldown ends.
+    # pgrep -f with $ anchor prevents self-matching (cron sh -c cmdline
+    # ends with "start", not surflare_watchdog.sh).
+    # KNOWN LIMITATION: brief restart window (<1s between stop and start)
+    # can cause duplicate if cron fires exactly then; watchdog's own
+    # duplicate detection (storm cooldown sub-loop) handles this case.
+    WATCHDOG_RESURRECT_CRON='*/5 * * * * [ -f /run/surflare_watchdog.stopped ] || { [ -f /run/surflare_watchdog.storm_cool_until ] && [ "$(cat /run/surflare_watchdog.storm_cool_until 2>/dev/null)" -gt "$(date +%s)" ] 2>/dev/null; } || pgrep -f "surflare_watchdog\\.sh$" >/dev/null 2>&1 || /etc/init.d/surflare-watchdog start'
 else
     DEADMAN_CRON=""
     WATCHDOG_RESURRECT_CRON=""
