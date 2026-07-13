@@ -249,6 +249,7 @@ if [ "$INIT" = "procd" ]; then
     # KNOWN LIMITATION: brief restart window (<1s between stop and start)
     # can cause duplicate if cron fires exactly then; watchdog's own
     # duplicate detection (storm cooldown sub-loop) handles this case.
+    # shellcheck disable=SC2016  # $() intentionally literal for cron runtime evaluation
     WATCHDOG_RESURRECT_CRON='*/5 * * * * [ -f /run/surflare_watchdog.stopped ] || { [ -f /run/surflare_watchdog.storm_cool_until ] && [ "$(cat /run/surflare_watchdog.storm_cool_until 2>/dev/null)" -gt "$(date +%s)" ] 2>/dev/null; } || pgrep -f "surflare_watchdog\\.sh$" >/dev/null 2>&1 || /etc/init.d/surflare-watchdog start'
 else
     DEADMAN_CRON=""
