@@ -1077,14 +1077,20 @@ _ensure_smartdns_loader_fix() {
 	if [ ! -e "$_lib_dir/ld-linux.so" ] || \
 		[ "$(readlink "$_lib_dir/ld-linux.so" 2>/dev/null)" != "/lib/ld-musl-x86_64.so.1" ]; then
 		mkdir -p "$_lib_dir" 2>/dev/null
-		ln -sf /lib/ld-musl-x86_64.so.1 "$_lib_dir/ld-linux.so" 2>/dev/null \
-			&& log "SmartDNS loader fix: repaired ld-linux.so symlink" \
-			|| log "WARN: SmartDNS loader fix: failed to repair ld-linux.so"
+		if ln -sf /lib/ld-musl-x86_64.so.1 "$_lib_dir/ld-linux.so" 2>/dev/null; then
+			log "SmartDNS loader fix: repaired ld-linux.so symlink"
+		else
+			log "WARN: SmartDNS loader fix: failed to repair ld-linux.so"
+		fi
 	fi
+	# shellcheck disable=SC2016  # literal ${SMARTDNS_BIN} match in wrapper file
 	if grep -q 'exec "${SMARTDNS_BIN}" $@' "$_wrapper" 2>/dev/null; then
-		sed -i 's|SMARTDNS_WORKDIR="$CWD" exec "${SMARTDNS_BIN}" $@|SMARTDNS_WORKDIR="$CWD" exec "${INTERPRETER}" "${SMARTDNS_BIN}" $@|' "$_wrapper" 2>/dev/null \
-			&& log "SmartDNS loader fix: repaired wrapper exec line" \
-			|| log "WARN: SmartDNS loader fix: failed to repair wrapper"
+		# shellcheck disable=SC2016  # literal pattern/replacement in wrapper file
+		if sed -i 's|SMARTDNS_WORKDIR="$CWD" exec "${SMARTDNS_BIN}" $@|SMARTDNS_WORKDIR="$CWD" exec "${INTERPRETER}" "${SMARTDNS_BIN}" $@|' "$_wrapper" 2>/dev/null; then
+			log "SmartDNS loader fix: repaired wrapper exec line"
+		else
+			log "WARN: SmartDNS loader fix: failed to repair wrapper"
+		fi
 	fi
 }
 
@@ -3758,16 +3764,26 @@ _run_advisory_diagnosis() {
 	# Write diagnosis JSON
 	# busybox printf: %d with non-numeric args defaults to 0 (safe fallback)
 	mkdir -p "$(dirname "$_diag_file")" 2>/dev/null
-	printf '{"version":1,"ts":"%s","health":"%s","tier1":{"conclusion":"%s","confidence":"%s","signals":"%s","recommendation":"%s"},"context":{"node":"%s","exit":"%s","transit":"%s","uptime_s":%d,"reconnects":%d,"fd_pct":%d,"proxy_errors":%d,"503s":%d,"candidate_inject":%d,"proxy_alive":%s,"proxy_pid":%d,"last_reconnect_s_ago":%d,"error_samples":"%s"}}\n' \
+	# All %d args default to 0 so busybox printf never hits "invalid number"
+	# which returns exit 1 without writing stderr to the redirected file.
+	# Subshell ensures shell-level errors are also captured by 2>>.
+	( printf '{"version":1,"ts":"%s","health":"%s","tier1":{"conclusion":"%s","confidence":"%s","signals":"%s","recommendation":"%s"},"context":{"node":"%s","exit":"%s","transit":"%s","uptime_s":%d,"reconnects":%d,"fd_pct":%d,"proxy_errors":%d,"503s":%d,"candidate_inject":%d,"proxy_alive":%s,"proxy_pid":%d,"last_reconnect_s_ago":%d,"error_samples":"%s"}}\n' \
 		"$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
 		"$_health" \
 		"$_san_conclusion" "$_confidence" "$_san_signals" "$_san_recommendation" \
 		"$_san_node" "$_san_exit" "$_san_transit" \
-		"$_uptime_s" "${_stats_reconnects:-0}" \
-		"$_fd_pct" "$_proxy_err" "$_503_count" "$_candidate_count" \
-		"$_proxy_alive" "$_proxy_pid" "$_last_reconnect_s_ago" "$_error_samples" \
-		> "$_diag_file" 2>>/tmp/diag_err.log || \
-		{ log "WARN: diagnosis export failed"; _ADVISORY_DIAGNOSIS_RUNNING=0; return 1; }
+		"${_uptime_s:-0}" "${_stats_reconnects:-0}" \
+		"${_fd_pct:-0}" "${_proxy_err:-0}" "${_503_count:-0}" "${_candidate_count:-0}" \
+		"${_proxy_alive:-false}" "${_proxy_pid:-0}" "${_last_reconnect_s_ago:-0}" "$_error_samples" \
+	) > "$_diag_file" 2>>/tmp/diag_err.log
+	# busybox printf returns exit 1 even when output is written successfully
+	# (observed with all-numeric args, empty stderr).  Check the file
+	# instead of the exit code to avoid false "export failed" warnings.
+	if [ ! -s "$_diag_file" ]; then
+		log "WARN: diagnosis export failed (uptime=${_uptime_s:-?} fd=${_fd_pct:-?} err=${_proxy_err:-?} 503=${_503_count:-?} pid=${_proxy_pid:-?} reconnect_ago=${_last_reconnect_s_ago:-?})"
+		_ADVISORY_DIAGNOSIS_RUNNING=0
+		return 1
+	fi
 
 	log "Diagnosis: ${_conclusion} (${_confidence}) -- ${_recommendation}"
 	_ADVISORY_DIAGNOSIS_RUNNING=0
@@ -4355,6 +4371,12 @@ connect_vpn() {
 		killall surflare surflare-proxy sexpect 2>/dev/null
 		wait_for_exit surflare
 		wait_for_exit surflare-proxy
+
+		# Stop the proxy log monitor and clear 503 storm state.  Without
+		# this, the old 503 count persists across reconnects and causes
+		# every post-reconnect health check to immediately re-trigger
+		# PROXY_BROKEN, cascading through all nodes without recovery.
+		_stop_proxy_log_monitor
 
 		# Flush ALL conntrack entries after proxy death.  The scoped
 		# flush (mark 1) in _unarm_killswitch_output only clears
@@ -5105,6 +5127,7 @@ _cn_direct_mtime=$(stat -c %Y /etc/surflare/cn_ipv4.txt /etc/surflare/cn_ipv4_ex
 # --source-only: define functions but do not enter main loop.
 # Used by test harnesses (Plan 03-04) to source this file.
 if [ "${_SOURCE_ONLY:-0}" -eq 1 ]; then
+	# shellcheck disable=SC2317  # return works when sourced, exit when executed
 	return 0 2>/dev/null || exit 0
 fi
 
