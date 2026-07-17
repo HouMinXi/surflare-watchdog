@@ -1405,6 +1405,29 @@ DNS_EOF
 	fi
 }
 
+# Ensure the surflare-proxy wrapper has the jq config patch.  surflare
+# auto-update can overwrite /usr/bin/surflare-proxy with a stock wrapper
+# that lacks the catch-all VPN route and INJECT_DOMAINS patches.  This
+# function detects the loss (grep for the jq marker) and restores from
+# the canonical backup at /usr/local/sbin/surflare-proxy.canonical.
+_ensure_wrapper() {
+	[ "$PLATFORM" = "router" ] || return 0
+	# Quick check: does the installed wrapper have the catch-all VPN patch?
+	if grep -q 'mh_via_auto_to_' /usr/bin/surflare-proxy 2>/dev/null; then
+		return 0
+	fi
+	log "WARN: wrapper missing jq patch (surflare auto-update?), restoring from canonical"
+	if [ ! -f /usr/local/sbin/surflare-proxy.canonical ]; then
+		log "ERROR: canonical wrapper not found at /usr/local/sbin/surflare-proxy.canonical"
+		return 1
+	fi
+	chattr -i /usr/bin/surflare-proxy 2>/dev/null || true
+	cp /usr/local/sbin/surflare-proxy.canonical /usr/bin/surflare-proxy
+	chmod +x /usr/bin/surflare-proxy
+	chattr +i /usr/bin/surflare-proxy 2>/dev/null || true
+	log "Wrapper restored from canonical backup"
+}
+
 # NOTE: _seal_killswitch_ff() removed (was called after server_ips populated).
 # surflare-proxy uses SO_MARK=0xff for outbound relay connections permanently,
 # not just during bootstrap.  Removing the 0xff accept rule caused ks-drop of
@@ -4501,6 +4524,7 @@ connect_vpn() {
 		# So this best-effort bump is NOT sufficient alone; the real
 		# guarantee is the ulimit in the wrapper, run in the proxy exec.
 		ulimit -n 65535 2>/dev/null || true
+		_ensure_wrapper
 		if ! surflare connect --node "$use_node" \
 			${MODE:+--mode "$MODE"} \
 			${effective_transit:+--transit "$effective_transit"} \
@@ -5083,6 +5107,9 @@ fi
 _ppid=$(awk '/^PPid/{print $2}' /proc/$$/status 2>/dev/null)
 _parent=$(cat /proc/"${_ppid:-0}"/comm 2>/dev/null || echo "?")
 log "watchdog started: ppid=${_ppid}(${_parent}) node=${_active_node} candidates=${#NODE_CANDIDATES[@]} interval=${CHECK_INTERVAL}s threshold=${FAIL_THRESHOLD} transient=${TRANSIENT_THRESHOLD}"
+
+# Restore wrapper if surflare auto-update overwrote it (before reading EXPECTED_MD5)
+_ensure_wrapper
 
 # Binary hash verification (warn-only, md5-gate in wrapper provides functional protection)
 _real_md5=$(md5sum /usr/bin/surflare-proxy.real 2>/dev/null | awk '{print $1}')
