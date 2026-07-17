@@ -1,0 +1,74 @@
+#!/bin/sh
+# surflare-proxy wrapper: patches sing-box config before forwarding to real binary.
+# This is the canonical source -- deployed to /usr/bin/surflare-proxy on the N100
+# and backed up to /usr/local/sbin/surflare-proxy.canonical for auto-restore.
+#
+# Patches applied (jq pipeline):
+#   1. urltest tolerance/interval tuning
+#   2. INJECT_DOMAINS -> proxy_rule_set (domains missing from surflare whitelist)
+#   3. catch-all route rule outbound: direct -> VPN (fixes sniff-failure leaks)
+#   4. route.final: direct -> VPN (secondary fallback)
+#
+# md5-gate: auto-restores patched binary if surflare auto-update replaces it.
+# The watchdog's _ensure_wrapper() restores THIS wrapper if surflare overwrites it.
+
+ulimit -n 65535 2>/dev/null || true
+
+REAL_BIN="/usr/bin/surflare-proxy.real"
+FALLBACK_BIN="/usr/local/lib/surflare-proxy-patched"
+EXPECTED_MD5="342ecaa9b0c528a696378a3d0ee67f58"
+TOLERANCE=300
+INTERVAL="60s"
+# Domains missing from surflare's proxy_rule_set that must go through VPN.
+INJECT_DOMAINS="claude.com,grokipedia.com,ipinfo.io,myip.wtf"
+
+# md5-gate: detect and rollback surflare auto-update
+_md5=$(md5sum "$REAL_BIN" 2>/dev/null | cut -d" " -f1)
+if [ "$_md5" != "$EXPECTED_MD5" ] && [ -x "$FALLBACK_BIN" ]; then
+	_fb_md5=$(md5sum "$FALLBACK_BIN" 2>/dev/null | cut -d" " -f1)
+	if [ "$_fb_md5" = "$EXPECTED_MD5" ]; then
+		cp "$REAL_BIN" "/tmp/surflare-proxy-autoupdate-$(date +%Y%m%d_%H%M%S)"
+		logger -t surflare-proxy "auto-update rolled back (new binary saved to /tmp)"
+		cp "$FALLBACK_BIN" "$REAL_BIN"
+	fi
+fi
+
+# Detect --config stdin among arguments
+_stdin=0
+for a in "$@"; do
+	case "$a" in
+		stdin) _stdin=1 ;;
+	esac
+done
+
+if [ "$_stdin" -eq 0 ]; then
+	exec "$REAL_BIN" "$@"
+fi
+
+# Two-stage: save stdin, patch with jq, feed to real binary
+_tmp=$(mktemp)
+_patched=$(mktemp)
+trap 'rm -f "$_tmp" "$_patched"' EXIT
+
+cat > "$_tmp"
+cp "$_tmp" /tmp/singbox-config-dump.json
+
+if jq --argjson T "$TOLERANCE" --arg I "$INTERVAL" --arg D "$INJECT_DOMAINS" '
+  .outbounds |= map(if .type == "urltest" then .tolerance = $T | .interval = $I else . end)
+  | .route.rule_set |= map(if .tag == "proxy_rule_set" then .rules |= map(
+      if .domain_suffix then
+        .domain_suffix |= (. + ($D | split(",")) | unique)
+      else . end
+    ) else . end)
+  | ([.outbounds[] | select(.tag|startswith("mh_via_auto_to_"))][0].tag // "direct") as $vpn
+  | .route.rules[-1].outbound = $vpn
+  | .route.final = $vpn
+' < "$_tmp" > "$_patched"; then
+	exec < "$_patched"
+	rm -f "$_tmp" "$_patched"
+	exec "$REAL_BIN" "$@"
+else
+	exec < "$_tmp"
+	rm -f "$_tmp" "$_patched"
+	exec "$REAL_BIN" "$@"
+fi
