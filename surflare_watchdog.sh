@@ -5420,25 +5420,39 @@ while true; do
 	else
 		# health="" -- all external probes timed out; local state was OK (check_vpn_health
 		# returns LOCAL_FAIL if local state is bad, so here local is confirmed healthy).
-		# This is a transient network spike, not a definitive VPN failure.
-		transient_count=$((transient_count + 1))
+		# When ALL probes fail simultaneously, the VPN tunnel is definitively
+		# down, not a transient network spike. Escalate directly to fail_count
+		# for fast recovery (~2 min via 4 cycles vs ~12 min via transient
+		# accumulation of 6 cycles each).
 		_healthy_consecutive=0
-		log "Health check transient timeout (local state OK), transient ${transient_count}/${TRANSIENT_THRESHOLD}"
-		if [ "$transient_count" -ge 2 ] && [ "$(cat "$DNS_STUCK_FILE" 2>/dev/null || echo 0)" -ge 4 ]; then
-			_insert_dns_fallback
-		fi
-		if [ "$transient_count" -ge "$TRANSIENT_THRESHOLD" ]; then
-			if _route_updater_active; then
-				# Route updater download window: proxy saturation is expected.
-				# Reset transient_count without escalating to fail_count so the
-				# watchdog does not cascade-reconnect during bulk downloads.
+		if _route_updater_active; then
+			# Route updater download window: proxy saturation is expected.
+			# Keep transient accumulation to avoid cascade-reconnect during
+			# bulk downloads.
+			transient_count=$((transient_count + 1))
+			log "HEALTH_SUPPRESSED: route_updater active; all probes timed out (expected), transient ${transient_count}/${TRANSIENT_THRESHOLD}"
+			if [ "$transient_count" -ge 2 ] && [ "$(cat "$DNS_STUCK_FILE" 2>/dev/null || echo 0)" -ge 4 ]; then
+				_insert_dns_fallback
+			fi
+			if [ "$transient_count" -ge "$TRANSIENT_THRESHOLD" ]; then
 				transient_count=0
-				log "HEALTH_SUPPRESSED: route_updater download window active; transient timeout expected, not escalating"
-			elif _control_probe; then
-				fail_count=$((fail_count + 1))
-				transient_count=0
-				log "Transient threshold reached (local network OK), escalating to fail_count: ${fail_count}"
-			else
+			fi
+		elif _control_probe; then
+			# Local network OK + all probes timed out = VPN tunnel down.
+			# Escalate directly to fail_count (bypasses transient accumulation).
+			fail_count=$((fail_count + 1))
+			transient_count=0
+			log "All external probes timed out (local OK), escalating directly to fail_count: ${fail_count}"
+		else
+			# Local network also down: not a VPN-specific issue.
+			# Keep transient accumulation to avoid reconnecting when the
+			# problem is the ISP, not the VPN.
+			transient_count=$((transient_count + 1))
+			log "All probes timed out and local network down, transient ${transient_count}/${TRANSIENT_THRESHOLD}"
+			if [ "$transient_count" -ge 2 ] && [ "$(cat "$DNS_STUCK_FILE" 2>/dev/null || echo 0)" -ge 4 ]; then
+				_insert_dns_fallback
+			fi
+			if [ "$transient_count" -ge "$TRANSIENT_THRESHOLD" ]; then
 				transient_count=0
 				log "Transient threshold reached but local network down, resetting (not escalating)"
 			fi
