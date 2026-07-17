@@ -1,0 +1,3 @@
+captive.apple.com
+www.msftconnecttest.com
+connectivitycheck.gstatic.com
