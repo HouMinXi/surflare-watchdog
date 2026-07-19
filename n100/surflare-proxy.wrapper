@@ -45,13 +45,17 @@ if [ "$_stdin" -eq 0 ]; then
 	exec "$REAL_BIN" "$@"
 fi
 
-# Two-stage: save stdin, patch with jq, feed to real binary
-_tmp=$(mktemp)
-_patched=$(mktemp)
+# Two-stage: save stdin, patch with jq, feed to real binary.
+# Check mktemp exit: if /tmp is full or read-only, abort rather than feed
+# empty filenames into cat/jq/exec below.
+_tmp=$(mktemp) || { logger -t surflare-proxy "ERROR: mktemp failed (_tmp)"; exit 1; }
+_patched=$(mktemp) || { logger -t surflare-proxy "ERROR: mktemp failed (_patched)"; rm -f "$_tmp"; exit 1; }
 trap 'rm -f "$_tmp" "$_patched"' EXIT
 
 cat > "$_tmp"
-cp "$_tmp" /tmp/singbox-config-dump.json
+# Debug dump only when explicitly enabled (SURFLARE_DEBUG=1).  The sing-box
+# config may carry auth tokens; do not persist it to /tmp unconditionally.
+[ -n "$SURFLARE_DEBUG" ] && cp "$_tmp" /tmp/singbox-config-dump.json
 
 if jq --argjson T "$TOLERANCE" --arg I "$INTERVAL" --arg D "$INJECT_DOMAINS" '
   .outbounds |= map(if .type == "urltest" then .tolerance = $T | .interval = $I else . end)
@@ -68,7 +72,11 @@ if jq --argjson T "$TOLERANCE" --arg I "$INTERVAL" --arg D "$INJECT_DOMAINS" '
 	rm -f "$_tmp" "$_patched"
 	exec "$REAL_BIN" "$@"
 else
-	exec < "$_tmp"
+	# jq failed: config may be malformed or jq missing.  Abort rather than
+	# fall back to the unpatched config -- the catch-all route rule would
+	# send unmatched traffic direct, leaking past the VPN.  surflare connect
+	# fails -> watchdog alerts and retries.
+	logger -t surflare-proxy "ERROR: jq config patch failed (malformed config or jq missing?), aborting to prevent traffic leak"
 	rm -f "$_tmp" "$_patched"
-	exec "$REAL_BIN" "$@"
+	exit 1
 fi

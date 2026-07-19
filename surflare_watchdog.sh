@@ -1421,8 +1421,19 @@ _ensure_wrapper() {
 		log "ERROR: canonical wrapper not found at /usr/local/sbin/surflare-proxy.canonical"
 		return 1
 	fi
+	# Verify the canonical backup carries the patch marker BEFORE copying.
+	# A corrupted canonical would otherwise leave the wrapper immutable AND
+	# broken after cp + chattr +i, trapping the proxy in a restore loop.
+	if ! grep -q 'mh_via_auto_to_' /usr/local/sbin/surflare-proxy.canonical 2>/dev/null; then
+		log "ERROR: canonical backup missing jq patch (canonical corrupted?)"
+		return 1
+	fi
 	chattr -i /usr/bin/surflare-proxy 2>/dev/null || true
-	cp /usr/local/sbin/surflare-proxy.canonical /usr/bin/surflare-proxy
+	if ! cp /usr/local/sbin/surflare-proxy.canonical /usr/bin/surflare-proxy; then
+		log "ERROR: cp from canonical failed"
+		chattr +i /usr/bin/surflare-proxy 2>/dev/null || true
+		return 1
+	fi
 	chmod +x /usr/bin/surflare-proxy
 	chattr +i /usr/bin/surflare-proxy 2>/dev/null || true
 	log "Wrapper restored from canonical backup"
@@ -4524,7 +4535,10 @@ connect_vpn() {
 		# So this best-effort bump is NOT sufficient alone; the real
 		# guarantee is the ulimit in the wrapper, run in the proxy exec.
 		ulimit -n 65535 2>/dev/null || true
-		_ensure_wrapper
+		if ! _ensure_wrapper; then
+			log "FATAL: wrapper restore failed, aborting connect to prevent traffic leak"
+			return 1
+		fi
 		if ! surflare connect --node "$use_node" \
 			${MODE:+--mode "$MODE"} \
 			${effective_transit:+--transit "$effective_transit"} \
@@ -5108,8 +5122,10 @@ _ppid=$(awk '/^PPid/{print $2}' /proc/$$/status 2>/dev/null)
 _parent=$(cat /proc/"${_ppid:-0}"/comm 2>/dev/null || echo "?")
 log "watchdog started: ppid=${_ppid}(${_parent}) node=${_active_node} candidates=${#NODE_CANDIDATES[@]} interval=${CHECK_INTERVAL}s threshold=${FAIL_THRESHOLD} transient=${TRANSIENT_THRESHOLD}"
 
-# Restore wrapper if surflare auto-update overwrote it (before reading EXPECTED_MD5)
-_ensure_wrapper
+# Restore wrapper if surflare auto-update overwrote it (before reading
+# EXPECTED_MD5).  Warn-only here: connect_vpn re-checks and aborts connect
+# on failure, so a broken wrapper cannot leak traffic.
+_ensure_wrapper || log "WARN: wrapper restore failed at startup"
 
 # Binary hash verification (warn-only, md5-gate in wrapper provides functional protection)
 _real_md5=$(md5sum /usr/bin/surflare-proxy.real 2>/dev/null | awk '{print $1}')
