@@ -76,6 +76,11 @@ TPROXY_503_ROTATE_THRESHOLD=5         # tproxy 503 count in health window to tri
 TPROXY_503_COOLDOWN=660                 # 600s health window + 60s margin for 2 cron refreshes (cron runs every 3 min)
 TPROXY_NFT_STAMP="/run/surflare_tproxy_nft.stamp"  # md5 of /etc/surflare-lan-tproxy.nft at last _restore_tproxy
 NODE_HEALTH_FILE="/var/run/surflare_node_health.json"
+NODE_ERR_ROTATE_THRESHOLD=50    # current-node outbound error count to trigger proactive rotation
+NODE_ERR_HEALTHY_MAX=10         # candidate healthy threshold, aligned with _node_is_log_healthy (>10 = unhealthy). Absent key = 0 = healthy.
+NODE_ERR_COOLDOWN=660           # seconds between proactive node-error rotation attempts (600s health window + 60s margin)
+NODE_ERR_STORM_CONSECUTIVE=7    # consecutive all-candidates-unhealthy hits before relay-wide storm cooldown
+NODE_HEALTH_WINDOW=600          # seconds; node_health.json freshness window (cron writes every 3 min)
 OBS_HEARTBEAT_EVERY=20                # log heartbeat every N observability probe runs (~10 min)
 TRANSIENT_THRESHOLD=6                 # consecutive external timeouts (local state OK) before escalating to fail_count
 AUTH_FAIL_THRESHOLD=3                 # consecutive auth refresh failures before forcing reconnect
@@ -4157,6 +4162,21 @@ get_cached_transit() {
 	echo ""
 }
 
+# Refresh _effective_transit from the current $TRANSIT / cache / candidates.
+# Called at init and before each consumer (_rotate_node, proactive node-error
+# rotation, startup observability) so a transit change made by connect_vpn
+# mid-run is reflected. Mirrors connect_vpn priority: $TRANSIT -> cache ->
+# TRANSIT_CANDIDATES[0].
+_refresh_effective_transit() {
+	_effective_transit="$TRANSIT"
+	if [ -z "$_effective_transit" ]; then
+		_effective_transit=$(head -1 "$TRANSIT_CACHE_FILE" 2>/dev/null) || true
+	fi
+	if [ -z "$_effective_transit" ] && [ "${#TRANSIT_CANDIDATES[@]}" -gt 0 ]; then
+		_effective_transit="${TRANSIT_CANDIDATES[0]}"
+	fi
+}
+
 save_transit_cache() {
 	echo "$1" > "$TRANSIT_CACHE_FILE" 2>/dev/null || true
 }
@@ -4298,11 +4318,11 @@ probe_best_transit() {
 }
 
 # _node_is_log_healthy: return 0 if no recent urltest errors for this node/transit combo.
-# Reads /run/surflare_node_health.json written by surflare_log_health.sh (3-min cron).
+# Reads $NODE_HEALTH_FILE written by surflare_log_health.sh (3-min cron).
 # Returns 1 (skip) if node has >10 errors in the log window, or if health data unavailable.
 _node_is_log_healthy() {
 	local node="$1" transit="${2:-}"
-	local health_file="/run/surflare_node_health.json"
+	local health_file="$NODE_HEALTH_FILE"
 	[ -f "$health_file" ] || return 0  # no data: assume healthy, let cascade decide
 	# Skip if health file is stale (>20 min)
 	local age
@@ -4340,11 +4360,9 @@ _rotate_node() {
 	fi
 	local prev="${_active_node}"
 	local effective_transit
-	effective_transit=$(cat "$TRANSIT_CACHE_FILE" 2>/dev/null) || true
-	# Mirror connect_vpn fallback: if cache absent, use first transit candidate
-	if [ -z "$effective_transit" ] && [ ${#TRANSIT_CANDIDATES[@]} -gt 0 ]; then
-		effective_transit="${TRANSIT_CANDIDATES[0]}"
-	fi
+	# Refresh so a transit change made by connect_vpn mid-run is reflected.
+	_refresh_effective_transit
+	effective_transit="$_effective_transit"
 	local tried=0
 	while [ "$tried" -lt "$n" ]; do
 		_node_idx=$(( (_node_idx + 1) % n ))
@@ -4361,7 +4379,7 @@ _rotate_node() {
 	done
 	# Verify the selected node is actually healthy (not a fallthrough to unhealthy)
 	if ! _node_is_log_healthy "${NODE_CANDIDATES[$_node_idx]}" "$effective_transit"; then
-		log "WARN: all nodes unhealthy, keeping ${prev} (skipped ${_active_node})"
+		log "WARN: all nodes unhealthy, keeping ${prev} (last tried ${NODE_CANDIDATES[$_node_idx]})"
 		_active_node="$prev"
 		# All nodes unhealthy: connect_vpn will check surflare status
 		# for auth need before reconnecting.
@@ -4371,6 +4389,74 @@ _rotate_node() {
 	log "Node rotation: ${prev} -> ${_active_node} ($((_node_idx + 1))/${n})"
 	_stats_rotations=$((_stats_rotations + 1))
 	printf '%s\t%d\n' "$_active_node" "$_node_idx" > "$ROTATION_STATE" 2>/dev/null || true
+}
+
+# Proactive node-error rotation: if the current exit node has accumulated
+# >= NODE_ERR_ROTATE_THRESHOLD outbound errors in the health window and at
+# least one candidate is healthy, rotate immediately by raising fail_count to
+# FAIL_THRESHOLD. Absent node_health.json key = 0 errors = healthy. If all
+# candidates are unhealthy across NODE_ERR_STORM_CONSECUTIVE cycles, enter
+# relay-wide storm cooldown. NODE_ERR_COOLDOWN prevents re-trigger on stale
+# data before the cron refreshes the health file.
+_handle_proactive_node_rotation() {
+	local _now="$1"
+	[ "$_now" -ge "${_node_err_cooldown_until:-0}" ] || return 0
+	[ -f "$NODE_HEALTH_FILE" ] || return 0
+	[ -n "$_active_node" ] || return 0
+	local _nh_mtime _nh_age
+	_nh_mtime=$(stat -c %Y "$NODE_HEALTH_FILE" 2>/dev/null || echo 0)
+	_nh_age=$(( _now - _nh_mtime ))
+	# Skip if file is stale or was written before the last rotation (stale data
+	# from the previous node that the cron has not refreshed yet).
+	[ "${_nh_age:-9999}" -le "$NODE_HEALTH_WINDOW" ] || return 0
+	[ "$_nh_mtime" -ge "${_node_err_rotate_ts:-0}" ] || return 0
+	# Refresh transit so a change made by connect_vpn mid-run is reflected.
+	_refresh_effective_transit
+	local _cur_key="mh_via_${_effective_transit}_to_${_active_node}"
+	# Build candidate keys as a JSON array for unambiguous jq iteration.
+	local _cand_json="[]" _c
+	for _c in "${NODE_CANDIDATES[@]}"; do
+		[ "$_c" = "$_active_node" ] && continue
+		[ "$_c" = "$_effective_transit" ] && continue
+		_cand_json=$(jq --arg k "mh_via_${_effective_transit}_to_${_c}" '. + [$k]' <<< "$_cand_json" 2>/dev/null) || _cand_json="[]"
+	done
+	# . as $root saves the root object before map(); inside map(. as $k | ...)
+	# the . is the current string element, so .nodes[$k] would index a string
+	# and jq aborts. $root.nodes[$k] indexes the original root. Absent key = 0
+	# = healthy; >=1 healthy candidate triggers rotation.
+	local _nh_read
+	_nh_read=$(jq -r --arg cur "$_cur_key" --argjson keys "$_cand_json" --argjson hmax "$NODE_ERR_HEALTHY_MAX" '
+	    . as $root | [ ($root.nodes[$cur].error_count // 0),
+	      ($keys | map(. as $k | ($root.nodes[$k].error_count // 0)) | map(select(. <= $hmax)) | length)
+	    ] | @tsv
+	' "$NODE_HEALTH_FILE" 2>/dev/null) || _nh_read=$'0\t0'
+	local _cur_err _other_healthy
+	_cur_err=$(printf '%s' "$_nh_read" | cut -f1)
+	_other_healthy=$(printf '%s' "$_nh_read" | cut -f2)
+	local _other_total=$(( ${#NODE_CANDIDATES[@]} - 1 ))
+	if [ "${_cur_err:-0}" -ge "$NODE_ERR_ROTATE_THRESHOLD" ]; then
+		if [ "${_other_healthy:-0}" -ge 1 ]; then
+			log "Node degraded: ${_active_node} has ${_cur_err} outbound errors, ${_other_healthy} healthy candidate(s), rotating"
+			fail_count=$FAIL_THRESHOLD
+			_node_err_consecutive=0
+		else
+			if [ "$_other_total" -le 0 ]; then
+				log "Node degraded, no other candidates available (single-node setup), cannot rotate"
+			else
+				_node_err_consecutive=$((_node_err_consecutive + 1))
+				log "Node degraded but all ${_other_total} candidates unhealthy (consecutive=${_node_err_consecutive}/${NODE_ERR_STORM_CONSECUTIVE})"
+				if [ "$_node_err_consecutive" -ge "$NODE_ERR_STORM_CONSECUTIVE" ]; then
+					log "Relay-wide degradation: entering storm cooldown"
+					_enter_storm_cooldown "node-error-relay-wide"
+					_node_err_consecutive=0
+				fi
+			fi
+		fi
+		_node_err_cooldown_until=$(( _now + NODE_ERR_COOLDOWN ))
+		_node_err_rotate_ts=$_now
+	else
+		_node_err_consecutive=0
+	fi
 }
 
 connect_vpn() {
@@ -5092,6 +5178,14 @@ _stats_start_ts=$(date +%s)
 _stats_last_report=$(date +%s)
 _tproxy_503_cooldown_until=0
 _tproxy_503_rotate_ts=0
+_node_err_cooldown_until=0
+_node_err_rotate_ts=0
+_node_err_consecutive=0
+_prev_active_node=""
+# effective_transit is refreshed before each consumer (_rotate_node, proactive
+# node-error rotation, startup observability) so a transit change made by
+# connect_vpn mid-run is reflected.
+_refresh_effective_transit
 STATS_REPORT_INTERVAL=21600  # 6h
 _fw4_last_check=$(date +%s)
 FW4_CHECK_INTERVAL=300        # 5 min
@@ -5121,6 +5215,30 @@ fi
 _ppid=$(awk '/^PPid/{print $2}' /proc/$$/status 2>/dev/null)
 _parent=$(cat /proc/"${_ppid:-0}"/comm 2>/dev/null || echo "?")
 log "watchdog started: ppid=${_ppid}(${_parent}) node=${_active_node} candidates=${#NODE_CANDIDATES[@]} interval=${CHECK_INTERVAL}s threshold=${FAIL_THRESHOLD} transient=${TRANSIENT_THRESHOLD}"
+
+# jq is required for proactive node-error rotation and startup observability
+# (node_health.json parsing). Warn if missing; the features fall back to safe
+# defaults (no rotation, no observability) but logs make the cause visible.
+if ! command -v jq >/dev/null 2>&1; then
+	log "WARN: jq not found, proactive node-error rotation and startup observability disabled"
+fi
+
+# Startup observability: dump the current node's error count and the keys
+# present in node_health.json. A healthy current node has no entry (the cron
+# only records nodes with errors), so absence alone is not a fault -- only
+# warn when NO key shares the current transit prefix, which indicates transit
+# derivation or tag format drift rather than a clean bill of health.
+if [ -f "$NODE_HEALTH_FILE" ] && [ -n "$_active_node" ] && command -v jq >/dev/null 2>&1; then
+	_startup_key="mh_via_${_effective_transit}_to_${_active_node}"
+	_startup_err=$(jq -r --arg k "$_startup_key" '.nodes[$k].error_count // 0' "$NODE_HEALTH_FILE" 2>/dev/null) || _startup_err=0
+	_startup_keys=$(jq -r '.nodes | keys | join(",")' "$NODE_HEALTH_FILE" 2>/dev/null) || _startup_keys=""
+	log "Startup node_health: key=${_startup_key} err=${_startup_err} observed_keys=[${_startup_keys}]"
+	_transit_prefix="mh_via_${_effective_transit}_to_"
+	_has_transit_peer=$(jq -r --arg p "$_transit_prefix" '.nodes | keys | map(startswith($p)) | any' "$NODE_HEALTH_FILE" 2>/dev/null) || _has_transit_peer="false"
+	if [ -n "$_startup_keys" ] && [ "$_has_transit_peer" != "true" ]; then
+		log "WARN: no node_health.json keys share transit prefix ${_transit_prefix} (observed: [${_startup_keys}]) -- transit derivation or tag format may have drifted"
+	fi
+fi
 
 # Restore wrapper if surflare auto-update overwrote it (before reading
 # EXPECTED_MD5).  Warn-only here: connect_vpn re-checks and aborts connect
@@ -5422,7 +5540,7 @@ while true; do
 			_nh_age=$(( _now - _nh_mtime ))
 			# Skip if file is stale (>600s) or was written before cooldown started
 			# (stale data from previous node that the cron hasn't refreshed yet)
-			if [ "$_nh_age" -le 600 ] && [ "$_nh_mtime" -ge "${_tproxy_503_rotate_ts:-0}" ]; then
+			if [ "$_nh_age" -le "$NODE_HEALTH_WINDOW" ] && [ "$_nh_mtime" -ge "${_tproxy_503_rotate_ts:-0}" ]; then
 				_tproxy_503=$(grep -o '"http_503": *[0-9]*' "$NODE_HEALTH_FILE" | awk -F': *' '{print $2}')
 				if [ "${_tproxy_503:-0}" -ge "$TPROXY_503_ROTATE_THRESHOLD" ]; then
 					log "Relay degraded: ${_tproxy_503} tproxy 503 in health window, rotating"
@@ -5432,6 +5550,11 @@ while true; do
 				fi
 			fi
 		fi
+
+		# Proactive node-error rotation: rotate immediately when the current exit
+		# node has >= NODE_ERR_ROTATE_THRESHOLD errors and a healthy candidate
+		# exists, instead of waiting for fail_count to build.
+		_handle_proactive_node_rotation "$_now"
 
 		# Periodic heartbeat -- confirms watchdog is alive during long healthy stretches
 		now=$(date +%s)
@@ -5551,7 +5674,15 @@ while true; do
 			_reconnect_window_start=0
 			_reconnect_window_count=0
 		else
+			_prev_active_node="$_active_node"
 			_rotate_node
+			# If rotation actually moved to a different node, the previous
+			# node-error state no longer applies: clear the proactive-rotation
+			# cooldown and consecutive counter so the new node gets a fair check.
+			if [ "$_active_node" != "${_prev_active_node:-}" ]; then
+				_node_err_cooldown_until=0
+				_node_err_consecutive=0
+			fi
 			# Adaptive backoff: double threshold after each reconnect so
 			# relay-wide degradation does not churn through nodes every 2min.
 			# Capped at FAIL_THRESHOLD_MAX; reset to base on healthy exit.
