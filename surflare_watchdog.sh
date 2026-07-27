@@ -1432,7 +1432,11 @@ DNS_EOF
 _ensure_wrapper() {
 	[ "$PLATFORM" = "router" ] || return 0
 	# Quick check: does the installed wrapper have the catch-all VPN patch?
-	if grep -q 'mh_via_auto_to_' /usr/bin/surflare-proxy 2>/dev/null; then
+	# INJECT_DOMAINS is the custom-patch marker (absent from stock surflare
+	# wrappers, present in the canonical backup). mh_via_auto_to_ was the old
+	# marker but was never present in the wrapper script, so the check always
+	# failed and blocked every reconnect.
+	if grep -q 'INJECT_DOMAINS' /usr/bin/surflare-proxy 2>/dev/null; then
 		return 0
 	fi
 	log "WARN: wrapper missing jq patch (surflare auto-update?), restoring from canonical"
@@ -1443,7 +1447,7 @@ _ensure_wrapper() {
 	# Verify the canonical backup carries the patch marker BEFORE copying.
 	# A corrupted canonical would otherwise leave the wrapper immutable AND
 	# broken after cp + chattr +i, trapping the proxy in a restore loop.
-	if ! grep -q 'mh_via_auto_to_' /usr/local/sbin/surflare-proxy.canonical 2>/dev/null; then
+	if ! grep -q 'INJECT_DOMAINS' /usr/local/sbin/surflare-proxy.canonical 2>/dev/null; then
 		log "ERROR: canonical backup missing jq patch (canonical corrupted?)"
 		return 1
 	fi
