@@ -28,7 +28,8 @@ if [ "$_md5" != "$EXPECTED_MD5" ] && [ -x "$FALLBACK_BIN" ]; then
 	_fb_md5=$(md5sum "$FALLBACK_BIN" 2>/dev/null | cut -d" " -f1)
 	if [ "$_fb_md5" = "$EXPECTED_MD5" ]; then
 		# Capture new binary before rollback for diff analysis
-		cp "$REAL_BIN" "/tmp/surflare-proxy-autoupdate-$(date +%Y%m%d_%H%M%S)"
+		_au_bin="/tmp/surflare-proxy-autoupdate-$(date +%Y%m%d_%H%M%S)"
+		cp "$REAL_BIN" "$_au_bin" && chmod 600 "$_au_bin"
 		logger -t surflare-proxy "auto-update rolled back (new binary saved to /tmp)"
 		cp "$FALLBACK_BIN" "$REAL_BIN"
 	fi
@@ -47,8 +48,9 @@ if [ "$_stdin" -eq 0 ]; then
 fi
 
 # Two-stage: save stdin, patch with jq, feed to real binary
-_tmp=$(mktemp)
-_patched=$(mktemp)
+_tmp=$(mktemp) || exit 1
+_patched=$(mktemp) || { rm -f "$_tmp"; exit 1; }
+chmod 600 "$_tmp" "$_patched"
 trap 'rm -f "$_tmp" "$_patched"' EXIT
 
 cat > "$_tmp"
