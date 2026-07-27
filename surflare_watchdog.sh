@@ -67,6 +67,14 @@ POST_RECONNECT_DNS_FLUSH=0           # 1=restart SmartDNS after reconnect to cle
 LOGIN_RETRIES=5                       # max login attempts per refresh cycle
 LOGIN_RETRY_DELAY=3                   # seconds between login retries
 HEARTBEAT_INTERVAL=600                # seconds between periodic "VPN healthy" log entries (0=off)
+SURFLARE_LATEST_JSON="https://www.surflare.com/files/download/latest.json"
+SURFLARE_DOWNLOAD_BASE="https://www.surflare.com/files/download"
+SURFLARE_WAN_IF="pppoe-wan"                 # direct WAN interface for upgrade probes
+SURFLARE_UPGRADE_INTERVAL=21600           # 6h: probe cadence for new releases
+SURFLARE_UPGRADE_SETTLE=30                # max seconds to wait for local state after restart
+SURFLARE_UPGRADE_VERIFY=90                # seconds to poll local+egress after settle
+SURFLARE_UPGRADE_POLL=10                  # seconds between verification polls
+SURFLARE_PROBE_FAIL_ALERT=5               # consecutive probe failures before alerting
 DIAG_GRACE_PERIOD=180                 # seconds: medium-severity diagnosis alerts wait this long before firing (0=off)
 SERVERCHAN_DAILY_CAP=3               # max Server Chan messages per day when bridge is down (0=unlimited)
 STORM_503_STATE="/run/surflare_503_state"  # 503 monitor -> health check evidence channel
@@ -177,7 +185,7 @@ else
 #   flock         -> util-linux   (all major distros)
 #   surflare/surflare-proxy -> from surflare installation
 # Note: nm-online is optional (NetworkManager package); falls back to sleep 15s.
-for cmd in curl killall pgrep flock surflare surflare-proxy python3 ss; do
+for cmd in curl killall pgrep flock surflare surflare-proxy python3 ss jq; do
 	if ! command -v "$cmd" >/dev/null 2>&1; then
 		echo "<3>surflare_watchdog: missing dependency: ${cmd}, exiting" >/dev/kmsg
 		exit 1
@@ -5377,6 +5385,418 @@ log "Startup nftables: killswitch=$(_table_exists killswitch) dns_enforce=$(_tab
 _cn_direct_mtime=$(stat -c %Y /etc/surflare/cn_ipv4.txt /etc/surflare/cn_ipv4_extra.txt /etc/surflare/cn_ipv6.txt 2>/dev/null | sort -rn | head -1)
 : "${_cn_direct_mtime:=0}"
 
+# surflare upgrade automation state (probe runs every SURFLARE_UPGRADE_INTERVAL).
+_upgrade_last_probe=0
+_SURFLARE_PROBE_FAILS=0
+
+
+# ============================================================================
+# surflare upgrade automation: probe -> snapshot -> check -> swap -> verify
+# -> rollback on failure.  Runs synchronously in the main loop (6h cadence),
+# blocking the health check during the swap+verify window (~150s).  The proxy
+# is stopped only during the binary swap (~10s); killswitch + tproxy rules
+# persist across the restart (they target :10800 which the new proxy rebinds).
+# ============================================================================
+
+# _surflare_ver_gt: return 0 if $1 is strictly greater than $2 (semver
+# major.minor.patch).  Bash, so herestrings are safe here.
+_surflare_ver_gt() {
+	local _a1 _a2 _a3 _b1 _b2 _b3
+	IFS=. read -r _a1 _a2 _a3 <<<"${1}.0.0"
+	IFS=. read -r _b1 _b2 _b3 <<<"${2}.0.0"
+	_a1=${_a1:-0}; _a2=${_a2:-0}; _a3=${_a3:-0}
+	_b1=${_b1:-0}; _b2=${_b2:-0}; _b3=${_b3:-0}
+	# 10# forces decimal (prevents octal interpretation of leading zeros).
+	[ "$((10#$_a1))" -gt "$((10#$_b1))" ] 2>/dev/null && return 0
+	[ "$((10#$_a1))" -lt "$((10#$_b1))" ] 2>/dev/null && return 1
+	[ "$((10#$_a2))" -gt "$((10#$_b2))" ] 2>/dev/null && return 0
+	[ "$((10#$_a2))" -lt "$((10#$_b2))" ] 2>/dev/null && return 1
+	[ "$((10#$_a3))" -gt "$((10#$_b3))" ] 2>/dev/null
+}
+
+# _atomic_write: write src to dest via temp+mv (crash-safe: a partial write
+# is discarded, dest is never seen half-written).  For chattr+i files, caller
+# must chattr -i before and chattr +i after.  Returns 0 on success, 1 on
+# failure (temp file cleaned up).
+_atomic_write() {
+	local _src="$1" _dest="$2"
+	if ! cat "$_src" > "${_dest}.new" 2>/dev/null; then
+		rm -f "${_dest}.new" 2>/dev/null
+		return 1
+	fi
+	if ! mv "${_dest}.new" "$_dest" 2>/dev/null; then
+		rm -f "${_dest}.new" 2>/dev/null
+		return 1
+	fi
+	return 0
+}
+
+# _check_surflare_release: fetch latest.json over direct WAN (pppoe-wan, no
+# VPN dependency).  Sets _SURFLARE_NEW_VER / _SURFLARE_NEW_FILE /
+# _SURFLARE_NEW_URL on success.  Returns 0 only if a STRICTLY NEWER version
+# exists.  Returns 1 on same-version, unreachable, or parse failure.
+_check_surflare_release() {
+	_SURFLARE_NEW_VER=""
+	_SURFLARE_NEW_FILE=""
+	_SURFLARE_NEW_URL=""
+	local _json _latest_ver _cur_ver _filename
+	_json=$(curl -sf --interface "$SURFLARE_WAN_IF" --connect-timeout 10 --max-time 30 \
+		"${SURFLARE_LATEST_JSON}?t=$(date +%s)" 2>/dev/null) || return 1
+	_latest_ver=$(printf '%s' "$_json" | jq -r '.linux.version // empty' 2>/dev/null)
+	_filename=$(printf '%s' "$_json" | jq -r '.linux.amd64 // empty' 2>/dev/null)
+	[ -n "$_latest_ver" ] && [ -n "$_filename" ] || return 1
+	_cur_ver=$(surflare --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+	[ -n "$_cur_ver" ] || return 1
+	# Same version -> return 2 (normal, not a probe failure).
+	if [ "$_latest_ver" = "$_cur_ver" ]; then
+		return 2
+	fi
+	# Only proceed if manifest is strictly newer (prevent auto-downgrade).
+	_surflare_ver_gt "$_latest_ver" "$_cur_ver" || return 2
+	_SURFLARE_NEW_VER="$_latest_ver"
+	_SURFLARE_NEW_FILE="$_filename"
+	_SURFLARE_NEW_URL="${SURFLARE_DOWNLOAD_BASE}/${_filename}"
+	return 0
+}
+
+# _snapshot_known_good: copy current binaries + config + wrapper state to a
+# timestamped snapshot dir for rollback.  Sets _SURFLARE_SNAPSHOT_DIR.
+# Returns 0 on success, 1 on failure (abort upgrade if snapshot fails).
+_snapshot_known_good() {
+	# mktemp -d: collision-proof (random suffix, unlike date-based names).
+	_SURFLARE_SNAPSHOT_DIR=$(mktemp -d /root/surflare-snapshot-XXXXXX) || return 1
+	local _real="/usr/bin/surflare-proxy.real"
+	local _cli="/usr/bin/surflare"
+	local _fb="/usr/local/lib/surflare-proxy-patched"
+	local _wrapper="/usr/bin/surflare-proxy"
+	local _canon="/usr/local/sbin/surflare-proxy.canonical"
+	# Binaries (read-only copy; .real may be running but cp reads fine).
+	cp -a "$_real" "$_SURFLARE_SNAPSHOT_DIR/surflare-proxy.real" 2>/dev/null || return 1
+	cp -a "$_cli" "$_SURFLARE_SNAPSHOT_DIR/surflare-cli" 2>/dev/null || return 1
+	cp -a "$_fb" "$_SURFLARE_SNAPSHOT_DIR/surflare-proxy-patched" 2>/dev/null || return 1
+	# Config dir (auth, nodedata, settings, mode -- small, <500KB).
+	cp -a /etc/surflare "$_SURFLARE_SNAPSHOT_DIR/etc-surflare" 2>/dev/null || return 1
+	# Wrapper + canonical + EXPECTED_MD5 (for restoring the md5-gate baseline).
+	cp -a "$_wrapper" "$_SURFLARE_SNAPSHOT_DIR/surflare-proxy-wrapper" 2>/dev/null || return 1
+	cp -a "$_canon" "$_SURFLARE_SNAPSHOT_DIR/surflare-proxy-canonical" 2>/dev/null || return 1
+	grep '^EXPECTED_MD5=' "$_wrapper" 2>/dev/null \
+		> "$_SURFLARE_SNAPSHOT_DIR/expected_md5.baseline" || true
+	# Record md5s for verification after restore.
+	md5sum "$_real" "$_cli" "$_fb" 2>/dev/null \
+		> "$_SURFLARE_SNAPSHOT_DIR/md5sums.baseline" || true
+	log "surflare-upgrade: snapshot saved to ${_SURFLARE_SNAPSHOT_DIR}"
+	return 0
+}
+
+# _check_new_binary: download the new package, extract the new .real, and
+# test it with `check -c` against the currently-running patched config
+# (dumped by the wrapper to /tmp/singbox-config-patched.json on each restart).
+# Returns 0 if the new binary accepts the config.  Sets _SURFLARE_NEW_REAL
+# (path to extracted new binary) + _SURFLARE_NEW_MD5 on success.
+_check_new_binary() {
+	_SURFLARE_NEW_REAL=""
+	_SURFLARE_NEW_CLI=""
+	_SURFLARE_NEW_MD5=""
+	local _cfg="/tmp/singbox-config-patched.json"
+	if [ ! -f "$_cfg" ]; then
+		log "surflare-upgrade: WARN no patched config at ${_cfg} (proxy not restarted yet?)"
+		return 1
+	fi
+	local _tmpdir _tar _new_real
+	_tmpdir=$(mktemp -d /tmp/surflare-upgrade-XXXXXX) || return 1
+	_tar="${_tmpdir}/package.tar.gz"
+	log "surflare-upgrade: downloading ${_SURFLARE_NEW_URL}"
+	if ! curl -sf --interface "$SURFLARE_WAN_IF" --connect-timeout 15 --max-time 120 \
+		-o "$_tar" "$_SURFLARE_NEW_URL" 2>/dev/null; then
+		log "surflare-upgrade: download failed"
+		rm -rf "$_tmpdir"
+		return 1
+	fi
+	# Verify gzip integrity before extraction.
+	if ! gzip -t "$_tar" 2>/dev/null; then
+		log "surflare-upgrade: package gzip check failed"
+		rm -rf "$_tmpdir"
+		return 1
+	fi
+	# Extract: package contains `surflare` (CLI) + `surflare-proxy` (binary).
+	# Reject path-traversal entries (absolute paths or ..) before extraction.
+	if tar -tzf "$_tar" 2>/dev/null | grep -qE '^/|\.\.'; then
+		log "surflare-upgrade: package contains unsafe paths, rejecting"
+		rm -rf "$_tmpdir"
+		return 1
+	fi
+	if ! tar -xzf "$_tar" -C "$_tmpdir" 2>/dev/null; then
+		log "surflare-upgrade: extraction failed"
+		rm -rf "$_tmpdir"
+		return 1
+	fi
+	# Find binary (package may have flat or nested directory structure).
+	_new_real=$(find "$_tmpdir" -name surflare-proxy -type f 2>/dev/null | head -1)
+	if [ -z "$_new_real" ] || [ ! -f "$_new_real" ]; then
+		log "surflare-upgrade: surflare-proxy not found in package"
+		rm -rf "$_tmpdir"
+		return 1
+	fi
+	chmod +x "$_new_real" 2>/dev/null || true
+	# Test config compatibility: does the new binary accept the patched config?
+	if ! "$_new_real" check -c "$_cfg" >/dev/null 2>&1; then
+		log "surflare-upgrade: new binary rejects current config (check failed)"
+		rm -rf "$_tmpdir"
+		return 1
+	fi
+	_SURFLARE_NEW_REAL="$_new_real"
+	_SURFLARE_NEW_CLI=$(find "$_tmpdir" -name surflare -type f 2>/dev/null | head -1)
+	_SURFLARE_NEW_MD5=$(md5sum "$_new_real" 2>/dev/null | cut -d' ' -f1)
+	_SURFLARE_UPGRADE_TMPDIR="$_tmpdir"
+	log "surflare-upgrade: new binary v${_SURFLARE_NEW_VER} (md5=${_SURFLARE_NEW_MD5}) accepts config"
+	return 0
+}
+
+# _stop_surflare_proxy: stop the running proxy cleanly, then SIGKILL leftover.
+# The wrapper/.real is ETXTBSY while running -- must stop before swapping.
+_stop_surflare_proxy() {
+	surflare disconnect >/dev/null 2>&1 || true
+	local _wait=0
+	while [ "$_wait" -lt 10 ]; do
+		_proc_alive surflare-proxy >/dev/null 2>&1 || break
+		sleep 1
+		_wait=$((_wait + 1))
+	done
+	if _proc_alive surflare-proxy >/dev/null 2>&1; then
+		_pids_by_comm surflare-proxy 2>/dev/null \
+			| while read -r _spid; do kill -9 "$_spid" 2>/dev/null || true; done
+		sleep 1
+	fi
+	log "surflare-upgrade: proxy stopped (waited ${_wait}s)"
+}
+
+# _start_surflare_proxy: restart the proxy with the current node/mode.
+# Killswitch + tproxy rules persist across restart (they target :10800).
+_start_surflare_proxy() {
+	surflare connect \
+		--node "${_active_node:-$NODE}" --mode "${MODE:-global}" \
+		--transit auto --daemon >/dev/null 2>&1 || true
+	# Wait for local state: process + :10800 + nft table + ip rule.
+	local _wait=0
+	while [ "$_wait" -lt "$SURFLARE_UPGRADE_SETTLE" ]; do
+		check_vpn_local_state && return 0
+		sleep 3
+		_wait=$((_wait + 3))
+	done
+	log "surflare-upgrade: local state not ready after ${SURFLARE_UPGRADE_SETTLE}s"
+	return 1
+}
+
+# _restore_surflare_snapshot: restore binaries + EXPECTED_MD5 from snapshot.
+# Called on verification failure.  Proxy must be stopped before calling.
+_restore_surflare_snapshot() {
+	local _snap="${_SURFLARE_SNAPSHOT_DIR}"
+	[ -d "$_snap" ] || { log "surflare-upgrade: snapshot missing, cannot rollback"; return 1; }
+	local _real="/usr/bin/surflare-proxy.real"
+	local _cli="/usr/bin/surflare"
+	local _fb="/usr/local/lib/surflare-proxy-patched"
+	local _wrapper="/usr/bin/surflare-proxy"
+	local _canon="/usr/local/sbin/surflare-proxy.canonical"
+	# Restore .real + CLI (atomic writes).
+	_atomic_write "${_snap}/surflare-proxy.real" "$_real" || return 1
+	_atomic_write "${_snap}/surflare-cli" "$_cli" || return 1
+	chmod +x "$_real" "$_cli" 2>/dev/null || true
+	# Restore FALLBACK (chattr+i -> -i, atomic write, +i).
+	chattr -i "$_fb" 2>/dev/null || true
+	if ! _atomic_write "${_snap}/surflare-proxy-patched" "$_fb"; then
+		chattr +i "$_fb" 2>/dev/null || true
+		return 1
+	fi
+	chmod +x "$_fb" 2>/dev/null || true
+	chattr +i "$_fb" 2>/dev/null || true
+	# Restore EXPECTED_MD5 in wrapper + canonical (chattr+i -> -i, cat>, +i).
+	local _old_md5
+	_old_md5=$(grep '^EXPECTED_MD5=' "${_snap}/surflare-proxy-wrapper" 2>/dev/null \
+		| cut -d'"' -f2)
+	if [ -n "$_old_md5" ]; then
+		chattr -i "$_wrapper" 2>/dev/null || true
+		sed "s/^EXPECTED_MD5=.*/EXPECTED_MD5=\"${_old_md5}\"/" "$_wrapper" > "${_wrapper}.tmp" \
+			&& cat "${_wrapper}.tmp" > "$_wrapper" && rm -f "${_wrapper}.tmp"
+		chattr +i "$_wrapper" 2>/dev/null || true
+		chattr -i "$_canon" 2>/dev/null || true
+		sed "s/^EXPECTED_MD5=.*/EXPECTED_MD5=\"${_old_md5}\"/" "$_canon" > "${_canon}.tmp" \
+			&& cat "${_canon}.tmp" > "$_canon" && rm -f "${_canon}.tmp"
+		chattr +i "$_canon" 2>/dev/null || true
+	fi
+	log "surflare-upgrade: snapshot restored from ${_snap}"
+	return 0
+}
+
+# _verify_surflare_upgrade: poll local state + tunnel egress for the verify
+# window.  Returns 0 if VPN is stable, 1 if it fails (triggers rollback).
+_verify_surflare_upgrade() {
+	local _elapsed=0 _consecutive_fail=0
+	while [ "$_elapsed" -lt "$SURFLARE_UPGRADE_VERIFY" ]; do
+		if check_vpn_local_state && _check_tunnel_egress; then
+			_consecutive_fail=0
+		else
+			_consecutive_fail=$((_consecutive_fail + 1))
+			log "surflare-upgrade: verify fail ${_consecutive_fail} at ${_elapsed}s"
+			# Local state failure is immediate rollback (binary can't run).
+			# Egress failure tolerates 1 transient blip (CDN routing).
+			check_vpn_local_state || return 1
+			[ "$_consecutive_fail" -ge 2 ] && return 1
+		fi
+		sleep "$SURFLARE_UPGRADE_POLL"
+		_elapsed=$((_elapsed + SURFLARE_UPGRADE_POLL))
+	done
+	log "surflare-upgrade: verified stable for ${SURFLARE_UPGRADE_VERIFY}s"
+	return 0
+}
+
+# _upgrade_surflare: orchestrate the full upgrade.  Called when a newer
+# version is detected.  Returns 0 on success, 1 on failure (rollback applied).
+_upgrade_surflare() {
+	local _cur_ver
+	_cur_ver=$(surflare --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+	log "surflare-upgrade: starting ${_cur_ver} -> v${_SURFLARE_NEW_VER}"
+	_send_alert "surflare upgrade starting" \
+		"v${_cur_ver} -> v${_SURFLARE_NEW_VER}. Snapshot+check+swap+verify in progress." \
+		"no"
+
+	# 1. Snapshot known-good state (abort if snapshot fails -- no safety net).
+	if ! _snapshot_known_good; then
+		log "surflare-upgrade: ABORT snapshot failed"
+		_send_alert "surflare upgrade aborted" "snapshot failed, no change made" "no"
+		return 1
+	fi
+
+	# 2. Download + check new binary (config compatibility test).
+	if ! _check_new_binary; then
+		log "surflare-upgrade: ABORT new binary check failed"
+		[ -n "${_SURFLARE_UPGRADE_TMPDIR:-}" ] && rm -rf "$_SURFLARE_UPGRADE_TMPDIR"
+		_send_alert "surflare upgrade aborted" \
+			"new binary check failed (download/extract/config-test). No change made." "no"
+		return 1
+	fi
+
+	# 3. Swap binaries (proxy must be stopped -- .real is ETXTBSY while running).
+	_stop_surflare_proxy
+
+	local _real="/usr/bin/surflare-proxy.real"
+	local _cli="/usr/bin/surflare"
+	local _fb="/usr/local/lib/surflare-proxy-patched"
+	local _wrapper="/usr/bin/surflare-proxy"
+	local _canon="/usr/local/sbin/surflare-proxy.canonical"
+
+	# Swap order (crash-safe): .real -> FALLBACK -> EXPECTED_MD5.
+	# If crash after .real but before EXPECTED_MD5: md5-gate sees new .real
+	# with old EXPECTED_MD5 -> rolls back to old FALLBACK (self-correcting).
+
+	# 3a. Swap .real + CLI (atomic writes; proxy stopped so no ETXTBSY).
+	local _swap_ok=1
+	_atomic_write "$_SURFLARE_NEW_REAL" "$_real" || _swap_ok=0
+	chmod +x "$_real" 2>/dev/null || true
+	if [ "$_swap_ok" -eq 1 ] && [ -f "$_SURFLARE_NEW_CLI" ]; then
+		_atomic_write "$_SURFLARE_NEW_CLI" "$_cli" \
+			|| log "surflare-upgrade: CLI write failed (non-fatal)"
+		chmod +x "$_cli" 2>/dev/null || true
+	fi
+	if [ "$_swap_ok" -ne 1 ]; then
+		log "surflare-upgrade: .real write failed -- ROLLBACK"
+		_restore_surflare_snapshot || true
+		_start_surflare_proxy || true
+		_send_alert "surflare upgrade rolled back" \
+			".real write failed. Restored v${_cur_ver}." "yes"
+		rm -rf "${_SURFLARE_UPGRADE_TMPDIR:-/nonexistent}" 2>/dev/null || true
+		return 1
+	fi
+
+	# 3b. Update FALLBACK to new binary (chattr -i, atomic write, chattr +i).
+	chattr -i "$_fb" 2>/dev/null || true
+	if ! _atomic_write "$_SURFLARE_NEW_REAL" "$_fb"; then
+		log "surflare-upgrade: FALLBACK write failed -- ROLLBACK"
+		chattr +i "$_fb" 2>/dev/null || true
+		_restore_surflare_snapshot || true
+		_start_surflare_proxy || true
+		_send_alert "surflare upgrade rolled back" \
+			"FALLBACK write failed. Restored v${_cur_ver}." "yes"
+		rm -rf "${_SURFLARE_UPGRADE_TMPDIR:-/nonexistent}" 2>/dev/null || true
+		return 1
+	fi
+	chmod +x "$_fb" 2>/dev/null || true
+	chattr +i "$_fb" 2>/dev/null || true
+
+	# 3c. Update EXPECTED_MD5 in wrapper + canonical LAST (md5-gate consistent).
+	chattr -i "$_wrapper" 2>/dev/null || true
+	sed "s/^EXPECTED_MD5=.*/EXPECTED_MD5=\"${_SURFLARE_NEW_MD5}\"/" \
+		"$_wrapper" > "${_wrapper}.tmp" \
+		&& cat "${_wrapper}.tmp" > "$_wrapper" && rm -f "${_wrapper}.tmp"
+	chattr +i "$_wrapper" 2>/dev/null || true
+	chattr -i "$_canon" 2>/dev/null || true
+	sed "s/^EXPECTED_MD5=.*/EXPECTED_MD5=\"${_SURFLARE_NEW_MD5}\"/" \
+		"$_canon" > "${_canon}.tmp" \
+		&& cat "${_canon}.tmp" > "$_canon" && rm -f "${_canon}.tmp"
+	chattr +i "$_canon" 2>/dev/null || true
+
+	log "surflare-upgrade: binaries swapped, restarting proxy"
+
+	# 4. Restart + verify.
+	if ! _start_surflare_proxy; then
+		log "surflare-upgrade: new proxy failed to start -- ROLLBACK"
+		_stop_surflare_proxy
+		_restore_surflare_snapshot || true
+		_start_surflare_proxy || true
+		_send_alert "surflare upgrade rolled back" \
+			"new proxy failed to start. Restored v${_cur_ver}." "yes"
+		rm -rf "${_SURFLARE_UPGRADE_TMPDIR:-/nonexistent}" 2>/dev/null || true
+		return 1
+	fi
+
+	if ! _verify_surflare_upgrade; then
+		log "surflare-upgrade: verification failed -- ROLLBACK"
+		_stop_surflare_proxy
+		_restore_surflare_snapshot || true
+		_start_surflare_proxy || true
+		_send_alert "surflare upgrade rolled back" \
+			"verification failed (VPN not stable). Restored v${_cur_ver}." "yes"
+		rm -rf "${_SURFLARE_UPGRADE_TMPDIR:-/nonexistent}" 2>/dev/null || true
+		return 1
+	fi
+
+	# 5. Success.
+	log "surflare-upgrade: SUCCESS v${_cur_ver} -> v${_SURFLARE_NEW_VER}"
+	_send_alert "surflare upgrade success" \
+		"v${_cur_ver} -> v${_SURFLARE_NEW_VER} verified stable." "no"
+	rm -rf "${_SURFLARE_UPGRADE_TMPDIR:-/nonexistent}" 2>/dev/null || true
+	return 0
+}
+
+# _maybe_upgrade_surflare: main loop entry point.  Guards on VPN health,
+# probes for new version, tracks probe failures, triggers upgrade.
+_maybe_upgrade_surflare() {
+	# Don't upgrade during active problems.
+	if ! check_vpn_local_state; then
+		log "surflare-upgrade: VPN not healthy, skipping probe"
+		return 0
+	fi
+	# Explicit rc capture: $? in else-branch is fragile across shell versions.
+	_check_surflare_release
+	_probe_rc=$?
+	if [ "$_probe_rc" -eq 0 ]; then
+		_SURFLARE_PROBE_FAILS=0
+		log "surflare-upgrade: new version v${_SURFLARE_NEW_VER} detected"
+		_upgrade_surflare || true
+	elif [ "$_probe_rc" -eq 2 ]; then
+		# same version (normal)
+		_SURFLARE_PROBE_FAILS=0
+	else
+		# probe failure (unreachable/parse)
+		_SURFLARE_PROBE_FAILS=$((_SURFLARE_PROBE_FAILS + 1))
+		if [ "$_SURFLARE_PROBE_FAILS" -ge "$SURFLARE_PROBE_FAIL_ALERT" ]; then
+			log "surflare-upgrade: probe failed ${_SURFLARE_PROBE_FAILS}x, alerting"
+			_send_alert "surflare upgrade probe unreachable" \
+				"probe failed ${_SURFLARE_PROBE_FAILS}x consecutive. Check WAN connectivity." "no"
+			_SURFLARE_PROBE_FAILS=0
+		fi
+	fi
+	return 0
+}
 # --source-only: define functions but do not enter main loop.
 # Used by test harnesses (Plan 03-04) to source this file.
 if [ "${_SOURCE_ONLY:-0}" -eq 1 ]; then
@@ -5722,6 +6142,14 @@ while true; do
 	if [ $((_now_stats - ${_stats_last_report:-0})) -ge "$STATS_REPORT_INTERVAL" ]; then
 		_report_stats
 		_export_diag_state "${health:-unknown}"
+	fi
+
+	# Periodic surflare upgrade probe (every 6h, same cadence as stats).
+	# Runs synchronously: blocks the health check during swap+verify (~150s).
+	_now_upgrade=${now:-$(date +%s)}
+	if [ $((_now_upgrade - ${_upgrade_last_probe:-0})) -ge "$SURFLARE_UPGRADE_INTERVAL" ]; then
+		_upgrade_last_probe=$_now_upgrade
+		_maybe_upgrade_surflare
 	fi
 
 	# Deferred diag state export (SIGUSR1 sets flag; nft may block in trap)

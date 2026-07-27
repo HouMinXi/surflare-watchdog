@@ -106,6 +106,11 @@ if jq --argjson T "$TOLERANCE" --arg I "$INTERVAL" --arg D "$INJECT_DOMAINS" '
         )
     else . end
 ' < "$_tmp" > "$_patched"; then
+	# Persist patched config for surflare-upgrade's check step (tests a
+	# new .real against the actual patched config before swapping).
+	# Overwritten on each proxy restart.  chmod 600: contains server IPs.
+	# Failure is non-fatal -- proxy must not break if /tmp is unwritable.
+	( umask 077; cp "$_patched" /tmp/singbox-config-patched.json; chmod 600 /tmp/singbox-config-patched.json ) 2>/dev/null || true
 	exec < "$_patched"
 	rm -f "$_tmp" "$_patched"
 	exec "$REAL_BIN" "$@"
