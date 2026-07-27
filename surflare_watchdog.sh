@@ -289,6 +289,7 @@ _ALERT_BRIDGE_TOKEN_FILE="/root/.surflare-bridge-token"
 _deliver_alert() {
 	local _title="${1:-surflare alert}"
 	local _body="${2:-}"
+	local _sc_fallback="${3:-yes}"
 	local _conf="/etc/surflare/wechat.conf"
 	local _sendkey
 
@@ -316,6 +317,18 @@ _deliver_alert() {
 	if [ "$_bridge_rc" -eq 0 ]; then
 		log "Alert sent via bridge: ${_title}"
 		return 0
+	fi
+
+	# ServerChan fallback only for alerts worth a page (real outages: fw4 DOWN,
+	# diagnosis that persisted past grace).  Self-healing events (reconnecting,
+	# storm cooldown, fw4 auto-recovered, LLM analysis follow-up) pass
+	# _sc_fallback=no so a bridge outage does not spam ServerChan -- when the
+	# bridge is up iLink already delivers them, and when it is down the event
+	# is not worth a standalone page.  Only an explicit "no" disables fallback;
+	# any other value (typo, empty) defaults to sending, never silently dropping.
+	if [ "$_sc_fallback" = "no" ]; then
+		log "ServerChan fallback disabled (bridge failed): ${_title}"
+		return 1
 	fi
 
 	# Server Chan fallback (WAN, CN direct) with daily cap.
@@ -360,6 +373,7 @@ _deliver_alert() {
 _send_alert() {
 	local _title="${1:-surflare alert}"
 	local _body="${2:-}"
+	local _sc_fallback="${3:-yes}"
 
 	local _now _last
 	_now=$(date +%s)
@@ -371,7 +385,7 @@ _send_alert() {
 	fi
 	_alert_last_ts=$_now
 
-	( _deliver_alert "$_title" "$_body" ) 9>&- 200>&- &
+	( _deliver_alert "$_title" "$_body" "$_sc_fallback" ) 9>&- 200>&- &
 }
 
 # Ecosystem health probes: DNS, tmpfs, crond, memory/OOM, BPF.
@@ -1993,7 +2007,9 @@ _enter_storm_cooldown() {
 	stop_packet_trace >/dev/null 2>&1
 	_remove_dns_fallback
 	log "Storm protection triggered (${_reason}): cooling for ${STORM_COOLING}s"
-	_send_alert "VPN storm cooldown" "reason=${_reason} reconnects=${reconnect_count}"
+	_send_alert "VPN storm cooldown" \
+		"reason=${_reason} reconnects=${reconnect_count}" \
+		"no"
 	# Phase 2A: Tombstone mode -- keep killswitch alive (CN bypass stays),
 	# replace tproxy with REJECT (no TCP black-hole, no IP leak), flush
 	# server_ips so VPN server traffic is also blocked.
@@ -2470,7 +2486,9 @@ _recover_fw4() {
 	# tables, breaking VPN until the watchdog reconnects (~60s outage).
 	if timeout 20 /etc/init.d/firewall reload >/dev/null 2>&1 && _check_fw4_health; then
 		log "fw4 reload recovered masquerade"
-		_send_alert "surflare: fw4 auto-recovered" "fw4/masquerade was missing and has been reloaded automatically."
+		_send_alert "surflare: fw4 auto-recovered" \
+			"fw4/masquerade was missing and has been reloaded automatically." \
+			"no"
 		return 0
 	fi
 	# Fallback: full restart if reload failed (e.g. fw4 table gone).
@@ -2478,11 +2496,15 @@ _recover_fw4() {
 	log "fw4 reload did not recover masquerade, attempting full restart"
 	if timeout 20 /etc/init.d/firewall restart >/dev/null 2>&1 && _check_fw4_health; then
 		log "fw4 restart recovered masquerade"
-		_send_alert "surflare: fw4 auto-recovered" "fw4/masquerade was missing and has been restarted automatically."
+		_send_alert "surflare: fw4 auto-recovered" \
+			"fw4/masquerade was missing and has been restarted automatically." \
+			"no"
 		return 0
 	fi
 	log "ERROR: fw4 restart did not recover masquerade"
-	_send_alert "surflare: fw4 DOWN" "fw4/masquerade missing and automatic restart failed. Manual check needed: /etc/init.d/firewall restart"
+	_send_alert "surflare: fw4 DOWN" \
+		"fw4/masquerade missing and automatic restart failed. Manual check needed: /etc/init.d/firewall restart" \
+		"yes"
 	return 1
 }
 
@@ -4136,13 +4158,13 @@ _send_diagnosis_alert() {
 	# each failure produces at most 2 alerts (tier1 + follow-up), and tier1
 	# itself is still rate-limited at 600s.
 	local _prev_ts=${_alert_last_ts:-0}
-	_send_alert "$_alert_title" "$(printf '%b' "$_alert_body")"
+	_send_alert "$_alert_title" "$(printf '%b' "$_alert_body")" "yes"
 
 	if [ "$_alert_last_ts" != "$_prev_ts" ]; then
 		(
 			_llm_analysis=$(_llm_enrich_diagnosis) || exit 0
 			[ -n "$_llm_analysis" ] || exit 0
-			_deliver_alert "[Analysis] ${_conclusion}" "$_llm_analysis"
+			_deliver_alert "[Analysis] ${_conclusion}" "$_llm_analysis" "no"
 		) 9>&- 200>&- &
 	fi
 
@@ -5698,7 +5720,9 @@ while true; do
 				log "Backoff: next reconnect threshold raised to ${FAIL_THRESHOLD}"
 			fi
 			log "Consecutive failures: ${fail_count}, starting reconnect..."
-			_send_alert "VPN reconnecting" "fail=${fail_count} node=${NODE} health=${health}"
+			_send_alert "VPN reconnecting" \
+				"fail=${fail_count} node=${NODE} health=${health}" \
+				"no"
 			_stats_reconnects=$((_stats_reconnects + 1))
 			date +%s > /run/surflare_last_reconnect 2>/dev/null || true
 			rm -f /run/surflare_auth_fail_signal 2>/dev/null || true
