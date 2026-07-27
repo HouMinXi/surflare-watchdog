@@ -14,7 +14,7 @@ ulimit -n 65535 2>/dev/null || true
 
 REAL_BIN="/usr/bin/surflare-proxy.real"
 FALLBACK_BIN="/usr/local/lib/surflare-proxy-patched"
-EXPECTED_MD5="e9ca7744c979a7214ed12ced1ade703a"
+EXPECTED_MD5="427f12993868c1a40c999bd47f655995"
 TOLERANCE=300
 INTERVAL="60s"
 # Domains missing from surflare's proxy_rule_set that must go through VPN.
