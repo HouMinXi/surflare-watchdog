@@ -20,7 +20,7 @@ fi
 # View logs    : sudo dmesg | grep surflare_watchdog
 
 NODE="Dallas"                          # Exit node (NA); transit/relay is auto
-NODE_CANDIDATES=("Chicago" "Miami" "Atlanta" "San Juan" "Los Angeles" "Dallas" "New York")
+NODE_CANDIDATES=("Chicago" "Miami" "Atlanta" "Los Angeles" "Dallas" "New York")  # fallback; _sync_node_candidates overrides from `surflare nodes` at startup
 # Connection mode: loaded from /etc/surflare/mode.conf if present,
 # otherwise resolved from PLATFORM (router->rule, laptop->global).
 # Deploying surflare_watchdog.sh no longer resets the mode setting.
@@ -5191,6 +5191,54 @@ for _dup in $(pgrep -f surflare_watchdog.sh 2>/dev/null); do
 		log "Startup: killed duplicate watchdog PID $_dup"
 done
 
+# Sync NODE_CANDIDATES from the live `surflare nodes` catalog so rotation
+# tracks the service rather than a hardcoded set. surflare retires nodes
+# (San Juan, once listed, is gone) and a stale entry makes _rotate_node
+# pick a node connect_vpn will reject. Falls back to the hardcoded defaults
+# if surflare or python3 is missing, the call times out, or no US node is
+# parsed -- the daemon must still start when the control plane is down.
+# python3 parses the flag-decorated TTY output via \U escapes so this file
+# stays ASCII (the US flag emoji is non-ASCII and would trip the commit gate).
+_sync_node_candidates() {
+	command -v surflare >/dev/null 2>&1 || return 0
+	command -v python3 >/dev/null 2>&1 || return 0
+	# `surflare nodes` is a network call (loads the full catalog); cap it so
+	# a hung API cannot block daemon startup. Capture the output and require
+	# a clean exit so a timeout/kill (partial output) falls back to the
+	# hardcoded list instead of overwriting it with truncated data.
+	local _raw _us
+	_raw=$(timeout 15 surflare nodes 2>/dev/null) || return 0
+	# PYTHONUTF8=1 forces UTF-8 stdin so the flag emoji parses regardless of
+	# the system locale (the daemon runs under procd where LC_ALL may be C).
+	_us=$(PYTHONUTF8=1 python3 -c '
+import sys, re
+seen = set()
+for line in sys.stdin:
+    if "\U0001F1FA\U0001F1F8" not in line:
+        continue
+    city = line.split("\U0001F1FA\U0001F1F8", 1)[1]
+    city = re.sub(r"\s*\(x\d+\).*", "", city).strip()
+    if city and city not in seen:
+        seen.add(city)
+        print(city)
+' <<< "$_raw") || return 0
+	[ -n "$_us" ] || return 0
+	local _arr=() _c
+	while IFS= read -r _c; do
+		[ -n "$_c" ] && _arr+=("$_c")
+	done <<< "$_us"
+	[ "${#_arr[@]}" -gt 0 ] || return 0
+	NODE_CANDIDATES=("${_arr[@]}")
+	log "Synced NODE_CANDIDATES from surflare (${#_arr[@]} US nodes): ${_arr[*]}"
+	# If the configured NODE was retired from the live list, fall back to the
+	# first candidate so connect_vpn does not try a node surflare will reject.
+	local _valid=0
+	for _c in "${NODE_CANDIDATES[@]}"; do
+		[ "$_c" = "$NODE" ] && { _valid=1; break; }
+	done
+	[ "$_valid" -eq 1 ] || NODE="${NODE_CANDIDATES[0]}"
+}
+
 # Clean up orphaned trace table from previous SIGKILL
 nft delete table inet watchdog_trace 2>/dev/null || true
 _startup_cleanup_dns_fallback
@@ -5227,6 +5275,10 @@ _fw4_last_check=$(date +%s)
 FW4_CHECK_INTERVAL=300        # 5 min
 _fw4_last_restart_ts=0
 FW4_RESTART_COOLDOWN=900      # 15 min, avoid thrashing repeated restarts
+# Sync NODE_CANDIDATES from the live surflare catalog and validate the
+# configured NODE against it (falls back to the hardcoded list above if the
+# CLI is unavailable, times out, or returns no US node).
+_sync_node_candidates
 _active_node="$NODE"
 _node_idx=0
 if [ -f "$ROTATION_STATE" ]; then
