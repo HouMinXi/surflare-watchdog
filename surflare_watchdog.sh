@@ -3354,7 +3354,10 @@ _report_stats() {
 	_now=$(date +%s)
 	_uptime_s=$((_now - _stats_start_ts))
 	_uptime_h=$((_uptime_s / 3600))
-	read -r _s503_count _ _ < "$STORM_503_STATE" 2>/dev/null || _s503_count=0
+	_s503_count=0
+	if [ -f "$STORM_503_STATE" ]; then
+		read -r _s503_count _ _ < "$STORM_503_STATE" 2>/dev/null || _s503_count=0
+	fi
 	log "STATS: up=${_uptime_h}h reconn=${_stats_reconnects} rot=${_stats_rotations} 503=${_s503_count} degraded=${_stats_degraded:-none} node=${_sess_node:-?} exit=${_sess_exit:-?}"
 	_stats_degraded=""
 	_stats_last_report=$_now
@@ -3484,7 +3487,10 @@ _export_diag_state() {
 	fi
 
 	# Read 503 state (3 fields: count first_epoch last_epoch)
-	read -r _s503_count _ _ < "$STORM_503_STATE" 2>/dev/null || _s503_count=0
+	_s503_count=0
+	if [ -f "$STORM_503_STATE" ]; then
+		read -r _s503_count _ _ < "$STORM_503_STATE" 2>/dev/null || _s503_count=0
+	fi
 
 	# Read proxy error rate (2 fields: count epoch)
 	# Plan 02-01 must be merged first; without it, file absent -> _err_count=0
