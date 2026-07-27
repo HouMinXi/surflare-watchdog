@@ -69,10 +69,9 @@ if jq --argjson T "$TOLERANCE" --arg I "$INTERVAL" --arg D "$INJECT_DOMAINS" '
   | if .dns.servers then
       .dns.servers |= map(
         # sing-box 1.12 DNS migration: {"address":"..."} ->
-        # {"type":"<scheme>","server":"<host>"}.  Type is the URL
-        # scheme (sing-box 1.12 uses https/tls/quic, not doh/dot).
-        # Path defaults to /dns-query, so server is host-only.
-        # Strip userinfo and path; scheme is case-insensitive.
+        # {"type":"<scheme>","server":"<host>"}.  default_domain_
+        # resolver = dns-direct (CN DNS, direct detour) so dial
+        # does not depend on VPN (chicken-and-egg with dns_remote).
         if (.address // "") | test("^[a-zA-Z]+://") then
           .type = (.address
               | capture("^(?<t>[a-zA-Z]+)://").t
@@ -103,7 +102,7 @@ if jq --argjson T "$TOLERANCE" --arg I "$INTERVAL" --arg D "$INJECT_DOMAINS" '
       )
       | .route.default_domain_resolver = (
           .route.default_domain_resolver
-          // {"server": (.dns.final // "dns-direct")}
+          // {"server": "dns-direct"}
         )
     else . end
 ' < "$_tmp" > "$_patched"; then
