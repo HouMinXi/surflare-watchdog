@@ -2036,7 +2036,7 @@ _enter_storm_cooldown() {
 	# current sleep. USR1 breaks out via run_health_check_now flag.
 	local _storm_probe_interval=60
 	local _storm_remaining=$STORM_COOLING
-	local _storm_sleep _storm_dup _spid _storm_mem
+	local _storm_sleep _storm_dup _spid _storm_mem _ppid
 	while [ "$_storm_remaining" -gt 0 ]; do
 		_storm_sleep=$(( _storm_remaining < _storm_probe_interval ? _storm_remaining : _storm_probe_interval ))
 		sleep "$_storm_sleep" &
@@ -2047,9 +2047,17 @@ _enter_storm_cooldown() {
 			_storm_dup=0
 			for _spid in $(pgrep -f 'surflare_watchdog\.sh$' 2>/dev/null); do
 				[ "$_spid" -eq "$$" ] && continue
-				# Only count procd-started instances (PPid=1), not
-				# our own child subshells (PPid=$$)
-				grep -q "PPid:.*1$" "/proc/$_spid/status" 2>/dev/null || continue
+				# Real daemon: procd-started (PPid=1) AND holds
+				# the singleton lock (fd 9, opened by the
+				# "Singleton enforcement" guard).  Either alone
+				# is insufficient: "( ... ) 9>&- 200>&- &"
+				# subshells reparent to PID 1 when their parent
+				# exits, and children spawned without "9>&-"
+				# inherit fd 9 from the parent.  Requiring both
+				# filters reparented subshells (no fd 9) and
+				# inherited-fd children (PPid != 1).
+				_ppid=$(awk '/^PPid:/{print $2}' "/proc/$_spid/status" 2>/dev/null)
+				[ "$_ppid" = "1" ] && [ -e "/proc/$_spid/fd/9" ] || continue
 				_storm_dup=$((_storm_dup + 1))
 			done
 			[ "$_storm_dup" -gt 0 ] && log "WARN: ${_storm_dup} duplicate watchdog(s) during storm cooldown"
