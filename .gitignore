@@ -39,3 +39,5 @@ n100/config/nodedata.dat
 n100/config/server_ips
 n100/config/settings.dat
 n100/config/wechat.conf
+.mcp.json
+scratch/
