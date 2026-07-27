@@ -66,6 +66,46 @@ if jq --argjson T "$TOLERANCE" --arg I "$INTERVAL" --arg D "$INJECT_DOMAINS" '
         .domain_suffix |= (. + ($D | split(",")) | unique)
       else . end
     ) else . end)
+  | if .dns.servers then
+      .dns.servers |= map(
+        # sing-box 1.12 DNS migration: {"address":"..."} ->
+        # {"type":"<scheme>","server":"<host>"}.  Type is the URL
+        # scheme (sing-box 1.12 uses https/tls/quic, not doh/dot).
+        # Path defaults to /dns-query, so server is host-only.
+        # Strip userinfo and path; scheme is case-insensitive.
+        if (.address // "") | test("^[a-zA-Z]+://") then
+          .type = (.address
+              | capture("^(?<t>[a-zA-Z]+)://").t
+              | ascii_downcase)
+          | .server = (.address
+              | sub("^[a-zA-Z]+://"; "")
+              | sub("^.*@"; "")
+              | sub("/.*$"; "")
+            )
+          | if (.server | test(":[0-9]+$")) then
+              .server_port = (.server
+                  | sub(".*:"; "") | tonumber)
+              | .server = (.server
+                  | sub(":[0-9]+$"; ""))
+            else . end
+          | del(.address)
+        elif .address then
+          .type = "udp"
+          | .server = .address
+          | if (.server | test(":[0-9]+$")) then
+              .server_port = (.server
+                  | sub(".*:"; "") | tonumber)
+              | .server = (.server
+                  | sub(":[0-9]+$"; ""))
+            else . end
+          | del(.address)
+        else . end
+      )
+      | .route.default_domain_resolver = (
+          .route.default_domain_resolver
+          // {"server": (.dns.final // "dns-direct")}
+        )
+    else . end
 ' < "$_tmp" > "$_patched"; then
 	exec < "$_patched"
 	rm -f "$_tmp" "$_patched"
