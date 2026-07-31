@@ -105,6 +105,16 @@ if jq --argjson T "$TOLERANCE" --arg I "$INTERVAL" --arg D "$INJECT_DOMAINS" '
           // {"server": "dns-direct"}
         )
     else . end
+  # Catch-all leak fix: the last surflare route rule is an explicit
+  # {"inbound":"tproxy-in","outbound":"direct"} that catches all
+  # tproxy traffic earlier rules miss, including connections whose
+  # domain sniff cannot parse (TLS ECH encrypts the SNI) and clients
+  # whose DNS bypasses port-53 hijack (Go resolver, DoH).  Route
+  # those to VPN instead of direct so GFW-blocked destinations reach
+  # the proxy.  Falls back to direct if no VPN outbound found.
+  | ([.outbounds[] | select(.tag|startswith("mh_via_auto_to_"))][0].tag // "direct") as $vpn
+  | .route.rules[-1].outbound = $vpn
+  | .route.final = $vpn
 ' < "$_tmp" > "$_patched"; then
 	# Persist patched config for surflare-upgrade's check step (tests a
 	# new .real against the actual patched config before swapping).
