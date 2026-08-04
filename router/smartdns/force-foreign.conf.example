@@ -1,5 +1,14 @@
 # SmartDNS force-foreign.conf
-# Purpose: Fix domains where VPN exit IP triggers server-side redirect loops.
+# Purpose: per-domain DNS overrides. Two distinct problems live here.
+#
+#   1. VPN exit IP triggers a server-side redirect loop -> pin to a CN IP
+#      with `address`, so the request takes the direct path (Bing, below).
+#   2. The domestic resolver returns a wrong answer -> route the lookup to
+#      the foreign group with `nameserver` (models.dev, below).
+#
+# These pull in opposite directions. Check which one you have before adding
+# a line: resolve the domain against two encrypted sources and compare. If
+# they agree, the DNS is fine and the problem is the exit IP.
 #
 # DIAGNOSIS METHOD (Playwright redirect capture):
 #   1. Capture redirect chain in browser
@@ -18,3 +27,16 @@
 #   Reference: Clash Verge #1702, SearxNG #2193, V2EX t/927161
 address /bing.com/202.89.233.101
 address /cn.bing.com/202.89.233.101
+
+# models.dev: the domestic resolver hands back the wrong host
+#   alidns  DoH -> 67.15.129.210 (theplanet.com), TTL 15
+#   doh.pub DoH -> 104.26.8.108, 172.67.69.147, ... (Cloudflare), TTL 300
+#   Both queries are encrypted, so this is not injection on the wire -- the
+#   two upstreams genuinely disagree and the domestic group answers first.
+#   Cloudflare is right: models.dev runs on alex/elle.ns.cloudflare.com.
+#   Port 443 on the wrong host does answer, which is why this reads as
+#   ERR_CERT_COMMON_NAME_INVALID in a browser and as a handshake timeout to
+#   curl, rather than as a connection refused.
+# Routing the domain through the proxy does NOT fix this. The address is
+#   already wrong by the time sing-box sees it.
+nameserver /models.dev/foreign
