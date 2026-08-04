@@ -3,6 +3,13 @@
 Custom artifacts deployed to the N100 router that don't fit in the main
 watchdog script. Everything here is reproducible from source.
 
+The surflare-proxy wrapper is NOT here despite the name of this directory.
+It lives at `scripts/surflare-proxy-wrapper.sh` and that is the copy that
+gets deployed to `/usr/bin/surflare-proxy`. A second copy used to sit in
+this directory calling itself the canonical source; it stopped being
+updated on 2026-07-19 and was removed. If you need to confirm which file
+is live, compare md5 against the router rather than trusting a path.
+
 ## patches/
 
 sing-box URLTest timeout fix (upstream PR#4256). Two versions:
