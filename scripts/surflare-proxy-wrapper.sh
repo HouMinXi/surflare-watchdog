@@ -20,7 +20,7 @@ INTERVAL="60s"
 # Domains missing from surflare's proxy_rule_set that must go through VPN.
 # Without this, sing-box catch-all (rule 10: tproxy-in -> direct) routes
 # them direct -> CN IP exposed or TLS handshake reset on direct route.
-INJECT_DOMAINS="claude.com,grokipedia.com,ipinfo.io"
+INJECT_DOMAINS="claude.com,grokipedia.com,ipinfo.io,models.dev"
 
 # md5-gate: detect and rollback surflare auto-update
 _md5=$(md5sum "$REAL_BIN" 2>/dev/null | cut -d" " -f1)
