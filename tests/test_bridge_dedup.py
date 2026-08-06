@@ -11,7 +11,6 @@ Tests the dedup mechanism in alert-bridge.py:
 """
 import json
 import os
-import sys
 import tempfile
 import threading
 import time
@@ -262,6 +261,29 @@ class TestDedupLogic(unittest.TestCase):
             self.assertEqual(len(self.gateway_calls), 2)
             h._respond.assert_called_with(200, {"status": "ok"})
             self.assertNotIn("[merged]", self.gateway_calls[1])
+        finally:
+            ab.BRIDGE_TOKEN = old_token
+
+    def test_gateway_failure_does_not_update_state(self):
+        """Test 7: failed send leaves no state; next post is not suppressed."""
+        old_token = ab.BRIDGE_TOKEN
+        ab.BRIDGE_TOKEN = "tok"
+        ab.send_via_gateway = lambda msg: {"success": False, "error": "boom"}
+        try:
+            h = self._make_handler(title="Flaky Alert")
+            ab.AlertHandler.do_POST(h)
+            h._respond.assert_called_with(502, {
+                "status": "error",
+                "message": "boom",
+            })
+            self.assertEqual(ab._load_state(), {})
+
+            # Gateway recovers: the very next post must send, not suppress.
+            ab.send_via_gateway = self._mock_send
+            h._respond.reset_mock()
+            ab.AlertHandler.do_POST(h)
+            self.assertEqual(len(self.gateway_calls), 1)
+            h._respond.assert_called_with(200, {"status": "ok"})
         finally:
             ab.BRIDGE_TOKEN = old_token
 

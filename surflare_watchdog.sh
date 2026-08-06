@@ -401,7 +401,6 @@ _send_alert() {
 		log "Alert rate-limited (${_diff}s since last, need 600s): ${_title}"
 		return 0
 	fi
-	_alert_last_ts=$_now
 
 	# Stamp file throttle for flap-class alerts
 	# Uses /run/surflare/ (root-only) to prevent local attacker from
@@ -423,6 +422,10 @@ _send_alert() {
 		fi
 		date +%s > "$_stamp"
 	fi
+
+	# Advance the rate-limiter only once the alert actually proceeds to
+	# delivery; a stamp-suppressed alert must not shadow later alerts.
+	_alert_last_ts=$_now
 
 	( _deliver_alert "$_title" "$_body" "$_sc_fallback" "$_class" ) 9>&- 200>&- &
 }
