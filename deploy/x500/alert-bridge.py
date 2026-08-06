@@ -16,6 +16,7 @@ import os
 import signal
 import hmac
 import syslog
+import tempfile
 import time
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse
@@ -50,6 +51,65 @@ if os.path.exists(BRIDGE_TOKEN_FILE):
 
 # Graceful shutdown flag
 _shutdown = False
+
+# Dedup state management
+_DEDUP_STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "alert-bridge-dedup.json")
+_DEDUP_WINDOW = 86400  # 24h rolling window per key
+_DEDUP_PRUNE_AGE = 172800  # 48h: prune keys older than this
+
+
+def _load_state() -> dict:
+    """Load dedup state from JSON file. Returns empty dict on missing/corrupt."""
+    try:
+        with open(_DEDUP_STATE_FILE, "r") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return {}
+
+
+def _save_state(state: dict) -> None:
+    """Atomic write of dedup state. Prunes keys older than 48h."""
+    now = time.time()
+    pruned = {k: v for k, v in state.items()
+              if now - v.get("last_sent_at", 0) < _DEDUP_PRUNE_AGE}
+    state_dir = os.path.dirname(_DEDUP_STATE_FILE)
+    if state_dir and not os.path.isdir(state_dir):
+        os.makedirs(state_dir, mode=0o700, exist_ok=True)
+    tmp_fd = None
+    tmp_path = None
+    try:
+        tmp_fd, tmp_path = tempfile.mkstemp(
+            dir=state_dir,
+            prefix=".dedup-",
+            suffix=".tmp",
+        )
+        with os.fdopen(tmp_fd, "w") as f:
+            json.dump(pruned, f)
+            tmp_fd = None
+        os.replace(tmp_path, _DEDUP_STATE_FILE)
+        tmp_path = None
+    finally:
+        if tmp_fd is not None:
+            try:
+                os.close(tmp_fd)
+            except OSError:
+                pass
+        if tmp_path is not None:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+
+def _dedup_key(data: dict) -> str:
+    """Two-tier dedup key: body["class"] if present, else title normalized."""
+    if "class" in data and data["class"]:
+        return data["class"]
+    title = data.get("title", "")
+    idx = title.find(" (")
+    if idx >= 0:
+        return title[:idx]
+    return title
 
 
 def _verify_token(provided: str) -> bool:
@@ -165,18 +225,67 @@ class AlertHandler(BaseHTTPRequestHandler):
             self._respond(503, {"status": "error", "message": "GATEWAY_URL not configured"})
             return
 
+        # Dedup check
+        key = _dedup_key(data)
+        now = time.time()
+        state = _load_state()
+
+        if key in state:
+            entry = state[key]
+            last_sent = entry.get("last_sent_at", 0)
+            suppressed = entry.get("suppressed_count", 0)
+            if now - last_sent < _DEDUP_WINDOW:
+                entry["suppressed_count"] = suppressed + 1
+                try:
+                    _save_state(state)
+                except OSError as exc:
+                    syslog.syslog(syslog.LOG_ERR,
+                                  f"alert-bridge: state save failed: {exc}")
+                syslog.syslog(syslog.LOG_INFO,
+                              f"alert-bridge: suppressed key={key!r} "
+                              f"count={suppressed + 1}")
+                self._respond(200, {
+                    "status": "suppressed",
+                    "key": key,
+                    "suppressed_count": suppressed + 1,
+                })
+                return
+
+        # Check if there were suppressions in previous window
+        suppressed_count = state.get(key, {}).get("suppressed_count", 0)
+        if suppressed_count > 0:
+            content = f"{content}\n[merged] {suppressed_count} similar alerts in past 24h"
+
         result = send_via_gateway(content)
         if result.get("success"):
-            syslog.syslog(syslog.LOG_INFO, f"alert-bridge: sent alert title={title!r}")
+            state[key] = {"last_sent_at": now, "suppressed_count": 0}
+            try:
+                _save_state(state)
+            except OSError as exc:
+                syslog.syslog(syslog.LOG_ERR,
+                              f"alert-bridge: state save failed: {exc}")
+            syslog.syslog(syslog.LOG_INFO,
+                          f"alert-bridge: sent alert title={title!r} key={key!r}")
             self._respond(200, {"status": "ok"})
         else:
-            syslog.syslog(syslog.LOG_ERR, f"alert-bridge: send failed: {result.get('error')}")
-            self._respond(502, {"status": "error", "message": result.get("error", "unknown")})
+            syslog.syslog(syslog.LOG_ERR,
+                          f"alert-bridge: send failed: {result.get('error')}")
+            self._respond(502, {
+                "status": "error",
+                "message": result.get("error", "unknown"),
+            })
 
     def do_GET(self):
         if self.path == "/health":
             uptime = int(time.time() - START_TIME)
             self._respond(200, {"status": "ok", "uptime_s": uptime})
+        elif self.path == "/dedup-state":
+            token = self.headers.get("X-Bridge-Token", "")
+            if not _verify_token(token):
+                self._respond(401, {"status": "error", "message": "invalid token"})
+                return
+            state = _load_state()
+            self._respond(200, {"status": "ok", "state": state})
         else:
             self._respond(404, {"status": "error", "message": "not found"})
 

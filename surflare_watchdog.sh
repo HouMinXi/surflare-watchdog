@@ -294,14 +294,16 @@ _ALERT_BRIDGE_TOKEN_FILE="/root/.surflare-bridge-token"
 # No rate limiting, no backgrounding -- caller decides both.
 # Called by _send_alert (rate-limited, backgrounded) and _send_diagnosis_alert
 # follow-up (no rate limit, already in background subshell).
+# Args: title, body, sc_fallback, class (optional)
 _deliver_alert() {
 	local _title="${1:-surflare alert}"
 	local _body="${2:-}"
 	local _sc_fallback="${3:-yes}"
+	local _class="${4:-}"
 	local _conf="/etc/surflare/wechat.conf"
 	local _sendkey
 
-	local _j_title _j_body _bridge_rc _bridge_token
+	local _j_title _j_body _j_class _bridge_rc _bridge_token _class_json
 	_j_title=$(printf '%s' "$_title" | sed 's/\\/\\\\/g; s/"/\\"/g' | tr '\t\n' ' ')
 	_j_body=$(printf '%s' "$_body" | sed 's/\\/\\\\/g; s/"/\\"/g' | tr '\t\n' ' ')
 
@@ -309,13 +311,19 @@ _deliver_alert() {
 	[ -f "$_ALERT_BRIDGE_TOKEN_FILE" ] && \
 		_bridge_token=$(cat "$_ALERT_BRIDGE_TOKEN_FILE" | tr -d '\r\n')
 
+	_class_json=""
+	if [ -n "$_class" ]; then
+		_j_class=$(printf '%s' "$_class" | sed 's/\\/\\\\/g; s/"/\\"/g' | tr '\t\n' ' ')
+		_class_json=",\"class\":\"${_j_class}\""
+	fi
+
 	_bridge_rc=0
 	if [ -n "$_bridge_token" ]; then
 		curl -sf --max-time "$_ALERT_BRIDGE_TIMEOUT" \
 			-X POST "$_ALERT_BRIDGE_URL" \
 			-H 'Content-Type: application/json' \
 			-H "X-Bridge-Token: ${_bridge_token}" \
-			-d "{\"title\":\"${_j_title}\",\"body\":\"${_j_body}\"}" \
+			-d "{\"title\":\"${_j_title}\",\"body\":\"${_j_body}\"${_class_json}}" \
 			>/dev/null 2>&1 || _bridge_rc=$?
 	else
 		log "WARN: bridge token missing, skipping bridge"
@@ -378,10 +386,12 @@ _deliver_alert() {
 # Rate limit: max 1 alert per 10 minutes (600s). Backgrounded to avoid
 # blocking the reconnect path. VPN-down safe: bridge is LAN (no VPN
 # needed); sctapi.ftqq.com is CN domestic.
+# Args: title, body, sc_fallback, class (optional)
 _send_alert() {
 	local _title="${1:-surflare alert}"
 	local _body="${2:-}"
 	local _sc_fallback="${3:-yes}"
+	local _class="${4:-}"
 
 	local _now _last
 	_now=$(date +%s)
@@ -393,7 +403,28 @@ _send_alert() {
 	fi
 	_alert_last_ts=$_now
 
-	( _deliver_alert "$_title" "$_body" "$_sc_fallback" ) 9>&- 200>&- &
+	# Stamp file throttle for flap-class alerts
+	# Uses /run/surflare/ (root-only) to prevent local attacker from
+	# pre-creating stamp files to suppress alerts.
+	if [ -n "$_class" ] && [[ "$_class" == flap:* ]]; then
+		if [[ ! "$_class" =~ ^flap:[a-z0-9]+$ ]]; then
+			log "ERROR: invalid flap class format: ${_class}"
+			return 1
+		fi
+		local _stamp_dir="/run/surflare"
+		mkdir -p "$_stamp_dir" 2>/dev/null || true
+		local _stamp="${_stamp_dir}/alert_${_class}.stamp"
+		if [ -f "$_stamp" ]; then
+			local _stamp_age=$(($(date +%s) - $(stat -c %Y "$_stamp" 2>/dev/null || echo 0)))
+			if [ "$_stamp_age" -lt 86400 ]; then
+				log "Alert suppressed (class=${_class}, ${_stamp_age}s < 86400s): ${_title}"
+				return 0
+			fi
+		fi
+		date +%s > "$_stamp"
+	fi
+
+	( _deliver_alert "$_title" "$_body" "$_sc_fallback" "$_class" ) 9>&- 200>&- &
 }
 
 # Ecosystem health probes: DNS, tmpfs, crond, memory/OOM, BPF.
@@ -2021,7 +2052,7 @@ _enter_storm_cooldown() {
 	log "Storm protection triggered (${_reason}): cooling for ${STORM_COOLING}s"
 	_send_alert "VPN storm cooldown" \
 		"reason=${_reason} reconnects=${reconnect_count}" \
-		"no"
+		"no" "flap:vpn"
 	# Phase 2A: Tombstone mode -- keep killswitch alive (CN bypass stays),
 	# replace tproxy with REJECT (no TCP black-hole, no IP leak), flush
 	# server_ips so VPN server traffic is also blocked.
@@ -2508,7 +2539,7 @@ _recover_fw4() {
 		log "fw4 reload recovered masquerade"
 		_send_alert "surflare: fw4 auto-recovered" \
 			"fw4/masquerade was missing and has been reloaded automatically." \
-			"no"
+			"no" "flap:fw4"
 		return 0
 	fi
 	# Fallback: full restart if reload failed (e.g. fw4 table gone).
@@ -2518,13 +2549,13 @@ _recover_fw4() {
 		log "fw4 restart recovered masquerade"
 		_send_alert "surflare: fw4 auto-recovered" \
 			"fw4/masquerade was missing and has been restarted automatically." \
-			"no"
+			"no" "flap:fw4"
 		return 0
 	fi
 	log "ERROR: fw4 restart did not recover masquerade"
 	_send_alert "surflare: fw4 DOWN" \
 		"fw4/masquerade missing and automatic restart failed. Manual check needed: /etc/init.d/firewall restart" \
-		"yes"
+		"yes" "fault:fw4"
 	return 1
 }
 
@@ -4178,13 +4209,13 @@ _send_diagnosis_alert() {
 	# each failure produces at most 2 alerts (tier1 + follow-up), and tier1
 	# itself is still rate-limited at 600s.
 	local _prev_ts=${_alert_last_ts:-0}
-	_send_alert "$_alert_title" "$(printf '%b' "$_alert_body")" "yes"
+	_send_alert "$_alert_title" "$(printf '%b' "$_alert_body")" "yes" "diagnosis:${_conclusion}"
 
 	if [ "$_alert_last_ts" != "$_prev_ts" ]; then
 		(
 			_llm_analysis=$(_llm_enrich_diagnosis) || exit 0
 			[ -n "$_llm_analysis" ] || exit 0
-			_deliver_alert "[Analysis] ${_conclusion}" "$_llm_analysis" "no"
+			_deliver_alert "[Analysis] ${_conclusion}" "$_llm_analysis" "no" "analysis:${_conclusion}"
 		) 9>&- 200>&- &
 	fi
 
@@ -5657,12 +5688,12 @@ _upgrade_surflare() {
 	log "surflare-upgrade: starting ${_cur_ver} -> v${_SURFLARE_NEW_VER}"
 	_send_alert "surflare upgrade starting" \
 		"v${_cur_ver} -> v${_SURFLARE_NEW_VER}. Snapshot+check+swap+verify in progress." \
-		"no"
+		"no" "upgrade:starting"
 
 	# 1. Snapshot known-good state (abort if snapshot fails -- no safety net).
 	if ! _snapshot_known_good; then
 		log "surflare-upgrade: ABORT snapshot failed"
-		_send_alert "surflare upgrade aborted" "snapshot failed, no change made" "no"
+		_send_alert "surflare upgrade aborted" "snapshot failed, no change made" "no" "upgrade:aborted"
 		return 1
 	fi
 
@@ -5671,7 +5702,7 @@ _upgrade_surflare() {
 		log "surflare-upgrade: ABORT new binary check failed"
 		[ -n "${_SURFLARE_UPGRADE_TMPDIR:-}" ] && rm -rf "$_SURFLARE_UPGRADE_TMPDIR"
 		_send_alert "surflare upgrade aborted" \
-			"new binary check failed (download/extract/config-test). No change made." "no"
+			"new binary check failed (download/extract/config-test). No change made." "no" "upgrade:aborted"
 		return 1
 	fi
 
@@ -5702,7 +5733,7 @@ _upgrade_surflare() {
 		_restore_surflare_snapshot || true
 		_start_surflare_proxy || true
 		_send_alert "surflare upgrade rolled back" \
-			".real write failed. Restored v${_cur_ver}." "yes"
+			".real write failed. Restored v${_cur_ver}." "yes" "upgrade:rollback"
 		rm -rf "${_SURFLARE_UPGRADE_TMPDIR:-/nonexistent}" 2>/dev/null || true
 		return 1
 	fi
@@ -5715,7 +5746,7 @@ _upgrade_surflare() {
 		_restore_surflare_snapshot || true
 		_start_surflare_proxy || true
 		_send_alert "surflare upgrade rolled back" \
-			"FALLBACK write failed. Restored v${_cur_ver}." "yes"
+			"FALLBACK write failed. Restored v${_cur_ver}." "yes" "upgrade:rollback"
 		rm -rf "${_SURFLARE_UPGRADE_TMPDIR:-/nonexistent}" 2>/dev/null || true
 		return 1
 	fi
@@ -5743,7 +5774,7 @@ _upgrade_surflare() {
 		_restore_surflare_snapshot || true
 		_start_surflare_proxy || true
 		_send_alert "surflare upgrade rolled back" \
-			"new proxy failed to start. Restored v${_cur_ver}." "yes"
+			"new proxy failed to start. Restored v${_cur_ver}." "yes" "upgrade:rollback"
 		rm -rf "${_SURFLARE_UPGRADE_TMPDIR:-/nonexistent}" 2>/dev/null || true
 		return 1
 	fi
@@ -5754,7 +5785,7 @@ _upgrade_surflare() {
 		_restore_surflare_snapshot || true
 		_start_surflare_proxy || true
 		_send_alert "surflare upgrade rolled back" \
-			"verification failed (VPN not stable). Restored v${_cur_ver}." "yes"
+			"verification failed (VPN not stable). Restored v${_cur_ver}." "yes" "upgrade:rollback"
 		rm -rf "${_SURFLARE_UPGRADE_TMPDIR:-/nonexistent}" 2>/dev/null || true
 		return 1
 	fi
@@ -5762,7 +5793,7 @@ _upgrade_surflare() {
 	# 5. Success.
 	log "surflare-upgrade: SUCCESS v${_cur_ver} -> v${_SURFLARE_NEW_VER}"
 	_send_alert "surflare upgrade success" \
-		"v${_cur_ver} -> v${_SURFLARE_NEW_VER} verified stable." "no"
+		"v${_cur_ver} -> v${_SURFLARE_NEW_VER} verified stable." "no" "upgrade:success"
 	rm -rf "${_SURFLARE_UPGRADE_TMPDIR:-/nonexistent}" 2>/dev/null || true
 	return 0
 }
@@ -5791,7 +5822,7 @@ _maybe_upgrade_surflare() {
 		if [ "$_SURFLARE_PROBE_FAILS" -ge "$SURFLARE_PROBE_FAIL_ALERT" ]; then
 			log "surflare-upgrade: probe failed ${_SURFLARE_PROBE_FAILS}x, alerting"
 			_send_alert "surflare upgrade probe unreachable" \
-				"probe failed ${_SURFLARE_PROBE_FAILS}x consecutive. Check WAN connectivity." "no"
+				"probe failed ${_SURFLARE_PROBE_FAILS}x consecutive. Check WAN connectivity." "no" "upgrade:probe_fail"
 			_SURFLARE_PROBE_FAILS=0
 		fi
 	fi
@@ -6214,7 +6245,7 @@ while true; do
 			log "Consecutive failures: ${fail_count}, starting reconnect..."
 			_send_alert "VPN reconnecting" \
 				"fail=${fail_count} node=${NODE} health=${health}" \
-				"no"
+				"no" "flap:vpn"
 			_stats_reconnects=$((_stats_reconnects + 1))
 			date +%s > /run/surflare_last_reconnect 2>/dev/null || true
 			rm -f /run/surflare_auth_fail_signal 2>/dev/null || true
