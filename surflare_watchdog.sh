@@ -3040,17 +3040,26 @@ check_vpn_health() {
 	# 503 storm override.  Health check passed but 503 monitor has
 	# accumulated evidence of sustained relay degradation (ADR-0001).
 	# Triggers PROXY_BROKEN when count >= 10 AND the most recent 503
-	# was within 300s (storm is still active).  Previous design used
-	# _s503_first (storm start) which made chronic storms (hours of
-	# steady 503) invisible because elapsed always exceeded the window.
-	# Using _s503_last detects both fast bursts and chronic storms.
+	# was within 300s AND the whole accumulation fits within 300s.
+	# The last-clause alone let chronic urltest probe noise (10-20
+	# relay 503s per hour on port-80 health endpoints) trip the
+	# override repeatedly on healthy nodes: trickle refills kept
+	# "last" forever fresh, so every check fired.  Requiring
+	# (last - first) <= window restores the rate semantics the
+	# constant documents.  Slow-burn relay degradation is still
+	# covered by the node-error rotation and Probe 7/egress axes.
+	# first > 0 and span >= 0 keep corrupt or clock-skewed
+	# state fail-closed.
 	if [ "$result" = "OK" ] || [ "$result" = "TUNNEL_OK" ]; then
 		if [ -f "$STORM_503_STATE" ]; then
 			local _s503_count _s503_first _s503_last _s503_now
 			read -r _s503_count _s503_first _s503_last < "$STORM_503_STATE" 2>/dev/null
 			_s503_now=$(date +%s)
 			if [ "${_s503_count:-0}" -ge "$STORM_503_OVERRIDE_COUNT" ] && \
-			   [ $((_s503_now - ${_s503_last:-0})) -le "$STORM_503_OVERRIDE_WINDOW" ]; then
+			   [ "${_s503_first:-0}" -gt 0 ] && \
+			   [ $((_s503_now - ${_s503_last:-0})) -le "$STORM_503_OVERRIDE_WINDOW" ] && \
+			   [ $((${_s503_last:-0} - ${_s503_first:-0})) -ge 0 ] && \
+			   [ $((${_s503_last:-0} - ${_s503_first:-0})) -le "$STORM_503_OVERRIDE_WINDOW" ]; then
 				result="PROXY_BROKEN"
 				log "503 storm override (${_s503_count} total, last $((_s503_now - _s503_last))s ago, storm age $((_s503_now - _s503_first))s) -> PROXY_BROKEN"
 			fi
