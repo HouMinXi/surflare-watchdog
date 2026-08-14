@@ -19,8 +19,13 @@ fi
 #                     /etc/systemd/system-sleep/surflare-resume.sh
 # View logs    : sudo dmesg | grep surflare_watchdog
 
-NODE="Dallas"                          # Exit node (NA); transit/relay is auto
-NODE_CANDIDATES=("Chicago" "Miami" "Atlanta" "Los Angeles" "Dallas" "New York")  # fallback; _sync_node_candidates overrides from `surflare nodes` at startup
+# Dedicated exit first: a non-shared IP keeps API providers from throttling
+# us for other tenants on shared exits. US cities stay behind it as fallback;
+# if the dedicated listing disappears from `surflare nodes` (subscription
+# lapse or retirement), NODE validation in _sync_node_candidates degrades
+# to the first city automatically.
+NODE="United States(65.195.35.200)"
+NODE_CANDIDATES=("United States(65.195.35.200)" "Chicago" "Miami" "Atlanta" "Los Angeles" "Dallas" "New York")  # fallback order; _sync_node_candidates rebuilds from `surflare nodes` at startup (dedicated IPs list in their own section and land first)
 # Connection mode: loaded from /etc/surflare/mode.conf if present,
 # otherwise resolved from PLATFORM (router->rule, laptop->global).
 # Deploying surflare_watchdog.sh no longer resets the mode setting.
@@ -5253,7 +5258,11 @@ done
 # if surflare or python3 is missing, the call times out, or no US node is
 # parsed -- the daemon must still start when the control plane is down.
 # python3 parses the flag-decorated TTY output via \U escapes so this file
-# stays ASCII (the US flag emoji is non-ASCII and would trip the commit gate).
+# stays ASCII (the emoji glyphs are non-ASCII and would trip the commit gate).
+# Dedicated IP entries carry a lock glyph and list in their own section above
+# the city sections, so they enter the candidate list first and win the NODE
+# fallback slot. Their whole label -- country plus parenthesized address --
+# is the tag `surflare connect --node` accepts (unlike cities, no (xN) strip).
 _sync_node_candidates() {
 	command -v surflare >/dev/null 2>&1 || return 0
 	command -v python3 >/dev/null 2>&1 || return 0
@@ -5269,6 +5278,12 @@ _sync_node_candidates() {
 import sys, re
 seen = set()
 for line in sys.stdin:
+    if "\U0001F512" in line:
+        tag = line.split("\U0001F512", 1)[1].strip()
+        if tag and tag not in seen:
+            seen.add(tag)
+            print(tag)
+        continue
     if "\U0001F1FA\U0001F1F8" not in line:
         continue
     city = line.split("\U0001F1FA\U0001F1F8", 1)[1]
@@ -5284,7 +5299,7 @@ for line in sys.stdin:
 	done <<< "$_us"
 	[ "${#_arr[@]}" -gt 0 ] || return 0
 	NODE_CANDIDATES=("${_arr[@]}")
-	log "Synced NODE_CANDIDATES from surflare (${#_arr[@]} US nodes): ${_arr[*]}"
+	log "Synced NODE_CANDIDATES from surflare (${#_arr[@]} nodes, dedicated first): ${_arr[*]}"
 	# If the configured NODE was retired from the live list, fall back to the
 	# first candidate so connect_vpn does not try a node surflare will reject.
 	local _valid=0
