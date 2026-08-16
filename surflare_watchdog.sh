@@ -53,6 +53,10 @@ LOCK_FILE=/run/surflare_watchdog.lock # Mutex lock to prevent concurrent reconne
 PIDFILE=/run/surflare_watchdog.pid    # PID file for reliable daemon shutdown
 RESTART_MARKER=/run/surflare_watchdog.restart  # set by main loop before reconnect; cleanup checks it
 ROTATION_STATE=/var/tmp/surflare_rotation  # Persists active node across restarts
+STORM_DWELL_MAX=900                    # a session dying younger than this counts as storm-killed
+STORM_DWELL_SESSIONS=3                 # this many consecutive short sessions = dwell-storm
+DWELL_HISTORY=/run/surflare_dwell      # ring of recent session dwell times (seconds, one per line)
+_dwell_storm_active=0                  # gate state: 1 while rotation is suppressed
 DIAG_SACK_THRESHOLD=20                # % of packets with SACK blocks to flag transit degradation
 DISCONNECT_SETTLE=1                   # seconds after surflare disconnect before killing processes
 CONNECT_SETTLE=20                     # seconds after surflare connect --daemon for VPN to establish
@@ -1184,6 +1188,12 @@ _cleanup_on_startup() {
 	# after init.d created the marker but before cleanup() ran, a stale
 	# marker would cause a future stop to skip proxy teardown.
 	rm -f "$RESTART_MARKER"
+
+	# Dwell history is run-scoped: a ring surviving a service restart
+	# carries pre-restart sessions into the storm gate and can suppress
+	# rotation on a fresh session.  Fresh ring = fresh evidence.  The
+	# glob also sweeps mktemp leftovers from a kill between trim and mv.
+	rm -f "$DWELL_HISTORY" "${DWELL_HISTORY}".tmp.* 2>/dev/null
 
 	# Zero-kill adopt decision: check whether a healthy proxy is running
 	# BEFORE any kill site.  If all conditions pass, set the adopt flag
@@ -3400,7 +3410,7 @@ _diagnose_tunnel_failure() {
 # _record_connect: call after every confirmed-healthy reconnect.
 # Captures the transit node that was actually used, updates session state.
 _record_connect() {
-	local node="$1" exit_country="$2" now
+	local node="$1" exit_country="$2" now _dwell_tmp
 	_exit_country_blocked=0  # reset every call to prevent stale flag
 	# Normalize health-check codes that are not ISO country codes
 	case "$exit_country" in
@@ -3431,6 +3441,30 @@ _record_connect() {
 	# Read the transit written by connect_vpn for every connection (not just after reprobe)
 	_sess_transit=$(cat /run/surflare_last_transit 2>/dev/null || echo "unknown")
 	log "Session: node=${_sess_node} transit=${_sess_transit} exit=${_sess_exit} prev=${_sess_prev_node:-none}(${_sess_prev_s}s)"
+	# Dwell history feeds the dwell-storm gate: keep the last
+	# STORM_DWELL_SESSIONS session lifetimes, newest last. If the append
+	# fails (/run full), the gate freezes at its last verdict -- surface
+	# that once per connect rather than silently.
+	if [ "$_sess_prev_s" -gt 0 ]; then
+		if ! echo "$_sess_prev_s" >> "$DWELL_HISTORY" 2>/dev/null; then
+			log "Dwell history write failed (${DWELL_HISTORY}), storm gate state frozen"
+		elif _dwell_tmp=$(mktemp "${DWELL_HISTORY}.tmp.XXXXXX" 2>/dev/null) && tail -n "$STORM_DWELL_SESSIONS" "$DWELL_HISTORY" > "$_dwell_tmp" 2>/dev/null; then
+			if ! mv -f "$_dwell_tmp" "$DWELL_HISTORY" 2>/dev/null; then
+				# A persistent mv failure would let the ring grow
+				# unbounded (wc -l scans it every loop); drop it --
+				# same fail-open reset as the trim-failure path.
+				rm -f "$DWELL_HISTORY" "$_dwell_tmp" 2>/dev/null
+				log "Dwell history trim move failed, ring reset (storm gate open)"
+			fi
+		else
+			# Trim failed (mktemp, tail, or temp write): drop the
+			# ring and any temp leftovers entirely (fail open, no
+			# storm) rather than keep an unbounded file. The next
+			# append recreates it.
+			rm -f "$DWELL_HISTORY" "${DWELL_HISTORY}".tmp.* 2>/dev/null
+			log "Dwell history trim failed, storm gate opened"
+		fi
+	fi
 	if [ "$_sess_prev_s" -gt 0 ] && [ "$_sess_prev_s" -lt 300 ]; then
 		log "NODE_DEGRADED: ${_sess_prev_node} survived ${_sess_prev_s}s (threshold 300s)"
 		_stats_degraded="${_stats_degraded:+$_stats_degraded }${_sess_prev_node}"
@@ -4485,6 +4519,42 @@ _rotate_node() {
 	log "Node rotation: ${prev} -> ${_active_node} ($((_node_idx + 1))/${n})"
 	_stats_rotations=$((_stats_rotations + 1))
 	printf '%s\t%d\n' "$_active_node" "$_node_idx" > "$ROTATION_STATE" 2>/dev/null || true
+}
+
+# _in_dwell_storm: true when the last STORM_DWELL_SESSIONS sessions all
+# died younger than STORM_DWELL_MAX -- the relay layer is killing every
+# node fast (the Asian-evening pattern). While true, proactive node-error
+# rotation is suppressed: in that state urltest probe failures fire en
+# masse while user traffic still flows, and rotating churns working
+# sessions (each reconnect costs the LAN 15-30s). Hard forwarding
+# failures still reconnect normally; the gate only removes the
+# proactive churn. Clears itself as soon as one session outlives the
+# threshold and enters the history.
+_in_dwell_storm() {
+	local _d _n _seen=0 _all_short=1 _lines
+	# Missing or unreadable history fails open (no storm): suppression is
+	# a last-resort lever, and a cold ring carries no evidence either way.
+	[ -r "$DWELL_HISTORY" ] || return 1
+	# wc -l output is stripped: BusyBox right-aligns counts on some
+	# builds and the case guard below would reject the leading spaces.
+	_n=$(( $(wc -l < "$DWELL_HISTORY" 2>/dev/null || echo 0) + 0 ))
+	case "$_n" in ''|*[!0-9]*) return 1 ;; esac
+	[ "$_n" -ge "$STORM_DWELL_SESSIONS" ] || return 1
+	# Only the last STORM_DWELL_SESSIONS lines are read, so a ring that
+	# grew past its bound cannot skew the verdict with stale sessions.
+	# The file is read once here: command substitution strips trailing
+	# newlines, so a trailing blank line makes the loop below see fewer
+	# lines than tail emitted -- the _seen check fails open on that.
+	# tail failing (or returning nothing) fails open -- same way.
+	_lines=$(tail -n "$STORM_DWELL_SESSIONS" "$DWELL_HISTORY" 2>/dev/null)
+	[ -n "$_lines" ] || return 1
+	while IFS= read -r _d; do
+		case "$_d" in ''|*[!0-9]*) return 1 ;; esac
+		_seen=$((_seen + 1))
+		[ "$_d" -lt "$STORM_DWELL_MAX" ] 2>/dev/null || { _all_short=0; break; }
+	done <<< "${_lines%$'\n'}"
+	[ "$_seen" -eq "$STORM_DWELL_SESSIONS" ] || return 1
+	[ "$_all_short" -eq 1 ]
 }
 
 # Proactive node-error rotation: if the current exit node has accumulated
@@ -6123,8 +6193,25 @@ while true; do
 
 		# Proactive node-error rotation: rotate immediately when the current exit
 		# node has >= NODE_ERR_ROTATE_THRESHOLD errors and a healthy candidate
-		# exists, instead of waiting for fail_count to build.
-		_handle_proactive_node_rotation "$_now"
+		# exists, instead of waiting for fail_count to build. Suppressed during
+		# dwell-storms (every node dying fast): rotating then churns sessions
+		# that still forward user traffic. Announce the transition once.
+		# A storm also needs the CURRENT session to still be young: if it has
+		# already outlived STORM_DWELL_MAX, the relay recovered and holding
+		# rotation back would keep a degrading node for no reason. The age
+		# floor also guards clock steps: a negative age (NTP or manual
+		# rollback) must never read as "young" and suppress rotation.
+		_dwell_age=$((_now - ${_sess_connect_s:-0}))
+		if _in_dwell_storm && [ "$_dwell_age" -ge 0 ] 2>/dev/null \
+		   && [ "$_dwell_age" -lt "$STORM_DWELL_MAX" ]; then
+			if [ "${_dwell_storm_active:-0}" -eq 0 ]; then
+				_dwell_storm_active=1
+				log "Dwell storm: last ${STORM_DWELL_SESSIONS} sessions all <${STORM_DWELL_MAX}s, proactive rotation suppressed"
+			fi
+		else
+			_dwell_storm_active=0
+			_handle_proactive_node_rotation "$_now"
+		fi
 
 		# Periodic heartbeat -- confirms watchdog is alive during long healthy stretches
 		now=$(date +%s)
