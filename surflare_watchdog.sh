@@ -57,6 +57,13 @@ STORM_DWELL_MAX=900                    # a session dying younger than this count
 STORM_DWELL_SESSIONS=3                 # this many consecutive short sessions = dwell-storm
 DWELL_HISTORY=/run/surflare_dwell      # ring of recent session dwell times (seconds, one per line)
 _dwell_storm_active=0                  # gate state: 1 while rotation is suppressed
+CONGESTION_PROBE_TARGETS="223.5.5.5 114.114.114.114"  # two CN DNS anycasts, neither rides the tunnel
+CONGESTION_RTT_MAX=500                 # ms; CN DNS avg RTT above this = uplink bufferbloat signature
+CONGESTION_LOSS_MAX=30                 # % loss per target; with 3 probes 33% = one packet lost
+CONGESTION_HOLD_MAX=1800               # s; reconnect suppressed at most this long while congested
+_line_congested_active=0               # 1 while reconnects are held for line congestion
+_line_congested_since=0                # epoch timestamp of the first congested verdict
+_hold_exit_node=0                      # 1 = next reconnect keeps the exit (relay-path evidence)
 DIAG_SACK_THRESHOLD=20                # % of packets with SACK blocks to flag transit degradation
 DISCONNECT_SETTLE=1                   # seconds after surflare disconnect before killing processes
 CONNECT_SETTLE=20                     # seconds after surflare connect --daemon for VPN to establish
@@ -4521,6 +4528,47 @@ _rotate_node() {
 	printf '%s\t%d\n' "$_active_node" "$_node_idx" > "$ROTATION_STATE" 2>/dev/null || true
 }
 
+# _line_congested: true when the local CN-direct path is degraded
+# (uplink saturation / bufferbloat, e.g. background bulk traffic).
+# Measured against two CN DNS anycasts that never ride the tunnel:
+# loss or latency far above the normal <40ms baseline is the
+# congestion signature.  A reconnect cannot fix the ISP line and each
+# one kills every LAN stream (full conntrack flush), so callers use
+# this to hold reconnects instead of churning.  Congestion is
+# line-wide: every PARSEABLE target must be degraded, so a single
+# blocked or dead anycast endpoint fails open and recovery is never
+# blocked.  A target whose ping output cannot be parsed is skipped
+# (its state is unknown, not evidence); zero parseable targets, an
+# empty target list, or a missing ping all fail open (return 1) --
+# an unmeasurable line must not block recovery.
+_line_congested() {
+	local _t _out _loss _avg _bad=0 _parsed=0
+	command -v ping >/dev/null 2>&1 || return 1
+	[ -n "$CONGESTION_PROBE_TARGETS" ] || return 1
+	for _t in $CONGESTION_PROBE_TARGETS; do
+		_out=$(ping -c 3 -W 1 "$_t" 2>/dev/null)
+		_loss=$(printf '%s\n' "$_out" | sed -n 's/.*received, \([0-9]*\)% packet loss.*/\1/p' | head -1)
+		case "$_loss" in ''|*[!0-9]*) continue ;; esac
+		_parsed=$((_parsed + 1))
+		if [ "$_loss" -ge "$CONGESTION_LOSS_MAX" ]; then
+			_bad=$((_bad + 1))
+		else
+			# busybox prints "round-trip min/avg/max = 8.4/9.2/12.1 ms";
+			# take the integer part of avg to stay POSIX-numeric.
+			_avg=$(printf '%s\n' "$_out" | grep -o '= [0-9.]*/[0-9.]*/' | head -1 | cut -d/ -f2 | cut -d. -f1)
+			case "$_avg" in ''|*[!0-9]*)
+				# latency unknown: the target is not evidence in
+				# either direction, so undo the parsed count
+				_parsed=$((_parsed - 1))
+				continue
+				;;
+			esac
+			[ "$_avg" -ge "$CONGESTION_RTT_MAX" ] && _bad=$((_bad + 1))
+		fi
+	done
+	[ "$_parsed" -gt 0 ] && [ "$_bad" -eq "$_parsed" ]
+}
+
 # _in_dwell_storm: true when the last STORM_DWELL_SESSIONS sessions all
 # died younger than STORM_DWELL_MAX -- the relay layer is killing every
 # node fast (the Asian-evening pattern). While true, proactive node-error
@@ -6046,6 +6094,11 @@ while true; do
 	fi
 
 	_auth_expired_this_cycle=0
+	# Loop-top reset: a relay-path hold raised in an earlier cycle must
+	# not survive to shape a reconnect triggered by different evidence,
+	# and the one-shot skip flag starts clean every iteration.
+	_hold_exit_node=0
+	_skip_reconnect_this_cycle=0
 	# Auth expired flag: short-circuit to connect_vpn with auth refresh.
 	# connect_vpn clears the flag (single clear point). sleep 1 prevents
 	# busy-loop if connect_vpn returns rc=2 (flock busy).
@@ -6105,19 +6158,69 @@ while true; do
 	elif [ "$health" = "PROXY_BROKEN" ]; then
 		# Tunnel is healthy (direct probes succeed) but surflare-proxy:10800
 		# is not forwarding traffic.  LAN devices would have no connectivity.
-		log "Proxy path broken: surflare-proxy:10800 not forwarding, triggering reconnect"
-		_export_diag_state "$health"
-		_run_advisory_diagnosis "$health" "" "$_auth_expired_this_cycle"
-		_send_diagnosis_alert "$health"
-		# Capture forensic snapshot BEFORE reconnect tears down proxy
-		# state.  Fire-and-forget background; won't delay reconnect.
-		if [ -x /usr/local/sbin/diag-proxy-broken.sh ]; then
-			/usr/local/sbin/diag-proxy-broken.sh &>/dev/null 9>&- 200>&- &
+		# Before tearing down: a reconnect cannot fix a congested ISP line,
+		# and each one flushes the full conntrack table, killing every LAN
+		# stream.  Hold reconnects while the CN-direct baseline is degraded
+		# (bounded by CONGESTION_HOLD_MAX so a truly dead proxy still
+		# recovers).
+		if _line_congested; then
+			_now_cong=$(date +%s)
+			if [ "${_line_congested_active:-0}" -eq 0 ]; then
+				_line_congested_active=1
+				_line_congested_since=$_now_cong
+				log "Local line congested (CN-direct degraded): reconnect suppressed, waiting for line recovery"
+				_send_alert "Local line congested, VPN reconnect suppressed" "" "yes" "congestion"
+			fi
+			if [ $((_now_cong - ${_line_congested_since:-0})) -lt "$CONGESTION_HOLD_MAX" ]; then
+				_export_diag_state "LOCAL_LINE_CONGESTED"
+				# Keep fail_count where it is: the moment the line
+				# recovers, the next PROXY_BROKEN verdict reconnects
+				# without an extra failure-building delay.
+				_skip_reconnect_this_cycle=1
+			else
+				log "Congestion held ${CONGESTION_HOLD_MAX}s and proxy still broken: reconnecting anyway"
+				_line_congested_active=0
+				# The reconnect reason is hold expiry, not relay-path
+				# evidence: a stale hold must not suppress rotation.
+				_hold_exit_node=0
+				# A still-congested NEXT cycle enters the first-seen
+				# block and starts a fresh hold.  Deliberate: during
+				# persistent congestion the proxy gets exactly one
+				# reconnect attempt per HOLD_MAX instead of churning
+				# every cycle.
+			fi
+		else
+			if [ "${_line_congested_active:-0}" -eq 1 ]; then
+				_line_congested_active=0
+				_line_congested_since=0
+				log "Local line recovered (CN-direct probes healthy)"
+				# _deliver_alert, not _send_alert: the 600s limiter
+				# would swallow a recovery that lands shortly after
+				# the congestion alert, leaving the user with a
+				# one-sided story.
+				_deliver_alert "Local line recovered, VPN reconnect logic resumed" "" "yes" "congestion"
+			fi
+			# Relay-path evidence (healthy tunnel + proxy 503s): the
+			# reconnect itself negotiates a fresh relay endpoint, so
+			# keep the exit node -- rotating it churns sessions without
+			# addressing the layer that failed.
+			_hold_exit_node=1
 		fi
-		transient_count=0
-		_cn_consecutive=0
-		_healthy_consecutive=0
-		fail_count=$FAIL_THRESHOLD
+		if [ "${_skip_reconnect_this_cycle:-0}" -ne 1 ]; then
+			log "Proxy path broken: surflare-proxy:10800 not forwarding, triggering reconnect"
+			_export_diag_state "$health"
+			_run_advisory_diagnosis "$health" "" "$_auth_expired_this_cycle"
+			_send_diagnosis_alert "$health"
+			# Capture forensic snapshot BEFORE reconnect tears down proxy
+			# state.  Fire-and-forget background; won't delay reconnect.
+			if [ -x /usr/local/sbin/diag-proxy-broken.sh ]; then
+				/usr/local/sbin/diag-proxy-broken.sh &>/dev/null 9>&- 200>&- &
+			fi
+			transient_count=0
+			_cn_consecutive=0
+			_healthy_consecutive=0
+			fail_count=$FAIL_THRESHOLD
+		fi
 
 	elif [ "$health" = "OK" ] || \
 	     { ! _health_is_failure "$health" && [ -n "$health" ]; }; then
@@ -6340,7 +6443,16 @@ while true; do
 			_reconnect_window_count=0
 		else
 			_prev_active_node="$_active_node"
-			_rotate_node
+			if [ "${_hold_exit_node:-0}" -eq 1 ]; then
+				# Relay-path evidence set this on the way in: the
+				# reconnect negotiates a fresh relay endpoint itself,
+				# and rotating the exit would churn sessions at a
+				# layer the failure never implicated.
+				_hold_exit_node=0
+				log "Node rotation held: relay-path failure, keeping exit ${_active_node}"
+			else
+				_rotate_node
+			fi
 			# If rotation actually moved to a different node, the previous
 			# node-error state no longer applies: clear the proactive-rotation
 			# cooldown and consecutive counter so the new node gets a fair check.
