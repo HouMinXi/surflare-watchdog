@@ -11,7 +11,7 @@ PASS=0; FAIL=0
 ok()  { PASS=$((PASS+1)); echo "  PASS: $1"; }
 bad() { FAIL=$((FAIL+1)); echo "  FAIL: $1"; }
 
-CONSTS=$(grep -E "^CONGESTION_PROBE_TARGETS=|^CONGESTION_RTT_MAX=|^CONGESTION_LOSS_MAX=|^CONGESTION_HOLD_MAX=" "$WATCHDOG")
+CONSTS=$(grep -E "^CONGESTION_PROBE_TARGETS=|^CONGESTION_RTT_MAX=|^CONGESTION_LOSS_MAX=|^CONGESTION_HOLD_MAX=|^STORM_503_HOLD_MAX=|^STORM_503_RECENT=|^PROXY_BROKEN_GRACE=|^STORM_503_STATE=" "$WATCHDOG")
 
 extract_fn() {
 	awk '/^_line_congested\(\)/,/^}/' "$1"
@@ -159,6 +159,10 @@ run_branch() {
 	# $2 = _line_congested_since seed (0 = long ago -> hold expired)
 	# $3 = watchdog file to extract from (defaults to $WATCHDOG)
 	# $4 = _line_congested_active seed (1 = already active, no first-seen)
+	# env PB_GRACE: seed for _pb_grace_since (default: now-99999 = the
+	# downstream PROXY_BROKEN grace is already expired so the reconnect
+	# fires and these congestion-gate assertions keep their meaning).
+	# env STORM_FILE: 503-state file (default: absent = no live storm).
 	# prints: fail_count hold skip recovered(1 if recovery log fired)
 	local wd="${3:-$WATCHDOG}" blk
 	blk=$(extract_branch "$wd")
@@ -168,9 +172,12 @@ run_branch() {
 		echo "EXTRACT_FAIL"
 		return 99
 	fi
+	PB_GRACE="${PB_GRACE:-$(( $(date +%s) - 99999 ))}" \
+	STORM_FILE="${STORM_FILE:-/nonexistent_503_state}" \
 	bash -c "
 		$STUBS
 		$CONSTS
+		STORM_503_STATE=\"\$STORM_FILE\"
 		_line_congested() { return $1; }
 		health=PROXY_BROKEN
 		fail_count=1
@@ -178,6 +185,9 @@ run_branch() {
 		_hold_exit_node=0
 		_line_congested_active=${4:-0}
 		_line_congested_since=$2
+		_storm_hold_active=0
+		_storm_hold_since=0
+		_pb_grace_since=\$PB_GRACE
 		_skip_reconnect_this_cycle=0
 		_auth_expired_this_cycle=0
 		LOG_BUF=

@@ -95,6 +95,18 @@ DIAG_GRACE_PERIOD=180                 # seconds: medium-severity diagnosis alert
 SERVERCHAN_DAILY_CAP=3               # max Server Chan messages per day when bridge is down (0=unlimited)
 STORM_503_STATE="/run/surflare_503_state"  # 503 monitor -> health check evidence channel
 STORM_503_OVERRIDE_COUNT=10           # cumulative 503s to override Probe 7
+STORM_503_HOLD_MAX=900                # seconds: hold reconnects while a live backend 503 storm
+                                     # persists (one reconnect attempt per window).  Backend
+                                     # storms pass on their own; reconnecting through one
+                                     # kills CN-direct flows for nothing (yinhe control:
+                                     # 0 disconnects through the same storms, client-only).
+STORM_503_RECENT=90                   # seconds: a 503 whose last_epoch is older than this
+                                     # means the storm has gone quiet
+PROXY_BROKEN_GRACE=240                # seconds a PROXY_BROKEN verdict must persist before
+                                     # the first reconnect fires.  A single-cycle verdict is
+                                     # indistinguishable from a relay blip urltest would
+                                     # ride out; teardown (tombstone + conntrack) is the
+                                     # expensive, LAN-wide collateral action.
 STORM_503_OVERRIDE_WINDOW=300         # seconds; all 10 503s must be within this window
 TPROXY_503_ROTATE_THRESHOLD=5         # tproxy 503 count in health window to trigger rotation
 TPROXY_503_COOLDOWN=660                 # 600s health window + 60s margin for 2 cron refreshes (cron runs every 3 min)
@@ -516,7 +528,11 @@ _run_observability_probes() {
 
 	# Probe 5 -- BPF keepalive (router-only)
 	if [ "$PLATFORM" = "router" ]; then
-		_bp_count=$(timeout 3 bpftool prog show 2>/dev/null | grep -c "loaded_at" || echo 0)
+		# grep -c already prints 0 on no match; the old `|| echo 0`
+		# appended a SECOND 0, making _bp_count "0\n0" and tripping
+		# "integer expression expected" on the -eq below.
+		_bp_count=$(timeout 3 bpftool prog show 2>/dev/null | grep -c "loaded_at" || true)
+		case "$_bp_count" in ''|*[!0-9]*) _bp_count=0 ;; esac
 		if [ "${_bp_count:-0}" -eq 0 ] && [ "$SECONDS" -gt 60 ]; then
 			log "WARN: BPF: no programs loaded"
 		fi
@@ -1545,14 +1561,16 @@ _unarm_killswitch_output() {
 	nft delete chain inet killswitch output 2>/dev/null || true
 
 	# Flush stale conntrack entries that used the old output chain rules.
-	# Scoped flush first (mark 1 = tproxy-marked flows only); unscoped
-	# fallback for older conntrack that lacks -m.
-	if conntrack -D -m mark 1 >/dev/null 2>&1; then
-		: # scoped flush ok
-	elif conntrack -F >/dev/null 2>&1; then
-		log "WARN: conntrack scoped flush unavailable; ran unscoped -F"
-	else
-		log "WARN: conntrack flush failed"
+	# Scoped flush only (ct mark 0x100 = tproxy-marked flows, set by the
+	# lan-tproxy rules).  NOTE: the old `-D -m mark 1` form was WRONG on
+	# conntrack-tools 1.4.8 -- it parsed "mark" as the mark VALUE (0) and
+	# deleted unrelated mark=0 flows while looking like a scoped success.
+	# `-m 256` is decimal for the 0x100 ct mark.  No full-table -F
+	# fallback: a scoped-flush failure leaves stale VPN flows (they die
+	# with their endpoints), while -F would kill every CN-direct flow on
+	# the LAN -- the exact collateral this redesign exists to prevent.
+	if ! conntrack -D -m 256 >/dev/null 2>&1; then
+		log "WARN: conntrack scoped flush failed; stale output-chain flows may persist"
 	fi
 
 	log "killswitch output chain removed, forward chain intact"
@@ -1766,18 +1784,17 @@ NFTEOF
 	# Flush stale conntrack entries that predate the new killswitch rules.
 	# Done AFTER the atomic nft -f load so the new rules are already
 	# governing new connections while old entries are being flushed.
-	# Prefer scoped flush (-D -m mark N) to only kill tproxy-marked flows,
+	# Scoped flush only (-D -m N) to kill just tproxy-marked flows,
 	# leaving unrelated connections (LAN, monitoring) untouched.
-	# Fall back to unscoped -F on older conntrack (<1.4.4) that lacks -m.
-	# stdout MUST be captured (not inherited): conntrack -D/-F print
+	# stdout MUST be captured (not inherited): conntrack -D prints
 	# every deleted entry to stdout, which procd would forward to syslog,
 	# flooding the log with thousands of conntrack lines on a busy router.
-	if conntrack -D -m mark 1 >/dev/null 2>&1; then
-		: # scoped flush ok
-	elif conntrack -F >/dev/null 2>&1; then
-		log "WARN: conntrack scoped flush unavailable; ran unscoped -F (drops ALL tracked connections)"
-	else
-		log "WARN: conntrack flush failed; pre-existing connections may persist"
+	# `-m 256` = decimal 0x100 (ct mark set by the lan-tproxy rules); the
+	# old `-m mark 1` spelling parsed "mark" as the value and mis-deleted.
+	# No unscoped -F fallback: see _scoped_conntrack_flush for why a
+	# full-table flush is worse than leftover stale flows.
+	if ! conntrack -D -m 256 >/dev/null 2>&1; then
+		log "WARN: conntrack scoped flush failed; pre-existing connections may persist"
 	fi
 	# Post-install verification: a silent nft -f failure would leave the
 	# watchdog believing killswitch is up while the kernel has no such
@@ -1950,6 +1967,31 @@ _remove_killswitch() {
 }
 
 # Replace the tproxy redirect rule with a reject so LAN TCP gets fast ICMP
+# _scoped_conntrack_flush: kill only VPN-dependent conntrack entries.
+# The old unconditional `conntrack -F` destroyed CN-direct and bypassed
+# LAN flows too -- that was the "every reconnect breaks ark/deepseek
+# and cloudflared" outage.  Classes covered:
+#   1. loopback flows (proxy upstream connections, the documented
+#      7440s-timeout table-saturation source)
+#   2. ct-marked flows (0x100, set by the lan-tproxy tproxy rules --
+#      identifies exactly the tproxied LAN flows)
+#   3. flows to the VPN server endpoints
+# Not deleted: LAN<->CN direct flows, bypassed devices, cloudflared's
+# direct (bypassed) connections -- they never depended on the proxy.
+# `conntrack -D` returning "0 flow entries deleted" is success; there
+# is deliberately NO full-table fallback (an empty class is not an
+# error, and stale unmarked entries expire on their own timers).
+_scoped_conntrack_flush() {
+	local _ip
+	conntrack -D -s 127.0.0.1 >/dev/null 2>&1 || true
+	conntrack -D -d 127.0.0.1 >/dev/null 2>&1 || true
+	conntrack -D -m 256 >/dev/null 2>&1 || true
+	for _ip in $(nft list set inet killswitch server_ips 2>/dev/null \
+		| grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}'); do
+		conntrack -D -d "$_ip" >/dev/null 2>&1 || true
+	done
+}
+
 # failure instead of black-holing into a dead proxy or leaking via direct
 # forwarding.  Idempotent: safe to call when tproxy is already tombstoned
 # or the table does not exist.  Leaves bypass_devices/auto_bypass sets and
@@ -4712,19 +4754,15 @@ connect_vpn() {
 		# PROXY_BROKEN, cascading through all nodes without recovery.
 		_stop_proxy_log_monitor
 
-		# Flush ALL conntrack entries after proxy death.  The scoped
-		# flush (mark 1) in _unarm_killswitch_output only clears
-		# tproxy-marked flows, but proxy upstream connections via
-		# loopback (src=127.0.0.1) carry no mark and persist for
-		# tcp_timeout_established=7440s, eventually saturating the
-		# table and causing "too many open files" on the next proxy.
-		# Tombstone (REJECT) is active so no LAN traffic is flowing;
-		# the flush is safe and the table rebuilds on reconnect.
-		if conntrack -F >/dev/null 2>&1; then
-			log "conntrack flushed (full table, proxy dead, tombstone active)"
-		else
-			log "WARN: conntrack flush failed; stale entries may persist"
-		fi
+		# Scoped conntrack flush after proxy death (see
+		# _scoped_conntrack_flush): loopback upstream flows (the
+		# 7440s-timeout saturation source), ct-marked tproxy flows,
+		# and server-endpoint flows.  CN-direct LAN flows and bypassed
+		# connections SURVIVE -- the old full -F killed them with
+		# every reconnect, which is how ark/deepseek/cloudflared died
+		# alongside the VPN they never used.
+		_scoped_conntrack_flush
+		log "conntrack flushed (scoped: loopback + tproxy-marked + server endpoints)"
 
 		# Flush residual nftables/routing rules that surflare disconnect may have missed.
 		# Without this, all TCP/UDP traffic stays fwmark'd -> routed to table 100 -> loopback
@@ -6097,6 +6135,10 @@ while true; do
 	# Loop-top reset: a relay-path hold raised in an earlier cycle must
 	# not survive to shape a reconnect triggered by different evidence,
 	# and the one-shot skip flag starts clean every iteration.
+	# _storm_hold_* deliberately NOT reset here: a hold must persist
+	# across cycles while the storm is live (same as _line_congested_*).
+	# _pb_grace_since also persists: the grace window only makes sense
+	# measured across cycles, and is cleared on an OK verdict.
 	_hold_exit_node=0
 	_skip_reconnect_this_cycle=0
 	# Auth expired flag: short-circuit to connect_vpn with auth refresh.
@@ -6206,6 +6248,78 @@ while true; do
 			# addressing the layer that failed.
 			_hold_exit_node=1
 		fi
+		# Storm hold: the diagnosis engine itself labels 503 storms
+		# "Backend issue" -- a reconnect renegotiates relay endpoints,
+		# which cannot fix backend-side failures, and each teardown
+		# kills CN-direct LAN flows.  The yinhe control (client-only,
+		# no watchdog) rides identical storms out via urltest
+		# fast-recover with zero disconnects.  Hold while the storm is
+		# live, bounded by STORM_503_HOLD_MAX so a wedged proxy still
+		# gets exactly one reconnect attempt per window.
+		if [ "${_skip_reconnect_this_cycle:-0}" -ne 1 ]; then
+			_storm_count=0 _storm_last=0
+			if [ -f "$STORM_503_STATE" ]; then
+				read -r _storm_count _ _storm_last < "$STORM_503_STATE" 2>/dev/null || { _storm_count=0; _storm_last=0; }
+			fi
+			case "${_storm_count}${_storm_last}" in
+				''|*[!0-9]*) _storm_count=0; _storm_last=0 ;;
+			esac
+			_now_storm=$(date +%s)
+			if [ "$_storm_count" -gt 0 ] && \
+			   [ $((_now_storm - _storm_last)) -le "$STORM_503_RECENT" ]; then
+				if [ "${_storm_hold_active:-0}" -eq 0 ]; then
+					_storm_hold_active=1
+					_storm_hold_since=$_now_storm
+					log "503 storm live (count=${_storm_count}): reconnect held -- backend storms pass without one"
+					_send_alert "Backend 503 storm, VPN reconnect held" "" "yes" "congestion"
+				fi
+				if [ $((_now_storm - ${_storm_hold_since:-0})) -lt "$STORM_503_HOLD_MAX" ]; then
+					_export_diag_state "BACKEND_503_HOLD"
+					# relay-layer failure evidence: a reconnect, when
+					# it eventually fires, must not rotate the exit
+					_hold_exit_node=1
+					_skip_reconnect_this_cycle=1
+				else
+					log "503 storm held ${STORM_503_HOLD_MAX}s and proxy still broken: reconnecting anyway"
+					_storm_hold_active=0
+					# hold expired on stale evidence: rotation logic
+					# must see fresh conditions, same as congestion
+					_hold_exit_node=0
+				fi
+			elif [ "${_storm_hold_active:-0}" -eq 1 ]; then
+				_storm_hold_active=0
+				log "503 storm quieted: reconnect logic resumed"
+			fi
+		fi
+		if [ "${_skip_reconnect_this_cycle:-0}" -ne 1 ]; then
+			# Grace window: a single-cycle PROXY_BROKEN verdict is
+			# indistinguishable from a relay blip the proxy's own
+			# urltest would ride out.  The teardown it triggers
+			# (tombstone + conntrack flush) is LAN-wide collateral;
+			# require the failure to persist first.  Cleared on an OK
+			# verdict; expiry falls through to the real reconnect.
+			# NOTE: after a reconnect, a still-broken verdict RE-ARMS
+			# the grace (the expiry above zeroed the timestamp).  That
+			# is a deliberate conservative tradeoff: the new session
+			# gets its own confirmation window before the next
+			# teardown.  CN-direct traffic is unaffected throughout
+			# (tombstone keeps cn_direct loaded), so the cost of the
+			# extra window is slower foreign-path escalation only.
+			_now_pb=$(date +%s)
+			if [ "${_pb_grace_since:-0}" -eq 0 ]; then
+				_pb_grace_since=$_now_pb
+				log "PROXY_BROKEN first seen: holding ${PROXY_BROKEN_GRACE}s for sustained-failure confirmation"
+				_export_diag_state "$health"
+				_run_advisory_diagnosis "$health" "" "$_auth_expired_this_cycle"
+				_send_diagnosis_alert "$health"
+				_skip_reconnect_this_cycle=1
+			elif [ $((_now_pb - _pb_grace_since)) -lt "$PROXY_BROKEN_GRACE" ]; then
+				log "PROXY_BROKEN sustained $((_now_pb - _pb_grace_since))/${PROXY_BROKEN_GRACE}s, still holding"
+				_skip_reconnect_this_cycle=1
+			else
+				_pb_grace_since=0
+			fi
+		fi
 		if [ "${_skip_reconnect_this_cycle:-0}" -ne 1 ]; then
 			log "Proxy path broken: surflare-proxy:10800 not forwarding, triggering reconnect"
 			_export_diag_state "$health"
@@ -6227,6 +6341,10 @@ while true; do
 		# VPN healthy -- Google 200/30x (tunnel working) OR country probe returned non-CN country
 		# Clear diagnosis grace timer: tunnel is working, any pending grace is moot
 		rm -f /run/surflare_diag_fail_since 2>/dev/null
+		# A confirmed-healthy verdict also retires an in-progress
+		# PROXY_BROKEN grace window: the blip was ridden out, exactly
+		# the case the grace exists to absorb.
+		_pb_grace_since=0
 
 		# Exit country enforcement BEFORE failback gate -- a blocked exit
 		# is NOT a healthy check and must not accumulate toward the gate.

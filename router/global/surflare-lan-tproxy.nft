@@ -93,12 +93,14 @@ table inet sw_lan_tproxy {
         iifname "br-lan" meta nfproto ipv4 meta l4proto tcp \
             tproxy ip to :10800 \
             meta mark set 0x00000001 \
+            ct mark set 0x00000100 \
             accept
 
         # TCP tproxy: IPv6 (same bare-port rationale as IPv4)
         iifname "br-lan" meta nfproto ipv6 meta l4proto tcp \
             tproxy ip6 to :10800 \
             meta mark set 0x00000001 \
+            ct mark set 0x00000100 \
             accept
 
         # QUIC block: reject remaining UDP/443 (non-DTLS) to force TCP/HTTP2
