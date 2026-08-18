@@ -593,6 +593,9 @@ _run_observability_probes() {
 # logger (which writes to kmsg), rate-limited to PROXY_LOG_RATE_SEC.
 _proxy_log_pid=""
 PROXY_LOG="/var/log/surflare/surflare-proxy.log"
+# The surflare CLI's own log; its "Connected server=<label>" lines are
+# the ground truth for which node the RUNNING proxy actually dialed.
+SURFLARE_CLI_LOG="/var/log/surflare/surflare.log"
 PROXY_LOG_RATE_SEC=60
 PROXY_ERR_STATE="/run/surflare_proxy_err_count"
 PROXY_ERR_THRESHOLD=10  # higher than 503's 5: general errors are noisier
@@ -1388,6 +1391,46 @@ _cleanup_on_startup() {
 		local _proxy_pid
 		_proxy_pid=$(_pids_by_comm surflare-proxy | head -1)
 		log "Startup: adopting running proxy (PID=${_proxy_pid:-unknown})"
+		# Reconcile rotation state with the ADOPTED session: the proxy
+		# outlives the watchdog, so the restored rotation state can name
+		# a node the proxy is not actually dialed into.  The CLI log's
+		# latest "Connected server=<label>" line is the ground truth for
+		# the live session; align _active_node/_node_idx and the state
+		# file with it so a later failure rotates FROM reality.
+		# _active_node/_node_idx are deliberately NOT local: this block
+		# exists to realign the script-level rotation state.
+		# Pin vs live session: the live session wins here ON PURPOSE.
+		# Bookkeeping must describe the node the proxy is actually
+		# dialed into, or the next failure rotates from fiction -- the
+		# exact defect this fix exists to kill.  Re-asserting the
+		# configured pin is the supervisor's job (300s re-pin grace),
+		# not a reason to lie about reality.
+		local _adopted_node _ai _afound=0
+		# Whitespace-tolerant: the current CLI writes "Connected  server="
+		# (two spaces, verified against the live log) but an upstream
+		# format tweak must degrade to "no reconcile", not silent staleness
+		# -- one-or-more spaces keeps both forms parseable.
+		_adopted_node=$(sed -n 's/.*Connected  *server=\(.*\) mode=.*/\1/p' \
+			"$SURFLARE_CLI_LOG" 2>/dev/null | tail -1)
+		if [ -n "$_adopted_node" ] && [ "$_adopted_node" != "$_active_node" ]; then
+			for _ai in "${!NODE_CANDIDATES[@]}"; do
+				if [ "${NODE_CANDIDATES[$_ai]}" = "$_adopted_node" ]; then
+					_afound=1
+					break
+				fi
+			done
+			if [ "$_afound" -eq 1 ]; then
+				log "Adopt reconcile: rotation ${_active_node} -> live session ${_adopted_node} ($((_ai + 1))/${#NODE_CANDIDATES[@]})"
+				_active_node="$_adopted_node"
+				_node_idx=$_ai
+				if ! printf '%s\t%d\n' "$_active_node" "$_node_idx" > "${ROTATION_STATE}.tmp" 2>/dev/null || \
+				   ! mv "${ROTATION_STATE}.tmp" "$ROTATION_STATE" 2>/dev/null; then
+					log "WARN: failed to persist rotation state to $ROTATION_STATE"
+				fi
+			else
+				log "WARN: adopted node '${_adopted_node}' not in NODE_CANDIDATES, keeping restored rotation ${_active_node}"
+			fi
+		fi
 		_start_proxy_log_monitor
 		# Skip nft delete and ip rule del -- proxy needs them intact.
 		# Killswitch is already armed from the previous instance;
@@ -5507,6 +5550,15 @@ FW4_RESTART_COOLDOWN=900      # 15 min, avoid thrashing repeated restarts
 _sync_node_candidates
 _active_node="$NODE"
 _node_idx=0
+# Locate the configured NODE in the catalog so a fileless start (or an
+# invalid saved entry) records the true cursor instead of a default 0
+# that would steer the next rotation from the wrong position.
+for _i in "${!NODE_CANDIDATES[@]}"; do
+	if [ "${NODE_CANDIDATES[$_i]}" = "$NODE" ]; then
+		_node_idx="$_i"
+		break
+	fi
+done
 if [ -f "$ROTATION_STATE" ]; then
 	IFS=$'\t' read -r _saved_node _saved_idx < "$ROTATION_STATE" 2>/dev/null || true
 	if [ -n "$_saved_node" ] && [ -n "$_saved_idx" ]; then
@@ -5525,6 +5577,70 @@ if [ -f "$ROTATION_STATE" ]; then
 			log "Saved node '${_saved_node}' not in NODE_CANDIDATES, starting from ${NODE}"
 		fi
 	fi
+fi
+# A configured dedicated pin (NODE carries the "(ip)" label form) always
+# wins over the saved rotation state: the file records history, the pin
+# is operator intent.  A stale file from a storm era must not steer
+# every future rotation away from the paid exit (2026-08-18 incident:
+# file said Los Angeles from the Aug-16 storm while the live session
+# ran the dedicated IP; the next failure rotated LA->Atlanta and the
+# pin was lost for minutes).
+# Heuristic, NOT full IPv4 validation: a label whose parens hold an
+# IP-ish run (one or more digits, a dot, then digits/dots) is treated
+# as a dedicated-exit pin.  "(1.1)" qualifies on purpose; "(2)",
+# "(1.)", "(backup)" and "()" do not.  The real enforcement is the
+# membership check below -- the override can never dial a node the
+# catalog does not list.  ERE on purpose: bash glob semantics for
+# adjacent bracket expressions differ across bash versions, and this
+# test must behave identically on every bash the watchdog runs on.
+if [[ $NODE =~ \([0-9]+\.[0-9.]+\) ]]; then
+	# Membership and index are recomputed UNCONDITIONALLY: with no
+	# state file _node_idx is still the default 0, and a pin living
+	# at any other index would be persisted with the wrong cursor.
+	_pin_found=0
+	for _i in "${!NODE_CANDIDATES[@]}"; do
+		if [ "${NODE_CANDIDATES[$_i]}" = "$NODE" ]; then
+			_node_idx="$_i"
+			_pin_found=1
+			break
+		fi
+	done
+	if [ "$_pin_found" -eq 1 ]; then
+		if [ "$_active_node" != "$NODE" ]; then
+			log "Pinned dedicated exit overrides saved rotation: ${_active_node} -> ${NODE}"
+		fi
+		_active_node="$NODE"
+	else
+		# Subscription lapse or catalog drift; the unified
+		# membership check below decides what is safe to dial.
+		log "WARN: pinned NODE '${NODE}' not in NODE_CANDIDATES, ignoring pin"
+	fi
+fi
+# Any configured NODE the catalog no longer lists must not be dialed.
+# When a valid state was restored _active_node differs from NODE and
+# this is a no-op; otherwise the unlisted NODE is all we have, so fall
+# back to the first listed candidate.
+if [ "$_active_node" = "$NODE" ] && [ "${#NODE_CANDIDATES[@]}" -gt 0 ]; then
+	_nfound=0
+	for _i in "${!NODE_CANDIDATES[@]}"; do
+		if [ "${NODE_CANDIDATES[$_i]}" = "$NODE" ]; then
+			_nfound=1
+			break
+		fi
+	done
+	if [ "$_nfound" -eq 0 ]; then
+		log "WARN: NODE '${NODE}' not in NODE_CANDIDATES, falling back to ${NODE_CANDIDATES[0]}"
+		_active_node="${NODE_CANDIDATES[0]}"
+		_node_idx=0
+	fi
+fi
+# Persist the startup selection so the file can never again be older
+# than the decision it claims to record.  tmp+mv so a crash mid-write
+# cannot leave a truncated file; a failed write must be loud: a
+# silently stale file is the exact defect this block exists to kill.
+if ! printf '%s\t%d\n' "$_active_node" "$_node_idx" > "${ROTATION_STATE}.tmp" 2>/dev/null || \
+   ! mv "${ROTATION_STATE}.tmp" "$ROTATION_STATE" 2>/dev/null; then
+	log "WARN: failed to persist rotation state to $ROTATION_STATE"
 fi
 _ppid=$(awk '/^PPid/{print $2}' /proc/$$/status 2>/dev/null)
 _parent=$(cat /proc/"${_ppid:-0}"/comm 2>/dev/null || echo "?")
