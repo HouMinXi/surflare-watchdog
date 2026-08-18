@@ -21,6 +21,11 @@ INTERVAL="60s"
 # Without this, sing-box catch-all (rule 10: tproxy-in -> direct) routes
 # them direct -> CN IP exposed or TLS handshake reset on direct route.
 INJECT_DOMAINS="claude.com,grokipedia.com,ipinfo.io,models.dev"
+# Domains pinned to the direct outbound, bypassing the VPN.  Use case:
+# home-hosted services fronted by Cloudflare Tunnel (omni.minxihou.site)
+# -- through the US exit a LAN request crosses the Pacific twice, while
+# direct CF anycast lands on the same PoP cloudflared dials from home.
+DIRECT_DOMAINS="minxihou.site"
 
 # md5-gate: detect and rollback surflare auto-update
 _md5=$(md5sum "$REAL_BIN" 2>/dev/null | cut -d" " -f1)
@@ -59,7 +64,7 @@ cat > "$_tmp"
 cp "$_tmp" /tmp/singbox-config-dump.json
 chmod 600 /tmp/singbox-config-dump.json
 
-if jq --argjson T "$TOLERANCE" --arg I "$INTERVAL" --arg D "$INJECT_DOMAINS" '
+if jq --argjson T "$TOLERANCE" --arg I "$INTERVAL" --arg D "$INJECT_DOMAINS" --arg DD "$DIRECT_DOMAINS" '
   .outbounds |= map(if .type == "urltest" then .tolerance = $T | .interval = $I else . end)
   | .route.rule_set |= map(if .tag == "proxy_rule_set" then .rules |= map(
       if .domain_suffix then
@@ -104,6 +109,28 @@ if jq --argjson T "$TOLERANCE" --arg I "$INTERVAL" --arg D "$INJECT_DOMAINS" '
           .route.default_domain_resolver
           // {"server": "dns-direct"}
         )
+    else . end
+  # DIRECT_DOMAINS: pin domains to the direct outbound.  The rule is
+  # inserted before the FIRST tproxy-in rule, not near the catch-all:
+  # the surflare tproxy rules reference rule_sets whose ip_cidr entries
+  # (Cloudflare ranges included) would otherwise claim these domains
+  # for the VPN before a later rule ever sees them.  Sniffing runs in
+  # rule 0, so the sniffed domain is available at this position.
+  # Entries are stripped of whitespace; empty entries are dropped and
+  # an empty list inserts no rule at all.  Insertion is skipped when
+  # no tproxy-in rule exists, so a surflare config layout change fails
+  # safe (traffic stays on the VPN path).
+  | ($DD | split(",") | map(gsub("[ \t]"; ""))
+      | map(select(length > 0))) as $dd
+  | ([.route.rules | to_entries[]
+      | select(((.value.inbound // [])
+          | if type == "array" then . else [.] end
+          | any(. == "tproxy-in"))) | .key][0]
+     // -1) as $pos
+  | if ($dd | length) > 0 and $pos >= 0 then
+      .route.rules |= (.[0:$pos]
+        + [{domain_suffix: $dd, inbound: "tproxy-in", outbound: "direct"}]
+        + .[$pos:])
     else . end
   # Catch-all leak fix: the last surflare route rule is an explicit
   # {"inbound":"tproxy-in","outbound":"direct"} that catches all
