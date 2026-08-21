@@ -240,19 +240,32 @@ LOGROTATE_CRON="30 4 * * * /usr/sbin/logrotate /etc/logrotate.conf >> /var/log/l
 if [ "$INIT" = "procd" ]; then
     DEADMAN_CRON="* * * * * /etc/init.d/surflare-watchdog deadman"
     # Watchdog-of-watchdog: resurrect dead watchdog if procd gives up.
-    # Checks (in order): stop marker, storm cooldown, pgrep, then starts.
+    # Checks (in order): stop marker, storm cooldown, PID-file liveness,
+    # then starts.
     # Storm cooldown: skip start if /run/surflare_watchdog.storm_cool_until
     # is in the future. Prevents duplicate watchdog during 600s cooldown
     # (kernel log incident: 85332 WARN duplicate during storm cooldown).
     # If watchdog died during cooldown, the file persists but timestamp
     # expires -> cron starts new instance after cooldown ends.
-    # pgrep -f with $ anchor prevents self-matching (cron sh -c cmdline
-    # ends with "start", not surflare_watchdog.sh).
-    # KNOWN LIMITATION: brief restart window (<1s between stop and start)
-    # can cause duplicate if cron fires exactly then; watchdog's own
-    # duplicate detection (storm cooldown sub-loop) handles this case.
+    # PID-file liveness (not bare pgrep): a live PID in
+    # /run/surflare_watchdog.pid that still names surflare_watchdog.sh in
+    # its cmdline means the procd-managed instance is alive and cron must
+    # do nothing. Orphan duplicate instances (PPid=1 strays that keep
+    # pgrep happy while the real watchdog is gone) no longer satisfy the
+    # check, so cron actually resurrects the real service instead of
+    # being fooled by strays -- the 2026-08-21 incident where a stopped
+    # stack was re-launched by cron behind a marker-ignoring respawn
+    # chain started exactly this way.
+    # The grep -v filter in the crontab-merge below matches this line via
+    # the "surflare_watchdog.stopped.*surflare-watchdog start" pattern;
+    # keep that substring present when editing.
     # shellcheck disable=SC2016  # $() intentionally literal for cron runtime evaluation
-    WATCHDOG_RESURRECT_CRON='*/5 * * * * [ -f /run/surflare_watchdog.stopped ] || { [ -f /run/surflare_watchdog.storm_cool_until ] && [ "$(cat /run/surflare_watchdog.storm_cool_until 2>/dev/null)" -gt "$(date +%s)" ] 2>/dev/null; } || pgrep -f "surflare_watchdog\\.sh$" >/dev/null 2>&1 || /etc/init.d/surflare-watchdog start'
+    # Liveness check: whole-argv match on the NUL-split cmdline. grepping
+    # the raw file would substring-match across argv boundaries and also
+    # hit unrelated processes that merely MENTION the watchdog (a
+    # `tail -f .../surflare_watchdog.log`); grep -x on tr-split lines
+    # requires one argv to BE the watchdog script itself.
+    WATCHDOG_RESURRECT_CRON='*/5 * * * * [ -f /run/surflare_watchdog.stopped ] || { [ -f /run/surflare_watchdog.storm_cool_until ] && [ "$(cat /run/surflare_watchdog.storm_cool_until 2>/dev/null)" -gt "$(date +%s)" ] 2>/dev/null; } || { _wp=$(cat /run/surflare_watchdog.pid 2>/dev/null); case "$_wp" in ""|0|*[!0-9]*) logger -t surflare-watchdog "resurrect cron: no valid pidfile, starting watchdog"; timeout 60 /etc/init.d/surflare-watchdog start && logger -t surflare-watchdog "resurrect cron: start ok" || logger -t surflare-watchdog "resurrect cron: start FAILED rc=$?" ;; *) tr "\0" "\n" < "/proc/$_wp/cmdline" 2>/dev/null | grep -qx ".*surflare_watchdog\.sh" || { logger -t surflare-watchdog "resurrect cron: pid $_wp gone, starting watchdog"; timeout 60 /etc/init.d/surflare-watchdog start && logger -t surflare-watchdog "resurrect cron: start ok" || logger -t surflare-watchdog "resurrect cron: start FAILED rc=$?"; } ;; esac; } || true'
 else
     DEADMAN_CRON=""
     WATCHDOG_RESURRECT_CRON=""

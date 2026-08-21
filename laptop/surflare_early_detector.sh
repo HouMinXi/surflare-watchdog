@@ -15,6 +15,7 @@ trap '[[ -n "$_sleep_pid" ]] && kill "$_sleep_pid" 2>/dev/null; exit 0' INT TERM
 # -- Configuration (must match watchdog paths) ------------------------
 readonly WATCHDOG_PID_FILE="/run/surflare_watchdog.pid"
 readonly DETECTOR_ALIVE_FILE="/run/surflare_detector.alive"
+readonly WATCHDOG_STOPPED_FILE="/run/surflare_watchdog.stopped"
 readonly MONITOR_INTERVAL=30     # seconds between ss samples
 readonly DEGRADATION_THRESHOLD=16 # min score to fire USR1 (threshold raised from 8 to reduce false positives on high-latency nodes)
 readonly COOLDOWN=300            # min seconds between USR1 signals; monitoring continues
@@ -141,6 +142,21 @@ last_alert=$(( -COOLDOWN ))
 no_ip_count=0
 
 while true; do
+    # A user-requested stop (init.d stop touches this marker) means the
+    # whole stack -- watchdog included -- must stay down. Keep looping
+    # cheaply so procd still sees a live process (no respawn storm), but
+    # stop touching the heartbeat or signalling: with the watchdog gone,
+    # server_ips empties once the stop teardown clears the killswitch set
+    # (a crash that skips teardown may leave stale IPs -- the guard idles
+    # correctly either way), and the alive file going stale is the
+    # intended signal that early detection is inactive.
+    if [[ -f "$WATCHDOG_STOPPED_FILE" ]]; then
+        sleep "$MONITOR_INTERVAL" & _sleep_pid=$!
+        wait "$_sleep_pid"
+        _sleep_pid=""
+        continue
+    fi
+
     # Heartbeat: the watchdog checks this file's mtime each cycle.
     # If stale by more than 75s it logs a warning that early detection is inactive.
     touch "$DETECTOR_ALIVE_FILE" 2>/dev/null || true
