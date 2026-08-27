@@ -20,7 +20,7 @@ INTERVAL="60s"
 # Domains missing from surflare's proxy_rule_set that must go through VPN.
 # Without this, sing-box catch-all (rule 10: tproxy-in -> direct) routes
 # them direct -> CN IP exposed or TLS handshake reset on direct route.
-INJECT_DOMAINS="claude.com,grokipedia.com,ipinfo.io,models.dev"
+INJECT_DOMAINS="claude.com,claude.ai,google.com,gemini.google.com,grokipedia.com,ipinfo.io,models.dev"
 # Domains pinned to the direct outbound, bypassing the VPN.  Use case:
 # home-hosted services fronted by Cloudflare Tunnel (omni.minxihou.site)
 # -- through the US exit a LAN request crosses the Pacific twice, while

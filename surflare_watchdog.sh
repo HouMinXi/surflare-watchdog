@@ -2943,12 +2943,25 @@ check_vpn_health() {
 		fi
 
 		# Check country probes (Cloudflare domain, Cloudflare IP, ifconfig.co)
+		# A CN verdict here is ambiguous: during reconnect windows (tombstone
+		# active, tproxy half-dismantled) these probes leak direct and report
+		# the ISP's own country even when the tunnel is alive.  Defer CN like
+		# the IP probes below: record it as a candidate, keep polling for a
+		# non-CN answer; only confirm CN at deadline (same semantics as
+		# _cn_candidate below).  Any non-CN country wins immediately.
 		local r_country
 		for tmp_file in "$tmp_cf" "$tmp_cf2" "$tmp_ifc"; do
 			r_country=$(cat "$tmp_file" 2>/dev/null)
 			if [[ "$r_country" =~ ^[A-Z]{2}$ ]]; then
-				result="$r_country"
-				break 2  # break out of both for and while
+				if [ "$r_country" = "CN" ]; then
+					if [ -z "$_cn_candidate" ]; then
+						_cn_candidate="CN"
+						_cn_wait_start=$SECONDS
+					fi
+				else
+					result="$r_country"
+					break 2  # break out of both for and while
+				fi
 			fi
 		done
 
@@ -3000,10 +3013,24 @@ check_vpn_health() {
 			break
 		fi
 
-		# CN deferred: if we have a CN candidate and waited 3s, confirm it
+		# CN deferred: confirm only after the settle window AND once
+		# the google witness has finished (or if google probe process exited).
+		# Leaked CN answers land in ~0.3s while a healthy-tunnel google needs
+		# 1-3s; confirming CN while google is still in flight kills a
+		# slow-but-alive tunnel's testimony.  tmp_gt receives the curl timing
+		# line when google finishes; ! kill -0 pid_g guards against SIGKILL/hang.
+		# pid_g guard: a failed probe spawn leaves it empty and `kill -0 ""`
+		# errors (inverted to true), which would confirm CN with no witness.
 		if [ -n "$_cn_candidate" ] && [ $((SECONDS - _cn_wait_start)) -ge 3 ]; then
-			result="$_cn_candidate"
-			break
+			if [ -s "$tmp_gt" ]; then
+				log "CN deferred confirmed: google witness finished (timing on record)"
+				result="$_cn_candidate"
+				break
+			elif [ -n "$pid_g" ] && ! kill -0 "$pid_g" 2>/dev/null; then
+				log "CN deferred confirmed: google probe exited without timing (check OOM/kill)"
+				result="$_cn_candidate"
+				break
+			fi
 		fi
 
 		# Check if all probes have already exited (no point polling further)
@@ -3041,11 +3068,16 @@ check_vpn_health() {
 		if [ -z "$result" ]; then
 			for tmp_file in "$tmp_cf" "$tmp_cf2" "$tmp_ifc"; do
 				r_country=$(cat "$tmp_file" 2>/dev/null)
-				if [[ "$r_country" =~ ^[A-Z]{2}$ ]]; then
+				if [[ "$r_country" =~ ^[A-Z]{2}$ ]] && [ "$r_country" != "CN" ]; then
 					result="$r_country"
 					break
 				fi
 			done
+			# Deferred CN from the polling loop wins only if no non-CN answer
+			# landed anywhere (same precedence as the loop itself).
+			if [ -z "$result" ] && [ -n "$_cn_candidate" ]; then
+				result="$_cn_candidate"
+			fi
 		fi
 		if [ -z "$result" ]; then
 			for tmp_file in "$tmp_ich" "$tmp_myip"; do
