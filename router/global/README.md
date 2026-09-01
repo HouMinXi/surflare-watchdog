@@ -120,7 +120,7 @@ LAN device (TCP/QUIC/DNS)
 |  bypass_src? ---------> accept
 |  lan_ranges? ---------> accept
 |  NTP UDP/123? --------> accept
-|  non-UDP? log "ks-fwd-mon:" (5/s)
+|  TCP? log "ks-fwd-mon:" (5/s; ICMP/UDP silent)
 |  IPv6: reject icmpv6
 |  IPv4: reject icmp
 +-----------------------------+
@@ -207,8 +207,9 @@ In rule mode, `bypass_devices` is empty (code guard skips population).
 - LAN CN traffic: continues via killswitch forward `bypass_ipv4`.
 - Non-CN UDP (router + LAN): silently **REJECT**ed (tproxy is TCP-only,
   so non-CN UDP has no VPN path -- killswitch blocks it by design).
-- Non-CN non-UDP reaching killswitch: logged via `ks-fwd-mon` before
+- Non-CN TCP reaching killswitch: logged via `ks-fwd-mon` before
   reject -- this means TCP escaped tproxy, worth investigating.
+  ICMP is rejected silently (Tailscale DERP pings have no VPN path).
 
 ## Configuration
 

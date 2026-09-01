@@ -1794,10 +1794,13 @@ table inet killswitch {
 		# NTP: basic utility, no privacy data, devices need accurate time
 		# for TLS certificate validation.
 		iifname "br-lan" udp dport 123 accept
-		# Only log non-UDP.  Non-CN UDP is correctly blocked here (tproxy
-		# is TCP-only); logging it flooded the 601-line dmesg ring buffer.
-		# TCP here means it escaped tproxy -- worth investigating.
-		iifname "br-lan" meta l4proto != udp limit rate 5/second burst 10 packets log prefix "ks-fwd-mon: "
+		# Only log TCP.  Non-CN UDP is correctly blocked here (tproxy
+		# is TCP-only); logging it flooded dmesg (1994049).  ICMP echo
+		# from LAN (Tailscale DERP probes on z66) is likewise correctly
+		# rejected -- tproxy cannot carry ICMP -- but logging it at 5/s
+		# filled the ring buffer the same way.  TCP here still means
+		# tproxy miss.
+		iifname "br-lan" meta l4proto tcp limit rate 5/second burst 10 packets log prefix "ks-fwd-mon: "
 		iifname "br-lan" meta nfproto ipv6 reject with icmpv6 addr-unreachable
 		iifname "br-lan" reject with icmp host-unreachable
 	}
