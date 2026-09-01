@@ -1709,6 +1709,18 @@ table inet killswitch {
 	# Their non-CN traffic is forwarded directly; no log noise needed.
 	set bypass_src  { type ipv4_addr; }
 	set bypass_src6 { type ipv6_addr; }
+	# derp_asia: Tailscale DERP nodes (sin/tok/hkg) that z66 reaches
+	# ISP-direct.  Paired with the same-named set in sw_lan_tproxy
+	# (surflare-lan-tproxy.nft), which exempts this traffic from tproxy
+	# so tailscaled's DERP region selection measures the CN path.
+	# User-adjudicated 2026-09-01 (project memory 56, branch A).
+	set derp_asia {
+		type ipv4_addr
+		elements = { 103.6.84.152, 172.237.28.183, 172.237.66.30,
+			172.237.72.8, 172.237.72.43, 172.237.72.79,
+			172.238.6.34, 172.238.6.179, 172.238.6.180,
+			205.147.105.30, 205.147.105.78 }
+	}
 	# CN domain nftset: SmartDNS adds resolved IPs when a CN domain
 	# resolves to a non-CN CDN IP (Cloudflare/Akamai/etc).  Allows
 	# LAN devices to reach CN content on foreign CDN directly without
@@ -1787,6 +1799,12 @@ table inet killswitch {
 		iifname "br-lan" ip6 daddr @cn6_domain_ips accept
 		iifname "br-lan" ip saddr @bypass_src accept
 		iifname "br-lan" ip6 saddr @bypass_src6 accept
+		# z66 Tailscale underlay, outbound-only (memory 56 branch A,
+		# adjudicated 2026-09-01): WireGuard peer UDP 41641 + DERP Asia
+		# (relay TCP/443, STUN UDP/3478).  No listener is exposed;
+		# return traffic matches ct state established,related above.
+		iifname "br-lan" ip saddr 192.168.100.12 udp dport 41641 accept
+		iifname "br-lan" ip saddr 192.168.100.12 ip daddr @derp_asia accept
 		# Private destinations from LAN (carrier IPs, app-internal VPNs)
 		# are not external leaks; accept like the output chain does.
 		iifname "br-lan" ip daddr @lan_ranges accept
