@@ -599,12 +599,14 @@ SURFLARE_CLI_LOG="/var/log/surflare/surflare.log"
 PROXY_LOG_RATE_SEC=60
 PROXY_ERR_STATE="/run/surflare_proxy_err_count"
 PROXY_ERR_THRESHOLD=10  # higher than 503's 5: general errors are noisier
+PROXY_LOG_LOGGER_TIMEOUT=1
+AUTH_EXPIRED_FILE="/run/surflare_auth_expired"
 
 _start_proxy_log_monitor() {
 	_stop_proxy_log_monitor
 	[ -f "$PROXY_LOG" ] || return 0
 	# Background: tail new lines, forward ERRORs to logger.
-	# Rate-limited: after forwarding one ERROR, sleep before the next.
+	# Reader keeps consuming; only syslog output is rate-limited.
 	# urltest: sing-box subscription auto-rotation (picks best node); NOT watchdog deploy count
 	# urltest 503: accumulate count + timestamps into STORM_503_STATE
 	# (ADR-0001 evidence channel).  USR1 fires at every 5th 503 to
@@ -614,6 +616,7 @@ _start_proxy_log_monitor() {
 	(   _503_count=0
 	    _503_first=0
 	    _err_count=0
+	    _last_proxy_log_emit=0
 	    tail -n 0 -F "$PROXY_LOG" 2>/dev/null | while IFS= read -r _line; do
 			echo "$_line" | grep -q 'ERROR' || continue
 			if echo "$_line" | grep -q 'urltest.*503'; then
@@ -624,14 +627,15 @@ _start_proxy_log_monitor() {
 					> "${STORM_503_STATE}.tmp" && \
 					mv "${STORM_503_STATE}.tmp" "$STORM_503_STATE" 2>/dev/null
 				if [ $((_503_count % 5)) -eq 0 ]; then
-					logger -t surflare-proxy \
-						"503 storm: ${_503_count} urltest 503 since ${_503_first}, requesting health check"
+					timeout "$PROXY_LOG_LOGGER_TIMEOUT" logger -t surflare-proxy \
+						"503 storm: ${_503_count} urltest 503 since ${_503_first}, requesting health check" \
+						|| true
 					kill -USR1 $$ 2>/dev/null || true
 				fi
 				continue
 			elif echo "$_line" | grep -qi "authentication required"; then
-				if [ ! -f /run/surflare_auth_expired ]; then
-					touch /run/surflare_auth_expired
+				if [ ! -f "$AUTH_EXPIRED_FILE" ]; then
+					touch "$AUTH_EXPIRED_FILE"
 					kill -USR1 $$ 2>/dev/null || true
 				fi
 				continue
@@ -643,8 +647,25 @@ _start_proxy_log_monitor() {
 			if [ $((_err_count % PROXY_ERR_THRESHOLD)) -eq 0 ]; then
 				kill -USR1 $$ 2>/dev/null || true
 			fi
-			logger -t surflare-proxy "$_line"
-			sleep "$PROXY_LOG_RATE_SEC"
+			# Keep consuming errors while limiting only their syslog output.
+			# A negative delta means the wall clock moved backwards: rebase
+			# the window silently to the new now.  Emitting on rollback
+			# would let NTP jitter oscillations spam syslog; the cost of
+			# silence is at most one rate window (60s).
+			_now=$(date +%s)
+			_diff=$((_now - _last_proxy_log_emit))
+			if [ "$_diff" -lt 0 ]; then
+				_last_proxy_log_emit=$_now
+				_diff=0
+			fi
+			if [ "$_diff" -ge "$PROXY_LOG_RATE_SEC" ]; then
+				# Every attempt (success or failure) advances the window:
+				# a dead syslog endpoint must not serialize ERRORs behind
+				# a 1s timeout, and a healthy one stays rate-limited.
+				_last_proxy_log_emit=$_now
+				timeout "$PROXY_LOG_LOGGER_TIMEOUT" logger -t surflare-proxy "$_line" \
+					|| true
+			fi
 		done
 	) 9>&- 200>&- &
 	_proxy_log_pid=$!
@@ -4907,10 +4928,10 @@ connect_vpn() {
 		# Auth expired flag: proxy log detected "authentication required".
 		# Forces _need_auth=1 even if surflare status reports OK.
 		# Flag cleared HERE (single clear point, no race with main loop).
-		if [ -f /run/surflare_auth_expired ]; then
+		if [ -f "$AUTH_EXPIRED_FILE" ]; then
 			log "connect_vpn: auth expired (proxy reported authentication required)"
 			_need_auth=1
-			rm -f /run/surflare_auth_expired
+			rm -f "$AUTH_EXPIRED_FILE"
 		fi
 		# Check subscription first (do NOT refresh, just log)
 		if echo "$_auth_status" | grep -qiE "subscription.*not active|not active.*subscription"; then
@@ -6316,7 +6337,7 @@ while true; do
 	# Do NOT reset _auth_expired_this_cycle here -- the diagnosis engine
 	# needs to see it if health is still bad after the refresh attempt.
 	# The variable is re-initialized to 0 at the top of each loop iteration.
-	if [ -f /run/surflare_auth_expired ]; then
+	if [ -f "$AUTH_EXPIRED_FILE" ]; then
 		_auth_expired_this_cycle=1
 		log "Auth expired signal detected, forcing reconnect with auth refresh"
 		connect_vpn
