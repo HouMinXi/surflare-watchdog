@@ -132,14 +132,17 @@ if jq --argjson T "$TOLERANCE" --arg I "$INTERVAL" --arg D "$INJECT_DOMAINS" --a
         + [{domain_suffix: $dd, inbound: "tproxy-in", outbound: "direct"}]
         + .[$pos:])
     else . end
-  # Catch-all leak fix: the last surflare route rule is an explicit
-  # {"inbound":"tproxy-in","outbound":"direct"} that catches all
-  # tproxy traffic earlier rules miss, including connections whose
-  # domain sniff cannot parse (TLS ECH encrypts the SNI) and clients
-  # whose DNS bypasses port-53 hijack (Go resolver, DoH).  Route
-  # those to VPN instead of direct so GFW-blocked destinations reach
-  # the proxy.  Falls back to direct if no VPN outbound found.
-  | ([.outbounds[] | select(.tag|startswith("mh_via_auto_to_"))][0].tag // "direct") as $vpn
+  # Find the active VPN urltest by type, not by a historical tag prefix.
+  # Transit-pinned sessions use tags such as mh_via_Washington_to_Atlanta;
+  # prefix-matching mh_via_auto_to silently fell back to direct and reopened
+  # the catch-all leak whenever TRANSIT was pinned.  udp_ exclusion skips
+  # the UDP-over-socks helper groups.  If no urltest survives the filter,
+  # log loudly and keep the direct fallback (traffic must not blackhole).
+  | ([.outbounds[] | select(.type == "urltest" and ((.tag | startswith("udp_")) | not))][0].tag // "direct") as $vpn
+  | . as $cfg
+  | if $vpn == "direct" then
+      "surflare-proxy wrapper: WARN no urltest outbound found, catch-all stays direct (config layout changed?)" | stderr | $cfg
+    else $cfg end
   | .route.rules[-1].outbound = $vpn
   | .route.final = $vpn
 ' < "$_tmp" > "$_patched"; then
@@ -148,6 +151,16 @@ if jq --argjson T "$TOLERANCE" --arg I "$INTERVAL" --arg D "$INJECT_DOMAINS" --a
 	# Overwritten on each proxy restart.  chmod 600: contains server IPs.
 	# Failure is non-fatal -- proxy must not break if /tmp is unwritable.
 	( umask 077; cp "$_patched" /tmp/singbox-config-patched.json; chmod 600 /tmp/singbox-config-patched.json ) 2>/dev/null || true
+	# The in-filter jq `stderr` line lands on our stderr (journal);
+	# mirror it to syslog so the silent-direct-fallback regression is
+	# visible in logread without scraping daemon output.  Check the
+	# OUTCOME (.route.final == "direct"), not the selection mechanism --
+	# duplicating the selector here would drift when the filter changes.
+	# Bounded like every watchdog logger call: a hung syslog daemon must
+	# not block exec of the real proxy binary.
+	if jq -e '.route.final == "direct"' "$_patched" >/dev/null 2>&1; then
+		timeout 5 logger -t surflare-proxy "wrapper: no urltest outbound found, catch-all stays direct" 2>/dev/null || true
+	fi
 	exec < "$_patched"
 	rm -f "$_tmp" "$_patched"
 	exec "$REAL_BIN" "$@"

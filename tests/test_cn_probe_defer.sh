@@ -212,17 +212,47 @@ case "$out" in
     *)         bad T6 "unexpected: $out" ;;
 esac
 
-# T7 regression: the full watchdog still parses and the wrapper carries
-# the four user-facing domains.
+# T7 regression: the full watchdog parses, the wrapper carries the
+# user-facing domains, and transit-pinned configs select their urltest
+# outbound instead of silently falling back to direct.
 _wrapper_domains=$(grep -m1 '^INJECT_DOMAINS=' scripts/surflare-proxy-wrapper.sh | cut -d'"' -f2)
+# Extract the wrapper's jq filter verbatim (between the single-quoted
+# invocation and the redirect) and its --arg values, so the test exercises
+# the exact deployed filter rather than a re-typed copy.
+_filter_start=$(grep -n "^if jq --argjson" scripts/surflare-proxy-wrapper.sh | head -1 | cut -d: -f1)
+_filter_end=$(grep -n "^' < \"\$_tmp\" > \"\$_patched\"; then$" scripts/surflare-proxy-wrapper.sh | head -1 | cut -d: -f1)
+_T=$(grep -m1 '^TOLERANCE=' scripts/surflare-proxy-wrapper.sh | cut -d= -f2)
+_I=$(grep -m1 '^INTERVAL=' scripts/surflare-proxy-wrapper.sh | cut -d'"' -f2)
+_DD=$(grep -m1 '^DIRECT_DOMAINS=' scripts/surflare-proxy-wrapper.sh | cut -d'"' -f2)
+_patched=$(mktemp)
+if [ -n "$_filter_start" ] && [ -n "$_filter_end" ] && [ "$_filter_end" -gt "$_filter_start" ]; then
+    _span=$((_filter_end - _filter_start - 1))
+    if [ "$_span" -lt 20 ] || [ "$_span" -gt 200 ]; then
+        _vpn_tag="extract-suspicious-span=$_span"
+    else
+        sed -n "$((_filter_start + 1)),$((_filter_end - 1))p" scripts/surflare-proxy-wrapper.sh > "$_patched.jq"
+        jq --argjson T "$_T" --arg I "$_I" --arg D "$_wrapper_domains" --arg DD "$_DD" \
+            -f "$_patched.jq" \
+            < tests/fixtures/singbox-transit-pinned.json > "$_patched" 2>/dev/null
+        _vpn_tag=$(jq -r '[.outbounds[] | select(.type == "urltest")][0].tag // "direct"' "$_patched" 2>/dev/null)
+        _final=$(jq -r '.route.final' "$_patched" 2>/dev/null)
+        _catchall=$(jq -r '.route.rules[-1].outbound' "$_patched" 2>/dev/null)
+    fi
+else
+    _vpn_tag="extract-failed" _final="" _catchall=""
+fi
 if bash -n "$WATCHDOG" \
    && grep -q 'claude.ai' <<<"$_wrapper_domains" \
    && grep -q 'google.com' <<<"$_wrapper_domains" \
-   && grep -q 'gemini.google.com' <<<"$_wrapper_domains"; then
-    ok "T7 wrapper domains + watchdog syntax"
+   && grep -q 'gemini.google.com' <<<"$_wrapper_domains" \
+   && [ "$_vpn_tag" != "direct" ] \
+   && [ "$_final" = "$_vpn_tag" ] \
+   && [ "$_catchall" = "$_vpn_tag" ]; then
+    ok "T7 wrapper domains + pinned-transit VPN catch-all + watchdog syntax"
 else
-    bad T7 "wrapper domains missing or watchdog syntax error"
+    bad T7 "wrapper contract failed: vpn=$_vpn_tag final=$_final catchall=$_catchall"
 fi
+rm -f "$_patched" "$_patched.jq"
 
 echo
 echo "RESULT: pass=$PASS fail=$FAIL"

@@ -117,10 +117,12 @@ LAN device (TCP/QUIC/DNS)
 |  established/related accept |    +-> ALL: VPN tunnel
 |  server_ips? ---------> accept       (no CN split at proxy)
 |  bypass_ipv4 (CN)? ---> accept
-|  bypass_src? ---------> accept
-|  lan_ranges? ---------> accept
+||  bypass_src? ---------> accept
+||  z66 UDP/41641? ------> accept  (Tailscale WG underlay, memory 56)
+||  z66 -> derp_asia? ---> accept  (DERP relay TCP/443 + STUN UDP/3478)
+||  lan_ranges? ---------> accept
 |  NTP UDP/123? --------> accept
-|  non-UDP? log "ks-fwd-mon:" (5/s)
+|  TCP? log "ks-fwd-mon:" (5/s; ICMP/UDP silent)
 |  IPv6: reject icmpv6
 |  IPv4: reject icmp
 +-----------------------------+
@@ -201,14 +203,23 @@ bypassed devices have NO VPN protection for non-CN traffic.**
 
 In rule mode, `bypass_devices` is empty (code guard skips population).
 
+`derp_asia` (Tailscale DERP sin/tok/hkg node IPs) is returned to the WAN
+before the tproxy rules for z66 (192.168.100.12) only, so z66's
+tailscaled measures and reaches Asia DERP over the ISP path instead of
+hairpinning through the US VPN exit.  The killswitch forward chain
+carries a same-named set accepting this traffic plus z66's WireGuard
+UDP/41641, outbound-only.  User-adjudicated 2026-09-01 (project memory
+56 branch A).
+
 ## VPN Downtime Behavior
 
 - Router's own CN traffic: continues via `bypass_ipv4` (direct ISP route).
 - LAN CN traffic: continues via killswitch forward `bypass_ipv4`.
 - Non-CN UDP (router + LAN): silently **REJECT**ed (tproxy is TCP-only,
   so non-CN UDP has no VPN path -- killswitch blocks it by design).
-- Non-CN non-UDP reaching killswitch: logged via `ks-fwd-mon` before
+- Non-CN TCP reaching killswitch: logged via `ks-fwd-mon` before
   reject -- this means TCP escaped tproxy, worth investigating.
+  ICMP is rejected silently (Tailscale DERP pings have no VPN path).
 
 ## Configuration
 

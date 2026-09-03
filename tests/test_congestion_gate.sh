@@ -3,6 +3,9 @@
 # _line_congested and the main-loop PROXY_BROKEN branch are EXTRACTED
 # from the real watchdog script so a pass proves the production logic,
 # not a copy.
+#
+# shellcheck disable=SC2015  # ok()/bad() always return 0: A && ok || bad is exact if/else here
+# shellcheck disable=SC2016  # single-quoted child-shell stubs keep $ expansions literal on purpose
 
 set -u
 cd "$(dirname "$0")/.." || exit 1

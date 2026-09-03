@@ -2,9 +2,11 @@
 # Tests for the dedicated-IP support in _sync_node_candidates.
 # The python parser is EXTRACTED from the real watchdog script (not copied)
 # so a passing test proves the production parser, not a drifted duplicate.
+#
+# shellcheck disable=SC2015  # ok()/bad() always return 0: A && ok || bad is exact if/else here
 
 set -u
-cd "$(dirname "$BASH_SOURCE")/.."
+cd "$(dirname "${BASH_SOURCE[0]}")/.." || exit 1
 WATCHDOG=surflare_watchdog.sh
 PASS=0; FAIL=0
 ok()  { PASS=$((PASS+1)); echo "  PASS: $1"; }

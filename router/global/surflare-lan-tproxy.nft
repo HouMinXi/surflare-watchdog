@@ -48,6 +48,23 @@ table inet sw_lan_tproxy {
         timeout 1h;
     }
 
+    # Tailscale DERP Asia (sin/hkg/tok): z66 (192.168.100.12) DERP
+    # relay/control TCP goes ISP-direct so tailscaled's region selection
+    # measures the CN path instead of the US VPN exit (which made sfo win
+    # and forced a 300-430ms relay for yinhe's RDP).  z66-only, outbound;
+    # return traffic rides conntrack.  User-adjudicated 2026-09-01
+    # (project memory 56, branch A).  Paired with a same-named set in the
+    # killswitch forward chain that accepts this traffic WAN-direct.
+    # Source: controlplane.tailscale.com/derpmap/default regions
+    # 3 (sin) / 7 (tok) / 20 (hkg); refresh if Tailscale rotates nodes.
+    set derp_asia {
+        type ipv4_addr;
+        elements = { 103.6.84.152, 172.237.28.183, 172.237.66.30,
+                     172.237.72.8, 172.237.72.43, 172.237.72.79,
+                     172.238.6.34, 172.238.6.179, 172.238.6.180,
+                     205.147.105.30, 205.147.105.78 }
+    }
+
     chain prerouting {
         type filter hook prerouting priority mangle - 10; policy accept;
 
@@ -78,6 +95,9 @@ table inet sw_lan_tproxy {
         # Catches CN content served through non-CN CDN (Cloudflare/Akamai).
         iifname "br-lan" ip daddr @cn_domain_ips return
         iifname "br-lan" ip6 daddr @cn6_domain_ips return
+
+        # Tailscale DERP Asia bypass (z66 only; see derp_asia set comment).
+        iifname "br-lan" ip saddr 192.168.100.12 ip daddr @derp_asia return
 
         # AnyConnect DTLS detection: UDP/443 with DTLS 1.2 version (0xFEFD).
         # Every DTLS 1.2 record carries 0xFEFD at byte 1-2 (protocol version),
