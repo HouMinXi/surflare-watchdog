@@ -6438,14 +6438,11 @@ while true; do
 			# addressing the layer that failed.
 			_hold_exit_node=1
 		fi
-		# Storm hold: the diagnosis engine itself labels 503 storms
-		# "Backend issue" -- a reconnect renegotiates relay endpoints,
-		# which cannot fix backend-side failures, and each teardown
-		# kills CN-direct LAN flows.  The yinhe control (client-only,
-		# no watchdog) rides identical storms out via urltest
-		# fast-recover with zero disconnects.  Hold while the storm is
-		# live, bounded by STORM_503_HOLD_MAX so a wedged proxy still
-		# gets exactly one reconnect attempt per window.
+		# urltest probe 503s (STORM_503_STATE) are not user-path death.
+		# LAN tproxy flows (ct mark 0x100) keep forwarding on the same
+		# relay socket while urltest redials 1.1.1.1 and gets 503.
+		# Do not skip reconnect on that counter; PROXY_BROKEN_GRACE
+		# still confirms a real PROXY_BROKEN (tproxy-axis) verdict.
 		if [ "${_skip_reconnect_this_cycle:-0}" -ne 1 ]; then
 			_storm_count=0 _storm_last=0
 			if [ -f "$STORM_503_STATE" ]; then
@@ -6457,29 +6454,9 @@ while true; do
 			_now_storm=$(date +%s)
 			if [ "$_storm_count" -gt 0 ] && \
 			   [ $((_now_storm - _storm_last)) -le "$STORM_503_RECENT" ]; then
-				if [ "${_storm_hold_active:-0}" -eq 0 ]; then
-					_storm_hold_active=1
-					_storm_hold_since=$_now_storm
-					log "503 storm live (count=${_storm_count}): reconnect held -- backend storms pass without one"
-					_send_alert "Backend 503 storm, VPN reconnect held" "" "yes" "congestion"
-				fi
-				if [ $((_now_storm - ${_storm_hold_since:-0})) -lt "$STORM_503_HOLD_MAX" ]; then
-					_export_diag_state "BACKEND_503_HOLD"
-					# relay-layer failure evidence: a reconnect, when
-					# it eventually fires, must not rotate the exit
-					_hold_exit_node=1
-					_skip_reconnect_this_cycle=1
-				else
-					log "503 storm held ${STORM_503_HOLD_MAX}s and proxy still broken: reconnecting anyway"
-					_storm_hold_active=0
-					# hold expired on stale evidence: rotation logic
-					# must see fresh conditions, same as congestion
-					_hold_exit_node=0
-				fi
-			elif [ "${_storm_hold_active:-0}" -eq 1 ]; then
-				_storm_hold_active=0
-				log "503 storm quieted: reconnect logic resumed"
+				log "urltest 503 noise (count=${_storm_count}): not holding reconnect"
 			fi
+			_storm_hold_active=0
 		fi
 		if [ "${_skip_reconnect_this_cycle:-0}" -ne 1 ]; then
 			# Grace window: a single-cycle PROXY_BROKEN verdict is

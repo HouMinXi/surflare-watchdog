@@ -77,29 +77,26 @@ run_branch() {
 NOW=$(date +%s)
 STORM_F=$(mktemp /tmp/fd_storm_XXXXXX)
 
-echo "T1: live storm, first sighting -> hold announced, reconnect suppressed"
+echo "T1: urltest storm file must NOT announce storm-live; grace absorbs"
 printf '5 1600000000 %s\n' "$NOW" > "$STORM_F"
 OUT=$(STORM_FILE=$STORM_F run_branch)
-# fail_count unchanged (1), relay-evidence hold raised (1), skip=1,
-# storm-live marker=1; grace never reached (g=0), no quieted log
-[ "$OUT" = "1 1 1 1 0 0" ] && ok "storm first-seen -> held" || bad "T1 wrong: $OUT"
+# fail_count 1, hold_exit 1 (PROXY_BROKEN always pins exit), skip=1
+# from grace first-seen; s=0 (no storm-live); g=1; q=0
+[ "$OUT" = "1 1 1 0 1 0" ] && ok "urltest storm -> grace, no storm-live" || bad "T1 wrong: $OUT"
 
-echo "T2: live storm, hold already active and fresh -> still suppressed"
+echo "T2: STORM_ACTIVE seed + fresh file still no storm-live"
 OUT=$(STORM_FILE=$STORM_F STORM_ACTIVE=1 STORM_SINCE=$NOW run_branch)
-[ "$OUT" = "1 1 1 0 0 0" ] && ok "storm persist -> held, no re-announce" || bad "T2 wrong: $OUT"
+[ "$OUT" = "1 1 1 0 1 0" ] && ok "active-seed -> grace, no storm-live" || bad "T2 wrong: $OUT"
 
-echo "T3: live storm but hold expired -> reconnect fires this cycle"
-# after storm-hold expiry the grace runs: seed it expired (command
-# prefix, NOT a plain assignment -- a bare PB_GRACE=x OUT=$(...) line
-# would persist PB_GRACE into the test shell and poison later tests)
+echo "T3: expired grace + storm file -> reconnect (hold_exit stays 1)"
+# prefix assignment: a bare PB_GRACE=x OUT=$(...) would persist into later tests
 OUT=$(PB_GRACE=$((NOW - 99999)) STORM_FILE=$STORM_F STORM_ACTIVE=1 STORM_SINCE=$((NOW - 99999)) run_branch)
-[ "$OUT" = "4 0 0 0 0 0" ] && ok "storm hold expired -> reconnect (grace also expired)" || bad "T3 wrong: $OUT"
+[ "$OUT" = "4 1 0 0 0 0" ] && ok "expired grace reconnects despite storm file" || bad "T3 wrong: $OUT"
 
-echo "T4: storm quieted (last 503 old) -> hold released with log, grace absorbs"
+echo "T4: stale last-epoch storm file -> same as no-storm, grace first-seen"
 printf '5 1600000000 %s\n' "$((NOW - 3600))" > "$STORM_F"
 OUT=$(STORM_FILE=$STORM_F STORM_ACTIVE=1 STORM_SINCE=$NOW run_branch)
-# quieted log fires (q=1), then grace first-seen holds (g=1, skip=1)
-[ "$OUT" = "1 1 1 0 1 1" ] && ok "storm quieted -> release + grace holds" || bad "T4 wrong: $OUT"
+[ "$OUT" = "1 1 1 0 1 0" ] && ok "stale storm file -> grace, no quieted/storm-live" || bad "T4 wrong: $OUT"
 rm -f "$STORM_F"
 
 echo "T5: no storm file, grace first sighting -> hold + first-seen log"
@@ -115,15 +112,23 @@ echo "T7: grace expired, no storm -> reconnect fires"
 OUT=$(PB_GRACE=$((NOW - 99999)) run_branch)
 [ "$OUT" = "4 1 0 0 0 0" ] && ok "grace expired -> reconnect" || bad "T7 wrong: $OUT"
 
-echo "T8: bug-inject -- disabling the storm gate must flip T1"
+echo "T8: bug-inject -- restoring skip on urltest 503 must flip T1"
 INJ=$(mktemp /tmp/fd_inj_XXXXXX)
-sed 's/\[ "\$_storm_count" -gt 0 \]/[ 0 -gt 0 ]/' "$WATCHDOG" > "$INJ"
+python3 - "$WATCHDOG" "$INJ" << 'PYEOF'
+import sys
+src, dst = sys.argv[1], sys.argv[2]
+s = open(src).read()
+old = '\t\t\t\tlog "urltest 503 noise (count=${_storm_count}): not holding reconnect"'
+new = '''\t\t\t\tlog "503 storm live (count=${_storm_count}): reconnect held -- backend storms pass without one"
+\t\t\t\t_skip_reconnect_this_cycle=1'''
+assert old in s, "noise-log anchor missing"
+open(dst, 'w').write(s.replace(old, new, 1))
+PYEOF
 STORM_F2=$(mktemp /tmp/fd_storm2_XXXXXX)
 printf '5 1600000000 %s\n' "$NOW" > "$STORM_F2"
 OUT=$(PB_GRACE=0 STORM_FILE=$STORM_F2 run_branch "$INJ")
-# gate dead -> falls to grace first-seen which still holds (g=1) --
-# the distinguishing marker is s=0 (no storm-live announcement)
-[ "$OUT" = "1 1 1 0 1 0" ] && ok "storm gate disabled -> no storm marker (caught)" || bad "T8 NOT caught: $OUT"
+# skip restored -> storm-live, grace never reached
+[ "$OUT" = "1 1 1 1 0 0" ] && ok "skip restored on urltest 503 -> storm-live (caught)" || bad "T8 NOT caught: $OUT"
 rm -f "$INJ" "$STORM_F2"
 
 echo "T9: bug-inject -- deleting the grace first-seen hold must flip T5"
