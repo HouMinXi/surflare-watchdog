@@ -3186,18 +3186,17 @@ check_vpn_health() {
 	# Only override when proxy probe actually finished (non-empty output).
 	# An empty tmp_proxy means the probe was killed before completing (early
 	# exit from polling loop) -- not evidence of tunnel failure.
-	# Probe 7 tests a single target (gstatic.com/generate_204). CDN PoP
-	# routing issues (#19) can make this target unreachable from a specific
-	# exit node while the proxy itself works fine. Confirm with
-	# _check_tunnel_egress (3 targets x 2 retries) before committing to
-	# PROXY_BROKEN -- eliminates CDN-specific false positives that caused
-	# cascade reconnects (Chicago 54s -> Atlanta 58s pattern, 2026-06-30).
+	# Probe 7 tests a single target (gstatic.com/generate_204).
+	# Probe 7 / N100 egress curl test the router's own OUTPUT path,
+	# not LAN tproxy (ct mark 0x100).  A miss here while LAN flows
+	# still forward is the 2026-09-04 pattern: log it, do not flip
+	# the verdict.  User-path death is tproxy 503 below.
 	if [ -n "$result" ] && [ "$result" != "TCP_BLOCK" ] && [ "$result" != "LOCAL_FAIL" ]; then
 		local r_proxy
 		r_proxy=$(cat "$tmp_proxy" 2>/dev/null)
 		if [ -n "$r_proxy" ] && [ "$r_proxy" != "OK" ]; then
 			if ! _check_tunnel_egress; then
-				result="PROXY_BROKEN"
+				log "Probe 7/egress missed (primary=${result}); not PROXY_BROKEN without tproxy 503"
 			fi
 		fi
 	fi
@@ -3206,44 +3205,31 @@ check_vpn_health() {
 	      "$tmp_gt" "$tmp_cft" "$tmp_cf2t" "$tmp_ifct" "$tmp_icht" "$tmp_myt" "$tmp_proxyt"
 	_hc_tmp=""
 
-	# Tunnel egress check after primary probes pass.  Tests N100 OUTPUT
-	# chain path (mark 0x1 -> VPN).  Relay-side 503 degradation is caught
-	# separately by the 503 storm monitor below.
 	if [ -n "$result" ] && [ "$result" != "TCP_BLOCK" ] && \
 	   [ "$result" != "LOCAL_FAIL" ] && [ "$result" != "CN" ] && \
 	   [ "$result" != "PROXY_BROKEN" ]; then
 		if ! _check_tunnel_egress; then
-			log "Tunnel egress check failed: VPN path not forwarding (primary=${result})"
-			result="PROXY_BROKEN"
+			log "Tunnel egress check failed (primary=${result}); not PROXY_BROKEN without tproxy 503"
 		fi
 	fi
 
-	# 503 storm override.  Health check passed but 503 monitor has
-	# accumulated evidence of sustained relay degradation (ADR-0001).
-	# Triggers PROXY_BROKEN when count >= 10 AND the most recent 503
-	# was within 300s AND the whole accumulation fits within 300s.
-	# The last-clause alone let chronic urltest probe noise (10-20
-	# relay 503s per hour on port-80 health endpoints) trip the
-	# override repeatedly on healthy nodes: trickle refills kept
-	# "last" forever fresh, so every check fired.  Requiring
-	# (last - first) <= window restores the rate semantics the
-	# constant documents.  Slow-burn relay degradation is still
-	# covered by the node-error rotation and Probe 7/egress axes.
-	# first > 0 and span >= 0 keep corrupt or clock-skewed
-	# state fail-closed.
+	# tproxy 503 override.  inbound/tproxy 503 is LAN user-path death.
+	# urltest probe 503s in STORM_503_STATE are not.  Missing or stale
+	# NODE_HEALTH_FILE fails closed (no override).
 	if [ "$result" = "OK" ] || [ "$result" = "TUNNEL_OK" ]; then
-		if [ -f "$STORM_503_STATE" ]; then
-			local _s503_count _s503_first _s503_last _s503_now
-			read -r _s503_count _s503_first _s503_last < "$STORM_503_STATE" 2>/dev/null
-			_s503_now=$(date +%s)
-			if [ "${_s503_count:-0}" -ge "$STORM_503_OVERRIDE_COUNT" ] && \
-			   [ "${_s503_first:-0}" -gt 0 ] && \
-			   [ $((_s503_now - ${_s503_last:-0})) -le "$STORM_503_OVERRIDE_WINDOW" ] && \
-			   [ $((${_s503_last:-0} - ${_s503_first:-0})) -ge 0 ] && \
-			   [ $((${_s503_last:-0} - ${_s503_first:-0})) -le "$STORM_503_OVERRIDE_WINDOW" ]; then
-				result="PROXY_BROKEN"
-				log "503 storm override (${_s503_count} total, last $((_s503_now - _s503_last))s ago, storm age $((_s503_now - _s503_first))s) -> PROXY_BROKEN"
+		local _tp503=0 _nh_mtime _nh_age _now_ov
+		_now_ov=$(date +%s)
+		if [ -f "$NODE_HEALTH_FILE" ]; then
+			_nh_mtime=$(stat -c %Y "$NODE_HEALTH_FILE" 2>/dev/null || echo 0)
+			_nh_age=$(( _now_ov - _nh_mtime ))
+			if [ "${_nh_age:-9999}" -le "$NODE_HEALTH_WINDOW" ]; then
+				_tp503=$(jq -r '.tproxy.categories.http_503 // 0' "$NODE_HEALTH_FILE" 2>/dev/null || echo 0)
 			fi
+		fi
+		case "${_tp503}" in ''|*[!0-9]*) _tp503=0 ;; esac
+		if [ "$_tp503" -ge "$TPROXY_503_ROTATE_THRESHOLD" ]; then
+			result="PROXY_BROKEN"
+			log "tproxy 503 override (${_tp503} in window) -> PROXY_BROKEN"
 		fi
 	fi
 
