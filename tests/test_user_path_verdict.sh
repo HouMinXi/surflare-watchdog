@@ -92,34 +92,29 @@ OUT=$(run_tail "$WATCHDOG" OK OK 0 0 5 9999)
 
 echo "V-inject: restoring STORM_503_STATE override must flip V1"
 INJ=$(mktemp /tmp/upv_inj_XXXXXX)
-# identity copy -- injection asserts current code still uses STORM file;
-# after the fix this block will splice the OLD 5-clause back in.
+# Anchor on the live tproxy-override comment.
+# Insert a STORM_503_STATE trip immediately before the result==OK
+# gate that follows it.
 cp "$WATCHDOG" "$INJ"
-# If production still reads STORM_503_STATE to set PROXY_BROKEN, V1
-# already failed above. After the fix, splice the old clause in:
 python3 - "$WATCHDOG" "$INJ" << 'PY'
 import sys
 src, dst = sys.argv[1], sys.argv[2]
 s = open(src).read()
-# After the fix the override reads NODE_HEALTH_FILE. Re-insert a
-# STORM_503_STATE trip so V1 goes PROXY_BROKEN -- proves the test
-# would catch a regression that restores the old gate.
-old = 'if [ "$result" = "OK" ] || [ "$result" = "TUNNEL_OK" ]; then'
-# only first occurrence in check_vpn_health tail is unique enough
-idx = s.find('# 503 storm override')
-if idx < 0:
-    idx = s.find('if [ "$result" = "OK" ] || [ "$result" = "TUNNEL_OK" ]; then')
-assert idx >= 0, "override anchor missing"
-# prepend an unconditional storm-file override immediately before
-# the result==OK gate in the tail (last occurrence before echo result)
-last = s.rfind('if [ "$result" = "OK" ] || [ "$result" = "TUNNEL_OK" ]; then')
-assert last > 0
+# Anchor on the live tproxy-override comment (unique in check_vpn_health
+# tail). Insert a STORM_503_STATE trip immediately before the result==OK
+# gate that follows it -- not rfind on the whole file.
+anchor = s.find("# tproxy 503 override")
+assert anchor >= 0, "tproxy override comment missing"
+gate = 'if [ "$result" = "OK" ] || [ "$result" = "TUNNEL_OK" ]; then'
+last = s.find(gate, anchor)
+assert last > anchor, "OK/TUNNEL_OK gate missing after tproxy override"
 inject = '''if [ -f "$STORM_503_STATE" ]; then
 		result="PROXY_BROKEN"
 	fi
 	'''
-s = s[:last] + inject + s[last:]
-open(dst, "w").write(s)
+s2 = s[:last] + inject + s[last:]
+assert s2 != s, "V-inject did not change the source"
+open(dst, "w").write(s2)
 PY
 OUT=$(run_tail "$INJ" OK OK 0 20 0 10)
 [ "$OUT" = "PROXY_BROKEN" ] && ok "inject storm-file override flips V1" || bad "V-inject got $OUT want PROXY_BROKEN"
@@ -177,22 +172,18 @@ python3 - "$WATCHDOG" "$INJ" << 'PY'
 import sys
 src, dst = sys.argv[1], sys.argv[2]
 s = open(src).read()
-old = 'log "urltest all-unhealthy consecutive=${_node_err_consecutive}/${NODE_ERR_STORM_CONSECUTIVE} (not rotating on probe counts)"'
-# Before the production change the rotate line still exists. After the
-# change we splice fail_count assignment back onto the healthy-candidate
-# branch. Handle both trees:
-if "fail_count=\$FAIL_THRESHOLD" in s.split("_handle_proactive_node_rotation")[1].split("connect_vpn")[0]:
-    # current (pre-fix) tree already rotates -- injection is identity
-    open(dst, "w").write(s)
-else:
-    needle = 'if [ "${_other_healthy:-0}" -ge 1 ]; then'
-    # may be gone; inject after the cur_err threshold
-    n = s.find("if [ \"${_cur_err:-0}\" -ge \"$NODE_ERR_ROTATE_THRESHOLD\" ]; then")
-    assert n > 0
-    # insert fail_count raise at start of that if-body
-    brace = s.find("\n", n)
-    s = s[:brace+1] + '\t\tfail_count=$FAIL_THRESHOLD\n' + s[brace+1:]
-    open(dst, "w").write(s)
+# Production no longer raises fail_count here. Splice it back at the
+# start of the cur_err-threshold body so R1 would go 4. Identity copy
+# is not an injection -- refuse it.
+rot = s.split("_handle_proactive_node_rotation()", 1)[1].split("\nconnect_vpn() {", 1)[0]
+assert "fail_count=$FAIL_THRESHOLD" not in rot, \
+    "production already raises fail_count; R-inject would be a no-op"
+n = s.find('if [ "${_cur_err:-0}" -ge "$NODE_ERR_ROTATE_THRESHOLD" ]; then')
+assert n > 0, "rotation threshold gate missing"
+brace = s.find("\n", n)
+s2 = s[:brace+1] + '\t\tfail_count=$FAIL_THRESHOLD\n' + s[brace+1:]
+assert s2 != s, "R-inject did not change the source"
+open(dst, "w").write(s2)
 PY
 OUT=$(run_rot "$INJ" 50 0)
 [ "$OUT" = "4" ] && ok "R-inject restore rotate flips R1" || bad "R-inject got $OUT want 4"
