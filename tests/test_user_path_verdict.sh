@@ -64,9 +64,11 @@ $tail_src
 	rm -rf "$d"
 }
 
-echo "V1: OK + urltest storm file + tproxy 0 -> stay OK"
-OUT=$(run_tail "$WATCHDOG" OK OK 0 20 0 "")
-[ "$OUT" = "OK" ] && ok "V1 storm file does not override" || bad "V1 got $OUT want OK"
+echo "V1: OK + urltest storm file + fresh tproxy http_503=0 -> stay OK"
+# age=10: NODE_HEALTH_FILE exists, mtime inside NODE_HEALTH_WINDOW, http_503=0.
+# Distinct from V5 (empty age = no health file).
+OUT=$(run_tail "$WATCHDOG" OK OK 0 20 0 10)
+[ "$OUT" = "OK" ] && ok "V1 storm file does not override with fresh http_503=0" || bad "V1 got $OUT want OK"
 
 echo "V2: OK + tproxy http_503=5 -> PROXY_BROKEN"
 OUT=$(run_tail "$WATCHDOG" OK OK 0 0 5 10)
@@ -119,7 +121,7 @@ inject = '''if [ -f "$STORM_503_STATE" ]; then
 s = s[:last] + inject + s[last:]
 open(dst, "w").write(s)
 PY
-OUT=$(run_tail "$INJ" OK OK 0 20 0 "")
+OUT=$(run_tail "$INJ" OK OK 0 20 0 10)
 [ "$OUT" = "PROXY_BROKEN" ] && ok "inject storm-file override flips V1" || bad "V-inject got $OUT want PROXY_BROKEN"
 rm -f "$INJ"
 
