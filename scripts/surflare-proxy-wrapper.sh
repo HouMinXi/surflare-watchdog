@@ -65,7 +65,7 @@ cp "$_tmp" /tmp/singbox-config-dump.json
 chmod 600 /tmp/singbox-config-dump.json
 
 if jq --argjson T "$TOLERANCE" --arg I "$INTERVAL" --arg D "$INJECT_DOMAINS" --arg DD "$DIRECT_DOMAINS" '
-  .outbounds |= map(if .type == "urltest" then .tolerance = $T | .interval = $I else . end)
+  .outbounds |= map(if .type == "urltest" then .tolerance = $T | .interval = $I | .domain_strategy = "ipv4_only" else . end)
   | .route.rule_set |= map(if .tag == "proxy_rule_set" then .rules |= map(
       if .domain_suffix then
         .domain_suffix |= (. + ($D | split(",")) | unique)

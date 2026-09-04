@@ -237,9 +237,10 @@ if [ -n "$_filter_start" ] && [ -n "$_filter_end" ] && [ "$_filter_end" -gt "$_f
         _vpn_tag=$(jq -r '[.outbounds[] | select(.type == "urltest")][0].tag // "direct"' "$_patched" 2>/dev/null)
         _final=$(jq -r '.route.final' "$_patched" 2>/dev/null)
         _catchall=$(jq -r '.route.rules[-1].outbound' "$_patched" 2>/dev/null)
+        _ds=$(jq -r '[.outbounds[] | select(.type=="urltest" and ((.tag|startswith("udp_"))|not)) | .domain_strategy] | unique | join(",")' "$_patched" 2>/dev/null)
     fi
 else
-    _vpn_tag="extract-failed" _final="" _catchall=""
+    _vpn_tag="extract-failed" _final="" _catchall="" _ds=""
 fi
 if bash -n "$WATCHDOG" \
    && grep -q 'claude.ai' <<<"$_wrapper_domains" \
@@ -247,12 +248,28 @@ if bash -n "$WATCHDOG" \
    && grep -q 'gemini.google.com' <<<"$_wrapper_domains" \
    && [ "$_vpn_tag" != "direct" ] \
    && [ "$_final" = "$_vpn_tag" ] \
-   && [ "$_catchall" = "$_vpn_tag" ]; then
-    ok "T7 wrapper domains + pinned-transit VPN catch-all + watchdog syntax"
+   && [ "$_catchall" = "$_vpn_tag" ] \
+   && [ "$_ds" = "ipv4_only" ]; then
+    ok "T7 wrapper domains + pinned-transit VPN catch-all + ipv4_only + watchdog syntax"
 else
-    bad T7 "wrapper contract failed: vpn=$_vpn_tag final=$_final catchall=$_catchall"
+    bad T7 "wrapper contract failed: vpn=$_vpn_tag final=$_final catchall=$_catchall ds=$_ds"
 fi
-rm -f "$_patched" "$_patched.jq"
+
+# T7-inject: stripping domain_strategy from the extracted jq must empty _ds
+# (proves T7 would catch a wrapper that drops the ipv4_only pin).
+_inj_jq=$(mktemp)
+_inj_out=$(mktemp)
+sed 's/ | .domain_strategy = "ipv4_only"//' "$_patched.jq" > "$_inj_jq"
+jq --argjson T "$_T" --arg I "$_I" --arg D "$_wrapper_domains" --arg DD "$_DD" \
+    -f "$_inj_jq" \
+    < tests/fixtures/singbox-transit-pinned.json > "$_inj_out" 2>/dev/null
+_ds_inj=$(jq -r '[.outbounds[] | select(.type=="urltest" and ((.tag|startswith("udp_"))|not)) | .domain_strategy] | unique | join(",")' "$_inj_out" 2>/dev/null)
+if [ "$_ds_inj" != "ipv4_only" ]; then
+    ok "T7-inject dropping domain_strategy empties pin (load-bearing)"
+else
+    bad T7-inject "injection left domain_strategy=$_ds_inj"
+fi
+rm -f "$_patched" "$_patched.jq" "$_inj_jq" "$_inj_out"
 
 echo
 echo "RESULT: pass=$PASS fail=$FAIL"

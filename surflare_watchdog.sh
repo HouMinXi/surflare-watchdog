@@ -3186,18 +3186,17 @@ check_vpn_health() {
 	# Only override when proxy probe actually finished (non-empty output).
 	# An empty tmp_proxy means the probe was killed before completing (early
 	# exit from polling loop) -- not evidence of tunnel failure.
-	# Probe 7 tests a single target (gstatic.com/generate_204). CDN PoP
-	# routing issues (#19) can make this target unreachable from a specific
-	# exit node while the proxy itself works fine. Confirm with
-	# _check_tunnel_egress (3 targets x 2 retries) before committing to
-	# PROXY_BROKEN -- eliminates CDN-specific false positives that caused
-	# cascade reconnects (Chicago 54s -> Atlanta 58s pattern, 2026-06-30).
+	# Probe 7 tests a single target (gstatic.com/generate_204).
+	# Probe 7 / N100 egress curl test the router's own OUTPUT path,
+	# not LAN tproxy (ct mark 0x100).  A miss here while LAN flows
+	# still forward is the 2026-09-04 pattern: log it, do not flip
+	# the verdict.  User-path death is tproxy 503 below.
 	if [ -n "$result" ] && [ "$result" != "TCP_BLOCK" ] && [ "$result" != "LOCAL_FAIL" ]; then
 		local r_proxy
 		r_proxy=$(cat "$tmp_proxy" 2>/dev/null)
 		if [ -n "$r_proxy" ] && [ "$r_proxy" != "OK" ]; then
 			if ! _check_tunnel_egress; then
-				result="PROXY_BROKEN"
+				log "Probe 7/egress missed (primary=${result}); not PROXY_BROKEN without tproxy 503"
 			fi
 		fi
 	fi
@@ -3206,44 +3205,31 @@ check_vpn_health() {
 	      "$tmp_gt" "$tmp_cft" "$tmp_cf2t" "$tmp_ifct" "$tmp_icht" "$tmp_myt" "$tmp_proxyt"
 	_hc_tmp=""
 
-	# Tunnel egress check after primary probes pass.  Tests N100 OUTPUT
-	# chain path (mark 0x1 -> VPN).  Relay-side 503 degradation is caught
-	# separately by the 503 storm monitor below.
 	if [ -n "$result" ] && [ "$result" != "TCP_BLOCK" ] && \
 	   [ "$result" != "LOCAL_FAIL" ] && [ "$result" != "CN" ] && \
 	   [ "$result" != "PROXY_BROKEN" ]; then
 		if ! _check_tunnel_egress; then
-			log "Tunnel egress check failed: VPN path not forwarding (primary=${result})"
-			result="PROXY_BROKEN"
+			log "Tunnel egress check failed (primary=${result}); not PROXY_BROKEN without tproxy 503"
 		fi
 	fi
 
-	# 503 storm override.  Health check passed but 503 monitor has
-	# accumulated evidence of sustained relay degradation (ADR-0001).
-	# Triggers PROXY_BROKEN when count >= 10 AND the most recent 503
-	# was within 300s AND the whole accumulation fits within 300s.
-	# The last-clause alone let chronic urltest probe noise (10-20
-	# relay 503s per hour on port-80 health endpoints) trip the
-	# override repeatedly on healthy nodes: trickle refills kept
-	# "last" forever fresh, so every check fired.  Requiring
-	# (last - first) <= window restores the rate semantics the
-	# constant documents.  Slow-burn relay degradation is still
-	# covered by the node-error rotation and Probe 7/egress axes.
-	# first > 0 and span >= 0 keep corrupt or clock-skewed
-	# state fail-closed.
+	# tproxy 503 override.  inbound/tproxy 503 is LAN user-path death.
+	# urltest probe 503s in STORM_503_STATE are not.  Missing or stale
+	# NODE_HEALTH_FILE fails closed (no override).
 	if [ "$result" = "OK" ] || [ "$result" = "TUNNEL_OK" ]; then
-		if [ -f "$STORM_503_STATE" ]; then
-			local _s503_count _s503_first _s503_last _s503_now
-			read -r _s503_count _s503_first _s503_last < "$STORM_503_STATE" 2>/dev/null
-			_s503_now=$(date +%s)
-			if [ "${_s503_count:-0}" -ge "$STORM_503_OVERRIDE_COUNT" ] && \
-			   [ "${_s503_first:-0}" -gt 0 ] && \
-			   [ $((_s503_now - ${_s503_last:-0})) -le "$STORM_503_OVERRIDE_WINDOW" ] && \
-			   [ $((${_s503_last:-0} - ${_s503_first:-0})) -ge 0 ] && \
-			   [ $((${_s503_last:-0} - ${_s503_first:-0})) -le "$STORM_503_OVERRIDE_WINDOW" ]; then
-				result="PROXY_BROKEN"
-				log "503 storm override (${_s503_count} total, last $((_s503_now - _s503_last))s ago, storm age $((_s503_now - _s503_first))s) -> PROXY_BROKEN"
+		local _tp503=0 _nh_mtime _nh_age _now_ov
+		_now_ov=$(date +%s)
+		if [ -f "$NODE_HEALTH_FILE" ]; then
+			_nh_mtime=$(stat -c %Y "$NODE_HEALTH_FILE" 2>/dev/null || echo 0)
+			_nh_age=$(( _now_ov - _nh_mtime ))
+			if [ "${_nh_age:-9999}" -le "$NODE_HEALTH_WINDOW" ]; then
+				_tp503=$(jq -r '.tproxy.categories.http_503 // 0' "$NODE_HEALTH_FILE" 2>/dev/null || echo 0)
 			fi
+		fi
+		case "${_tp503}" in ''|*[!0-9]*) _tp503=0 ;; esac
+		if [ "$_tp503" -ge "$TPROXY_503_ROTATE_THRESHOLD" ]; then
+			result="PROXY_BROKEN"
+			log "tproxy 503 override (${_tp503} in window) -> PROXY_BROKEN"
 		fi
 	fi
 
@@ -4808,22 +4794,19 @@ _handle_proactive_node_rotation() {
 	_other_healthy=$(printf '%s' "$_nh_read" | cut -f2)
 	local _other_total=$(( ${#NODE_CANDIDATES[@]} - 1 ))
 	if [ "${_cur_err:-0}" -ge "$NODE_ERR_ROTATE_THRESHOLD" ]; then
-		if [ "${_other_healthy:-0}" -ge 1 ]; then
-			log "Node degraded: ${_active_node} has ${_cur_err} outbound errors, ${_other_healthy} healthy candidate(s), rotating"
-			fail_count=$FAIL_THRESHOLD
-			_node_err_consecutive=0
-		else
-			if [ "$_other_total" -le 0 ]; then
-				log "Node degraded, no other candidates available (single-node setup), cannot rotate"
-			else
-				_node_err_consecutive=$((_node_err_consecutive + 1))
-				log "Node degraded but all ${_other_total} candidates unhealthy (consecutive=${_node_err_consecutive}/${NODE_ERR_STORM_CONSECUTIVE})"
-				if [ "$_node_err_consecutive" -ge "$NODE_ERR_STORM_CONSECUTIVE" ]; then
-					log "Relay-wide degradation: entering storm cooldown"
-					_enter_storm_cooldown "node-error-relay-wide"
-					_node_err_consecutive=0
-				fi
+		# urltest error_count is probe noise (1.1.1.1 / relay 503),
+		# not LAN tproxy death.  Do not raise fail_count.  If every
+		# candidate is also noisy, count toward relay-wide cooldown.
+		if [ "${_other_healthy:-0}" -lt 1 ] && [ "$_other_total" -gt 0 ]; then
+			_node_err_consecutive=$((_node_err_consecutive + 1))
+			log "urltest all-unhealthy consecutive=${_node_err_consecutive}/${NODE_ERR_STORM_CONSECUTIVE} (not rotating on probe counts)"
+			if [ "$_node_err_consecutive" -ge "$NODE_ERR_STORM_CONSECUTIVE" ]; then
+				log "Relay-wide degradation: entering storm cooldown"
+				_enter_storm_cooldown "node-error-relay-wide"
+				_node_err_consecutive=0
 			fi
+		else
+			_node_err_consecutive=0
 		fi
 		_node_err_cooldown_until=$(( _now + NODE_ERR_COOLDOWN ))
 		_node_err_rotate_ts=$_now
@@ -6438,14 +6421,11 @@ while true; do
 			# addressing the layer that failed.
 			_hold_exit_node=1
 		fi
-		# Storm hold: the diagnosis engine itself labels 503 storms
-		# "Backend issue" -- a reconnect renegotiates relay endpoints,
-		# which cannot fix backend-side failures, and each teardown
-		# kills CN-direct LAN flows.  The yinhe control (client-only,
-		# no watchdog) rides identical storms out via urltest
-		# fast-recover with zero disconnects.  Hold while the storm is
-		# live, bounded by STORM_503_HOLD_MAX so a wedged proxy still
-		# gets exactly one reconnect attempt per window.
+		# urltest probe 503s (STORM_503_STATE) are not user-path death.
+		# LAN tproxy flows (ct mark 0x100) keep forwarding on the same
+		# relay socket while urltest redials 1.1.1.1 and gets 503.
+		# Do not skip reconnect on that counter; PROXY_BROKEN_GRACE
+		# still confirms a real PROXY_BROKEN (tproxy-axis) verdict.
 		if [ "${_skip_reconnect_this_cycle:-0}" -ne 1 ]; then
 			_storm_count=0 _storm_last=0
 			if [ -f "$STORM_503_STATE" ]; then
@@ -6457,29 +6437,9 @@ while true; do
 			_now_storm=$(date +%s)
 			if [ "$_storm_count" -gt 0 ] && \
 			   [ $((_now_storm - _storm_last)) -le "$STORM_503_RECENT" ]; then
-				if [ "${_storm_hold_active:-0}" -eq 0 ]; then
-					_storm_hold_active=1
-					_storm_hold_since=$_now_storm
-					log "503 storm live (count=${_storm_count}): reconnect held -- backend storms pass without one"
-					_send_alert "Backend 503 storm, VPN reconnect held" "" "yes" "congestion"
-				fi
-				if [ $((_now_storm - ${_storm_hold_since:-0})) -lt "$STORM_503_HOLD_MAX" ]; then
-					_export_diag_state "BACKEND_503_HOLD"
-					# relay-layer failure evidence: a reconnect, when
-					# it eventually fires, must not rotate the exit
-					_hold_exit_node=1
-					_skip_reconnect_this_cycle=1
-				else
-					log "503 storm held ${STORM_503_HOLD_MAX}s and proxy still broken: reconnecting anyway"
-					_storm_hold_active=0
-					# hold expired on stale evidence: rotation logic
-					# must see fresh conditions, same as congestion
-					_hold_exit_node=0
-				fi
-			elif [ "${_storm_hold_active:-0}" -eq 1 ]; then
-				_storm_hold_active=0
-				log "503 storm quieted: reconnect logic resumed"
+				log "urltest 503 noise (count=${_storm_count}): not holding reconnect"
 			fi
+			_storm_hold_active=0
 		fi
 		if [ "${_skip_reconnect_this_cycle:-0}" -ne 1 ]; then
 			# Grace window: a single-cycle PROXY_BROKEN verdict is
