@@ -123,6 +123,79 @@ OUT=$(run_tail "$INJ" OK OK 0 20 0 "")
 [ "$OUT" = "PROXY_BROKEN" ] && ok "inject storm-file override flips V1" || bad "V-inject got $OUT want PROXY_BROKEN"
 rm -f "$INJ"
 
+# --- Task 3: urltest error_count must not raise fail_count ---
+extract_rot() {
+	awk '
+		/^_handle_proactive_node_rotation\(\)/ { in_blk=1 }
+		in_blk { print }
+		in_blk && /^}$/ { exit }
+	' "$1"
+}
+printf '%s\n' "$(extract_rot "$WATCHDOG")" | grep -q 'NODE_ERR_ROTATE_THRESHOLD' \
+	|| { echo "FATAL: rotation extract empty"; exit 1; }
+
+ROT_CONSTS=$(grep -E '^NODE_ERR_ROTATE_THRESHOLD=|^NODE_ERR_HEALTHY_MAX=|^NODE_ERR_COOLDOWN=|^NODE_ERR_STORM_CONSECUTIVE=|^NODE_HEALTH_WINDOW=|^NODE_HEALTH_FILE=' "$WATCHDOG")
+
+run_rot() {
+	local wd="${1:-$WATCHDOG}" cur_err="${2:-50}" other_err="${3:-0}"
+	local d nh now
+	d=$(mktemp -d)
+	nh="$d/nh.json"
+	now=$(date +%s)
+	printf '{"nodes":{"mh_via_Washington_to_Dallas":{"error_count":%s},"mh_via_Washington_to_Chicago":{"error_count":%s}},"tproxy":{"categories":{"http_503":0}}}\n' \
+		"$cur_err" "$other_err" > "$nh"
+	bash -c "
+		$ROT_CONSTS
+		NODE_HEALTH_FILE='$nh'
+		_active_node='Dallas'
+		_effective_transit='Washington'
+		NODE_CANDIDATES=(Dallas Chicago)
+		fail_count=0
+		FAIL_THRESHOLD=4
+		_node_err_cooldown_until=0
+		_node_err_rotate_ts=0
+		_node_err_consecutive=0
+		log() { :; }
+		_refresh_effective_transit() { :; }
+		_enter_storm_cooldown() { :; }
+		$(extract_rot "$wd")
+		_handle_proactive_node_rotation $now
+		echo \$fail_count
+	" 2>/dev/null
+	rm -rf "$d"
+}
+
+echo "R1: urltest error_count=50 + healthy candidate + tproxy 0 -> fail_count stays 0"
+OUT=$(run_rot "$WATCHDOG" 50 0)
+[ "$OUT" = "0" ] && ok "R1 no rotate on urltest count" || bad "R1 got $OUT want 0"
+
+echo "R-inject: restoring fail_count=\$FAIL_THRESHOLD must flip R1"
+INJ=$(mktemp /tmp/upv_rot_XXXXXX)
+python3 - "$WATCHDOG" "$INJ" << 'PY'
+import sys
+src, dst = sys.argv[1], sys.argv[2]
+s = open(src).read()
+old = 'log "urltest all-unhealthy consecutive=${_node_err_consecutive}/${NODE_ERR_STORM_CONSECUTIVE} (not rotating on probe counts)"'
+# Before the production change the rotate line still exists. After the
+# change we splice fail_count assignment back onto the healthy-candidate
+# branch. Handle both trees:
+if "fail_count=\$FAIL_THRESHOLD" in s.split("_handle_proactive_node_rotation")[1].split("connect_vpn")[0]:
+    # current (pre-fix) tree already rotates -- injection is identity
+    open(dst, "w").write(s)
+else:
+    needle = 'if [ "${_other_healthy:-0}" -ge 1 ]; then'
+    # may be gone; inject after the cur_err threshold
+    n = s.find("if [ \"${_cur_err:-0}\" -ge \"$NODE_ERR_ROTATE_THRESHOLD\" ]; then")
+    assert n > 0
+    # insert fail_count raise at start of that if-body
+    brace = s.find("\n", n)
+    s = s[:brace+1] + '\t\tfail_count=$FAIL_THRESHOLD\n' + s[brace+1:]
+    open(dst, "w").write(s)
+PY
+OUT=$(run_rot "$INJ" 50 0)
+[ "$OUT" = "4" ] && ok "R-inject restore rotate flips R1" || bad "R-inject got $OUT want 4"
+rm -f "$INJ"
+
 echo
 echo "PASS=$PASS FAIL=$FAIL"
 [ "$FAIL" -eq 0 ]

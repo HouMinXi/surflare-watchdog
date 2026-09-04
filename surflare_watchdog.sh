@@ -4794,22 +4794,19 @@ _handle_proactive_node_rotation() {
 	_other_healthy=$(printf '%s' "$_nh_read" | cut -f2)
 	local _other_total=$(( ${#NODE_CANDIDATES[@]} - 1 ))
 	if [ "${_cur_err:-0}" -ge "$NODE_ERR_ROTATE_THRESHOLD" ]; then
-		if [ "${_other_healthy:-0}" -ge 1 ]; then
-			log "Node degraded: ${_active_node} has ${_cur_err} outbound errors, ${_other_healthy} healthy candidate(s), rotating"
-			fail_count=$FAIL_THRESHOLD
-			_node_err_consecutive=0
-		else
-			if [ "$_other_total" -le 0 ]; then
-				log "Node degraded, no other candidates available (single-node setup), cannot rotate"
-			else
-				_node_err_consecutive=$((_node_err_consecutive + 1))
-				log "Node degraded but all ${_other_total} candidates unhealthy (consecutive=${_node_err_consecutive}/${NODE_ERR_STORM_CONSECUTIVE})"
-				if [ "$_node_err_consecutive" -ge "$NODE_ERR_STORM_CONSECUTIVE" ]; then
-					log "Relay-wide degradation: entering storm cooldown"
-					_enter_storm_cooldown "node-error-relay-wide"
-					_node_err_consecutive=0
-				fi
+		# urltest error_count is probe noise (1.1.1.1 / relay 503),
+		# not LAN tproxy death.  Do not raise fail_count.  If every
+		# candidate is also noisy, count toward relay-wide cooldown.
+		if [ "${_other_healthy:-0}" -lt 1 ] && [ "$_other_total" -gt 0 ]; then
+			_node_err_consecutive=$((_node_err_consecutive + 1))
+			log "urltest all-unhealthy consecutive=${_node_err_consecutive}/${NODE_ERR_STORM_CONSECUTIVE} (not rotating on probe counts)"
+			if [ "$_node_err_consecutive" -ge "$NODE_ERR_STORM_CONSECUTIVE" ]; then
+				log "Relay-wide degradation: entering storm cooldown"
+				_enter_storm_cooldown "node-error-relay-wide"
+				_node_err_consecutive=0
 			fi
+		else
+			_node_err_consecutive=0
 		fi
 		_node_err_cooldown_until=$(( _now + NODE_ERR_COOLDOWN ))
 		_node_err_rotate_ts=$_now
