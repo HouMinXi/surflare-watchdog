@@ -60,6 +60,24 @@ extract_adopt() {
 	' "$1"
 }
 
+# Offline `surflare status` stub.  STATUS_OUT is the body, STATUS_RC
+# the exit (124 = timeout/fail-closed).  PATH-prepended so production
+# `timeout 5 surflare status` hits this, not a real CLI.
+make_surflare_stub() {
+	local d
+	d=$(mktemp -d /tmp/rp_sf_XXXXXX)
+	# STATUS_OUT/STATUS_RC baked into the stub so the child does not
+	# need them exported through nested bash -c quoting.
+	printf '%s\n' "#!/bin/sh" > "$d/surflare"
+	printf '%s\n' "STATUS_RC=${STATUS_RC:-0}" >> "$d/surflare"
+	printf '%s\n' "cat <<'STATUS_EOF'" >> "$d/surflare"
+	printf '%s\n' "${STATUS_OUT:-}" >> "$d/surflare"
+	printf '%s\n' "STATUS_EOF" >> "$d/surflare"
+	printf '%s\n' "exit \"\$STATUS_RC\"" >> "$d/surflare"
+	chmod +x "$d/surflare"
+	printf '%s\n' "$d"
+}
+
 # run_startup <wd-file>: env seeds NODE, CANDS (space-separated,
 # dedicated first), ROT_FILE_CONTENT (empty = no file).  Prints
 # "active idx | file-content | override-log-flag".
@@ -93,8 +111,9 @@ run_startup() {
 	rm -f "$rfile"
 }
 
-# run_adopt <wd-file>: env seeds ACTIVE, CLI_LOG_CONTENT, CANDS.
-# Prints "active idx | file-content | reconcile-log-flag".
+# run_adopt <wd-file>: env seeds ACTIVE, STATUS_OUT, STATUS_RC, CANDS.
+# CLI_LOG_CONTENT is poison-only (stale daemon log); reconcile must
+# ignore it.  Prints "active idx | file-content | reconcile-log-flag".
 run_adopt() {
 	local wd="${1:-$WATCHDOG}" blk
 	blk=$(extract_adopt "$wd")
@@ -102,17 +121,20 @@ run_adopt() {
 		echo "EXTRACT_FAIL"
 		return 99
 	fi
-	local clog rfile
+	local clog rfile stubdir
 	clog=$(mktemp /tmp/rp_cli_XXXXXX)
 	rfile=$(mktemp /tmp/rp_rot_XXXXXX)
 	printf '%s\n' "${CLI_LOG_CONTENT:-}" > "$clog"
-	# sentinel: simulate a missing/unreadable CLI log
 	[ "${CLI_LOG_CONTENT:-}" = "__MISSING__" ] && rm -f "$clog"
 	printf '%s\n' "${ROT_FILE_CONTENT:-}" > "$rfile"
+	stubdir=$(make_surflare_stub)
 	ACTIVE="${ACTIVE:-}" CANDS="${CANDS:-}" CLOG="$clog" RFILE="$rfile" \
+	STUBDIR="$stubdir" \
 	bash -c "
 		set -u
 		log() { LOG_BUF=\"\$LOG_BUF|\$1\"; }
+		PATH=\"\$STUBDIR:\$PATH\"
+		export PATH
 		SURFLARE_CLI_LOG=\"\$CLOG\"
 		ROTATION_STATE=\"\$RFILE\"
 		IFS='|' read -r -a NODE_CANDIDATES <<< \"\$CANDS\"
@@ -127,7 +149,7 @@ run_adopt() {
 		}
 		run
 	" 2>/dev/null
-	rm -f "$clog" "$rfile"
+	rm -rf "$clog" "$rfile" "$stubdir"
 }
 
 echo "T1: stale file (LA) + pinned NODE -> pin wins, file rewritten"
@@ -145,21 +167,23 @@ OUT=$(NODE="Chicago" CANDS="Chicago|Los Angeles|Atlanta" \
 	ROT_FILE_CONTENT="$(printf 'Miami\t9')" run_startup)
 [ "$OUT" = "Chicago|0|Chicago	0|0" ] && ok "unknown saved -> NODE" || bad "T3 wrong: $OUT"
 
-echo "T4: adopt reconcile -- live session is the pin, rotation said LA"
+echo "T4: adopt reconcile -- status Server is the pin, rotation said LA"
 OUT=$(ACTIVE="Los Angeles" CANDS="$DEDICATED|Los Angeles|Atlanta" \
-	CLI_LOG_CONTENT="+0800 [INFO]  Connected  server=$DEDICATED mode=rule relay=auto" \
+	STATUS_OUT="  Server:      $DEDICATED" \
+	CLI_LOG_CONTENT="+0800 [INFO]  Connected  server=Los Angeles mode=rule relay=auto" \
 	ROT_FILE_CONTENT="$(printf 'Los Angeles\t1')" run_adopt)
 [ "$OUT" = "$DEDICATED|0|$DEDICATED	0|1" ] && ok "adopt reconciled to live pin" || bad "T4 wrong: $OUT"
 
-echo "T5: adopt no-op when live session already matches"
+echo "T5: adopt no-op when status already matches"
 OUT=$(ACTIVE="Los Angeles" CANDS="$DEDICATED|Los Angeles|Atlanta" \
-	CLI_LOG_CONTENT="+0800 [INFO]  Connected  server=Los Angeles mode=rule relay=auto" \
+	STATUS_OUT="  Server:      Los Angeles" \
 	ROT_FILE_CONTENT="$(printf 'Los Angeles\t1')" run_adopt)
 [ "$OUT" = "Los Angeles|1|Los Angeles	1|0" ] && ok "no-op when aligned" || bad "T5 wrong: $OUT"
 
-echo "T6: adopt with unparseable CLI log -> keep restored state"
+echo "T6: adopt with unparseable status (no Server:) -> keep restored state"
 OUT=$(ACTIVE="Los Angeles" CANDS="$DEDICATED|Los Angeles|Atlanta" \
-	CLI_LOG_CONTENT="garbage line without connect" \
+	STATUS_OUT="garbage line without server field" \
+	CLI_LOG_CONTENT="+0800 [INFO]  Connected  server=$DEDICATED mode=rule relay=auto" \
 	ROT_FILE_CONTENT="$(printf 'Los Angeles\t1')" run_adopt)
 [ "$OUT" = "Los Angeles|1|Los Angeles	1|0" ] && ok "unparseable -> keep" || bad "T6 wrong: $OUT"
 
@@ -189,6 +213,7 @@ assert s.count(old) == 1, "reconcile anchor missing"
 open(dst, 'w').write(s.replace(old, ': reconcile deleted', 1))
 PYEOF
 OUT=$(ACTIVE="Los Angeles" CANDS="$DEDICATED|Los Angeles|Atlanta" \
+	STATUS_OUT="  Server:      $DEDICATED" \
 	CLI_LOG_CONTENT="+0800 [INFO]  Connected  server=$DEDICATED mode=rule relay=auto" \
 	ROT_FILE_CONTENT="$(printf 'Los Angeles\t1')" run_adopt "$INJ")
 # the essential: _active_node must NOT flip to the adopted node. The
@@ -202,11 +227,11 @@ OUT=$(NODE="$DEDICATED" CANDS="Chicago|Los Angeles|Atlanta" \
 	ROT_FILE_CONTENT="$(printf 'Los Angeles\t1')" run_startup)
 [ "$OUT" = "Los Angeles|1|Los Angeles	1|0" ] && ok "lapsed pin -> restored kept" || bad "T9 wrong: $OUT"
 
-echo "T10: CLI log with SINGLE space after Connected -> reconcile still fires"
+echo "T10: status Server: with extra spaces still parses (tui sed)"
 OUT=$(ACTIVE="Los Angeles" CANDS="$DEDICATED|Los Angeles|Atlanta" \
-	CLI_LOG_CONTENT="+0800 [INFO]  Connected server=$DEDICATED mode=rule relay=auto" \
+	STATUS_OUT="  Server:      $DEDICATED" \
 	ROT_FILE_CONTENT="$(printf 'Los Angeles\t1')" run_adopt)
-[ "$OUT" = "$DEDICATED|0|$DEDICATED	0|1" ] && ok "single-space log parsed" || bad "T10 wrong: $OUT"
+[ "$OUT" = "$DEDICATED|0|$DEDICATED	0|1" ] && ok "padded Server: parsed" || bad "T10 wrong: $OUT"
 
 echo "T11: NODE with non-IP parens (Chicago (backup)) is NOT a pin -> saved restored"
 OUT=$(NODE="Chicago (backup)" CANDS="Chicago (backup)|Los Angeles|Atlanta" \
@@ -231,18 +256,20 @@ echo "T15: pin at NON-ZERO index, no state file -> idx follows the pin"
 OUT=$(NODE="$DEDICATED" CANDS="Los Angeles|$DEDICATED|Atlanta" run_startup)
 [ "$OUT" = "$DEDICATED|1|$DEDICATED	1|0" ] && ok "pin idx recomputed" || bad "T15 wrong: $OUT"
 
-echo "T16: adopt -- live node NOT in candidates -> keep restored, no reconcile"
+echo "T16: adopt -- status Server NOT in candidates -> keep restored, no reconcile"
 OUT=$(ACTIVE="Los Angeles" CANDS="$DEDICATED|Los Angeles|Atlanta" \
-	CLI_LOG_CONTENT="+0800 [INFO]  Connected  server=Miami mode=rule relay=auto" \
+	STATUS_OUT="  Server:      Miami" \
 	ROT_FILE_CONTENT="$(printf 'Los Angeles\t1')" run_adopt)
 [ "$OUT" = "Los Angeles|1|Los Angeles	1|0" ] && ok "unlisted live node -> keep" || bad "T16 wrong: $OUT"
 
-echo "T17: adopt -- two-line CLI log, the LATEST Connected line wins"
+echo "T17: status=LA beats stale CLI Connected=dedicated (daemon reconnect)"
+# Measured N100 2026-09-05 17:56: watchdog connect --daemon --node LA
+# does not append a Connected line; CLI log still named the pin.
 OUT=$(ACTIVE="Los Angeles" CANDS="$DEDICATED|Los Angeles|Atlanta" \
-	CLI_LOG_CONTENT="+0800 [INFO]  Connected  server=Atlanta mode=rule relay=auto
-+0900 [INFO]  Connected  server=$DEDICATED mode=rule relay=auto" \
+	STATUS_OUT="  Server:      Los Angeles" \
+	CLI_LOG_CONTENT="+0800 [INFO]  Connected  server=$DEDICATED mode=rule relay=auto" \
 	ROT_FILE_CONTENT="$(printf 'Los Angeles\t1')" run_adopt)
-[ "$OUT" = "$DEDICATED|0|$DEDICATED	0|1" ] && ok "latest line wins" || bad "T17 wrong: $OUT"
+[ "$OUT" = "Los Angeles|1|Los Angeles	1|0" ] && ok "status wins over stale CLI" || bad "T17 wrong: $OUT"
 
 echo "T18: no state file + non-pin NODE at non-zero index -> true cursor persisted"
 OUT=$(NODE="Atlanta" CANDS="Chicago|Los Angeles|Atlanta" run_startup)
@@ -285,10 +312,11 @@ OUT=$(NODE="Miami" CANDS="Chicago|Los Angeles|Atlanta" run_startup)
 
 echo "T25: adopt persist failure -> WARN logged (not silent)"
 BLK=$(extract_adopt "$WATCHDOG")
-OUT=$(bash -c "
+STUBDIR=$(STATUS_OUT="  Server:      $DEDICATED" make_surflare_stub)
+OUT=$(PATH="$STUBDIR:$PATH" bash -c "
 	set -u
 	log() { LOG_BUF=\"\$LOG_BUF|\$1\"; }
-	SURFLARE_CLI_LOG=\"\$1\"; ROTATION_STATE=/nonexistent_rp/state
+	ROTATION_STATE=/nonexistent_rp/state
 	IFS='|' read -r -a NODE_CANDIDATES <<< \"$DEDICATED|Los Angeles|Atlanta\"
 	LOG_BUF=
 	run() {
@@ -298,14 +326,16 @@ OUT=$(bash -c "
 		case \"\$LOG_BUF\" in *failed\\ to\\ persist*) echo WARN_SEEN ;; *) echo \"NO_WARN:\$LOG_BUF\" ;; esac
 	}
 	run
-" _ <(printf '+0800 [INFO]  Connected  server=%s mode=rule relay=auto\n' "$DEDICATED") 2>/dev/null)
+" 2>/dev/null)
 [ "$OUT" = "WARN_SEEN" ] && ok "adopt persist failure warns" || bad "T25 wrong: $OUT"
+rm -rf "$STUBDIR"
 
-echo "T26: CLI log file MISSING -> no reconcile, restored state kept"
+echo "T26: status non-zero (rc=124) -> no reconcile, even if CLI log names the pin"
 OUT=$(ACTIVE="Los Angeles" CANDS="$DEDICATED|Los Angeles|Atlanta" \
-	CLI_LOG_CONTENT="__MISSING__" \
+	STATUS_RC=124 STATUS_OUT="  Server:      $DEDICATED" \
+	CLI_LOG_CONTENT="+0800 [INFO]  Connected  server=$DEDICATED mode=rule relay=auto" \
 	ROT_FILE_CONTENT="$(printf 'Los Angeles\t1')" run_adopt)
-[ "$OUT" = "Los Angeles|1|Los Angeles	1|0" ] && ok "missing log -> keep" || bad "T26 wrong: $OUT"
+[ "$OUT" = "Los Angeles|1|Los Angeles	1|0" ] && ok "status fail-closed -> keep" || bad "T26 wrong: $OUT"
 
 echo "T27: '(1.)' (digit dot, nothing after) is NOT pin-shaped"
 OUT=$(NODE="(1.)" CANDS="(1.)|Los Angeles" \
@@ -335,12 +365,25 @@ sys.exit(0 if "_reconcile_rotation_with_live_session" in window else 1)
 PY
 [ $? -eq 0 ] && ok "main loop calls reconcile" || bad "T30: no loop call before check_vpn_health"
 
-echo "T31: adopt path calls the same function (no second copy of the CLI parse)"
-n=$(grep -c 's/\.\*Connected' "$WATCHDOG" || true)
+echo "T31: reconcile reads surflare status, not CLI Connected lines"
+python3 - "$WATCHDOG" << 'PY'
+import sys
+from pathlib import Path
+text = Path(sys.argv[1]).read_text()
+start = text.find("_reconcile_rotation_with_live_session() {")
+end = text.find("\n}", start)
+body = text[start:end]
+ok = (
+    "timeout 5 surflare status" in body
+    and "Server:" in body
+    and "Connected" not in body
+)
+sys.exit(0 if ok else 1)
+PY
+t31_rc=$?
 calls=$(grep -c '_reconcile_rotation_with_live_session' "$WATCHDOG" || true)
-# definition + adopt call + loop call >= 3; Connected parse == 1
-[ "$n" -eq 1 ] && [ "$calls" -ge 3 ] \
-	&& ok "single parse, >=3 call sites" || bad "T31: Connected=$n calls=$calls"
+[ "$t31_rc" -eq 0 ] && [ "$calls" -ge 3 ] \
+	&& ok "status source, >=3 call sites" || bad "T31: status-source rc=$t31_rc calls=$calls"
 
 echo "T32: bug-inject -- deleting the loop call must fail T30 (load-bearing)"
 if ! grep -q '^_reconcile_rotation_with_live_session()' "$WATCHDOG"; then
@@ -376,10 +419,7 @@ PY
 	rm -f "$INJ"
 fi
 
-echo "T33: reconcile bounds CLI log scan (tail -n 200 before sed)"
-# Main-loop call must not rescan the whole file every 30s.  Bound the
-# input to the last 200 lines, then sed.  T17 (latest-of-two Connected
-# lines) still fits in that window.
+echo "T33: reconcile wraps status in timeout 5 (same budget as connect_vpn)"
 python3 - "$WATCHDOG" << 'PY'
 import sys
 from pathlib import Path
@@ -387,23 +427,36 @@ text = Path(sys.argv[1]).read_text()
 start = text.find("_reconcile_rotation_with_live_session() {")
 end = text.find("\n}", start)
 body = text[start:end]
-sys.exit(0 if "tail -n 200" in body and "sed -n" in body else 1)
+sys.exit(0 if "timeout 5 surflare status" in body else 1)
 PY
-[ $? -eq 0 ] && ok "bounded tail before sed" || bad "T33: no tail -n 200 in reconcile"
+[ $? -eq 0 ] && ok "timeout 5 around status" || bad "T33: no timeout 5 surflare status in reconcile"
 
-echo "T34: bug-inject -- dropping the tail bound must fail T33"
-if ! grep -q 'tail -n 200' "$WATCHDOG"; then
-	bad "T34: no tail bound to inject"
+echo "T34: bug-inject -- dropping the timeout wrap must fail T33"
+python3 - "$WATCHDOG" << 'PY'
+import sys
+from pathlib import Path
+text = Path(sys.argv[1]).read_text()
+start = text.find("_reconcile_rotation_with_live_session() {")
+end = text.find("\n}", start)
+body = text[start:end]
+sys.exit(0 if "timeout 5 surflare status" in body else 1)
+PY
+if [ $? -ne 0 ]; then
+	bad "T34: no timeout 5 in reconcile to inject"
 else
-	INJ=$(mktemp /tmp/rp_inj_tail_XXXXXX)
+	INJ=$(mktemp /tmp/rp_inj_to_XXXXXX)
 	python3 - "$WATCHDOG" "$INJ" << 'PYEOF'
 import sys
 from pathlib import Path
 src, dst = sys.argv[1], sys.argv[2]
 s = Path(src).read_text()
-old = "tail -n 200"
-assert s.count(old) == 1, old
-Path(dst).write_text(s.replace(old, "cat", 1))
+start = s.find("_reconcile_rotation_with_live_session() {")
+end = s.find("\n}", start)
+body = s[start:end]
+old = "timeout 5 surflare status"
+assert old in body, old
+new_body = body.replace(old, "surflare status", 1)
+Path(dst).write_text(s[:start] + new_body + s[end:])
 PYEOF
 	python3 - "$INJ" << 'PY'
 import sys
@@ -412,9 +465,9 @@ text = Path(sys.argv[1]).read_text()
 start = text.find("_reconcile_rotation_with_live_session() {")
 end = text.find("\n}", start)
 body = text[start:end]
-sys.exit(0 if "tail -n 200" in body and "sed -n" in body else 1)
+sys.exit(0 if "timeout 5 surflare status" in body else 1)
 PY
-	[ $? -ne 0 ] && ok "tail bound deleted -> T33 would fail" || bad "T34 NOT caught"
+	[ $? -ne 0 ] && ok "timeout wrap deleted -> T33 would fail" || bad "T34 NOT caught"
 	rm -f "$INJ"
 fi
 
