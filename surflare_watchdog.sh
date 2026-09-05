@@ -586,8 +586,9 @@ _run_observability_probes() {
 # logger (which writes to kmsg), rate-limited to PROXY_LOG_RATE_SEC.
 _proxy_log_pid=""
 PROXY_LOG="/var/log/surflare/surflare-proxy.log"
-# The surflare CLI's own log; its "Connected server=<label>" lines are
-# the ground truth for which node the RUNNING proxy actually dialed.
+# CLI session log.  Kept for diagnostics; rotation reconcile does NOT
+# read it.  `connect --daemon` does not append a session line, so the
+# file lags the live node (measured N100 2026-09-05 17:56).
 SURFLARE_CLI_LOG="/var/log/surflare/surflare.log"
 PROXY_LOG_RATE_SEC=60
 PROXY_ERR_STATE="/run/surflare_proxy_err_count"
@@ -596,12 +597,20 @@ PROXY_LOG_LOGGER_TIMEOUT=1
 AUTH_EXPIRED_FILE="/run/surflare_auth_expired"
 
 # _reconcile_rotation_with_live_session: align _active_node/_node_idx
-# and the rotation state file with the CLI log's latest
-# "Connected server=<label>" line.  Live session wins ON PURPOSE:
-# bookkeeping must describe the node the proxy is actually dialed
-# into, or the next failure rotates from fiction.  Re-asserting the
-# configured pin is the supervisor's job (300s re-pin grace), not a
-# reason to lie about reality.
+# and the rotation state file with `surflare status` Server:.  Live
+# session wins ON PURPOSE: bookkeeping must describe the node the
+# proxy is actually dialed into, or the next failure rotates from
+# fiction.  Re-asserting the configured pin is the supervisor's job
+# (300s re-pin grace), not a reason to lie about reality.
+#
+# Status is the only source.  Fail-closed: timeout / non-zero / empty
+# Server: / not in NODE_CANDIDATES -> keep the current cursor.  After
+# our own connect_vpn the in-memory cursor is already the node we
+# asked for; overwriting it from a stale session log is the 17:56
+# regression.
+#
+# Parse matches tui-supervisor.sh:142 (grep Server: + sed).  timeout 5
+# matches connect_vpn's status budget.
 #
 # Called from adopt (proxy outlived this watchdog) AND from the main
 # loop (tui-supervisor pin / any out-of-band connect that did not go
@@ -610,17 +619,13 @@ AUTH_EXPIRED_FILE="/run/surflare_auth_expired"
 _reconcile_rotation_with_live_session() {
 	# _active_node/_node_idx are script-level on purpose: this
 	# function exists to realign them.  Do not local them.
-	local _adopted_node _ai _afound=0
-	# Whitespace-tolerant: the current CLI writes "Connected  server="
-	# (two spaces, verified against the live log) but an upstream
-	# format tweak must degrade to "no reconcile", not silent staleness
-	# -- one-or-more spaces keeps both forms parseable.
-	# Bound the scan: main-loop call must not reread a multi-MB CLI
-	# log every 30s.  Latest Connected line is at EOF (measured N100
-	# 2026-09-05: last Connected = last line of 837).  200 lines is
-	# ample for T17 (latest-of-two) and for a reconnect burst.
-	_adopted_node=$(tail -n 200 "$SURFLARE_CLI_LOG" 2>/dev/null | \
-		sed -n 's/.*Connected  *server=\(.*\) mode=.*/\1/p' | tail -1)
+	local _adopted_node _ai _afound=0 _status_out _status_rc=0
+	_status_out=$(timeout 5 surflare status 2>/dev/null) || _status_rc=$?
+	# Fail-closed: a hung or missing CLI must not rewrite the cursor
+	# from some other source.
+	[ "$_status_rc" -eq 0 ] || return 0
+	# Same parse as scripts/tui-supervisor.sh:142.
+	_adopted_node=$(printf '%s\n' "$_status_out" | grep "Server:" | head -1 | sed "s/.*Server: *//;s/ *$//")
 	if [ -n "$_adopted_node" ] && [ "$_adopted_node" != "$_active_node" ]; then
 		for _ai in "${!NODE_CANDIDATES[@]}"; do
 			if [ "${NODE_CANDIDATES[$_ai]}" = "$_adopted_node" ]; then
@@ -632,7 +637,7 @@ _reconcile_rotation_with_live_session() {
 			log "Adopt reconcile: rotation ${_active_node} -> live session ${_adopted_node} ($((_ai + 1))/${#NODE_CANDIDATES[@]})"
 			_active_node="$_adopted_node"
 			_node_idx=$_ai
-			if ! printf '%s\t%d\n' "$_active_node" "$_node_idx" > "${ROTATION_STATE}.tmp" 2>/dev/null || \
+			if ! printf '%s	%d\n' "$_active_node" "$_node_idx" > "${ROTATION_STATE}.tmp" 2>/dev/null || \
 			   ! mv "${ROTATION_STATE}.tmp" "$ROTATION_STATE" 2>/dev/null; then
 				log "WARN: failed to persist rotation state to $ROTATION_STATE"
 			fi
@@ -6326,10 +6331,11 @@ while true; do
 		sleep 1
 	fi
 
-	# Align rotation bookkeeping with the live CLI session.  tui-supervisor
-	# (and any other out-of-band pin) reconnects without going through
-	# _rotate_node, so without this the cursor stays on the last city
-	# until the next watchdog restart.
+	# Align rotation bookkeeping with live `surflare status` Server:.
+	# tui-supervisor (and any other out-of-band pin) reconnects without
+	# going through _rotate_node, so without this the cursor stays on
+	# the last city until the next watchdog restart.  Status is the
+	# only source -- the CLI session log lags daemon reconnects.
 	_reconcile_rotation_with_live_session
 
 	health=$(check_vpn_health)
