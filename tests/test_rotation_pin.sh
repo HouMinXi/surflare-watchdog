@@ -31,9 +31,28 @@ extract_startup() {
 	' "$1"
 }
 
-# Adopt reconcile block: the comment anchor through the closing fi
-# before _start_proxy_log_monitor.
+# Live-session reconcile function: extracted so T4-T26 keep working
+# after the adopt inline is replaced by a call.  The function body is
+# the production source of truth (same bytes as adopt + main loop).
+extract_reconcile_fn() {
+	awk '
+		/^_reconcile_rotation_with_live_session\(\)/ { f=1 }
+		f { print }
+		f && /^}/ { exit }
+	' "$1"
+}
+
+# Adopt reconcile block: prefer the extracted function; fall back to
+# the historical inline (pre-extract trees) so T7/T8 inject still
+# targets production bytes.
 extract_adopt() {
+	local fn
+	fn=$(extract_reconcile_fn "$1")
+	if [ -n "$fn" ]; then
+		printf '%s\n' "$fn"
+		echo '_reconcile_rotation_with_live_session'
+		return
+	fi
 	awk '
 		/Reconcile rotation state with the ADOPTED session/ { f=1 }
 		f && /_start_proxy_log_monitor/ { exit }
@@ -295,8 +314,109 @@ OUT=$(NODE="(1.)" CANDS="(1.)|Los Angeles" \
 
 echo "T28: valid saved node with STALE saved index -> idx recomputed from catalog, not file"
 OUT=$(NODE="Chicago" CANDS="Chicago|Los Angeles|Atlanta" \
-	ROT_FILE_CONTENT="$(printf 'Los Angeles\t9')" run_startup)
+	ROT_FILE_CONTENT="$(printf 'Los Angeles	9')" run_startup)
 [ "$OUT" = "Los Angeles|1|Los Angeles	1|0" ] && ok "stale saved idx recomputed" || bad "T28 wrong: $OUT"
+
+echo "T29: _reconcile_rotation_with_live_session is a named function (not adopt-only inline)"
+grep -q '^_reconcile_rotation_with_live_session()' "$WATCHDOG" \
+	&& ok "reconcile is a function" || bad "T29: function missing"
+
+echo "T30: main loop calls reconcile every cycle (tui pin path, not just adopt)"
+# The call must sit in the 20 lines immediately BEFORE the MAIN-LOOP
+# assignment health=$(check_vpn_health) (single-tab indent, not the
+# crash-path new_health=).
+python3 - "$WATCHDOG" << 'PY'
+import sys
+from pathlib import Path
+lines = Path(sys.argv[1]).read_text().splitlines()
+idx = next(i for i, l in enumerate(lines) if l.startswith("	health=$(check_vpn_health)"))
+window = "\n".join(lines[max(0, idx-20):idx])
+sys.exit(0 if "_reconcile_rotation_with_live_session" in window else 1)
+PY
+[ $? -eq 0 ] && ok "main loop calls reconcile" || bad "T30: no loop call before check_vpn_health"
+
+echo "T31: adopt path calls the same function (no second copy of the CLI parse)"
+n=$(grep -c 's/\.\*Connected' "$WATCHDOG" || true)
+calls=$(grep -c '_reconcile_rotation_with_live_session' "$WATCHDOG" || true)
+# definition + adopt call + loop call >= 3; Connected parse == 1
+[ "$n" -eq 1 ] && [ "$calls" -ge 3 ] \
+	&& ok "single parse, >=3 call sites" || bad "T31: Connected=$n calls=$calls"
+
+echo "T32: bug-inject -- deleting the loop call must fail T30 (load-bearing)"
+if ! grep -q '^_reconcile_rotation_with_live_session()' "$WATCHDOG"; then
+	bad "T32: no function to inject"
+else
+	INJ=$(mktemp /tmp/rp_inj_loop_XXXXXX)
+	python3 - "$WATCHDOG" "$INJ" << 'PYEOF'
+import sys
+from pathlib import Path
+src, dst = sys.argv[1], sys.argv[2]
+s = Path(src).read_text()
+old = "_reconcile_rotation_with_live_session\n"
+idx = s.find(old)
+assert idx >= 0, "no call"
+idx2 = s.find(old, idx + len(old))
+assert idx2 >= 0, "need a second call (loop)"
+Path(dst).write_text(s[:idx2] + s[idx2+len(old):])
+PYEOF
+	if [ $? -ne 0 ]; then
+		bad "T32: inject could not find two calls"
+	else
+		python3 - "$INJ" << 'PY'
+import sys
+from pathlib import Path
+lines = Path(sys.argv[1]).read_text().splitlines()
+idx = next(i for i, l in enumerate(lines) if l.startswith("	health=$(check_vpn_health)"))
+window = "\n".join(lines[max(0, idx-20):idx])
+sys.exit(0 if "_reconcile_rotation_with_live_session" in window else 1)
+PY
+		rc=$?
+		[ "$rc" -ne 0 ] && ok "loop-call deleted -> T30 would fail" || bad "T32 NOT caught"
+	fi
+	rm -f "$INJ"
+fi
+
+echo "T33: reconcile bounds CLI log scan (tail -n 200 before sed)"
+# Main-loop call must not rescan the whole file every 30s.  Bound the
+# input to the last 200 lines, then sed.  T17 (latest-of-two Connected
+# lines) still fits in that window.
+python3 - "$WATCHDOG" << 'PY'
+import sys
+from pathlib import Path
+text = Path(sys.argv[1]).read_text()
+start = text.find("_reconcile_rotation_with_live_session() {")
+end = text.find("\n}", start)
+body = text[start:end]
+sys.exit(0 if "tail -n 200" in body and "sed -n" in body else 1)
+PY
+[ $? -eq 0 ] && ok "bounded tail before sed" || bad "T33: no tail -n 200 in reconcile"
+
+echo "T34: bug-inject -- dropping the tail bound must fail T33"
+if ! grep -q 'tail -n 200' "$WATCHDOG"; then
+	bad "T34: no tail bound to inject"
+else
+	INJ=$(mktemp /tmp/rp_inj_tail_XXXXXX)
+	python3 - "$WATCHDOG" "$INJ" << 'PYEOF'
+import sys
+from pathlib import Path
+src, dst = sys.argv[1], sys.argv[2]
+s = Path(src).read_text()
+old = "tail -n 200"
+assert s.count(old) == 1, old
+Path(dst).write_text(s.replace(old, "cat", 1))
+PYEOF
+	python3 - "$INJ" << 'PY'
+import sys
+from pathlib import Path
+text = Path(sys.argv[1]).read_text()
+start = text.find("_reconcile_rotation_with_live_session() {")
+end = text.find("\n}", start)
+body = text[start:end]
+sys.exit(0 if "tail -n 200" in body and "sed -n" in body else 1)
+PY
+	[ $? -ne 0 ] && ok "tail bound deleted -> T33 would fail" || bad "T34 NOT caught"
+	rm -f "$INJ"
+fi
 
 echo
 echo "PASS=$PASS FAIL=$FAIL"
