@@ -740,9 +740,8 @@ TRANSIT="auto"          # surflare picks relay automatically
 CHECK_INTERVAL=30       # seconds between health checks
 FAIL_THRESHOLD=4        # consecutive failures before reconnect
 STORM_COOLDOWN=600      # seconds after all candidates exhausted
-STORM_503_OVERRIDE_COUNT=10   # 503s to override Probe 7 (ADR-0001)
-STORM_503_OVERRIDE_WINDOW=300 # fast-storm window (seconds)
-STORM_503_ACTIVE_WINDOW=60    # active-storm window (seconds)
+TPROXY_503_ROTATE_THRESHOLD=5  # inbound/tproxy 503s in health window -> rotate
+                               # urltest 503s do not override Probe 7 or hold reconnect
 ```
 
 **`surflare_early_detector.sh`**

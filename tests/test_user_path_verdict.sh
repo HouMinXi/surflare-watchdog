@@ -25,7 +25,7 @@ TAIL=$(extract_tail "$WATCHDOG")
 printf '%s\n' "$TAIL" | grep -q '_check_tunnel_egress' || { echo "FATAL: tail extract missing egress"; exit 1; }
 printf '%s\n' "$TAIL" | grep -q 'echo "\$result"' || { echo "FATAL: tail extract missing echo"; exit 1; }
 
-CONSTS=$(grep -E '^STORM_503_OVERRIDE_COUNT=|^STORM_503_OVERRIDE_WINDOW=|^TPROXY_503_ROTATE_THRESHOLD=|^NODE_HEALTH_WINDOW=|^STORM_503_STATE=|^NODE_HEALTH_FILE=' "$WATCHDOG")
+CONSTS=$(grep -E '^TPROXY_503_ROTATE_THRESHOLD=|^NODE_HEALTH_WINDOW=|^STORM_503_STATE=|^NODE_HEALTH_FILE=' "$WATCHDOG")
 
 # run_tail WD RESULT TMP_PROXY EGRESS_RC STORM_COUNT TP503 AGE
 # EGRESS_RC 0 = _check_tunnel_egress succeeds
@@ -188,6 +188,65 @@ PY
 OUT=$(run_rot "$INJ" 50 0)
 [ "$OUT" = "4" ] && ok "R-inject restore rotate flips R1" || bad "R-inject got $OUT want 4"
 rm -f "$INJ"
+
+# H1: OK-path tproxy rotate must read .tproxy.categories.http_503,
+# not the last "http_503" in the file (nodes also carry that key).
+extract_tproxy_ok() {
+	awk '
+		/# Tproxy health check:/ { in_blk=1 }
+		in_blk { print }
+		in_blk && /# Proactive node-error rotation:/ { exit }
+	' "$1"
+}
+run_tproxy_ok() {
+	local wd="$1" json="$2"
+	local d nh
+	d=$(mktemp -d)
+	nh="$d/nh.json"
+	printf '%s\n' "$json" > "$nh"
+	bash -c "
+		NODE_HEALTH_WINDOW=600
+		TPROXY_503_ROTATE_THRESHOLD=5
+		TPROXY_503_COOLDOWN=660
+		NODE_HEALTH_FILE='$nh'
+		fail_count=0
+		FAIL_THRESHOLD=4
+		_tproxy_503_cooldown_until=0
+		_tproxy_503_rotate_ts=0
+		log() { :; }
+		run() {
+$(extract_tproxy_ok "$wd")
+		}
+		run
+		echo \$fail_count
+	" 2>/dev/null
+	rm -rf "$d"
+}
+# tproxy has no http_503 key; nodes does. grep -o last-match would
+# rotate on 9; jq .tproxy.categories.http_503 must stay 0.
+MIXED='{"tproxy":{"categories":{"loopback_reject":0}},"nodes":{"x":{"http_503":9}}}'
+REAL='{"tproxy":{"categories":{"http_503":5}},"nodes":{"x":{"http_503":0}}}'
+echo "H1a: tproxy=0 + nodes.http_503=9 -> fail_count stays 0"
+OUT=$(run_tproxy_ok "$WATCHDOG" "$MIXED")
+[ "$OUT" = "0" ] && ok "H1a ignores nodes http_503" || bad "H1a got $OUT want 0"
+echo "H1b: tproxy=5 -> fail_count=4"
+OUT=$(run_tproxy_ok "$WATCHDOG" "$REAL")
+[ "$OUT" = "4" ] && ok "H1b tproxy 503 still rotates" || bad "H1b got $OUT want 4"
+
+echo "H2: rotation comment must not teach fail_count raise"
+rot_hdr=$(sed -n '/^# Proactive node-error rotation:/,/^_handle_proactive_node_rotation()/{p;}' "$WATCHDOG")
+if printf '%s\n' "$rot_hdr" | grep -q 'raising fail_count'; then
+	bad "H2 comment still says raising fail_count"
+else
+	ok "H2 rotation comment matches body"
+fi
+
+echo "H3: dead storm-override constants are not live assignments"
+if grep -E '^STORM_503_OVERRIDE_COUNT=|^STORM_503_HOLD_MAX=|^STORM_503_OVERRIDE_WINDOW=' "$WATCHDOG" | grep -v '^#'; then
+	bad "H3 dead constants still assigned"
+else
+	ok "H3 dead constants gone"
+fi
 
 echo
 echo "PASS=$PASS FAIL=$FAIL"

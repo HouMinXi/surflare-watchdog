@@ -254,6 +254,41 @@ else
 fi
 rm -f "$_patched" "$_patched.jq"
 
+# T8: jq failure must abort, never exec the real binary on unpatched
+# stdin (catch-all stays direct -> leak). memory 36 required abort;
+# the else currently execs REAL_BIN silently.
+_else=$(awk '
+	/if jq --argjson/ { in_jq=1 }
+	in_jq && /^else$/ { in_else=1; next }
+	in_else && /^fi$/ { exit }
+	in_else { print }
+' scripts/surflare-proxy-wrapper.sh)
+# shellcheck disable=SC2016  # grep for the literal exec "$REAL_BIN"; expand would empty the needle
+if [ -z "$_else" ]; then
+	bad T8 "could not extract jq else branch"
+elif printf '%s\n' "$_else" | grep -q 'exec "$REAL_BIN"'; then
+	bad T8 "jq-fail still execs REAL_BIN (unpatched catch-all leak)"
+elif ! printf '%s\n' "$_else" | grep -q 'exit 1'; then
+	bad T8 "jq-fail does not exit 1"
+elif ! printf '%s\n' "$_else" | grep -q 'logger'; then
+	bad T8 "jq-fail is silent (no logger)"
+else
+	ok "T8 jq-fail aborts with log, does not exec REAL_BIN"
+fi
+
+# T9: pre-patch dump must be gated; unpatched JSON carries passwords.
+if grep -n 'singbox-config-dump.json' scripts/surflare-proxy-wrapper.sh | grep -q SURFLARE_DEBUG; then
+	ok "T9 dump gated on SURFLARE_DEBUG"
+elif awk '
+	/SURFLARE_DEBUG/ { gated=1 }
+	/singbox-config-dump.json/ { dump=1; if (gated) ok=1 }
+	END { exit(ok ? 0 : 1) }
+' scripts/surflare-proxy-wrapper.sh; then
+	ok "T9 dump gated on SURFLARE_DEBUG"
+else
+	bad T9 "dump of unpatched config is unconditional (passwords in /tmp)"
+fi
+
 echo
 echo "RESULT: pass=$PASS fail=$FAIL"
 [ "$FAIL" -eq 0 ]

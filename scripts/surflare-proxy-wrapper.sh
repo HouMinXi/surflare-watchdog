@@ -61,8 +61,8 @@ trap 'rm -f "$_tmp" "$_patched"' EXIT
 cat > "$_tmp"
 # Dump pre-patch config for debugging (routing rules, DNS, outbounds).
 # Overwritten on each proxy restart.  chmod 600: contains server IPs.
-cp "$_tmp" /tmp/singbox-config-dump.json
-chmod 600 /tmp/singbox-config-dump.json
+# Unpatched stdin carries outbound passwords. Default off.
+[ -n "$SURFLARE_DEBUG" ] && cp "$_tmp" /tmp/singbox-config-dump.json && chmod 600 /tmp/singbox-config-dump.json
 
 if jq --argjson T "$TOLERANCE" --arg I "$INTERVAL" --arg D "$INJECT_DOMAINS" --arg DD "$DIRECT_DOMAINS" '
   .outbounds |= map(if .type == "urltest" then .tolerance = $T | .interval = $I else . end)
@@ -165,7 +165,8 @@ if jq --argjson T "$TOLERANCE" --arg I "$INTERVAL" --arg D "$INJECT_DOMAINS" --a
 	rm -f "$_tmp" "$_patched"
 	exec "$REAL_BIN" "$@"
 else
-	exec < "$_tmp"
+	# Abort: jq patch failed. Exec on unpatched stdin would reopen the catch-all leak.
+	timeout 5 logger -t surflare-proxy "wrapper: jq patch failed, aborting to prevent catch-all leak" 2>/dev/null || true
 	rm -f "$_tmp" "$_patched"
-	exec "$REAL_BIN" "$@"
+	exit 1
 fi

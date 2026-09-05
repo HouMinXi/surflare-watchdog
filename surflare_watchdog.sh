@@ -93,13 +93,7 @@ SURFLARE_UPGRADE_POLL=10                  # seconds between verification polls
 SURFLARE_PROBE_FAIL_ALERT=5               # consecutive probe failures before alerting
 DIAG_GRACE_PERIOD=180                 # seconds: medium-severity diagnosis alerts wait this long before firing (0=off)
 SERVERCHAN_DAILY_CAP=3               # max Server Chan messages per day when bridge is down (0=unlimited)
-STORM_503_STATE="/run/surflare_503_state"  # 503 monitor -> health check evidence channel
-STORM_503_OVERRIDE_COUNT=10           # cumulative 503s to override Probe 7
-STORM_503_HOLD_MAX=900                # seconds: hold reconnects while a live backend 503 storm
-                                     # persists (one reconnect attempt per window).  Backend
-                                     # storms pass on their own; reconnecting through one
-                                     # kills CN-direct flows for nothing (yinhe control:
-                                     # 0 disconnects through the same storms, client-only).
+STORM_503_STATE="/run/surflare_503_state"  # urltest 503 counter (STATS / noise log only; not a verdict)
 STORM_503_RECENT=90                   # seconds: a 503 whose last_epoch is older than this
                                      # means the storm has gone quiet
 PROXY_BROKEN_GRACE=240                # seconds a PROXY_BROKEN verdict must persist before
@@ -107,7 +101,6 @@ PROXY_BROKEN_GRACE=240                # seconds a PROXY_BROKEN verdict must pers
                                      # indistinguishable from a relay blip urltest would
                                      # ride out; teardown (tombstone + conntrack) is the
                                      # expensive, LAN-wide collateral action.
-STORM_503_OVERRIDE_WINDOW=300         # seconds; all 10 503s must be within this window
 TPROXY_503_ROTATE_THRESHOLD=5         # tproxy 503 count in health window to trigger rotation
 TPROXY_503_COOLDOWN=660                 # 600s health window + 60s margin for 2 cron refreshes (cron runs every 3 min)
 TPROXY_NFT_STAMP="/run/surflare_tproxy_nft.stamp"  # md5 of /etc/surflare-lan-tproxy.nft at last _restore_tproxy
@@ -4750,13 +4743,11 @@ _in_dwell_storm() {
 	[ "$_all_short" -eq 1 ]
 }
 
-# Proactive node-error rotation: if the current exit node has accumulated
-# >= NODE_ERR_ROTATE_THRESHOLD outbound errors in the health window and at
-# least one candidate is healthy, rotate immediately by raising fail_count to
-# FAIL_THRESHOLD. Absent node_health.json key = 0 errors = healthy. If all
-# candidates are unhealthy across NODE_ERR_STORM_CONSECUTIVE cycles, enter
-# relay-wide storm cooldown. NODE_ERR_COOLDOWN prevents re-trigger on stale
-# data before the cron refreshes the health file.
+# Proactive node-error rotation: urltest error_count is probe noise
+# (1.1.1.1 / relay 503), not LAN tproxy death. Do not raise fail_count.
+# If every candidate is also noisy across NODE_ERR_STORM_CONSECUTIVE
+# cycles, enter relay-wide storm cooldown. NODE_ERR_COOLDOWN prevents
+# re-trigger on stale data before the cron refreshes the health file.
 _handle_proactive_node_rotation() {
 	local _now="$1"
 	[ "$_now" -ge "${_node_err_cooldown_until:-0}" ] || return 0
@@ -6552,7 +6543,8 @@ while true; do
 			# Skip if file is stale (>600s) or was written before cooldown started
 			# (stale data from previous node that the cron hasn't refreshed yet)
 			if [ "$_nh_age" -le "$NODE_HEALTH_WINDOW" ] && [ "$_nh_mtime" -ge "${_tproxy_503_rotate_ts:-0}" ]; then
-				_tproxy_503=$(grep -o '"http_503": *[0-9]*' "$NODE_HEALTH_FILE" | awk -F': *' '{print $2}')
+				_tproxy_503=$(jq -r '.tproxy.categories.http_503 // 0' "$NODE_HEALTH_FILE" 2>/dev/null || echo 0)
+				case "${_tproxy_503}" in ''|*[!0-9]*) _tproxy_503=0 ;; esac
 				if [ "${_tproxy_503:-0}" -ge "$TPROXY_503_ROTATE_THRESHOLD" ]; then
 					log "Relay degraded: ${_tproxy_503} tproxy 503 in health window, rotating"
 					fail_count=$FAIL_THRESHOLD
