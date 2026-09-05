@@ -595,6 +595,53 @@ PROXY_ERR_THRESHOLD=10  # higher than 503's 5: general errors are noisier
 PROXY_LOG_LOGGER_TIMEOUT=1
 AUTH_EXPIRED_FILE="/run/surflare_auth_expired"
 
+# _reconcile_rotation_with_live_session: align _active_node/_node_idx
+# and the rotation state file with the CLI log's latest
+# "Connected server=<label>" line.  Live session wins ON PURPOSE:
+# bookkeeping must describe the node the proxy is actually dialed
+# into, or the next failure rotates from fiction.  Re-asserting the
+# configured pin is the supervisor's job (300s re-pin grace), not a
+# reason to lie about reality.
+#
+# Called from adopt (proxy outlived this watchdog) AND from the main
+# loop (tui-supervisor pin / any out-of-band connect that did not go
+# through _rotate_node).  Without the loop call, a long-lived watchdog
+# keeps a stale cursor until the next restart.
+_reconcile_rotation_with_live_session() {
+	# _active_node/_node_idx are script-level on purpose: this
+	# function exists to realign them.  Do not local them.
+	local _adopted_node _ai _afound=0
+	# Whitespace-tolerant: the current CLI writes "Connected  server="
+	# (two spaces, verified against the live log) but an upstream
+	# format tweak must degrade to "no reconcile", not silent staleness
+	# -- one-or-more spaces keeps both forms parseable.
+	# Bound the scan: main-loop call must not reread a multi-MB CLI
+	# log every 30s.  Latest Connected line is at EOF (measured N100
+	# 2026-09-05: last Connected = last line of 837).  200 lines is
+	# ample for T17 (latest-of-two) and for a reconnect burst.
+	_adopted_node=$(tail -n 200 "$SURFLARE_CLI_LOG" 2>/dev/null | \
+		sed -n 's/.*Connected  *server=\(.*\) mode=.*/\1/p' | tail -1)
+	if [ -n "$_adopted_node" ] && [ "$_adopted_node" != "$_active_node" ]; then
+		for _ai in "${!NODE_CANDIDATES[@]}"; do
+			if [ "${NODE_CANDIDATES[$_ai]}" = "$_adopted_node" ]; then
+				_afound=1
+				break
+			fi
+		done
+		if [ "$_afound" -eq 1 ]; then
+			log "Adopt reconcile: rotation ${_active_node} -> live session ${_adopted_node} ($((_ai + 1))/${#NODE_CANDIDATES[@]})"
+			_active_node="$_adopted_node"
+			_node_idx=$_ai
+			if ! printf '%s\t%d\n' "$_active_node" "$_node_idx" > "${ROTATION_STATE}.tmp" 2>/dev/null || \
+			   ! mv "${ROTATION_STATE}.tmp" "$ROTATION_STATE" 2>/dev/null; then
+				log "WARN: failed to persist rotation state to $ROTATION_STATE"
+			fi
+		else
+			log "WARN: adopted node '${_adopted_node}' not in NODE_CANDIDATES, keeping restored rotation ${_active_node}"
+		fi
+	fi
+}
+
 _start_proxy_log_monitor() {
 	_stop_proxy_log_monitor
 	[ -f "$PROXY_LOG" ] || return 0
@@ -1405,46 +1452,7 @@ _cleanup_on_startup() {
 		local _proxy_pid
 		_proxy_pid=$(_pids_by_comm surflare-proxy | head -1)
 		log "Startup: adopting running proxy (PID=${_proxy_pid:-unknown})"
-		# Reconcile rotation state with the ADOPTED session: the proxy
-		# outlives the watchdog, so the restored rotation state can name
-		# a node the proxy is not actually dialed into.  The CLI log's
-		# latest "Connected server=<label>" line is the ground truth for
-		# the live session; align _active_node/_node_idx and the state
-		# file with it so a later failure rotates FROM reality.
-		# _active_node/_node_idx are deliberately NOT local: this block
-		# exists to realign the script-level rotation state.
-		# Pin vs live session: the live session wins here ON PURPOSE.
-		# Bookkeeping must describe the node the proxy is actually
-		# dialed into, or the next failure rotates from fiction -- the
-		# exact defect this fix exists to kill.  Re-asserting the
-		# configured pin is the supervisor's job (300s re-pin grace),
-		# not a reason to lie about reality.
-		local _adopted_node _ai _afound=0
-		# Whitespace-tolerant: the current CLI writes "Connected  server="
-		# (two spaces, verified against the live log) but an upstream
-		# format tweak must degrade to "no reconcile", not silent staleness
-		# -- one-or-more spaces keeps both forms parseable.
-		_adopted_node=$(sed -n 's/.*Connected  *server=\(.*\) mode=.*/\1/p' \
-			"$SURFLARE_CLI_LOG" 2>/dev/null | tail -1)
-		if [ -n "$_adopted_node" ] && [ "$_adopted_node" != "$_active_node" ]; then
-			for _ai in "${!NODE_CANDIDATES[@]}"; do
-				if [ "${NODE_CANDIDATES[$_ai]}" = "$_adopted_node" ]; then
-					_afound=1
-					break
-				fi
-			done
-			if [ "$_afound" -eq 1 ]; then
-				log "Adopt reconcile: rotation ${_active_node} -> live session ${_adopted_node} ($((_ai + 1))/${#NODE_CANDIDATES[@]})"
-				_active_node="$_adopted_node"
-				_node_idx=$_ai
-				if ! printf '%s\t%d\n' "$_active_node" "$_node_idx" > "${ROTATION_STATE}.tmp" 2>/dev/null || \
-				   ! mv "${ROTATION_STATE}.tmp" "$ROTATION_STATE" 2>/dev/null; then
-					log "WARN: failed to persist rotation state to $ROTATION_STATE"
-				fi
-			else
-				log "WARN: adopted node '${_adopted_node}' not in NODE_CANDIDATES, keeping restored rotation ${_active_node}"
-			fi
-		fi
+		_reconcile_rotation_with_live_session
 		_start_proxy_log_monitor
 		# Skip nft delete and ip rule del -- proxy needs them intact.
 		# Killswitch is already armed from the previous instance;
@@ -6317,6 +6325,12 @@ while true; do
 		connect_vpn
 		sleep 1
 	fi
+
+	# Align rotation bookkeeping with the live CLI session.  tui-supervisor
+	# (and any other out-of-band pin) reconnects without going through
+	# _rotate_node, so without this the cursor stays on the last city
+	# until the next watchdog restart.
+	_reconcile_rotation_with_live_session
 
 	health=$(check_vpn_health)
 
