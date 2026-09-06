@@ -2326,8 +2326,15 @@ _update_bypass_devices() {
 			mac=$(echo "$line" | awk '{print tolower($1)}' | tr -d '\r')
 			case "$mac" in '#'*|'') continue ;; esac
 			local _v6
+			# `ip -6 neigh show dev br-lan` is 4 fields (ADDR lladdr MAC
+			# STATE) so MAC is $3.  Without `dev` it is 6 fields and MAC
+			# is $5.  Match the lladdr token, not a column number.
 			_v6=$(ip -6 neigh show dev br-lan 2>/dev/null \
-				| awk -v m="$mac" 'tolower($5)==tolower(m) && $1!~/^fe80/ {print $1}')
+				| awk -v m="$mac" 'BEGIN{m=tolower(m)} {
+					for (i=1; i<NF; i++)
+						if (tolower($i)=="lladdr" && tolower($(i+1))==m && $1 !~ /^[Ff][Ee]80/)
+							print $1
+				}')
 			[ -n "$_v6" ] && all_v6="${all_v6:+$all_v6,}$(echo "$_v6" | tr '\n' ',' | sed 's/,$//')"
 		done < "$BYPASS_LAN_MACS_FILE"
 	fi
