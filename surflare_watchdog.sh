@@ -952,7 +952,8 @@ _setup_kernel_moat() {
 _setup_chnroute() {
 	# Populates CN bypass CIDRs into killswitch bypass_ipv4/bypass_ipv6
 	# (both modes) and surflare output chain cn_ipv4/cn_ipv6 accept rules
-	# (global mode only -- rule mode delegates CN split to surflare-proxy).
+	# (global mode only -- router-originated CN).  LAN tproxy cn_direct
+	# is a separate load via _load_tproxy_cn_direct (both modes).
 	local cn_v4_file="/etc/surflare/cn_ipv4.txt"
 	local cn_v6_file="/etc/surflare/cn_ipv6.txt"
 	mkdir -p /etc/surflare 2>/dev/null || true
@@ -1153,9 +1154,11 @@ _ks_batch=$(mktemp /tmp/ks_bypass_all.XXXXXX)
 
 # Load CN CIDRs into sw_lan_tproxy cn_direct/cn6_direct sets so that
 # CN-destined LAN traffic bypasses tproxy and exits via ISP direct.
-# This fixes CDN acceleration and CN app geo-detection in global mode.
-# In rule mode: no-op (surflare-proxy handles CN split at app layer).
-# Called after _restore_tproxy (which empties all sets via destroy+reload)
+# Runs in both modes.  In rule mode sing-box still splits at app
+# layer; nft return is additive (hits go ISP direct, misses still
+# reach sing-box).  Optional "force" arg is ignored -- leftover from
+# when this was a rule-mode no-op.
+# Called after _restore_tproxy (destroy+reload empties the sets)
 # and at the end of _setup_chnroute (initial connect).
 _load_tproxy_cn_direct() {
 	# Belt-and-suspenders CN bypass at nftables layer.  In rule mode
@@ -1218,7 +1221,7 @@ _load_tproxy_cn_direct() {
 			local _v4c _v6c
 			_v4c=$(nft list set inet sw_lan_tproxy cn_direct 2>/dev/null | grep -c '/')
 			_v6c=$(nft list set inet sw_lan_tproxy cn6_direct 2>/dev/null | grep -c '/')
-			log "Tproxy cn_direct loaded: ${_v4c} v4 + ${_v6c} v6 CIDRs (global mode LAN CN bypass)"
+			log "Tproxy cn_direct loaded: ${_v4c} v4 + ${_v6c} v6 CIDRs (LAN CN bypass, all modes)"
 		else
 			log "WARN: tproxy cn_direct load failed: ${_nft_err}"
 		fi
@@ -2090,11 +2093,11 @@ _scoped_conntrack_flush() {
 _tombstone_tproxy() {
 	nft list table inet sw_lan_tproxy >/dev/null 2>&1 || return 0
 	# Load CN IPs into cn_direct so domestic traffic bypasses tproxy
-	# during the tombstone window.  In rule mode cn_direct is normally
-	# empty (sing-box handles CN split); during tombstone sing-box is
-	# dead so we must route CN direct at the nftables layer.
-	# _restore_tproxy() recreates cn_direct as empty (destroy+reload),
-	# returning to normal rule-mode behavior automatically.
+	# during the tombstone window (sing-box is dead; nft return is
+	# the only CN path).  cn_direct is already populated in both
+	# modes; this call is a reload in case destroy left it empty.
+	# _restore_tproxy() destroy+reload empties the sets then calls
+	# _load_tproxy_cn_direct again -- same contents, not "empty".
 	_load_tproxy_cn_direct force
 	# Replace each tproxy rule with a protocol-matched reject so only
 	# the originally proxied protocols are blocked.  Without the qualifier

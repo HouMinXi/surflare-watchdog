@@ -21,8 +21,8 @@ The `cn_direct` / `cn6_direct` sets in the tproxy table are populated by
 CDN) + cn_ipv6.txt after each VPN connect.  This gives CN apps a domestic
 IP while non-CN traffic still goes through VPN.
 
-In rule mode these sets are empty (surflare-proxy handles CN split at
-the application layer).
+Same load runs in rule mode.  sing-box still splits leftovers at
+the application layer; nft return is additive.
 
 ## Remaining Limitations
 
@@ -179,20 +179,22 @@ Router process (opkg, curl, SSH)
 
 ## Key Difference from Rule Mode
 
-Two CN bypass mechanisms exist only in global mode:
+LAN `cn_direct` is loaded in both modes.  The mechanism unique to
+global mode is the **router output** path:
 
-1. **LAN cn_direct bypass** (`sw_lan_tproxy`): `_load_tproxy_cn_direct()`
-   populates `cn_direct` / `cn6_direct` sets from cn_ipv4.txt +
-   cn_ipv4_extra.txt + cn_ipv6.txt after each VPN connect.  CN-destined
-   LAN traffic returns before tproxy, goes through killswitch forward
-   (`bypass_ipv4` accepts it), exits via ISP direct.
+1. **LAN cn_direct bypass** (`sw_lan_tproxy`, both modes):
+   `_load_tproxy_cn_direct()` populates `cn_direct` / `cn6_direct`
+   from cn_ipv4.txt + cn_ipv4_extra.txt + cn_ipv6.txt after each VPN
+   connect.  CN-destined LAN traffic returns before tproxy and before
+   UDP/443 reject, then killswitch `bypass_ipv4` accepts it.
 
-2. **Router cn_ipv4 bypass** (`inet surflare` output): `_setup_chnroute()`
-   inserts `ip daddr @cn_ipv4 accept` so the router's own CN traffic
-   (opkg, curl) bypasses surflare-proxy at kernel level.
+2. **Router cn_ipv4 bypass** (`inet surflare` output, global only):
+   `_setup_chnroute()` inserts `ip daddr @cn_ipv4 accept` so the
+   router's own CN traffic (opkg, curl) bypasses surflare-proxy at
+   kernel level.  Rule mode has no output-chain rule.
 
-In rule mode, surflare-proxy handles CN/non-CN split at the application
-layer.  Both `cn_direct` sets and `cn_ipv4` accept rules are absent.
+In rule mode sing-box still splits destinations **not** in
+`cn_direct` at the application layer.
 
 `bypass_devices` is populated from `router/global/bypass-macs.conf`
 (deployed to `/etc/surflare/bypass-macs.conf` by install.sh).  Bypassed
@@ -201,7 +203,9 @@ direct.  Their IPs are synced to killswitch `bypass_src` (forward
 accept) and dns_enforce `vpn_bypass` (DNS exemption).  **WARNING:
 bypassed devices have NO VPN protection for non-CN traffic.**
 
-In rule mode, `bypass_devices` is empty (code guard skips population).
+`bypass_devices` is filled from `bypass-macs.conf` in both modes
+(N100 live: .11 BT, .17 Mac/AnyConnect, .120 work laptop).  There is
+no rule-mode skip.
 
 `derp_asia` (Tailscale DERP sin/tok/hkg node IPs) is returned to the WAN
 before the tproxy rules for z66 (192.168.100.12) only, so z66's
@@ -243,7 +247,7 @@ To verify on a running system:
 # Check mode
 grep '^MODE=' /usr/local/sbin/surflare_watchdog.sh
 
-# Verify cn_direct sets are populated (global only, ~4700 CIDRs)
+# Verify cn_direct sets are populated (both modes, ~2300 v4 CIDRs)
 nft list set inet sw_lan_tproxy cn_direct | grep -c "/"
 
 # Verify cn_ipv4 accept in surflare output
