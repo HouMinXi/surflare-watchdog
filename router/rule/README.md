@@ -80,10 +80,10 @@ LAN device (TCP/QUIC/DNS)
 | sw_lan_tproxy prerouting (mangle-10), table inet         |
 |   1. IPv4 private dest? ----------> return (direct)      |
 |   2. IPv6 private dest? ----------> return (direct)      |
-|   3. in bypass_devices? ----------> return (empty/rule)   |
+|   3. in bypass_devices? ----------> return (MAC list)     |
 |   4. in auto_bypass? -------------> return (AnyConnect)   |
-|   5. in cn_direct? ---------------> return (empty/rule)   |
-|   6. in cn6_direct? --------------> return (empty/rule)   |
+|   5. in cn_direct? ---------------> return (CN ISP)       |
+|   6. in cn6_direct? --------------> return (CN ISP)       |
 |   7. DTLS 1.2 UDP/443 0xFEFD? ----> auto_bypass, return  |
 |   8. IPv4 TCP? ---> tproxy ip to :10800   (mark 0x1)     |
 |   9. IPv6 TCP? ---> tproxy ip6 to :10800  (mark 0x1)     |
@@ -112,7 +112,11 @@ LAN device (TCP/QUIC/DNS)
 
 ### Rule mode tproxy notes
 
-- `cn_direct` / `cn6_direct` sets exist in the nft file but remain empty.
+- `cn_direct` / `cn6_direct` are loaded in both modes by
+  `_load_tproxy_cn_direct()` (cn_ipv4.txt + extra + cn_ipv6.txt).
+  Hits return before tproxy and before UDP/443 reject, so CN QUIC
+  goes ISP direct.  Destinations not in the sets still reach
+  sing-box in rule mode.
 - `derp_asia` (Tailscale DERP sin/tok/hkg node IPs) is returned to the
   WAN before the tproxy rules for z66 (192.168.100.12) only, so z66's
   tailscaled measures and reaches Asia DERP over the ISP path instead of
@@ -120,12 +124,10 @@ LAN device (TCP/QUIC/DNS)
   and forced a 300-430ms relay).  The killswitch forward chain carries a
   same-named set accepting this traffic plus z66's WireGuard UDP/41641,
   outbound-only.  User-adjudicated 2026-09-01 (project memory 56 branch A).
-  The return rules never match; surflare-proxy handles CN split at the
-  application layer.  Sets are present for structural parity with global
-  mode (same table schema, different population).
-- `bypass_devices` is empty: `_update_bypass_devices()` has a `MODE != "global"`
-  guard that skips population in rule mode.  `router/rule/bypass-macs.conf`
-  is comments-only; even if MACs were listed, the code guard prevents activation.
+- `bypass_devices` is filled from `/etc/surflare/bypass-macs.conf` in
+  both modes (`_update_bypass_devices` has no MODE skip).  N100 live:
+  .11 BT, .17 Mac/AnyConnect, .120 work laptop.  The example file in
+  `router/rule/bypass-macs.conf` is placeholders only.
 - `auto_bypass` is IPv4-only (`type ipv4_addr`).  DTLS detection rule
   uses `meta nfproto ipv4` to avoid IPv6 false matches.
 
@@ -172,14 +174,15 @@ Router process (opkg, curl, SSH)
 
 ## Key Difference from Global Mode
 
-In global mode, `_load_tproxy_cn_direct()` populates the `cn_direct` /
-`cn6_direct` sets from cn_ipv4.txt + cn_ipv4_extra.txt + cn_ipv6.txt,
-so CN-destined LAN traffic returns before tproxy and routes via ISP
-direct (domestic IP for CDN + geo-detection).
+`_load_tproxy_cn_direct()` populates `cn_direct` / `cn6_direct` from
+cn_ipv4.txt + cn_ipv4_extra.txt + cn_ipv6.txt in **both** modes, so
+CN-destined LAN traffic (TCP and UDP/443) returns before tproxy /
+QUIC reject and routes via ISP direct.
 
-In rule mode, surflare-proxy handles CN/non-CN split at the application
-layer.  The `cn_direct` / `cn6_direct` sets remain empty, and no
-`cn_ipv4` accept rules are added to the surflare output chain.
+In rule mode sing-box still splits at the application layer for
+destinations **not** in those sets.  Kernel `cn_direct` is additive,
+not a substitute.  The surflare output chain still has no `cn_ipv4`
+accept rules in rule mode (router-originated CN is a different path).
 
 `bypass_ipv4` in the killswitch is populated in both modes (VPN-down
 resilience + LAN CN UDP direct routing).

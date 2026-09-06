@@ -539,7 +539,7 @@ state from any prior crash or unclean shutdown. Steps execute in order:
  5. Detect tombstoned tproxy
       - reject rules left behind from prior crash
       - restore tproxy rules from nft file
-      - Global mode: also repopulate cn_direct sets
+      - both modes: also repopulate cn_direct sets
  6. Clean orphaned watchdog_trace table
  7. Clean stale IPC files
       - /run/surflare_auth_fail_signal

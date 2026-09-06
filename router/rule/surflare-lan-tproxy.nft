@@ -89,9 +89,10 @@ table inet sw_lan_tproxy {
         # Dynamic bypass: devices already detected as corporate VPN
         iifname "br-lan" ip saddr @auto_bypass return
 
-        # CN destinations: ISP direct (populated in global mode only).
-        # In rule mode these sets remain empty -- rules never match;
-        # surflare-proxy handles CN split at app layer instead.
+        # CN destinations: ISP direct.  Watchdog loads cn_direct /
+        # cn6_direct in BOTH modes (cn_ipv4.txt + extra + cn_ipv6.txt).
+        # Hits return here (TCP and UDP/443) before tproxy/reject.
+        # Misses still reach sing-box for app-layer split in rule mode.
         # After device bypass so bypass_devices/auto_bypass users keep their
         # explicit override for ALL traffic, not just non-CN.
         iifname "br-lan" ip daddr @cn_direct return

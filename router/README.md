@@ -6,9 +6,9 @@ Scripts and config for N100 mini-PC running iStoreOS or OpenWrt (procd init).
 
 | File | Purpose |
 |------|---------|
-| `rule/surflare-lan-tproxy.nft` | `table inet` dual-stack tproxy (rule mode). LAN TCP+QUIC IPv4+IPv6 to surflare-proxy. `cn_direct`/`cn6_direct` sets present but empty (proxy handles CN split). |
-| `global/surflare-lan-tproxy.nft` | Same table structure (global mode). `cn_direct`/`cn6_direct` populated by watchdog with CN CIDRs for ISP direct bypass. |
-| `rule/bypass-macs.conf` | Mode-specific bypass config: empty in rule mode (proxy handles CN for all devices equally). |
+| `rule/surflare-lan-tproxy.nft` | `table inet` dual-stack tproxy (rule mode). LAN TCP to surflare-proxy; UDP/443 reject after `cn_direct` return. Watchdog loads `cn_direct`/`cn6_direct` in both modes. |
+| `global/surflare-lan-tproxy.nft` | Same table structure (global mode). Same `cn_direct`/`cn6_direct` load. |
+| `rule/bypass-macs.conf` | Mode-specific bypass config. N100 live still lists .11/.17/.120 even in rule mode (AnyConnect + BT). |
 | `global/bypass-macs.conf` | Mode-specific bypass config: devices needing full CN ISP direct (e.g. Thunder). **WARNING: bypassed devices have NO VPN protection.** |
 | `update-cn-domains.sh` | Weekly cron: downloads dnsmasq-china-list, converts to SmartDNS nameserver format, validates, restarts SmartDNS. |
 | `smartdns/custom.conf.example` | SmartDNS config template: domestic group (CN DoT/DoH), foreign group (1.1.1.1 via VPN), Bing fix, bootstrap isolation. |
