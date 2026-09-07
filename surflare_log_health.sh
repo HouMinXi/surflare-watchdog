@@ -19,6 +19,7 @@ readonly DEFAULT_WINDOW=10   # minutes of log to scan
 
 WINDOW_MINUTES=$DEFAULT_WINDOW
 OUT_FILE=$DEFAULT_OUT
+LOG_OVERRIDE=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -28,17 +29,21 @@ while [[ $# -gt 0 ]]; do
         --out)
             [[ -n "${2:-}" ]] || { echo "Missing value for --out"; exit 1; }
             OUT_FILE="$2"; shift 2 ;;
-        *) echo "Unknown arg: $1"; exit 1 ;;
+        --log)
+            [[ -n "${2:-}" ]] || { echo "Missing value for --log"; exit 1; }
+            LOG_OVERRIDE="$2"; shift 2 ;;
+        *) echo "Unknown arg: $1"; exit 1; ;;
     esac
 done
 
-[ -f "$LOG_FILE" ] || { echo "Log not found: $LOG_FILE"; exit 1; }
+LOG_FILE_TO_USE="${LOG_OVERRIDE:-$LOG_FILE}"
+[ -f "$LOG_FILE_TO_USE" ] || { echo "Log not found: $LOG_FILE_TO_USE"; exit 1; }
 
 TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 
 # Parse: extract urltest errors from last WINDOW_MINUTES minutes
 # Log format: +0800 2026-06-15 23:07:10 ERROR [...] outbound/urltest[NODE]: message
-python3 - "$LOG_FILE" "$TS" "$WINDOW_MINUTES" "$OUT_FILE" << 'PYEOF'
+python3 - "$LOG_FILE_TO_USE" "$TS" "$WINDOW_MINUTES" "$OUT_FILE" << 'PYEOF'
 import json, os, re, sys
 from datetime import datetime, timezone, timedelta
 
@@ -57,20 +62,33 @@ pat_urltest = re.compile(
 pat_tproxy = re.compile(
     r'^\+0800 (\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) ERROR (?:.* )?inbound/tproxy\[[^\]]+\]: .*(reject loopback|503 Service Unavailable|i/o timeout|connection timed out)(.*)$'
 )
+# User-path errors: "connection: open connection to <dst> using
+# outbound/socks[...]" -- traffic the LAN actually rides.  urltest
+# probes (rotated every 60s, high volume) and direct outbound are
+# not user-path.  127.0.0.1 dials are watchdog health probes.
+pat_userpath = re.compile(
+    r'^\+0800 (\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) ERROR (?:\[[^\]]*\] )?connection: open connection to (\S+) using outbound/socks\[([^\]]+)\]: (.+)$'
+)
 TZ_CST = timezone(timedelta(hours=8))
 
 node_errors = {}   # node_name -> {"count": N, "last": "msg", "last_ts": datetime}
 # tproxy error counters by category
 tproxy_counts = {"loopback_reject": 0, "http_503": 0, "io_timeout": 0, "conn_timeout": 0}
 tproxy_last_ts = None
+# user-path counters (LAN-visible traffic on socks outbound)
+userpath_counts = {"socks_errors": 0, "auth_required": 0}
+userpath_last_ts = None
 lines_scanned = 0
 
 with open(log_path, 'rb') as f:
     # Seek to ~last 2MB to avoid scanning full file (avg line ~120 bytes, 2MB ~ 17k lines)
     f.seek(0, 2)
     size = f.tell()
-    f.seek(max(0, size - 2_000_000))
-    f.readline()  # skip partial line
+    if size > 2_000_000:
+        f.seek(size - 2_000_000)
+        f.readline()  # skip partial line
+    else:
+        f.seek(0)
     for raw in f:
         lines_scanned += 1
         try:
@@ -114,6 +132,24 @@ with open(log_path, 'rb') as f:
                 tproxy_counts["io_timeout"] += 1
             elif "connection timed out" in category:
                 tproxy_counts["conn_timeout"] += 1
+            continue
+
+        # Match user-path socks outbound errors
+        m3 = pat_userpath.match(line)
+        if m3:
+            ts_str, dst, outbound, msg = m3.group(1), m3.group(2), m3.group(3), m3.group(4)
+            try:
+                log_dt = datetime.strptime(ts_str, '%Y-%m-%d %H:%M:%S').replace(tzinfo=TZ_CST)
+            except ValueError:
+                continue
+            if log_dt.astimezone(timezone.utc) < cutoff_utc:
+                continue
+            if dst.startswith("127.0.0.1") or dst.startswith("[::1]"):
+                continue
+            userpath_last_ts = ts_str
+            userpath_counts["socks_errors"] += 1
+            if "authentication required" in msg:
+                userpath_counts["auth_required"] += 1
 
 # Build result: include both observed nodes and infer healthy/unhealthy
 nodes_out = {}
@@ -134,12 +170,20 @@ tproxy_out = {
     "last_error_ts": tproxy_last_ts,
 }
 
+# user-path health: LAN-visible socks outbound errors
+userpath_out = {
+    "healthy": userpath_counts["socks_errors"] == 0,
+    **userpath_counts,
+    "last_error_ts": userpath_last_ts,
+}
+
 out = {
     "timestamp": ts_now,
     "window_minutes": window_min,
     "lines_scanned": lines_scanned,
     "nodes": nodes_out,
     "tproxy": tproxy_out,
+    "user_path": userpath_out,
 }
 
 tmp = out_path + ".tmp"

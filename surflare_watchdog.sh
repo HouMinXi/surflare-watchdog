@@ -103,6 +103,9 @@ PROXY_BROKEN_GRACE=240                # seconds a PROXY_BROKEN verdict must pers
                                      # expensive, LAN-wide collateral action.
 TPROXY_503_ROTATE_THRESHOLD=5         # tproxy 503 count in health window to trigger rotation
 TPROXY_503_COOLDOWN=660                 # 600s health window + 60s margin for 2 cron refreshes (cron runs every 3 min)
+EGRESS_STREAK_THRESHOLD=3              # consecutive _check_tunnel_egress failures that flip OK -> PROXY_BROKEN
+EGRESS_STREAK_WINDOW=900               # seconds a streak stays valid without a new miss (stale -> restart at 1)
+EGRESS_STREAK_STATE="/run/surflare_egress_streak"  # "<count> <ts> <auth_count>" written by check_vpn_health
 TPROXY_NFT_STAMP="/run/surflare_tproxy_nft.stamp"  # md5 of /etc/surflare-lan-tproxy.nft at last _restore_tproxy
 NODE_HEALTH_FILE="/var/run/surflare_node_health.json"
 NODE_ERR_ROTATE_THRESHOLD=50    # current-node outbound error count to trigger proactive rotation
@@ -2798,6 +2801,22 @@ _exempt_cn_output() {
 		ip daddr @cn_output accept \
 		2>/dev/null || true
 }
+# _egress_auth_bump: count "authentication required" errors on the user-path
+# socks outbound in the recent proxy log.  During relay token expiry the
+# socks outbound fails with auth errors while established connections keep
+# working -- a zero-baseline death signature (799 hits during the 2026-09-07
+# outage, 0 on healthy days).  Echoes a cumulative count.
+_egress_auth_bump() {
+	local _auth=0 _log _age
+	for _log in /var/log/surflare/surflare-proxy.log /var/log/surflare/surflare-proxy.log.1; do
+		[ -r "$_log" ] || continue
+		_age=$(( $(date +%s) - $(stat -c %Y "$_log" 2>/dev/null || echo 0) ))
+		[ "$_age" -gt $((EGRESS_STREAK_WINDOW * 2)) ] && continue
+		_auth=$((_auth + $(grep -c 'outbound/socks\[.*\]: authentication required' "$_log" 2>/dev/null || echo 0)))
+	done
+	echo "$_auth"
+}
+
 # _check_tunnel_egress: test whether the VPN tunnel can reach external endpoints.
 # Tests OUTPUT -> mark 0x1 -> VPN path (locally originated traffic).
 # Does NOT test surflare-proxy:10800 tproxy path (port 10800 is a tproxy
@@ -3221,14 +3240,6 @@ check_vpn_health() {
 	      "$tmp_gt" "$tmp_cft" "$tmp_cf2t" "$tmp_ifct" "$tmp_icht" "$tmp_myt" "$tmp_proxyt"
 	_hc_tmp=""
 
-	if [ -n "$result" ] && [ "$result" != "TCP_BLOCK" ] && \
-	   [ "$result" != "LOCAL_FAIL" ] && [ "$result" != "CN" ] && \
-	   [ "$result" != "PROXY_BROKEN" ]; then
-		if ! _check_tunnel_egress; then
-			log "Tunnel egress check failed (primary=${result}); not PROXY_BROKEN without tproxy 503"
-		fi
-	fi
-
 	# tproxy 503 override.  inbound/tproxy 503 is LAN user-path death.
 	# urltest probe 503s in STORM_503_STATE are not.  Missing or stale
 	# NODE_HEALTH_FILE fails closed (no override).
@@ -3246,6 +3257,42 @@ check_vpn_health() {
 		if [ "$_tp503" -ge "$TPROXY_503_ROTATE_THRESHOLD" ]; then
 			result="PROXY_BROKEN"
 			log "tproxy 503 override (${_tp503} in window) -> PROXY_BROKEN"
+		fi
+	fi
+
+	if [ -n "$result" ] && [ "$result" != "TCP_BLOCK" ] && \
+	   [ "$result" != "LOCAL_FAIL" ] && [ "$result" != "CN" ] && \
+	   [ "$result" != "PROXY_BROKEN" ]; then
+		# Egress-streak override.  _check_tunnel_egress dials fresh
+		# connections through sing-box -- the same user path LAN tproxy
+		# rides (ct mark 0x100).  During the 2026-09-07 outage the primary
+		# probes stayed OK/TUNNEL_OK/country (mark 0x1, established relay
+		# socket) while every egress re-dial failed for 2.4h; the watchdog
+		# held "healthy" the whole time.  A single miss stays log-only
+		# (the 2026-09-04 guard: transient CDN blips).  N consecutive
+		# misses within EGRESS_STREAK_WINDOW are user-path death.
+		local _es_count=0 _es_ts=0 _es_auth=0 _es_now
+		_es_now=$(date +%s)
+		if [ -f "$EGRESS_STREAK_STATE" ]; then
+			read -r _es_count _es_ts _es_auth < "$EGRESS_STREAK_STATE" 2>/dev/null || { _es_count=0; _es_ts=0; _es_auth=0; }
+		fi
+		case "${_es_count:-0}" in ''|*[!0-9]*) _es_count=0 ;; esac
+		case "${_es_ts:-0}" in ''|*[!0-9]*) _es_ts=0 ;; esac
+		case "${_es_auth:-0}" in ''|*[!0-9]*) _es_auth=0 ;; esac
+		# Streak expiry: a streak whose last miss is older than the
+		# window is a different event (or a long-quiet tunnel), restart at 1.
+		[ "$_es_ts" -gt 0 ] && [ $((_es_now - _es_ts)) -gt "$EGRESS_STREAK_WINDOW" ] && _es_count=0
+		if _check_tunnel_egress; then
+			printf '0 0 0\n' > "$EGRESS_STREAK_STATE" 2>/dev/null || true
+		else
+			_es_count=$((_es_count + 1))
+			_es_auth=$(_egress_auth_bump)
+			printf '%s %s %s\n' "$_es_count" "$_es_now" "$_es_auth" > "$EGRESS_STREAK_STATE" 2>/dev/null || true
+			log "Tunnel egress check failed (primary=${result}); streak ${_es_count}/${EGRESS_STREAK_THRESHOLD}"
+			if [ "$_es_count" -ge "$EGRESS_STREAK_THRESHOLD" ]; then
+				result="PROXY_BROKEN"
+				log "egress streak override (${_es_count} consecutive, auth=${_es_auth}) -> PROXY_BROKEN"
+			fi
 		fi
 	fi
 
