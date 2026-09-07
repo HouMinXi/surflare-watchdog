@@ -145,6 +145,8 @@ _diag_sack_pct=0                      # % of packets with SACK blocks
 _diag_rst_in=0                        # RST packets received from server
 _transit_grace_ts=0                   # epoch when SERVER_APP_FAILURE granted transit reprobe grace
 TRANSIT_GRACE_TTL=300                 # seconds to honor transit grace before expiry (5 min)
+SPEED_PROBE_TIMEOUT=90                # seconds for `surflare nodes --speed` before falling back to legacy rotation
+SPEED_PROBE_ENABLED=1                 # gate: live node-relay rating filter on rotation (0 = legacy sequential)
 EVENT_LOG="/var/log/surflare_events.jsonl"
 # Auto-detect WiFi interface; fallback to wlp9s0f0 if iw is unavailable
 WIFI_INTERFACE=$(iw dev 2>/dev/null | awk '/Interface/{print $2; exit}')
@@ -4698,6 +4700,65 @@ PYEOF2
 	return 0  # healthy
 }
 
+# _parse_speed_ratings: read `surflare nodes --speed` output on stdin,
+# emit NODE_SPEED_RATINGS assignment "City=Rating;City=Rating" for cities
+# that carry a rating word.  Unrated cities are emitted as City=unrated
+# so callers can distinguish "probed, no rating" from "not in table".
+# Table lines look like: "  🇺🇸 Dallas  Excellent" or "  🇺🇸 New York"
+# (multi-word cities are kept whole; the last word, when alphabetic and
+# not part of the city, is the rating).
+_parse_speed_ratings() {
+	local _line _rating _city _out="" _w _city_words=""
+	while IFS= read -r _line; do
+		# Strip non-ASCII (flag emoji) and collapse to words
+		_line=$(printf '%s' "$_line" | tr -d '\200-\377' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+		[ -z "$_line" ] && continue
+		local _words
+		read -r -a _words <<< "$_line"
+		[ "${#_words[@]}" -lt 1 ] && continue
+		# Drop a leading ISO country code token (survived emoji strip)
+		case "${_words[0]}" in [A-Z][A-Z]) _words=("${_words[@]:1}") ;; esac
+		[ "${#_words[@]}" -lt 1 ] && continue
+		# Last word: rating if it matches the vocabulary, else unrated
+		_rating="unrated"
+		case "${_words[$(( ${#_words[@]} - 1 ))]}" in
+			Excellent|Good|Fair|Poor)
+				_rating="${_words[$(( ${#_words[@]} - 1 ))]}"
+				_words=("${_words[@]:0:$(( ${#_words[@]} - 1 ))}")
+				;;
+		esac
+		_city_words=""
+		for _w in "${_words[@]}"; do
+			_city_words="${_city_words:+${_city_words} }${_w}"
+		done
+		# Skip headers, dedicated IPs, markers, group labels
+		case "$_city_words" in
+			''|*'('*|*[0-9]*|'★'*|'🔒'*|'Auto Best'|'Dedicated'*|'Recommended'*|'Europe'|'APAC'|'Middle East And Africa'|'Loading'*|'Speed test'*)
+				continue
+				;;
+		esac
+		# Unrated rows (probe could not measure this city) are still
+		# recorded so _rotate_node can tell "probed, no verdict" apart
+		# from "absent from the table".
+		_out="${_out:+${_out};}${_city_words}=${_rating}"
+	done
+	echo "NODE_SPEED_RATINGS=\"${_out}\""
+}
+
+# _speed_probe_nodes: run the live relay probe and populate
+# NODE_SPEED_RATINGS (semicolon-separated City=Rating pairs).  Bounded by
+# SPEED_PROBE_TIMEOUT; any failure leaves ratings empty so _rotate_node
+# falls back to legacy sequential order.  Writes /run state for stats.
+_speed_probe_nodes() {
+	NODE_SPEED_RATINGS=""
+	local _probe_out
+	_probe_out=$(timeout "$SPEED_PROBE_TIMEOUT" surflare nodes --speed 2>/dev/null)
+	[ -z "$_probe_out" ] && return 1
+	eval "$(_parse_speed_ratings <<< "$_probe_out")"
+	[ -n "${NODE_SPEED_RATINGS:-}" ] || return 1
+	return 0
+}
+
 _rotate_node() {
 	local n=${#NODE_CANDIDATES[@]}
 	if [ "$n" -le 1 ]; then
@@ -4708,6 +4769,32 @@ _rotate_node() {
 	# Refresh so a transit change made by connect_vpn mid-run is reflected.
 	_refresh_effective_transit
 	effective_transit="$_effective_transit"
+	# Live relay probe: reconnect teardown costs 14-30s per attempt, and a
+	# dead node costs a full cycle.  `surflare nodes --speed` probes every
+	# node relay in ~40s and reports a rating; filter candidates through
+	# it before rotating.  Probe failure or empty ratings fall back to
+	# legacy sequential rotation -- never strand rotation on missing data.
+	if [ "${SPEED_PROBE_ENABLED:-1}" -eq 1 ]; then
+		_speed_probe_nodes
+		# No candidate rated Excellent/Good anywhere: the relay fleet
+		# is uniformly degraded or the ratings are stale.  Either way
+		# the filter has nothing to offer -- clear it and fall back to
+		# legacy sequential order instead of skipping every node.
+		if [ -n "${NODE_SPEED_RATINGS:-}" ]; then
+			local _any_good=0 _ci _cr
+			for _ci in "${NODE_CANDIDATES[@]}"; do
+				_cr=$(printf '%s' "$NODE_SPEED_RATINGS" | tr ';' '\n' | sed -n "s/^${_ci}=//p" | head -1)
+				if [ "${_cr:-}" = "Excellent" ] || [ "${_cr:-}" = "Good" ]; then
+					_any_good=1
+					break
+				fi
+			done
+			[ "$_any_good" -eq 1 ] || {
+				log "Speed probe: no candidate rated Excellent/Good, falling back to sequential rotation"
+				NODE_SPEED_RATINGS=""
+			}
+		fi
+	fi
 	local tried=0
 	while [ "$tried" -lt "$n" ]; do
 		_node_idx=$(( (_node_idx + 1) % n ))
@@ -4719,6 +4806,18 @@ _rotate_node() {
 		# Skip nodes with recent urltest errors (log-based real-time health)
 		if ! _node_is_log_healthy "${NODE_CANDIDATES[$_node_idx]}" "$effective_transit"; then
 			continue
+		fi
+		# Live speed rating: only rotate onto nodes the probe rates
+		# Excellent or Good.  Unrated/poor nodes are skipped -- unless
+		# NO rated candidate exists, then fall through to legacy order
+		# (a stale/failed probe must not strand rotation).
+		if [ "${SPEED_PROBE_ENABLED:-1}" -eq 1 ] && [ -n "${NODE_SPEED_RATINGS:-}" ]; then
+			local _cand="${NODE_CANDIDATES[$_node_idx]}"
+			local _speed_rating
+			_speed_rating=$(printf '%s' "$NODE_SPEED_RATINGS" | tr ';' '\n' | sed -n "s/^${_cand}=//p" | head -1)
+			if [ "${_speed_rating:-unrated}" != "Excellent" ] && [ "${_speed_rating:-unrated}" != "Good" ]; then
+				continue
+			fi
 		fi
 		break
 	done
@@ -4733,7 +4832,7 @@ _rotate_node() {
 	fi
 	log "Node rotation: ${prev} -> ${_active_node} ($((_node_idx + 1))/${n})"
 	_stats_rotations=$((_stats_rotations + 1))
-	printf '%s\t%d\n' "$_active_node" "$_node_idx" > "$ROTATION_STATE" 2>/dev/null || true
+	printf '%s	%d\n' "$_active_node" "$_node_idx" > "$ROTATION_STATE" 2>/dev/null || true
 }
 
 # _line_congested: true when the local CN-direct path is degraded
