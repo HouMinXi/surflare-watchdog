@@ -38,9 +38,8 @@ run_probe() {
 $table
 TBL
 	" > /tmp/speed_parse_$$.out 2>/dev/null
-	# parser writes NODE_SPEED_RATINGS="City=Rating;City=Rating"
-	eval "$(cat /tmp/speed_parse_$$.out)"
-	eval "$outvar=\"\$NODE_SPEED_RATINGS\""
+	# parser emits the raw "City=Rating;..." value
+	eval "$outvar=\"\$(cat /tmp/speed_parse_$$.out)\""
 	rm -f /tmp/speed_parse_$$.out
 }
 
@@ -62,7 +61,9 @@ echo "S2: rotate skips Poor/unrated, picks first Excellent/Good in candidate ord
 RATINGS2=""
 run_probe "  🇺🇸 Dallas  Poor
   🇺🇸 Chicago  Good" RATINGS2
-FN_ROTATE=$(extract_fn _rotate_node)
+FN_ROTATE="$(extract_fn _rating_for_city)
+$(extract_fn _rotate_node)"
+FN_RATING="$(extract_fn _rating_for_city)"
 OUT=$(bash -c "
 	NODE_CANDIDATES=(Dallas Chicago Miami 'New York')
 	SPEED_PROBE_ENABLED=1
@@ -100,6 +101,7 @@ OUT3=$(bash -c "
 	_speed_probe_nodes() { return 0; }
 	log() { echo \"\$@\"; }
 	_stats_rotations=0
+$(extract_fn _rating_for_city)
 $(extract_fn _rotate_node)
 	_rotate_node
 	echo \"RESULT_NODE=\$_active_node\"
@@ -122,6 +124,7 @@ OUT4=$(bash -c "
 	_speed_probe_nodes() { return 1; }
 	log() { echo \"\$@\"; }
 	_stats_rotations=0
+$(extract_fn _rating_for_city)
 $(extract_fn _rotate_node)
 	_rotate_node
 	echo \"RESULT_NODE=\$_active_node\"

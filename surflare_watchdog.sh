@@ -4742,7 +4742,10 @@ _parse_speed_ratings() {
 		# from "absent from the table".
 		_out="${_out:+${_out};}${_city_words}=${_rating}"
 	done
-	echo "NODE_SPEED_RATINGS=\"${_out}\""
+	# Emit the raw value only -- the caller assigns it directly.
+	# Never emit a shell assignment: this string derives from external
+	# command output and must not be eval'd.
+	printf '%s\n' "$_out"
 }
 
 # _speed_probe_nodes: run the live relay probe and populate
@@ -4754,8 +4757,25 @@ _speed_probe_nodes() {
 	local _probe_out
 	_probe_out=$(timeout "$SPEED_PROBE_TIMEOUT" surflare nodes --speed 2>/dev/null)
 	[ -z "$_probe_out" ] && return 1
-	eval "$(_parse_speed_ratings <<< "$_probe_out")"
+	NODE_SPEED_RATINGS=$(_parse_speed_ratings <<< "$_probe_out")
 	[ -n "${NODE_SPEED_RATINGS:-}" ] || return 1
+	return 0
+}
+
+# _rating_for_city CITY: echo the rating for CITY from NODE_SPEED_RATINGS
+# (or "absent").  Uses case-glob matching on exact "City=" prefixes so a
+# candidate name is never interpolated into a regex.
+_rating_for_city() {
+	local _want="$1" _entry _name _val
+	for _entry in ${NODE_SPEED_RATINGS//;/ }; do
+		_name="${_entry%%=*}"
+		_val="${_entry#*=}"
+		if [ "$_name" = "$_want" ]; then
+			printf '%s\n' "$_val"
+			return 0
+		fi
+	done
+	printf 'absent\n'
 	return 0
 }
 
@@ -4783,7 +4803,7 @@ _rotate_node() {
 		if [ -n "${NODE_SPEED_RATINGS:-}" ]; then
 			local _any_good=0 _ci _cr
 			for _ci in "${NODE_CANDIDATES[@]}"; do
-				_cr=$(printf '%s' "$NODE_SPEED_RATINGS" | tr ';' '\n' | sed -n "s/^${_ci}=//p" | head -1)
+				_cr=$(_rating_for_city "$_ci")
 				if [ "${_cr:-}" = "Excellent" ] || [ "${_cr:-}" = "Good" ]; then
 					_any_good=1
 					break
@@ -4814,7 +4834,7 @@ _rotate_node() {
 		if [ "${SPEED_PROBE_ENABLED:-1}" -eq 1 ] && [ -n "${NODE_SPEED_RATINGS:-}" ]; then
 			local _cand="${NODE_CANDIDATES[$_node_idx]}"
 			local _speed_rating
-			_speed_rating=$(printf '%s' "$NODE_SPEED_RATINGS" | tr ';' '\n' | sed -n "s/^${_cand}=//p" | head -1)
+			_speed_rating=$(_rating_for_city "$_cand")
 			if [ "${_speed_rating:-unrated}" != "Excellent" ] && [ "${_speed_rating:-unrated}" != "Good" ]; then
 				continue
 			fi
