@@ -4701,9 +4701,10 @@ PYEOF2
 }
 
 # _parse_speed_ratings: read `surflare nodes --speed` output on stdin,
-# emit NODE_SPEED_RATINGS assignment "City=Rating;City=Rating" for cities
-# that carry a rating word.  Unrated cities are emitted as City=unrated
-# so callers can distinguish "probed, no rating" from "not in table".
+# emit the raw "City=Rating;City=Rating" value (the caller assigns it to
+# NODE_SPEED_RATINGS directly -- never eval'd).  Unrated cities are
+# emitted as City=unrated so callers can distinguish "probed, no rating"
+# from "not in table".
 # Table lines look like: "  🇺🇸 Dallas  Excellent" or "  🇺🇸 New York"
 # (multi-word cities are kept whole; the last word, when alphabetic and
 # not part of the city, is the rating).
