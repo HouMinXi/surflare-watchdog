@@ -56,6 +56,20 @@ echo "$RATINGS" | grep -q "Miami=Fair" && ok "S1 Miami=Fair" || bad "S1 Miami mi
 echo "$RATINGS" | grep -q "New York=unrated" && ok "S1 unrated city marked" || bad "S1 New York unrated missing"
 echo "$RATINGS" | grep -q "Atlanta=Poor" && ok "S1 Atlanta=Poor" || bad "S1 Atlanta missing"
 
+echo "S6: multi-word city lookup stays whole"
+bash -c "
+$(extract_fn _rating_for_city)
+NODE_SPEED_RATINGS='New York=Good;Dallas=Poor'
+r=\$(_rating_for_city 'New York')
+[ \"\$r\" = \"Good\" ] && echo S6_OK || echo S6_GOT_\$r
+" | grep -q S6_OK && ok "S6 New York=Good resolved as one entry" || bad "S6 multi-word lookup broke"
+bash -c "
+$(extract_fn _rating_for_city)
+NODE_SPEED_RATINGS='New York=Good;Dallas=Poor'
+r=\$(_rating_for_city Dallas)
+[ \"\$r\" = \"Poor\" ] && echo S6B_OK || echo S6B_GOT_\$r
+" | grep -q S6B_OK && ok "S6b Dallas lookup after multi-word entry" || bad "S6b second entry lookup broke"
+
 echo "S2: rotate skips Poor/unrated, picks first Excellent/Good in candidate order"
 # fixture: candidates Dallas Chicago Miami NY; only Miami=Fair Chicago=Good rated
 RATINGS2=""

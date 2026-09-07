@@ -4710,8 +4710,9 @@ PYEOF2
 _parse_speed_ratings() {
 	local _line _rating _city _out="" _w _city_words=""
 	while IFS= read -r _line; do
-		# Strip non-ASCII (flag emoji) and collapse to words
-		_line=$(printf '%s' "$_line" | tr -d '\200-\377' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+		# Strip everything outside printable ASCII (flags, emoji):
+		# the CLI table is emoji-flag + ASCII city + ASCII rating.
+		_line=$(printf '%s' "$_line" | tr -cd '\11\12\15\40-\176' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
 		[ -z "$_line" ] && continue
 		local _words
 		read -r -a _words <<< "$_line"
@@ -4763,11 +4764,13 @@ _speed_probe_nodes() {
 }
 
 # _rating_for_city CITY: echo the rating for CITY from NODE_SPEED_RATINGS
-# (or "absent").  Uses case-glob matching on exact "City=" prefixes so a
-# candidate name is never interpolated into a regex.
+# (or "absent").  Walks the semicolon-separated table entry by entry so
+# multi-word city names stay whole -- no whitespace splitting, no regex.
 _rating_for_city() {
-	local _want="$1" _entry _name _val
-	for _entry in ${NODE_SPEED_RATINGS//;/ }; do
+	local _want="$1" _table="${NODE_SPEED_RATINGS:-}" _entry _name _val
+	while [ -n "$_table" ]; do
+		_entry="${_table%%;*}"
+		[ "$_entry" = "$_table" ] && _table="" || _table="${_table#*;}"
 		_name="${_entry%%=*}"
 		_val="${_entry#*=}"
 		if [ "$_name" = "$_want" ]; then
