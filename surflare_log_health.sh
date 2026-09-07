@@ -32,7 +32,7 @@ while [[ $# -gt 0 ]]; do
         --log)
             [[ -n "${2:-}" ]] || { echo "Missing value for --log"; exit 1; }
             LOG_OVERRIDE="$2"; shift 2 ;;
-        *) echo "Unknown arg: $1"; exit 1; ;;
+        *) echo "Unknown arg: $1"; exit 1 ;;
     esac
 done
 
@@ -144,7 +144,7 @@ with open(log_path, 'rb') as f:
                 continue
             if log_dt.astimezone(timezone.utc) < cutoff_utc:
                 continue
-            if dst.startswith("127.0.0.1") or dst.startswith("[::1]"):
+            if dst.startswith("127.0.0.1") or dst.startswith("[::1]") or dst.startswith("localhost"):
                 continue
             userpath_last_ts = ts_str
             userpath_counts["socks_errors"] += 1

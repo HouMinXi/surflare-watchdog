@@ -2805,16 +2805,16 @@ _exempt_cn_output() {
 # socks outbound in the recent proxy log.  During relay token expiry the
 # socks outbound fails with auth errors while established connections keep
 # working -- a zero-baseline death signature (799 hits during the 2026-09-07
-# outage, 0 on healthy days).  Echoes a cumulative count.
+# outage, 0 on healthy days).  Advisory only (logged with the streak, never
+# a trigger).  Bounded to the last 2000 lines (~240KB) so a large rotated
+# log cannot stall the health check; grep -c always prints a count (0 on
+# no match), so no || fallback is needed.
 _egress_auth_bump() {
-	local _auth=0 _log _age
-	for _log in /var/log/surflare/surflare-proxy.log /var/log/surflare/surflare-proxy.log.1; do
-		[ -r "$_log" ] || continue
-		_age=$(( $(date +%s) - $(stat -c %Y "$_log" 2>/dev/null || echo 0) ))
-		[ "$_age" -gt $((EGRESS_STREAK_WINDOW * 2)) ] && continue
-		_auth=$((_auth + $(grep -c 'outbound/socks\[.*\]: authentication required' "$_log" 2>/dev/null || echo 0)))
-	done
-	echo "$_auth"
+	local _n
+	_n=$(tail -n 2000 /var/log/surflare/surflare-proxy.log 2>/dev/null \
+		| grep -c 'outbound/socks\[[^]]*\]: authentication required' 2>/dev/null)
+	case "${_n:-}" in ''|*[!0-9]*) _n=0 ;; esac
+	echo "${_n:-0}"
 }
 
 # _check_tunnel_egress: test whether the VPN tunnel can reach external endpoints.
