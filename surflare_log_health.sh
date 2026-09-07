@@ -67,7 +67,7 @@ pat_tproxy = re.compile(
 # probes (rotated every 60s, high volume) and direct outbound are
 # not user-path.  127.0.0.1 dials are watchdog health probes.
 pat_userpath = re.compile(
-    r'^\+0800 (\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) ERROR (?:\[[^\]]*\] )?connection: open connection to (\S+) using outbound/socks\[([^\]]+)\]: (.+)$'
+    r'^\+0800 (\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) ERROR (?:.* )?connection: open connection to (\S+) using outbound/socks\[[^\]]+\]: (.+)$'
 )
 TZ_CST = timezone(timedelta(hours=8))
 
@@ -137,7 +137,7 @@ with open(log_path, 'rb') as f:
         # Match user-path socks outbound errors
         m3 = pat_userpath.match(line)
         if m3:
-            ts_str, dst, outbound, msg = m3.group(1), m3.group(2), m3.group(3), m3.group(4)
+            ts_str, dst, msg = m3.group(1), m3.group(2), m3.group(3)
             try:
                 log_dt = datetime.strptime(ts_str, '%Y-%m-%d %H:%M:%S').replace(tzinfo=TZ_CST)
             except ValueError:
