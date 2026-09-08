@@ -8,7 +8,7 @@
 #
 # New contract:
 #   _check_tunnel_egress classifies each probe attempt:
-#     0 = healthy  (any target answered within EGRESS_DEAD_TIMEOUT)
+#     0 = healthy  (some target answered within EGRESS_DEGRADED_TIMEOUT)
 #     2 = degraded (answered, but slower than EGRESS_DEGRADED_TIMEOUT)
 #     1 = dead     (no target answered within EGRESS_DEAD_TIMEOUT)
 #   The egress streak counts ONLY dead exits.  A degraded tunnel logs
