@@ -2839,12 +2839,19 @@ _egress_auth_bump() {
 _check_tunnel_egress() {
 	# Uses multiple targets with retry to avoid false positives from
 	# transient CDN routing issues (gstatic.com PoP instability observed).
+	# Band guard: a misconfigured DEAD < DEGRADED would invert the bands
+	# (every degraded reading classified dead).  Clamp instead of trusting.
+	local _dead_t="$EGRESS_DEAD_TIMEOUT"
+	if ! _float_lte "$EGRESS_DEGRADED_TIMEOUT" "$_dead_t"; then
+		_dead_t="$EGRESS_DEGRADED_TIMEOUT"
+		log "WARN: EGRESS_DEAD_TIMEOUT < EGRESS_DEGRADED_TIMEOUT, clamping dead band to ${_dead_t}s"
+	fi
 	local _targets="https://connectivitycheck.gstatic.com/generate_204 https://ifconfig.me https://icanhazip.com"
 	local _attempt _url _code _t _out
 	local _best_t=""
 	for _attempt in 1 2; do
 		for _url in $_targets; do
-			_out=$(curl -s --connect-timeout 3 --max-time "$EGRESS_DEAD_TIMEOUT" \
+			_out=$(curl -s --connect-timeout 3 --max-time "$_dead_t" \
 			       -o /dev/null -w '%{http_code} %{time_total}' \
 			       "$_url" 2>/dev/null)
 			_code=${_out%% *}

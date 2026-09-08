@@ -63,8 +63,10 @@ SHIM
 
 # --- extract the egress-streak tail of check_vpn_health (same harness trick as test_egress_streak) ---
 extract_tail() {
+	# Anchors on code (not comments): the temp-file cleanup rm is the
+	# first stable statement of the verdict tail, echo "$result" its end.
 	awk '
-		/# Probe 7 tests a single target/ { in_blk=1 }
+		/rm -f "\$tmp_g"/ { in_blk=1 }
 		in_blk { print }
 		in_blk && /echo "\$result"/ { exit }
 	' "$1"
