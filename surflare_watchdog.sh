@@ -103,9 +103,12 @@ PROXY_BROKEN_GRACE=240                # seconds a PROXY_BROKEN verdict must pers
                                      # expensive, LAN-wide collateral action.
 TPROXY_503_ROTATE_THRESHOLD=5         # tproxy 503 count in health window to trigger rotation
 TPROXY_503_COOLDOWN=660                 # 600s health window + 60s margin for 2 cron refreshes (cron runs every 3 min)
-EGRESS_STREAK_THRESHOLD=3              # consecutive _check_tunnel_egress failures that flip OK -> PROXY_BROKEN
+EGRESS_STREAK_THRESHOLD=3              # consecutive dead egress checks that flip OK -> PROXY_BROKEN
 EGRESS_STREAK_WINDOW=900               # seconds a streak stays valid without a new miss (stale -> restart at 1)
 EGRESS_STREAK_STATE="/run/surflare_egress_streak"  # "<count> <ts> <auth_count>" written by check_vpn_health
+EGRESS_DEGRADED_TIMEOUT=5              # seconds: a probe answered slower than this is "degraded" (slow-but-usable)
+EGRESS_DEAD_TIMEOUT=15                 # seconds: no target answered within this is "dead" (user-path outage)
+_BAND_WARNED=0                         # run-scoped: band-inversion warning logged once, not per probe
 TPROXY_NFT_STAMP="/run/surflare_tproxy_nft.stamp"  # md5 of /etc/surflare-lan-tproxy.nft at last _restore_tproxy
 NODE_HEALTH_FILE="/var/run/surflare_node_health.json"
 NODE_ERR_ROTATE_THRESHOLD=50    # current-node outbound error count to trigger proactive rotation
@@ -2823,23 +2826,65 @@ _egress_auth_bump() {
 # Tests OUTPUT -> mark 0x1 -> VPN path (locally originated traffic).
 # Does NOT test surflare-proxy:10800 tproxy path (port 10800 is a tproxy
 # listener, not SOCKS5; localhost connections trigger sing-box loopback reject).
-# Returns 0 if tunnel works, 1 if broken.  Called after primary health check
-# succeeds to detect the blind spot where the tunnel is up but egress is dead.
+# Returns three levels, because "slow but usable" and "dead" need different
+# answers -- rotating away from a degraded-but-working tunnel is the only
+# real outage a LAN user experiences (2026-09-08 Washington 503 storm:
+# z66 user path 4/4 OK at 5-10s while the old single 8s threshold flapped
+# and bought a rotation every 4th flap).
+#   0 = healthy  (some target answered within EGRESS_DEGRADED_TIMEOUT)
+#   2 = degraded (some target answered, but slower than EGRESS_DEGRADED_TIMEOUT;
+#                 logs and observability see it, the streak does not count it)
+#   1 = dead     (no target answered within EGRESS_DEAD_TIMEOUT)
+# Called after primary health check succeeds to detect the blind spot where
+# the tunnel is up but egress is dead.
 _check_tunnel_egress() {
 	# Uses multiple targets with retry to avoid false positives from
 	# transient CDN routing issues (gstatic.com PoP instability observed).
+	# Band guard: a misconfigured DEAD < DEGRADED would invert the bands
+	# (every degraded reading classified dead).  Clamp instead of trusting.
+	# Warn once per watchdog run, not on every probe (this runs each cycle).
+	local _dead_t="$EGRESS_DEAD_TIMEOUT"
+	if ! _float_lte "$EGRESS_DEGRADED_TIMEOUT" "$_dead_t"; then
+		_dead_t="$EGRESS_DEGRADED_TIMEOUT"
+		if [ "${_BAND_WARNED:-0}" -ne 1 ]; then
+			_BAND_WARNED=1
+			log "WARN: EGRESS_DEAD_TIMEOUT < EGRESS_DEGRADED_TIMEOUT, clamping dead band to ${_dead_t}s"
+		fi
+	fi
 	local _targets="https://connectivitycheck.gstatic.com/generate_204 https://ifconfig.me https://icanhazip.com"
-	local _attempt _url _code
+	local _attempt _url _code _t _out
+	local _best_t=""
 	for _attempt in 1 2; do
 		for _url in $_targets; do
-			_code=$(curl -s --connect-timeout 3 --max-time 8 \
-			       -o /dev/null -w '%{http_code}' \
+			_out=$(curl -s --connect-timeout 3 --max-time "$_dead_t" \
+			       -o /dev/null -w '%{http_code} %{time_total}' \
 			       "$_url" 2>/dev/null)
-			case "$_code" in 200|204) return 0 ;; esac
+			_code=${_out%% *}
+			_t=${_out##* }
+			case "$_code" in 200|204)
+				case "$_t" in ''|*[!0-9.]*) _t=99 ;; esac
+				if [ -z "$_best_t" ] || _float_lte "$_t" "$_best_t"; then
+					_best_t=$_t
+				fi
+				;; esac
 		done
+		[ -n "$_best_t" ] && break
 		[ "$_attempt" -lt 2 ] && sleep 1
 	done
-	return 1
+	if [ -z "$_best_t" ]; then
+		return 1
+	fi
+	if _float_lte "$_best_t" "$EGRESS_DEGRADED_TIMEOUT"; then
+		return 0
+	fi
+	log "egress degraded: best target ${_best_t}s (threshold ${EGRESS_DEGRADED_TIMEOUT}s)"
+	return 2
+}
+
+# _float_lte A B: true when float A <= float B.  awk does the comparison;
+# a non-numeric A (already defaulted to 99) never passes a numeric B.
+_float_lte() {
+	awk -v a="$1" -v b="$2" 'BEGIN { exit !(a <= b) }'
 }
 
 # check_vpn_health: two-layer check -- local state first, then parallel external probes.
@@ -3272,8 +3317,13 @@ check_vpn_health() {
 		# socket) while every egress re-dial failed for 2.4h; the watchdog
 		# held "healthy" the whole time.  A single miss stays log-only
 		# (the 2026-09-04 guard: transient CDN blips).  N consecutive
-		# misses within EGRESS_STREAK_WINDOW are user-path death.
-		local _es_count=0 _es_ts=0 _es_auth=0 _es_now
+		# dead misses within EGRESS_STREAK_WINDOW are user-path death.
+		# Degraded (slow-but-usable, exit 2) neither increments nor
+		# resets the streak: a degraded tunnel is working for users and
+		# must not buy a rotation; a real dead count must not be erased
+		# by an intermediate degraded reading (2026-09-08 storm had
+		# exactly this alternation).
+		local _es_count=0 _es_ts=0 _es_auth=0 _es_now _es_rc
 		_es_now=$(date +%s)
 		if [ -f "$EGRESS_STREAK_STATE" ]; then
 			read -r _es_count _es_ts _es_auth < "$EGRESS_STREAK_STATE" 2>/dev/null || { _es_count=0; _es_ts=0; _es_auth=0; }
@@ -3284,8 +3334,14 @@ check_vpn_health() {
 		# Streak expiry: a streak whose last miss is older than the
 		# window is a different event (or a long-quiet tunnel), restart at 1.
 		[ "$_es_ts" -gt 0 ] && [ $((_es_now - _es_ts)) -gt "$EGRESS_STREAK_WINDOW" ] && _es_count=0
-		if _check_tunnel_egress; then
+		_check_tunnel_egress
+		_es_rc=$?
+		if [ "$_es_rc" -eq 0 ]; then
 			printf '0 0 0\n' > "$EGRESS_STREAK_STATE" 2>/dev/null || true
+		elif [ "$_es_rc" -eq 2 ]; then
+			# Degraded: hold the streak exactly as-is.  Log-only exit;
+			# _check_tunnel_egress already logged the latency.
+			:
 		else
 			_es_count=$((_es_count + 1))
 			_es_auth=$(_egress_auth_bump)
