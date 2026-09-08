@@ -2841,10 +2841,14 @@ _check_tunnel_egress() {
 	# transient CDN routing issues (gstatic.com PoP instability observed).
 	# Band guard: a misconfigured DEAD < DEGRADED would invert the bands
 	# (every degraded reading classified dead).  Clamp instead of trusting.
+	# Warn once per watchdog run, not on every probe (this runs each cycle).
 	local _dead_t="$EGRESS_DEAD_TIMEOUT"
 	if ! _float_lte "$EGRESS_DEGRADED_TIMEOUT" "$_dead_t"; then
 		_dead_t="$EGRESS_DEGRADED_TIMEOUT"
-		log "WARN: EGRESS_DEAD_TIMEOUT < EGRESS_DEGRADED_TIMEOUT, clamping dead band to ${_dead_t}s"
+		if [ "${_BAND_WARNED:-0}" -ne 1 ]; then
+			_BAND_WARNED=1
+			log "WARN: EGRESS_DEAD_TIMEOUT < EGRESS_DEGRADED_TIMEOUT, clamping dead band to ${_dead_t}s"
+		fi
 	fi
 	local _targets="https://connectivitycheck.gstatic.com/generate_204 https://ifconfig.me https://icanhazip.com"
 	local _attempt _url _code _t _out
