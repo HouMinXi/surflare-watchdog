@@ -24,7 +24,7 @@
 
 set -u
 cd "$(dirname "$0")/.." || exit 1
-WATCHDOG=surflare_watchdog.sh
+WATCHDOG="${WATCHDOG:-surflare_watchdog.sh}"
 PASS=0; FAIL=0
 ok()  { PASS=$((PASS+1)); echo "  PASS: $1"; }
 bad() { FAIL=$((FAIL+1)); echo "  FAIL: $1"; }
@@ -36,9 +36,14 @@ echo "$CONSTS" | grep -q '^EGRESS_DEGRADED_TIMEOUT=' \
 echo "$CONSTS" | grep -q '^EGRESS_DEAD_TIMEOUT=' \
 	|| { echo "FATAL: EGRESS_DEAD_TIMEOUT missing"; exit 1; }
 
+EGRESS_FN=$(sed -n '/^_check_tunnel_egress() {/,/^}/p' "$WATCHDOG")
+FLOAT_FN=$(sed -n '/^_float_lte() {/,/^}/p' "$WATCHDOG")
+UPGRADE_FN=$(sed -n '/^_verify_surflare_upgrade() {/,/^}/p' "$WATCHDOG")
+[ -n "$EGRESS_FN" ] || { echo "FATAL: egress extract empty"; exit 1; }
+[ -n "$FLOAT_FN" ] || { echo "FATAL: float extract empty"; exit 1; }
+[ -n "$UPGRADE_FN" ] || { echo "FATAL: upgrade extract empty"; exit 1; }
+
 # run_egress CURL_OUTPUT -> exercise _check_tunnel_egress with a curl PATH-shim
-# CURL_OUTPUT: what every curl invocation prints on stdout
-# ("204 1.5" = code 204 in 1.5s; "000 30.0" = timeout).
 run_egress() {
 	local curl_out="$1"
 	local d rc
@@ -52,8 +57,8 @@ SHIM
 	PATH="$d/bin:$PATH" bash -c "
 		$CONSTS
 		log() { :; }
-		$(sed -n '/^_check_tunnel_egress() {/,/^}/p' "$WATCHDOG")
-		$(sed -n '/^_float_lte() {/,/^}/p' "$WATCHDOG")
+		$EGRESS_FN
+		$FLOAT_FN
 		_check_tunnel_egress
 	" 2>/dev/null
 	rc=$?
@@ -61,10 +66,8 @@ SHIM
 	return $rc
 }
 
-# --- extract the egress-streak tail of check_vpn_health (same harness trick as test_egress_streak) ---
+# --- extract the egress-streak tail of check_vpn_health ---
 extract_tail() {
-	# Anchors on code (not comments): the temp-file cleanup rm is the
-	# first stable statement of the verdict tail, echo "$result" its end.
 	awk '
 		/rm -f "\$tmp_g"/ { in_blk=1 }
 		in_blk { print }
@@ -93,7 +96,7 @@ run_tail() {
 		log() { :; }
 		_check_tunnel_egress() { return $egress_rc; }
 		run() {
-$(extract_tail "$WATCHDOG")
+$TAIL
 		}
 		run
 	" 2>/dev/null
@@ -132,7 +135,7 @@ OUT=$(bash -c "
 	log() { :; }
 	_check_tunnel_egress() { return 2; }
 	run() {
-$(extract_tail "$WATCHDOG")
+$TAIL
 	}
 	run
 " 2>/dev/null)
@@ -145,7 +148,6 @@ OUT=$(run_tail OK 1 "2 $NOW")
 [ "$OUT" = "PROXY_BROKEN" ] && ok "T6 dead streak flips" || bad "T6 got $OUT want PROXY_BROKEN"
 
 echo "T7: auth-bump guard still wired (dead with auth noise -> auth counted)"
-# covered by test_egress_streak T7 equivalent; here verify _egress_auth_bump exists
 grep -q '_egress_auth_bump' "$WATCHDOG" && ok "T7 auth bump present" || bad "T7 auth bump missing"
 
 echo "T8: injection - degraded counted as dead must be caught"
@@ -155,14 +157,13 @@ python3 - "$WATCHDOG" "$INJ" << 'PY'
 import sys
 src, dst = sys.argv[1], sys.argv[2]
 s = open(src).read()
-# Break the dead-only guard: treat degraded (rc 2) the same as dead.
 old = '\t\telif [ "$_es_rc" -eq 2 ]; then'
 new = '\t\telif false; then'
 assert old in s, "degraded branch missing"
 s = s.replace(old, new, 1)
 open(dst, 'w').write(s)
 PY
-# With the guard broken, degraded must increment the streak file.
+INJ_TAIL=$(extract_tail "$INJ")
 d8=$(mktemp -d); sp8="$d8/sp"
 printf '1 %s\n' "$NOW" > "$sp8"
 INJ_OUT=$(bash -c "
@@ -173,7 +174,7 @@ INJ_OUT=$(bash -c "
 	log() { :; }
 	_check_tunnel_egress() { return 2; }
 	run() {
-$(extract_tail "$INJ")
+$INJ_TAIL
 	}
 	run
 " 2>/dev/null)
@@ -186,6 +187,236 @@ else
 fi
 rm -rf "$d8"
 rm -f "$INJ"
+
+# =========================================================================
+# Consolidated Argv Setup Budget Tests (T9..T14)
+# =========================================================================
+
+run_egress_argv() {
+	local setup_time="$1"
+	local d rc
+	d=$(mktemp -d)
+	mkdir -p "$d/bin"
+	cat > "$d/bin/curl" <<SHIM
+#!/bin/sh
+ct=999
+mt=999
+prev=""
+for arg in "\$@"; do
+	case "\$prev" in
+		--connect-timeout) ct="\$arg" ;;
+		--max-time) mt="\$arg" ;;
+	esac
+	prev=""
+	case "\$arg" in
+		--connect-timeout) prev="--connect-timeout" ;;
+		--max-time) prev="--max-time" ;;
+	esac
+done
+sim_time=$setup_time
+if awk -v s="\$sim_time" -v c="\$ct" 'BEGIN { exit !(s > c) }'; then
+	echo "000 \$sim_time"
+	exit 28
+fi
+if awk -v s="\$sim_time" -v m="\$mt" 'BEGIN { exit !(s > m) }'; then
+	echo "000 \$sim_time"
+	exit 28
+fi
+echo "204 \$sim_time"
+exit 0
+SHIM
+	chmod +x "$d/bin/curl"
+	PATH="$d/bin:$PATH" bash -c "
+		$CONSTS
+		log() { :; }
+		$EGRESS_FN
+		$FLOAT_FN
+		_check_tunnel_egress
+	" 2>/dev/null
+	rc=$?
+	rm -rf "$d"
+	return $rc
+}
+
+echo "T9: argv setup 4s -> healthy (exit 0)"
+run_egress_argv 4.0; RC=$?
+if [ "$RC" = "0" ]; then ok "T9 setup 4s healthy"; else bad "T9 rc=$RC want 0"; fi
+
+echo "T10: argv setup 8s -> degraded (exit 2)"
+run_egress_argv 8.0; RC=$?
+if [ "$RC" = "2" ]; then ok "T10 setup 8s degraded"; else bad "T10 rc=$RC want 2"; fi
+
+echo "T11: argv setup 2s -> healthy (exit 0)"
+run_egress_argv 2.0; RC=$?
+if [ "$RC" = "0" ]; then ok "T11 setup 2s healthy"; else bad "T11 rc=$RC want 0"; fi
+
+echo "T12: argv setup 16s with total 15 -> dead (exit 1)"
+run_egress_argv 16.0; RC=$?
+if [ "$RC" = "1" ]; then ok "T12 setup 16s dead"; else bad "T12 rc=$RC want 1"; fi
+
+echo "T13: argv setup 5s (threshold boundary) -> healthy (exit 0)"
+run_egress_argv 5.0; RC=$?
+if [ "$RC" = "0" ]; then ok "T13 setup 5s boundary healthy"; else bad "T13 rc=$RC want 0"; fi
+
+echo "T14: argv setup 12s -> degraded (exit 2)"
+run_egress_argv 12.0; RC=$?
+if [ "$RC" = "2" ]; then ok "T14 setup 12s degraded"; else bad "T14 rc=$RC want 2"; fi
+
+# =========================================================================
+# Consolidated _verify_surflare_upgrade Consumer Tests (T15..T22)
+# =========================================================================
+
+run_upgrade() {
+	local local_rc="$1"; shift
+	local egress_rcs=("$@")
+	local d
+	d=$(mktemp -d)
+	local poll_file="$d/poll_count"
+	echo 0 > "$poll_file"
+	local egress_file="$d/egress_codes"
+	printf '%s\n' "${egress_rcs[@]}" > "$egress_file"
+	local egress_called="$d/egress_called"
+	local rc=0
+	bash -c "
+		SURFLARE_UPGRADE_VERIFY=90
+		SURFLARE_UPGRADE_POLL=10
+		log() { :; }
+		sleep() {
+			local n=\${1:-0}
+			local cur=\$(cat '$poll_file' 2>/dev/null || echo 0)
+			echo \$((cur + n)) > '$poll_file'
+		}
+		check_vpn_local_state() { return $local_rc; }
+		_check_tunnel_egress() {
+			touch '$egress_called'
+			local idx=\$(cat '$poll_file' 2>/dev/null || echo 0)
+			local pick=\$(( idx / 10 ))
+			local lines=\$(wc -l < '$egress_file')
+			[ \"\$lines\" -gt 0 ] || return 1
+			pick=\$(( pick % lines ))
+			local code
+			code=\$(sed -n \"\$((pick + 1))p\" '$egress_file')
+			return \"\${code:-1}\"
+		}
+		$UPGRADE_FN
+		_verify_surflare_upgrade
+	" 2>/dev/null
+	rc=$?
+	if [ -f "$egress_called" ]; then
+		EGRESS_INVOKED=1
+	else
+		EGRESS_INVOKED=0
+	fi
+	rm -rf "$d"
+	return $rc
+}
+
+echo "T15: upgrade all degraded (rc=2) -> pass (exit 0)"
+run_upgrade 0 2 2 2 2 2 2 2 2 2; RC=$?
+if [ "$RC" = "0" ]; then ok "T15 upgrade all degraded passes"; else bad "T15 rc=$RC want 0"; fi
+
+echo "T16: upgrade sequence 1/2/1/2 (degraded resets counter) -> pass (exit 0)"
+run_upgrade 0 1 2 1 2 1 2 1 2 1; RC=$?
+if [ "$RC" = "0" ]; then ok "T16 upgrade 1/2/1/2 passes"; else bad "T16 rc=$RC want 0"; fi
+
+echo "T17: upgrade all healthy (rc=0) -> pass (exit 0)"
+run_upgrade 0 0 0 0 0 0 0 0 0 0; RC=$?
+if [ "$RC" = "0" ]; then ok "T17 upgrade all healthy passes"; else bad "T17 rc=$RC want 0"; fi
+
+echo "T18: upgrade all dead (rc=1) -> rollback (exit 1)"
+run_upgrade 0 1 1 1 1 1 1 1 1 1; RC=$?
+if [ "$RC" = "1" ]; then ok "T18 upgrade all dead rolls back"; else bad "T18 rc=$RC want 1"; fi
+
+echo "T19: upgrade local failure rc=1 -> immediate rollback (exit 1) without calling egress"
+EGRESS_INVOKED=0
+run_upgrade 1 0 0 0 0 0 0 0 0 0; RC=$?
+if [ "$RC" = "1" ] && [ "$EGRESS_INVOKED" = "0" ]; then
+	ok "T19 upgrade local fail rc=1 rolls back without egress"
+else
+	bad "T19 rc=$RC (want 1) egress_invoked=$EGRESS_INVOKED (want 0)"
+fi
+
+echo "T20: upgrade local failure rc=2 -> immediate rollback (exit 1) without calling egress"
+EGRESS_INVOKED=0
+run_upgrade 2 0 0 0 0 0 0 0 0 0; RC=$?
+if [ "$RC" = "1" ] && [ "$EGRESS_INVOKED" = "0" ]; then
+	ok "T20 upgrade local fail rc=2 rolls back without egress"
+else
+	bad "T20 rc=$RC (want 1) egress_invoked=$EGRESS_INVOKED (want 0)"
+fi
+
+echo "T21: upgrade sequence 1/1 (two consecutive dead) -> rollback (exit 1)"
+run_upgrade 0 1 1 0 0 0 0 0 0 0; RC=$?
+if [ "$RC" = "1" ]; then ok "T21 upgrade 1/1 rolls back"; else bad "T21 rc=$RC want 1"; fi
+
+echo "T22: upgrade unknown nonzero egress (rc=3) -> rollback (exit 1)"
+run_upgrade 0 3 3 3 3 3 3 3 3 3; RC=$?
+if [ "$RC" = "1" ]; then ok "T22 upgrade unknown nonzero rolls back"; else bad "T22 rc=$RC want 1"; fi
+
+# =========================================================================
+# Consolidated G1 Blindspot Detection Tests (T23..T25)
+# =========================================================================
+
+extract_g1() {
+	awk '
+		/# G1 blindspot detection:/ { in_blk=1 }
+		in_blk {
+			if (/^\tif /) depth++
+			if (depth > 0) print
+			if (/^\tfi$/) { depth--; if (depth == 0) exit }
+		}
+	' "$1"
+}
+G1_BLOCK=$(extract_g1 "$WATCHDOG")
+[ -n "$G1_BLOCK" ] || { echo "FATAL: G1 extract empty"; exit 1; }
+
+run_g1() {
+	local result_in="$1" egress_rc="$2"
+	local d tmp_proxy
+	d=$(mktemp -d)
+	tmp_proxy="$d/proxy"
+	printf 'FAIL\n' > "$tmp_proxy"
+	bash -c "
+		result='$result_in'
+		tmp_proxy='$tmp_proxy'
+		_check_tunnel_egress() { return $egress_rc; }
+		log() { echo \"LOG: \$*\"; }
+		run() {
+$G1_BLOCK
+		}
+		run
+		echo \"FINAL_RESULT=\$result\"
+	" 2>/dev/null
+	rm -rf "$d"
+}
+
+echo "T23: G1 dead (rc=1) -> logs miss and preserves verdict"
+OUT23=$(run_g1 TUNNEL_OK 1)
+if echo "$OUT23" | grep -q 'LOG:.*miss' && echo "$OUT23" | grep -q 'FINAL_RESULT=TUNNEL_OK'; then
+	ok "T23 G1 dead logs miss and preserves verdict"
+else
+	bad "T23 G1 dead failed: output was $OUT23"
+fi
+
+echo "T24: G1 degraded (rc=2) -> NO miss log and preserves verdict"
+OUT24=$(run_g1 TUNNEL_OK 2)
+if echo "$OUT24" | grep -q 'LOG:.*miss'; then
+	bad "T24 G1 degraded logged miss (should not log miss)"
+elif ! echo "$OUT24" | grep -q 'FINAL_RESULT=TUNNEL_OK'; then
+	bad "T24 G1 degraded changed verdict: output was $OUT24"
+else
+	ok "T24 G1 degraded no miss log and preserves verdict"
+fi
+
+echo "T25: G1 healthy (rc=0) -> NO miss log and preserves verdict"
+OUT25=$(run_g1 TUNNEL_OK 0)
+if echo "$OUT25" | grep -q 'LOG:.*miss'; then
+	bad "T25 G1 healthy logged miss (should not log miss)"
+elif ! echo "$OUT25" | grep -q 'FINAL_RESULT=TUNNEL_OK'; then
+	bad "T25 G1 healthy changed verdict: output was $OUT25"
+else
+	ok "T25 G1 healthy no miss log and preserves verdict"
+fi
 
 echo
 echo "RESULT: $PASS passed, $FAIL failed"

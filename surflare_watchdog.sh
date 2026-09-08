@@ -2856,7 +2856,7 @@ _check_tunnel_egress() {
 	local _best_t=""
 	for _attempt in 1 2; do
 		for _url in $_targets; do
-			_out=$(curl -s --connect-timeout 3 --max-time "$_dead_t" \
+			_out=$(curl -s --connect-timeout "$_dead_t" --max-time "$_dead_t" \
 			       -o /dev/null -w '%{http_code} %{time_total}' \
 			       "$_url" 2>/dev/null)
 			_code=${_out%% *}
@@ -3277,9 +3277,15 @@ check_vpn_health() {
 		local r_proxy
 		r_proxy=$(cat "$tmp_proxy" 2>/dev/null)
 		if [ -n "$r_proxy" ] && [ "$r_proxy" != "OK" ]; then
-			if ! _check_tunnel_egress; then
-				log "Probe 7/egress missed (primary=${result}); not PROXY_BROKEN without tproxy 503"
-			fi
+			local _g1_egress_rc
+			_check_tunnel_egress
+			_g1_egress_rc=$?
+			case "$_g1_egress_rc" in
+				0|2) ;;
+				*)
+					log "Probe 7/egress missed (primary=${result}); not PROXY_BROKEN without tproxy 503"
+					;;
+			esac
 		fi
 	fi
 
@@ -6259,7 +6265,12 @@ _restore_surflare_snapshot() {
 _verify_surflare_upgrade() {
 	local _elapsed=0 _consecutive_fail=0
 	while [ "$_elapsed" -lt "$SURFLARE_UPGRADE_VERIFY" ]; do
-		if check_vpn_local_state && _check_tunnel_egress; then
+		local _up_egress_rc=1
+		if check_vpn_local_state; then
+			_check_tunnel_egress
+			_up_egress_rc=$?
+		fi
+		if [ "$_up_egress_rc" -eq 0 ] || [ "$_up_egress_rc" -eq 2 ]; then
 			_consecutive_fail=0
 		else
 			_consecutive_fail=$((_consecutive_fail + 1))
