@@ -108,6 +108,7 @@ EGRESS_STREAK_WINDOW=900               # seconds a streak stays valid without a 
 EGRESS_STREAK_STATE="/run/surflare_egress_streak"  # "<count> <ts> <auth_count>" written by check_vpn_health
 EGRESS_DEGRADED_TIMEOUT=5              # seconds: a probe answered slower than this is "degraded" (slow-but-usable)
 EGRESS_DEAD_TIMEOUT=15                 # seconds: no target answered within this is "dead" (user-path outage)
+_BAND_WARNED=0                         # run-scoped: band-inversion warning logged once, not per probe
 TPROXY_NFT_STAMP="/run/surflare_tproxy_nft.stamp"  # md5 of /etc/surflare-lan-tproxy.nft at last _restore_tproxy
 NODE_HEALTH_FILE="/var/run/surflare_node_health.json"
 NODE_ERR_ROTATE_THRESHOLD=50    # current-node outbound error count to trigger proactive rotation
