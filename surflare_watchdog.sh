@@ -2830,7 +2830,7 @@ _egress_auth_bump() {
 # real outage a LAN user experiences (2026-09-08 Washington 503 storm:
 # z66 user path 4/4 OK at 5-10s while the old single 8s threshold flapped
 # and bought a rotation every 4th flap).
-#   0 = healthy  (some target answered fast, <= EGRESS_DEGRADED_TIMEOUT)
+#   0 = healthy  (some target answered within EGRESS_DEGRADED_TIMEOUT)
 #   2 = degraded (some target answered, but slower than EGRESS_DEGRADED_TIMEOUT;
 #                 logs and observability see it, the streak does not count it)
 #   1 = dead     (no target answered within EGRESS_DEAD_TIMEOUT)

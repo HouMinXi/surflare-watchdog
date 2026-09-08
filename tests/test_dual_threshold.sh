@@ -176,12 +176,14 @@ $(extract_tail "$INJ")
 	run
 " 2>/dev/null)
 read -r cnt8 _ < "$sp8"
+INJ_OUT=$(cat "$sp8" 2>/dev/null)
 if [ "$cnt8" = "2" ]; then
-	ok "T8 injection incremented streak (T5 detects this bug)"
+	ok "T8 injection incremented streak (T5 detects this bug), state=${INJ_OUT:-empty}"
 else
 	bad "T8 injection not detectable: broken guard left streak at $cnt8"
 fi
-rm -rf "$d8" rm -f "$INJ"
+rm -rf "$d8"
+rm -f "$INJ"
 
 echo
 echo "RESULT: $PASS passed, $FAIL failed"
