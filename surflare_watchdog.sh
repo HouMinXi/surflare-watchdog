@@ -4726,6 +4726,46 @@ probe_best_transit() {
 	echo "$best_node"
 }
 
+# Dedicated-IP nodes get provider-internal outbound tags (private_NNN) in the
+# sing-box config, so health keys rebuilt from the display name never match
+# (2026-09-12: dedicated leg dead 3h, 99 urltest errors attributed to nothing,
+# rotation never fired). Resolve the effective node_health key: the exact
+# display-name key when the health file carries it; otherwise, for a
+# dedicated-label node ("Name(ipv4)"), a single private_NNN key under the
+# same transit prefix. Two or more private keys = ambiguous: keep the display
+# key (absent = healthy) rather than misattribute errors to the wrong node.
+_node_log_key() {
+	local node="$1" transit="${2:-}"
+	local key
+	if [ -n "$transit" ]; then
+		key="mh_via_${transit}_to_${node}"
+	else
+		printf '%s\n' "$node"
+		return 0
+	fi
+	[ -f "$NODE_HEALTH_FILE" ] || { printf '%s\n' "$key"; return 0; }
+	command -v jq >/dev/null 2>&1 || { printf '%s\n' "$key"; return 0; }
+	if jq -e --arg k "$key" '.nodes | has($k)' "$NODE_HEALTH_FILE" >/dev/null 2>&1; then
+		printf '%s\n' "$key"
+		return 0
+	fi
+	# Dedicated label is a trailing parenthesized IPv4 ("Name(65.1.2.3)").
+	# Four full octets, anchored: looser forms ((1.2), (1.2.3.4.)) must not
+	# qualify for private-tag attribution.
+	if [[ $node =~ \([0-9]{1,3}(\.[0-9]{1,3}){3}\)$ ]]; then
+		local _priv _npriv
+		_priv=$(jq -r --arg p "mh_via_${transit}_to_" \
+			'.nodes | keys | map(select(startswith($p) and test("_to_private_[0-9]+$"))) | .[]' \
+			"$NODE_HEALTH_FILE" 2>/dev/null)
+		_npriv=$(printf '%s\n' "$_priv" | grep -c .)
+		if [ "$_npriv" = "1" ]; then
+			printf '%s\n' "$_priv"
+			return 0
+		fi
+	fi
+	printf '%s\n' "$key"
+}
+
 # _node_is_log_healthy: return 0 if no recent urltest errors for this node/transit combo.
 # Reads $NODE_HEALTH_FILE written by surflare_log_health.sh (3-min cron).
 # Returns 1 (skip) if node has >10 errors in the log window, or if health data unavailable.
@@ -4737,13 +4777,8 @@ _node_is_log_healthy() {
 	local age
 	age=$(( $(date +%s) - $(stat -c %Y "$health_file" 2>/dev/null || echo 0) ))
 	[ "$age" -gt 1200 ] && return 0  # stale: assume healthy
-	# Construct log key: "mh_via_TRANSIT_to_NODE" or just "NODE"
 	local log_key
-	if [ -n "$transit" ]; then
-		log_key="mh_via_${transit}_to_${node}"
-	else
-		log_key="$node"
-	fi
+	log_key=$(_node_log_key "$node" "$transit")
 	local err_count
 	err_count=$(python3 - "$health_file" "$log_key" << 'PYEOF2'
 import json, sys
@@ -5017,7 +5052,8 @@ _handle_proactive_node_rotation() {
 	[ "$_nh_mtime" -ge "${_node_err_rotate_ts:-0}" ] || return 0
 	# Refresh transit so a change made by connect_vpn mid-run is reflected.
 	_refresh_effective_transit
-	local _cur_key="mh_via_${_effective_transit}_to_${_active_node}"
+	local _cur_key
+	_cur_key=$(_node_log_key "$_active_node" "$_effective_transit")
 	# Build candidate keys as a JSON array for unambiguous jq iteration.
 	local _cand_json="[]" _c
 	for _c in "${NODE_CANDIDATES[@]}"; do
@@ -5962,7 +5998,7 @@ fi
 # warn when NO key shares the current transit prefix, which indicates transit
 # derivation or tag format drift rather than a clean bill of health.
 if [ -f "$NODE_HEALTH_FILE" ] && [ -n "$_active_node" ] && command -v jq >/dev/null 2>&1; then
-	_startup_key="mh_via_${_effective_transit}_to_${_active_node}"
+	_startup_key=$(_node_log_key "$_active_node" "$_effective_transit")
 	_startup_err=$(jq -r --arg k "$_startup_key" '.nodes[$k].error_count // 0' "$NODE_HEALTH_FILE" 2>/dev/null) || _startup_err=0
 	_startup_keys=$(jq -r '.nodes | keys | join(",")' "$NODE_HEALTH_FILE" 2>/dev/null) || _startup_keys=""
 	log "Startup node_health: key=${_startup_key} err=${_startup_err} observed_keys=[${_startup_keys}]"

@@ -128,6 +128,18 @@ extract_rot() {
 		in_blk && /^}$/ { exit }
 	' "$1"
 }
+# _handle_proactive_node_rotation resolves its health key via _node_log_key;
+# the harness must extract the helper too or the call fails silently under
+# bash -c 2>/dev/null and cur_err collapses to 0.
+extract_node_log_key() {
+	awk '
+		/^_node_log_key\(\)/ { in_blk=1 }
+		in_blk { print }
+		in_blk && /^}$/ { exit }
+	' "$1"
+}
+printf '%s\n' "$(extract_node_log_key "$WATCHDOG")" | grep -q '_to_private_' \
+	|| { echo "FATAL: _node_log_key extract empty"; exit 1; }
 printf '%s\n' "$(extract_rot "$WATCHDOG")" | grep -q 'NODE_ERR_ROTATE_THRESHOLD' \
 	|| { echo "FATAL: rotation extract empty"; exit 1; }
 
@@ -155,6 +167,7 @@ run_rot() {
 		log() { :; }
 		_refresh_effective_transit() { :; }
 		_enter_storm_cooldown() { :; }
+		$(extract_node_log_key "$wd")
 		$(extract_rot "$wd")
 		_handle_proactive_node_rotation $now
 		echo \$fail_count
