@@ -4,15 +4,16 @@
 # --force still prompts.  Sources the real script (BASH_SOURCE guard
 # keeps main from running).  Last block neuters the guard in a copy to
 # prove the refusal comes from that code, not from the test itself.
+# shellcheck disable=SC2015  # ok/bad idiom
 set -u
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/.." || exit 1
 DEPLOY="scripts/surflare_deploy.sh"
 fail=0
 
 ok()  { echo "PASS: $1"; }
 bad() { echo "FAIL: $1"; fail=1; }
 
-# shellcheck source=scripts/surflare_deploy.sh
+# shellcheck source=/dev/null
 source "$DEPLOY"
 
 A="$(printf 'NODE="x"\nTRANSIT="y"')"

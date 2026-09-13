@@ -4,8 +4,9 @@
 # real watchdog heredoc -- never duplicated here -- and loaded inside an
 # isolated user+net namespace (unshare -Urn).  Each namespace lives for
 # one sh -c invocation, so multi-step sequences stay in a single call.
+# shellcheck disable=SC2015,SC2016  # ok/bad idiom; $1 is for the inner sh -c
 set -u
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/.." || exit 1
 WD="surflare_watchdog.sh"
 PROCD="router/services/procd/surflare-watchdog"
 CONF="router/smartdns/custom.conf.example"

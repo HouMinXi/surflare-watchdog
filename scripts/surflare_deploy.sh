@@ -7,6 +7,8 @@
 # tproxy nft files deploy via manual scp.
 # bypass-macs.conf is NOT deployed -- scp single-file; N100 version
 # is authoritative (contains real MACs, repo has sanitized fakes).
+# shellcheck disable=SC2029  # $REMOTE_WATCHDOG must expand client-side
+# inside every ssh remote command -- that is how the path reaches the box.
 
 set -euo pipefail
 
@@ -97,7 +99,7 @@ main() {
     fi
 
     # Backup current version, then atomic replace
-    # shellcheck disable=SC2087
+    # shellcheck disable=SC2087,SC2029
     ssh "$N100" <<DEPLOY
 if [ -f "$REMOTE_WATCHDOG" ]; then
     cp "$REMOTE_WATCHDOG" "${REMOTE_WATCHDOG}.prev"
