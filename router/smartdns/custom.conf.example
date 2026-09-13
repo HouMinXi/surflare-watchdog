@@ -33,9 +33,10 @@ server-tls 120.53.53.53 -group domestic -exclude-default-group
 server-https https://doh.pub/dns-query -group domestic -exclude-default-group
 server-https https://dns.alidns.com/dns-query -group domestic -exclude-default-group
 
-# Plain UDP - fallback (fastest response when TLS handshake is slow)
-server 223.5.5.5 -group domestic -exclude-default-group
-server 119.29.29.29 -group domestic -exclude-default-group
+# Domestic group carries DoT/DoH only.  Plain UDP to the same anycasts is
+# hijacked by the vendor proxy and answers with US/HK CDN addresses
+# (spec 2026-09-12-cn-dns-view), so the UDP lines are removed, not kept
+# as fallback.
 
 # -- Foreign DNS (default group, via VPN) --------------------------------
 # These packets are marked 0x1 by surflare OUTPUT chain -> go through VPN
