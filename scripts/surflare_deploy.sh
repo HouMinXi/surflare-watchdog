@@ -14,44 +14,91 @@ N100="root@192.168.100.1"
 REMOTE_WATCHDOG="/usr/local/sbin/surflare_watchdog.sh"
 DEPLOY_WAIT=30
 NO_RESTART=0
-
-# Parse flags
-for arg in "$@"; do
-    case "$arg" in
-        --no-restart) NO_RESTART=1 ;;
-    esac
-done
-
-# Positional: first non-flag argument is the local file
+FORCE=0
 LOCAL_WATCHDOG=""
-for arg in "$@"; do
-    case "$arg" in --*) ;; *) LOCAL_WATCHDOG="$arg"; break ;; esac
-done
-LOCAL_WATCHDOG="${LOCAL_WATCHDOG:-surflare_watchdog.sh}"
 
-if [ ! -f "$LOCAL_WATCHDOG" ]; then
-    echo "FATAL: $LOCAL_WATCHDOG not found"
-    exit 1
-fi
+# Print NODE= and TRANSIT= values from a watchdog file, one per line,
+# quotes kept, trailing comments stripped.  Missing lines print nothing.
+_cfg_vals() {
+    { grep -m1 '^NODE=' "$1"; grep -m1 '^TRANSIT=' "$1"; } 2>/dev/null \
+        | sed 's/[[:space:]]*#.*$//' || true
+}
 
-# Step 1: Local syntax check
-echo "Validating syntax..."
-if ! bash -n "$LOCAL_WATCHDOG"; then
-    echo "FATAL: syntax check failed, aborting deploy"
-    exit 1
-fi
-echo "Syntax OK"
+# Refuse when local NODE=/TRANSIT= differ from live (I10).  The live box
+# may be mid-soak on spliced values (e.g. a dedicated-IP trial); an
+# unguarded scp would silently revert that soak.  --force overrides,
+# but still asks.
+# $1 = local cfg vals, $2 = live cfg vals, $3 = force flag
+_live_cfg_guard() {
+    [ "$1" = "$2" ] && return 0
+    echo "NODE=/TRANSIT= differ between local file and live N100:" >&2
+    printf '  local: %s\n' "$1" >&2
+    printf '  live : %s\n' "$2" >&2
+    if [ "$3" -ne 1 ]; then
+        echo "FATAL: refusing to deploy. Splice the live values into the local file, or re-run with --force." >&2
+        return 1
+    fi
+    read -r -p "--force given. Overwrite live NODE=/TRANSIT= with local values? [y/N] " _fc
+    if [ "${_fc,,}" != "y" ]; then
+        echo "Aborted."
+        return 1
+    fi
+    return 0
+}
 
-# Step 2: Deploy to N100
-echo "Deploying to N100..."
-if ! scp "$LOCAL_WATCHDOG" "${N100}:${REMOTE_WATCHDOG}.new"; then
-    echo "FATAL: scp failed"
-    exit 1
-fi
+main() {
+    # Parse flags
+    for arg in "$@"; do
+        case "$arg" in
+            --no-restart) NO_RESTART=1 ;;
+            --force) FORCE=1 ;;
+        esac
+    done
 
-# Backup current version, then atomic replace
-# shellcheck disable=SC2087
-ssh "$N100" <<DEPLOY
+    # Positional: first non-flag argument is the local file
+    for arg in "$@"; do
+        case "$arg" in --*) ;; *) LOCAL_WATCHDOG="$arg"; break ;; esac
+    done
+    LOCAL_WATCHDOG="${LOCAL_WATCHDOG:-surflare_watchdog.sh}"
+
+    if [ ! -f "$LOCAL_WATCHDOG" ]; then
+        echo "FATAL: $LOCAL_WATCHDOG not found"
+        exit 1
+    fi
+
+    # Step 1: Local syntax check
+    echo "Validating syntax..."
+    if ! bash -n "$LOCAL_WATCHDOG"; then
+        echo "FATAL: syntax check failed, aborting deploy"
+        exit 1
+    fi
+    echo "Syntax OK"
+
+    # Step 1.5: live-cfg guard.  Runs BEFORE any remote mutation so a
+    # refusal leaves the box byte-identical (T15).
+    echo "Comparing NODE=/TRANSIT= against live N100..."
+    local _local_cfg _remote_raw _remote_cfg
+    _local_cfg="$(_cfg_vals "$LOCAL_WATCHDOG")"
+    # shellcheck disable=SC2029  # $REMOTE_WATCHDOG must expand client-side
+    if ! _remote_raw="$(ssh "$N100" "{ grep -m1 '^NODE=' '$REMOTE_WATCHDOG'; grep -m1 '^TRANSIT=' '$REMOTE_WATCHDOG'; } 2>/dev/null")"; then
+        echo "FATAL: cannot reach N100 to compare NODE=/TRANSIT=" >&2
+        exit 1
+    fi
+    _remote_cfg="$(printf '%s\n' "$_remote_raw" | sed 's/[[:space:]]*#.*$//')"
+    if ! _live_cfg_guard "$_local_cfg" "$_remote_cfg" "$FORCE"; then
+        exit 1
+    fi
+
+    # Step 2: Deploy to N100
+    echo "Deploying to N100..."
+    if ! scp "$LOCAL_WATCHDOG" "${N100}:${REMOTE_WATCHDOG}.new"; then
+        echo "FATAL: scp failed"
+        exit 1
+    fi
+
+    # Backup current version, then atomic replace
+    # shellcheck disable=SC2087
+    ssh "$N100" <<DEPLOY
 if [ -f "$REMOTE_WATCHDOG" ]; then
     cp "$REMOTE_WATCHDOG" "${REMOTE_WATCHDOG}.prev"
 else
@@ -61,43 +108,49 @@ mv "${REMOTE_WATCHDOG}.new" "$REMOTE_WATCHDOG"
 chmod +x "$REMOTE_WATCHDOG"
 DEPLOY
 
-echo "Deployed.  Showing diff (first 50 lines):"
-ssh "$N100" "diff '${REMOTE_WATCHDOG}.prev' '$REMOTE_WATCHDOG' 2>/dev/null | head -50" || true
+    echo "Deployed.  Showing diff (first 50 lines):"
+    ssh -n "$N100" "diff '${REMOTE_WATCHDOG}.prev' '$REMOTE_WATCHDOG' 2>/dev/null | head -50" || true
 
-# Step 3: Restart gate
-if [ "$NO_RESTART" -eq 1 ]; then
-    echo "Deploy complete (--no-restart).  File on N100 updated, .prev backup kept."
-    echo "To restart manually:  ssh $N100 /etc/init.d/surflare-watchdog restart"
-    exit 0
-fi
-
-read -r -p "Restart watchdog on N100? [y/N] " _confirm
-if [ "${_confirm,,}" != "y" ]; then
-    echo "Aborted by user."
-    if ssh "$N100" "test -f '${REMOTE_WATCHDOG}.prev'"; then
-        echo "Rolling back to .prev..."
-        ssh "$N100" "mv '${REMOTE_WATCHDOG}.prev' '$REMOTE_WATCHDOG'"
+    # Step 3: Restart gate
+    if [ "$NO_RESTART" -eq 1 ]; then
+        echo "Deploy complete (--no-restart).  File on N100 updated, .prev backup kept."
+        echo "To restart manually:  ssh $N100 /etc/init.d/surflare-watchdog restart"
+        exit 0
     fi
-    exit 0
-fi
 
-# Step 4: Restart and monitor
-echo "Restarting watchdog..."
-ssh "$N100" "/etc/init.d/surflare-watchdog restart"
-echo "Waiting ${DEPLOY_WAIT}s for crash check..."
-sleep "$DEPLOY_WAIT"
+    read -r -p "Restart watchdog on N100? [y/N] " _confirm
+    if [ "${_confirm,,}" != "y" ]; then
+        echo "Aborted by user."
+        if ssh "$N100" "test -f '${REMOTE_WATCHDOG}.prev'"; then
+            echo "Rolling back to .prev..."
+            ssh "$N100" "mv '${REMOTE_WATCHDOG}.prev' '$REMOTE_WATCHDOG'"
+        fi
+        exit 0
+    fi
 
-# Crash check via PID file (not pgrep -- avoids ssh shell self-match)
-if ssh "$N100" 'kill -0 "$(cat /run/surflare_watchdog.pid 2>/dev/null)" 2>/dev/null'; then
-    echo "Deploy OK -- watchdog running (PID file verified)"
-else
-    echo "WARN: watchdog not running after ${DEPLOY_WAIT}s"
-    if ssh "$N100" "test -f '${REMOTE_WATCHDOG}.prev'"; then
-        echo "ROLLBACK: restoring .prev and restarting..."
-        ssh "$N100" "mv '${REMOTE_WATCHDOG}.prev' '$REMOTE_WATCHDOG' && /etc/init.d/surflare-watchdog restart"
-        exit 1
+    # Step 4: Restart and monitor
+    echo "Restarting watchdog..."
+    ssh "$N100" "/etc/init.d/surflare-watchdog restart"
+    echo "Waiting ${DEPLOY_WAIT}s for crash check..."
+    sleep "$DEPLOY_WAIT"
+
+    # Crash check via PID file (not pgrep -- avoids ssh shell self-match)
+    if ssh "$N100" 'kill -0 "$(cat /run/surflare_watchdog.pid 2>/dev/null)" 2>/dev/null'; then
+        echo "Deploy OK -- watchdog running (PID file verified)"
     else
-        echo "FATAL: crash on first deploy, no .prev available -- manual intervention needed"
-        exit 1
+        echo "WARN: watchdog not running after ${DEPLOY_WAIT}s"
+        if ssh "$N100" "test -f '${REMOTE_WATCHDOG}.prev'"; then
+            echo "ROLLBACK: restoring .prev and restarting..."
+            ssh "$N100" "mv '${REMOTE_WATCHDOG}.prev' '$REMOTE_WATCHDOG' && /etc/init.d/surflare-watchdog restart"
+            exit 1
+        else
+            echo "FATAL: crash on first deploy, no .prev available -- manual intervention needed"
+            exit 1
+        fi
     fi
+}
+
+# Sourceable for tests: main runs only when executed, not when sourced.
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+    main "$@"
 fi
