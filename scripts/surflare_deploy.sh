@@ -14,7 +14,7 @@ set -euo pipefail
 
 N100="root@192.168.100.1"
 REMOTE_WATCHDOG="/usr/local/sbin/surflare_watchdog.sh"
-DEPLOY_WAIT=30
+DEPLOY_WAIT="${DEPLOY_WAIT:-30}"
 NO_RESTART=0
 FORCE=0
 LOCAL_WATCHDOG=""
@@ -82,7 +82,7 @@ main() {
     local _local_cfg _remote_raw _remote_cfg
     _local_cfg="$(_cfg_vals "$LOCAL_WATCHDOG")"
     # shellcheck disable=SC2029  # $REMOTE_WATCHDOG must expand client-side
-    if ! _remote_raw="$(ssh "$N100" "{ grep -m1 '^NODE=' '$REMOTE_WATCHDOG'; grep -m1 '^TRANSIT=' '$REMOTE_WATCHDOG'; } 2>/dev/null")"; then
+    if ! _remote_raw="$(ssh -n "$N100" "{ grep -m1 '^NODE=' '$REMOTE_WATCHDOG'; grep -m1 '^TRANSIT=' '$REMOTE_WATCHDOG'; } 2>/dev/null")"; then
         echo "FATAL: cannot reach N100 to compare NODE=/TRANSIT=" >&2
         exit 1
     fi
@@ -93,7 +93,12 @@ main() {
 
     # Step 2: Deploy to N100
     echo "Deploying to N100..."
-    if ! scp "$LOCAL_WATCHDOG" "${N100}:${REMOTE_WATCHDOG}.new"; then
+    # scp's underlying ssh may drain the caller's stdin: a piped answer
+    # for the restart prompt below would be eaten here, read would hit
+    # EOF, and set -e would kill the script between deploy and restart
+    # (silent half-deploy).  Feed scp /dev/null so it cannot reach our
+    # stdin.
+    if ! scp "$LOCAL_WATCHDOG" "${N100}:${REMOTE_WATCHDOG}.new" < /dev/null; then
         echo "FATAL: scp failed"
         exit 1
     fi
@@ -120,30 +125,33 @@ DEPLOY
         exit 0
     fi
 
-    read -r -p "Restart watchdog on N100? [y/N] " _confirm
+    # Guarded read: EOF (empty pipe, /dev/null stdin) must not kill the
+    # script under set -e after the file has already landed.  No answer
+    # means the safe path: abort and roll back to .prev.
+    read -r -p "Restart watchdog on N100? [y/N] " _confirm || _confirm=""
     if [ "${_confirm,,}" != "y" ]; then
         echo "Aborted by user."
-        if ssh "$N100" "test -f '${REMOTE_WATCHDOG}.prev'"; then
+        if ssh -n "$N100" "test -f '${REMOTE_WATCHDOG}.prev'"; then
             echo "Rolling back to .prev..."
-            ssh "$N100" "mv '${REMOTE_WATCHDOG}.prev' '$REMOTE_WATCHDOG'"
+            ssh -n "$N100" "mv '${REMOTE_WATCHDOG}.prev' '$REMOTE_WATCHDOG'"
         fi
         exit 0
     fi
 
     # Step 4: Restart and monitor
     echo "Restarting watchdog..."
-    ssh "$N100" "/etc/init.d/surflare-watchdog restart"
+    ssh -n "$N100" "/etc/init.d/surflare-watchdog restart"
     echo "Waiting ${DEPLOY_WAIT}s for crash check..."
     sleep "$DEPLOY_WAIT"
 
     # Crash check via PID file (not pgrep -- avoids ssh shell self-match)
-    if ssh "$N100" 'kill -0 "$(cat /run/surflare_watchdog.pid 2>/dev/null)" 2>/dev/null'; then
+    if ssh -n "$N100" 'kill -0 "$(cat /run/surflare_watchdog.pid 2>/dev/null)" 2>/dev/null'; then
         echo "Deploy OK -- watchdog running (PID file verified)"
     else
         echo "WARN: watchdog not running after ${DEPLOY_WAIT}s"
-        if ssh "$N100" "test -f '${REMOTE_WATCHDOG}.prev'"; then
+        if ssh -n "$N100" "test -f '${REMOTE_WATCHDOG}.prev'"; then
             echo "ROLLBACK: restoring .prev and restarting..."
-            ssh "$N100" "mv '${REMOTE_WATCHDOG}.prev' '$REMOTE_WATCHDOG' && /etc/init.d/surflare-watchdog restart"
+            ssh -n "$N100" "mv '${REMOTE_WATCHDOG}.prev' '$REMOTE_WATCHDOG' && /etc/init.d/surflare-watchdog restart"
             exit 1
         else
             echo "FATAL: crash on first deploy, no .prev available -- manual intervention needed"
