@@ -2209,6 +2209,19 @@ _restore_tproxy() {
 	fi
 }
 
+# True when the LAN tproxy table is missing (first connect) OR exists
+# without any tproxy rule in prerouting -- the tombstone shape.  A
+# proxy-death tombstone replaces the tproxy rules with REJECT, and if no
+# reconnect follows, health probes keep passing because they ride the
+# router OUTPUT path, not the LAN tproxy path (2026-09-13: LAN REJECTed
+# ~6h with every health tick logging "VPN healthy").  The health-success
+# branch gates on this shape, not on table presence alone.  The
+# 'tproxy.*10800' pattern is the same one _tombstone_tproxy matches on.
+_lan_tproxy_needs_restore() {
+	nft list table inet sw_lan_tproxy >/dev/null 2>&1 || return 0
+	! nft list chain inet sw_lan_tproxy prerouting 2>/dev/null | grep -q 'tproxy.*10800'
+}
+
 # Enter storm-protection cooldown. Called from the three storm trigger
 # sites (post-crash, post-reconnect, connect failure) which previously
 # duplicated the same ~12 lines. The reason string is logged for forensic
@@ -6863,9 +6876,13 @@ while true; do
 		_remove_dns_fallback
 		_patch_surflare_icmp_lan
 
-		# Ensure sw_lan_tproxy is loaded on first successful connect.
-		# Without this, LAN devices have no tproxy rules until the first reconnect.
-		if ! nft list table inet sw_lan_tproxy >/dev/null 2>&1; then
+		# Ensure sw_lan_tproxy is loaded AND in tproxy shape on every
+		# healthy tick.  Table missing: first-connect load.  Table
+		# tombstoned (REJECT in place of tproxy rules): proxy-death
+		# tombstone with no following reconnect -- health probes ride
+		# the router OUTPUT path, so a healthy verdict does not prove
+		# the LAN plane works.  Gate on shape, not just presence.
+		if _lan_tproxy_needs_restore; then
 			_restore_tproxy
 			_update_bypass_devices
 		fi
