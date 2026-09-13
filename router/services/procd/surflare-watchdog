@@ -124,6 +124,7 @@ stop_service() {
 # DUPLICATE: also defined in surflare_watchdog.sh _full_teardown(). Sync changes.
 _full_teardown() {
     nft delete table inet killswitch 2>/dev/null
+    nft delete table inet cn_dns_direct 2>/dev/null
     nft delete table inet sw_lan_tproxy 2>/dev/null
     nft delete table ip dns_enforce 2>/dev/null
     nft delete table inet surflare 2>/dev/null

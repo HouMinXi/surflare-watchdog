@@ -2752,6 +2752,46 @@ _block_unreachable_doh() {
 		ip daddr '{ 1.1.1.1, 1.0.0.1, 8.8.8.8, 8.8.4.4 }' tcp dport 443 reject \
 		2>/dev/null || true
 }
+# China-view DNS for DIRECT destinations (spec 2026-09-12-cn-dns-view).
+# The vendor proxy hijacks UDP/53 to the public DNS anycasts and answers
+# domestic names with US/HK CDN addresses; those answers then crawl or die
+# on the DIRECT path. Marking router-originated DNS to those anycasts 0xff
+# sends it to WAN instead: killswitch output accepts mark 0xff, and our
+# output hook (priority -160) runs 10 earlier than the vendor hook (-150),
+# so the mark is already set when inet surflare classifies the packet.
+# destroy+create in one nft -f keeps N calls idempotent (I12); teardown
+# lives in _full_teardown (I11).
+_install_cn_dns_direct() {
+	local _cd_tmp="/tmp/cn_dns_direct_$$.nft"
+	cat > "$_cd_tmp" << 'NFTEOF'
+destroy table inet cn_dns_direct
+table inet cn_dns_direct {
+    set dns_anycast {
+        type ipv4_addr
+        flags interval
+        elements = {
+            223.5.5.5, 223.6.6.6,
+            120.53.53.53, 1.12.12.12, 119.29.29.29,
+            114.114.114.114
+        }
+    }
+    chain output {
+        type route hook output priority -160;
+        ip daddr @dns_anycast udp dport 53 meta mark set 0x000000ff counter accept
+        ip daddr @dns_anycast tcp dport { 853, 443 } meta mark set 0x000000ff counter accept
+    }
+}
+NFTEOF
+	if nft -f "$_cd_tmp"; then
+		rm -f "$_cd_tmp"
+		return 0
+	fi
+	nft -f "$_cd_tmp" >&2  # echo real nft error to stderr/dmesg
+	log "WARN: cn_dns_direct install failed"
+	rm -f "$_cd_tmp"
+	return 1
+}
+
 # _exempt_cn_output: load all CN IPv4 CIDRs into an nftables set and insert
 # an accept rule before the output chain catchall so N100-local traffic to
 # CN IPs never enters tproxy.  Replaces the narrower _exempt_local_dns_servers
@@ -5278,6 +5318,7 @@ connect_vpn() {
 		# settle window (~60s), causing sing-box loopback rejects.
 		# Loading here shrinks the gap from ~2min to <1s.
 		_exempt_cn_output
+		_install_cn_dns_direct
 		# The proxy's inet surflare table now handles output routing; killswitch
 		# O1 (v3.2): poll-based readiness with data-plane verification.
 		# Phase 1: wait for local state (process/nftables/routing).
@@ -5376,6 +5417,7 @@ connect_vpn() {
 		if ! nft list table inet killswitch >/dev/null 2>&1; then
 			_install_killswitch
 		fi
+		_install_cn_dns_direct
 
 		exit 0
 	) 9>"$LOCK_FILE"
@@ -5629,6 +5671,7 @@ cleanup() {
 
 _full_teardown() {
 	nft delete table inet killswitch 2>/dev/null
+	nft delete table inet cn_dns_direct 2>/dev/null
 	nft delete table inet sw_lan_tproxy 2>/dev/null
 	nft delete table ip dns_enforce 2>/dev/null
 	nft delete table inet surflare 2>/dev/null
@@ -6045,6 +6088,7 @@ if ! nft list table inet killswitch >/dev/null 2>&1; then
 		log "WARN: startup killswitch install failed"
 	fi
 fi
+_install_cn_dns_direct
 
 log "Startup nftables: killswitch=$(_table_exists killswitch) dns_enforce=$(_table_exists dns_enforce) surflare_moat=$(_table_exists surflare_moat)"
 
@@ -6568,6 +6612,7 @@ while true; do
 						log "WARN: post-crash killswitch install failed -- IP leak protection inactive"
 					fi
 				fi
+				_install_cn_dns_direct
 				_update_killswitch_server_ips
 				_restore_tproxy
 				_block_unreachable_doh
@@ -6831,6 +6876,7 @@ while true; do
 				log "WARN: killswitch install failed -- IP leak protection inactive"
 			fi
 		fi
+		_install_cn_dns_direct
 
 		# Tproxy health check: detect relay degradation invisible to tunnel probes.
 		# node_health.json (written by surflare_log_health.sh every 3 min) tracks
@@ -7092,6 +7138,7 @@ while true; do
 							log "WARN: Kill switch failed to install -- IP leak protection inactive"
 						fi
 					fi
+					_install_cn_dns_direct
 					_update_killswitch_server_ips
 					# Restore LAN tproxy now that the new proxy is ready on :10800.
 					_restore_tproxy
