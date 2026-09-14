@@ -96,17 +96,29 @@ _hk24h_parse_443() {
 }
 
 _hk24h_collect_peers() {
+	# One table, not ss+netstat union. Same ESTAB :443 sits in both
+	# (N100 2026-09-14: 55+55). hop_n would be 2x sockets.
+	# ss first; empty ss (OpenWrt `ss -tn state established`) falls
+	# back to netstat. Stubs follow the same rule.
 	if [ -n "${HK24H_SS_OUT+x}" ] || [ -n "${HK24H_NETSTAT_OUT+x}" ]; then
-		{
-			[ -n "${HK24H_SS_OUT+x}" ] && [ -f "$HK24H_SS_OUT" ] && cat "$HK24H_SS_OUT"
-			[ -n "${HK24H_NETSTAT_OUT+x}" ] && [ -f "$HK24H_NETSTAT_OUT" ] && cat "$HK24H_NETSTAT_OUT"
-		} | _hk24h_parse_443
+		if [ -n "${HK24H_SS_OUT+x}" ] && [ -f "$HK24H_SS_OUT" ]; then
+			_ss=$(_hk24h_parse_443 < "$HK24H_SS_OUT")
+			if [ -n "$_ss" ]; then
+				printf "%s\n" "$_ss"
+				return 0
+			fi
+		fi
+		if [ -n "${HK24H_NETSTAT_OUT+x}" ] && [ -f "$HK24H_NETSTAT_OUT" ]; then
+			_hk24h_parse_443 < "$HK24H_NETSTAT_OUT"
+		fi
 		return 0
 	fi
-	{
-		ss -tn 2>/dev/null || true
-		netstat -tn 2>/dev/null || true
-	} | _hk24h_parse_443
+	_ss=$(ss -tn 2>/dev/null | _hk24h_parse_443)
+	if [ -n "$_ss" ]; then
+		printf "%s\n" "$_ss"
+		return 0
+	fi
+	netstat -tn 2>/dev/null | _hk24h_parse_443
 }
 
 _hk24h_sample() {

@@ -166,6 +166,17 @@ _hk24h_collect_peers" 2>/dev/null)"
 	[ -z "$PEERS3" ] \
 		&& ok "collect_peers ignores LAN 443" \
 		|| bad "collect_peers leaked LAN: [$PEERS3]"
+
+	# Same hop on ss AND netstat: production used to add the two tables
+	# (N100 55+55). hop_n must be sockets from one table, ss first.
+	printf '%s\n' 'ESTAB 0 0 100.65.254.219:46890 152.32.238.178:443' > "$TMP/ss_both"
+	printf '%s\n' 'tcp 0 0 100.65.254.219:46890 152.32.238.178:443 ESTABLISHED' > "$TMP/netstat_both"
+	PEERS4=$(HK24H_SS_OUT="$TMP/ss_both" HK24H_NETSTAT_OUT="$TMP/netstat_both" bash -c "$FNS
+_hk24h_collect_peers" 2>/dev/null)
+	N4=$(printf '%s\n' "$PEERS4" | grep -Fxc '152.32.238.178' || true)
+	[ "$N4" = "1" ] \
+		&& ok "collect_peers ss wins, no ss+netstat double count" \
+		|| bad "collect_peers double-counted hop: n=$N4 [$PEERS4]"
 else
 	bad "collect_peers netstat skipped (function missing)"
 	bad "collect_peers ss https skipped (function missing)"
