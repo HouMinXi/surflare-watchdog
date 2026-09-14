@@ -3739,6 +3739,27 @@ _diagnose_tunnel_failure() {
 	fi
 }
 
+# _backfill_session_identity: an adopted tunnel (proxy outlived this
+# watchdog) never passes through _record_connect, so _sess_node/_sess_exit
+# stay empty and every STATS line prints node=? exit=? for the whole
+# uptime even though the live node is known.  _active_node is kept
+# reconciled with `surflare status` Server: by
+# _reconcile_rotation_with_live_session, so it is as truthful as the
+# reconnect path's record.  Fill the identity once, on the first healthy
+# tick.  _sess_connect_s is deliberately NOT set: the dwell gate reads 0
+# as an ancient session, which matches the adopt reality (the tunnel
+# predates this watchdog) and keeps rotation semantics unchanged.
+_backfill_session_identity() {
+	local health="$1"
+	[ -z "$_sess_node" ] || return 0
+	_sess_node="$_active_node"
+	case "$health" in
+		OK|TUNNEL_OK) _sess_exit="?" ;;
+		*) _sess_exit="$health" ;;
+	esac
+	log "Session identity backfilled from live session: node=${_sess_node} exit=${_sess_exit}"
+}
+
 # _record_connect: call after every confirmed-healthy reconnect.
 # Captures the transit node that was actually used, updates session state.
 _record_connect() {
@@ -5581,6 +5602,15 @@ _check_trace_alive() {
 	fi
 }
 
+# --source-only: stop here when sourced by test harnesses.  This must
+# sit before the wake-hook/daemon top-level code below: the arg-reject
+# there exits on any non-empty $1, and "--source-only" is a non-empty
+# $1, so a return placed later never gets a chance to run.
+if [ "${_SOURCE_ONLY:-0}" -eq 1 ]; then
+	# shellcheck disable=SC2317  # return works when sourced, exit when executed
+	return 0 2>/dev/null || exit 0
+fi
+
 # === Wake hook mode (called by systemd-sleep with $1=pre|post) ===
 if [ "$1" = "pre" ]; then
 	exit 0 # Nothing to do before sleep
@@ -6528,13 +6558,6 @@ _maybe_upgrade_surflare() {
 	fi
 	return 0
 }
-# --source-only: define functions but do not enter main loop.
-# Used by test harnesses (Plan 03-04) to source this file.
-if [ "${_SOURCE_ONLY:-0}" -eq 1 ]; then
-	# shellcheck disable=SC2317  # return works when sourced, exit when executed
-	return 0 2>/dev/null || exit 0
-fi
-
 while true; do
 	# Diagnostic mode: pause without tearing down protections.
 	# SIGUSR2 toggles _diag_mode; while active, the loop sleeps
@@ -6847,6 +6870,10 @@ while true; do
 		# PROXY_BROKEN grace window: the blip was ridden out, exactly
 		# the case the grace exists to absorb.
 		_pb_grace_since=0
+
+		# Adopted tunnels never see _record_connect; fill the STATS
+		# session identity once from the reconciled live node.
+		_backfill_session_identity "$health"
 
 		# Exit country enforcement BEFORE failback gate -- a blocked exit
 		# is NOT a healthy check and must not accumulate toward the gate.
