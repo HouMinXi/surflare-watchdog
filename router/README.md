@@ -13,6 +13,7 @@ Scripts and config for N100 mini-PC running iStoreOS or OpenWrt (procd init).
 | `update-cn-domains.sh` | Weekly cron: downloads dnsmasq-china-list, converts to SmartDNS nameserver format, validates, restarts SmartDNS. |
 | `smartdns/custom.conf.example` | SmartDNS config template: domestic group (CN DoT/DoH), foreign group (1.1.1.1 via VPN), Bing fix, bootstrap isolation. |
 | `smartdns/force-foreign.conf.example` | Per-domain VPN-path overrides for CN-IP duality domains (e.g. bing.com). |
+| `smartdns/gmail-smtp.conf.example` | smtp.gmail.com / smtp.googlemail.com -> gmail_smtp nftset (tcp/465,587 ISP-direct). |
 | `smartdns/smartdns-custom.init` | procd init script for custom SmartDNS instance on port 6053. |
 | `services/procd/` | procd init scripts for surflare-watchdog (no early-detector: nm-online unavailable). |
 
@@ -33,6 +34,7 @@ Then configure SmartDNS:
 ```bash
 cp router/smartdns/custom.conf.example /etc/smartdns/custom.conf
 cp router/smartdns/force-foreign.conf.example /etc/smartdns/force-foreign.conf
+cp router/smartdns/gmail-smtp.conf.example /etc/smartdns/gmail-smtp.conf
 # Edit /etc/smartdns/custom.conf: add wechat sendkey to /etc/surflare/wechat.conf
 /etc/init.d/smartdns-custom start && /etc/init.d/smartdns-custom enable
 ```

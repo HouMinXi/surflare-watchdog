@@ -85,6 +85,7 @@ LAN device (TCP/QUIC/DNS)
 |   5. in cn_direct? ---------------> return (CN ISP)       |
 |   6. in cn6_direct? --------------> return (CN ISP)       |
 |   7. DTLS 1.2 UDP/443 0xFEFD? ----> auto_bypass, return  |
+|   7b. gmail_smtp tcp/465,587? ----> return (ISP direct) |
 |   8. IPv4 TCP? ---> tproxy ip to :10800   (mark 0x1)     |
 |   9. IPv6 TCP? ---> tproxy ip6 to :10800  (mark 0x1)     |
 |  10. IPv4 QUIC? --> reject (ICMP port-unreachable)        |
@@ -102,6 +103,7 @@ LAN device (TCP/QUIC/DNS)
 ||  bypass_src? ---------> accept
 ||  z66 UDP/41641? ------> accept  (Tailscale WG underlay, memory 56)
 ||  z66 -> derp_asia? ---> accept  (DERP relay TCP/443 + STUN UDP/3478)
+||  gmail_smtp tcp/465,587? -> accept (Gmail submission, ISP)
 ||  lan_ranges? ---------> accept
 |  NTP UDP/123? --------> accept
 |  TCP? log "ks-fwd-mon:" (5/s; ICMP/UDP silent)
@@ -124,6 +126,11 @@ LAN device (TCP/QUIC/DNS)
   and forced a 300-430ms relay).  The killswitch forward chain carries a
   same-named set accepting this traffic plus z66's WireGuard UDP/41641,
   outbound-only.  User-adjudicated 2026-09-01 (project memory 56 branch A).
+- `gmail_smtp` / `gmail_smtp6`: SmartDNS fills smtp.gmail.com and
+  smtp.googlemail.com IPs.  tproxy returns only tcp/465 and tcp/587
+  (not 22/25, not 443) so Gmail submission skips the VPN exit, which
+  RST/timeout SMTP.  killswitch forward has the matching accept.
+  Sets start empty; a LAN DNS query populates them.  Timeout 1h.
 - `bypass_devices` is filled from `/etc/surflare/bypass-macs.conf` in
   both modes (`_update_bypass_devices` has no MODE skip).  N100 live:
   .11 BT, .17 Mac/AnyConnect, .120 work laptop.  The example file in

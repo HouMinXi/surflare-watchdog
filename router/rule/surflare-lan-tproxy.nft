@@ -68,6 +68,22 @@ table inet sw_lan_tproxy {
                      205.147.105.30, 205.147.105.78 }
     }
 
+    # Gmail SMTP submission: SmartDNS fills resolved IPs of smtp.gmail.com
+    # / smtp.googlemail.com.  Only tcp/465 and tcp/587 return here; 443 on
+    # the same Google addresses still hits tproxy.  Empty until a LAN DNS
+    # query; entries expire after 1h.
+    set gmail_smtp {
+        type ipv4_addr;
+        flags interval, timeout;
+        timeout 1h;
+    }
+
+    set gmail_smtp6 {
+        type ipv6_addr;
+        flags interval, timeout;
+        timeout 1h;
+    }
+
     chain prerouting {
         type filter hook prerouting priority mangle - 10; policy accept;
 
@@ -105,6 +121,12 @@ table inet sw_lan_tproxy {
 
         # Tailscale DERP Asia bypass (z66 only; see derp_asia set comment).
         iifname "br-lan" ip saddr 192.168.100.12 ip daddr @derp_asia return
+
+        # Gmail SMTP submission (465/587 only).  Dedicated VPN exits drop
+        # SMTP; WAN-direct 587 already answers 220.  Port-limited so HTTPS
+        # on shared Google IPs stays in tproxy.
+        iifname "br-lan" ip daddr @gmail_smtp tcp dport { 465, 587 } return
+        iifname "br-lan" ip6 daddr @gmail_smtp6 tcp dport { 465, 587 } return
 
         # AnyConnect DTLS detection: UDP/443 with DTLS 1.2 version (0xFEFD).
         # Every DTLS 1.2 record carries 0xFEFD at byte 1-2 (protocol version),

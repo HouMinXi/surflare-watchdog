@@ -1,0 +1,14 @@
+# Gmail SMTP submission (tcp/465, tcp/587) -- ISP-direct, not the VPN exit.
+# Dedicated Surflare exits RST/timeout SMTP; the WAN path already answers 220.
+#
+# SmartDNS writes resolved A/AAAA into gmail_smtp / gmail_smtp6 on both
+# tproxy and killswitch tables.  nft rules match those sets AND dport
+# 465/587, so HTTPS on the same Google addresses still goes through tproxy.
+# speed-check-mode none: SMTP IPs need not answer ping/80/443.
+#
+# Deploy: copy to /etc/smartdns/gmail-smtp.conf and add
+#   conf-file /etc/smartdns/gmail-smtp.conf
+# to custom.conf, then restart SmartDNS.  A LAN query for smtp.gmail.com
+# fills the sets; git send-email does that query first.
+domain-rules /smtp.gmail.com/ -speed-check-mode none -nftset #4:inet#sw_lan_tproxy#gmail_smtp,#6:inet#sw_lan_tproxy#gmail_smtp6,#4:inet#killswitch#gmail_smtp,#6:inet#killswitch#gmail_smtp6
+domain-rules /smtp.googlemail.com/ -speed-check-mode none -nftset #4:inet#sw_lan_tproxy#gmail_smtp,#6:inet#sw_lan_tproxy#gmail_smtp6,#4:inet#killswitch#gmail_smtp,#6:inet#killswitch#gmail_smtp6

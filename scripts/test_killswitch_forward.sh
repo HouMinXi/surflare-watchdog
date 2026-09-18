@@ -55,5 +55,9 @@ check "nft list chain inet killswitch output 2>/dev/null | grep -qE 'mark 0x0*1[
 check "nft list chain inet killswitch output 2>/dev/null | grep -qE 'mark 0x0*ff[[:space:]]'" \
 	"output mark 0xff accept"
 
-echo "=== Done: $((7 - FAIL))/7 passed ==="
+# 8. Gmail SMTP 465/587 accept (ISP-direct submission; not 22/25)
+check "nft list chain inet killswitch forward 2>/dev/null | grep -q 'ip daddr @gmail_smtp tcp dport'" \
+	"gmail_smtp 465/587 accept"
+
+echo "=== Done: $((8 - FAIL))/8 passed ==="
 exit $FAIL

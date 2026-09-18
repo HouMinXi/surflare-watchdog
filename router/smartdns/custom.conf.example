@@ -63,6 +63,9 @@ nameserver /akamai.net/domestic
 # -- Force-foreign overrides (domains with CN-IP duality, must use VPN DNS) -
 conf-file /etc/smartdns/force-foreign.conf
 
+# Gmail SMTP 465/587: resolved IPs go in gmail_smtp nftset (ISP direct).
+conf-file /etc/smartdns/gmail-smtp.conf
+
 
 # -- Bing: force CN IP DIRECT path (VPN exit IPs trigger redirect loop) --
 domain-rules /bing.com/ -address 202.89.233.101 -speed-check-mode none

@@ -103,6 +103,7 @@ LAN device (TCP/QUIC/DNS)
 |   5. in cn_direct? ---------------> return (CN ISP)  ***  |
 |   6. in cn6_direct? --------------> return (CN ISP)  ***  |
 |   7. DTLS 1.2 UDP/443 0xFEFD? ----> auto_bypass, return  |
+|   7b. gmail_smtp tcp/465,587? ----> return (ISP direct) |
 |   8. IPv4 TCP? ---> tproxy ip to :10800   (mark 0x1)     |
 |   9. IPv6 TCP? ---> tproxy ip6 to :10800  (mark 0x1)     |
 |  10. IPv4 QUIC? --> reject (ICMP port-unreachable)        |
@@ -120,6 +121,7 @@ LAN device (TCP/QUIC/DNS)
 ||  bypass_src? ---------> accept
 ||  z66 UDP/41641? ------> accept  (Tailscale WG underlay, memory 56)
 ||  z66 -> derp_asia? ---> accept  (DERP relay TCP/443 + STUN UDP/3478)
+||  gmail_smtp tcp/465,587? -> accept (Gmail submission, ISP)
 ||  lan_ranges? ---------> accept
 |  NTP UDP/123? --------> accept
 |  TCP? log "ks-fwd-mon:" (5/s; ICMP/UDP silent)
@@ -214,6 +216,11 @@ hairpinning through the US VPN exit.  The killswitch forward chain
 carries a same-named set accepting this traffic plus z66's WireGuard
 UDP/41641, outbound-only.  User-adjudicated 2026-09-01 (project memory
 56 branch A).
+
+`gmail_smtp` / `gmail_smtp6` return only tcp/465 and tcp/587 (ISP
+direct); 443 on those Google IPs still hits tproxy.  killswitch
+forward has the matching accept.  Sets start empty until a LAN DNS
+query; timeout 1h.
 
 ## VPN Downtime Behavior
 

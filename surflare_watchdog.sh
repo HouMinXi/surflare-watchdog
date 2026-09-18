@@ -1479,6 +1479,7 @@ _cleanup_on_startup() {
 			_update_killswitch_server_ips
 		fi
 		_ensure_dns_enforce
+		_ensure_gmail_smtp_ks
 		# Unified tproxy restore guard (Problem A + Problem B):
 		#   B: table exists but no live tproxy rules (tombstoned) -- restore
 		#      so LAN traffic is not silently rejected while watchdog
@@ -1555,6 +1556,61 @@ _cleanup_on_startup() {
 			mv "$PROXY_LOG" "${PROXY_LOG}.$(date +%Y%m%d_%H%M%S)" 2>/dev/null || true
 			log "Proxy log rotated (was $((_log_size / 1048576))MB)"
 		fi
+	fi
+}
+
+# Hot-add gmail_smtp sets + forward accept onto a live killswitch.
+# Adopt / healthy ticks skip _install_killswitch when the table already
+# exists; without this, SMTP that tproxy returned hits the old reject.
+# Idempotent: skips if both v4 and v6 accept rules are already present.
+_ensure_gmail_smtp_ks() {
+	[ "$PLATFORM" = "router" ] || return 0
+	nft list table inet killswitch >/dev/null 2>&1 || return 0
+	local _ks_fwd _need_v4=1 _need_v6=1 _h _added=0
+	_ks_fwd=$(nft list chain inet killswitch forward 2>/dev/null)
+	echo "$_ks_fwd" | grep -q 'ip daddr @gmail_smtp tcp dport' && _need_v4=0
+	echo "$_ks_fwd" | grep -q 'ip6 daddr @gmail_smtp6 tcp dport' && _need_v6=0
+	[ "$_need_v4" -eq 0 ] && [ "$_need_v6" -eq 0 ] && return 0
+	nft add set inet killswitch gmail_smtp \
+		'{ type ipv4_addr; flags interval, timeout; timeout 1h; }' \
+		2>/dev/null || true
+	nft add set inet killswitch gmail_smtp6 \
+		'{ type ipv6_addr; flags interval, timeout; timeout 1h; }' \
+		2>/dev/null || true
+	# Insert before the first reject so IPv6 SMTP is not eaten by
+	# icmpv6 addr-unreachable (that rule sits above the IPv4 reject).
+	# BusyBox awk has no (v6)?.  'icmp' is a prefix of 'icmpv6', so
+	# this hits the first reject (v6 sits above v4 on the live chain).
+	_h=$(nft -a list chain inet killswitch forward 2>/dev/null | \
+		awk '/reject with icmp/ { print $NF; exit }')
+	if [ "$_need_v4" -eq 1 ]; then
+		if [ -n "$_h" ]; then
+			nft insert rule inet killswitch forward handle "$_h" \
+				iifname "br-lan" ip daddr @gmail_smtp tcp dport '{ 465, 587 }' accept \
+				2>/dev/null && _added=1
+		else
+			nft add rule inet killswitch forward \
+				iifname "br-lan" ip daddr @gmail_smtp tcp dport '{ 465, 587 }' accept \
+				2>/dev/null && _added=1
+		fi
+	fi
+	if [ "$_need_v6" -eq 1 ]; then
+		if [ -n "$_h" ]; then
+			nft insert rule inet killswitch forward handle "$_h" \
+				iifname "br-lan" ip6 daddr @gmail_smtp6 tcp dport '{ 465, 587 }' accept \
+				2>/dev/null && _added=1
+		else
+			nft add rule inet killswitch forward \
+				iifname "br-lan" ip6 daddr @gmail_smtp6 tcp dport '{ 465, 587 }' accept \
+				2>/dev/null && _added=1
+		fi
+	fi
+	_ks_fwd=$(nft list chain inet killswitch forward 2>/dev/null)
+	if echo "$_ks_fwd" | grep -q 'ip daddr @gmail_smtp tcp dport' && \
+	   echo "$_ks_fwd" | grep -q 'ip6 daddr @gmail_smtp6 tcp dport'; then
+		[ "$_added" -eq 1 ] && log "Kill switch: gmail_smtp 465/587 accept armed"
+	else
+		log "WARN: gmail_smtp hot-add incomplete (v4/v6 accept missing)"
 	fi
 }
 
@@ -1760,6 +1816,11 @@ table inet killswitch {
 			172.238.6.34, 172.238.6.179, 172.238.6.180,
 			205.147.105.30, 205.147.105.78 }
 	}
+	# Gmail SMTP submission IPs (smtp.gmail.com / smtp.googlemail.com).
+	# Paired with sw_lan_tproxy gmail_smtp; only tcp/465 and tcp/587
+	# are accepted below.  SmartDNS fills the set; timeout 1h.
+	set gmail_smtp  { type ipv4_addr; flags interval, timeout; timeout 1h; }
+	set gmail_smtp6 { type ipv6_addr; flags interval, timeout; timeout 1h; }
 	# CN domain nftset: SmartDNS adds resolved IPs when a CN domain
 	# resolves to a non-CN CDN IP (Cloudflare/Akamai/etc).  Allows
 	# LAN devices to reach CN content on foreign CDN directly without
@@ -1844,6 +1905,11 @@ table inet killswitch {
 		# return traffic matches ct state established,related above.
 		iifname "br-lan" ip saddr 192.168.100.12 udp dport 41641 accept
 		iifname "br-lan" ip saddr 192.168.100.12 ip daddr @derp_asia accept
+		# Gmail SMTP submission (465/587 only).  tproxy returns this
+		# traffic to the WAN; without this accept, killswitch forward
+		# would reject it.  Do not widen to 22/25.
+		iifname "br-lan" ip daddr @gmail_smtp tcp dport { 465, 587 } accept
+		iifname "br-lan" ip6 daddr @gmail_smtp6 tcp dport { 465, 587 } accept
 		# Private destinations from LAN (carrier IPs, app-internal VPNs)
 		# are not external leaks; accept like the output chain does.
 		iifname "br-lan" ip daddr @lan_ranges accept
@@ -5464,6 +5530,7 @@ connect_vpn() {
 		if ! nft list table inet killswitch >/dev/null 2>&1; then
 			_install_killswitch
 		fi
+		_ensure_gmail_smtp_ks
 		_install_cn_dns_direct
 
 		exit 0
@@ -6144,6 +6211,7 @@ if ! nft list table inet killswitch >/dev/null 2>&1; then
 		log "WARN: startup killswitch install failed"
 	fi
 fi
+_ensure_gmail_smtp_ks
 _install_cn_dns_direct
 
 log "Startup nftables: killswitch=$(_table_exists killswitch) dns_enforce=$(_table_exists dns_enforce) surflare_moat=$(_table_exists surflare_moat)"
@@ -6933,6 +7001,7 @@ while true; do
 				log "WARN: killswitch install failed -- IP leak protection inactive"
 			fi
 		fi
+		_ensure_gmail_smtp_ks
 		_install_cn_dns_direct
 
 		# Tproxy health check: detect relay degradation invisible to tunnel probes.
