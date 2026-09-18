@@ -625,6 +625,31 @@ AUTH_EXPIRED_FILE="/run/surflare_auth_expired"
 # loop (tui-supervisor pin / any out-of-band connect that did not go
 # through _rotate_node).  Without the loop call, a long-lived watchdog
 # keeps a stale cursor until the next restart.
+#
+# Catalog dedicated rows may trail an ISP suffix that status Server:
+# omits. Exact match first; else the IPv4 inside parens.
+_node_candidate_index() {
+	local _want="$1" _i _cand _ip _cip
+	[ -n "$_want" ] || return 1
+	for _i in "${!NODE_CANDIDATES[@]}"; do
+		[ "${NODE_CANDIDATES[$_i]}" = "$_want" ] && {
+			printf '%s\n' "$_i"
+			return 0
+		}
+	done
+	_ip=$(printf '%s' "$_want" | sed -n 's/.*(\([0-9][0-9.]*[0-9]\)).*/\1/p')
+	[ -n "$_ip" ] || return 1
+	for _i in "${!NODE_CANDIDATES[@]}"; do
+		_cand="${NODE_CANDIDATES[$_i]}"
+		_cip=$(printf '%s' "$_cand" | sed -n 's/.*(\([0-9][0-9.]*[0-9]\)).*/\1/p')
+		[ "$_cip" = "$_ip" ] && {
+			printf '%s\n' "$_i"
+			return 0
+		}
+	done
+	return 1
+}
+
 _reconcile_rotation_with_live_session() {
 	# _active_node/_node_idx are script-level on purpose: this
 	# function exists to realign them.  Do not local them.
@@ -636,12 +661,7 @@ _reconcile_rotation_with_live_session() {
 	# Same parse as scripts/tui-supervisor.sh:142.
 	_adopted_node=$(printf '%s\n' "$_status_out" | grep "Server:" | head -1 | sed "s/.*Server: *//;s/ *$//")
 	if [ -n "$_adopted_node" ] && [ "$_adopted_node" != "$_active_node" ]; then
-		for _ai in "${!NODE_CANDIDATES[@]}"; do
-			if [ "${NODE_CANDIDATES[$_ai]}" = "$_adopted_node" ]; then
-				_afound=1
-				break
-			fi
-		done
+		_ai=$(_node_candidate_index "$_adopted_node") && _afound=1 || _afound=0
 		if [ "$_afound" -eq 1 ]; then
 			log "Adopt reconcile: rotation ${_active_node} -> live session ${_adopted_node} ($((_ai + 1))/${#NODE_CANDIDATES[@]})"
 			_active_node="$_adopted_node"
@@ -5965,8 +5985,10 @@ done
 # stays ASCII (the emoji glyphs are non-ASCII and would trip the commit gate).
 # Dedicated IP entries carry a lock glyph and list in their own section above
 # the city sections, so they enter the candidate list first and win the NODE
-# fallback slot. Their whole label -- country plus parenthesized address --
-# is the tag `surflare connect --node` accepts (unlike cities, no (xN) strip).
+# fallback slot. Country plus parenthesized address is the connect --node
+# tag (unlike cities, no (xN) strip). Trailing ISP text after the IPv4
+# parens (AT&T on the 12.104 dedicated row) is display-only: status
+# Server: omits it, so the parser strips it or adopt never matches.
 _sync_node_candidates() {
 	command -v surflare >/dev/null 2>&1 || return 0
 	command -v python3 >/dev/null 2>&1 || return 0
@@ -5984,6 +6006,7 @@ seen = set()
 for line in sys.stdin:
     if "\U0001F512" in line:
         tag = line.split("\U0001F512", 1)[1].strip()
+        tag = re.sub(r"(\(\d+(?:\.\d+){3}\))\s*[A-Za-z&+].*$", r"\1", tag)
         if tag and tag not in seen:
             seen.add(tag)
             print(tag)

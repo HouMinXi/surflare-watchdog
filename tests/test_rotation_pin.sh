@@ -34,6 +34,14 @@ extract_startup() {
 # Live-session reconcile function: extracted so T4-T26 keep working
 # after the adopt inline is replaced by a call.  The function body is
 # the production source of truth (same bytes as adopt + main loop).
+extract_index_fn() {
+	awk '
+		/^_node_candidate_index\(\)/ { f=1 }
+		f { print }
+		f && /^}/ { exit }
+	' "$1"
+}
+
 extract_reconcile_fn() {
 	awk '
 		/^_reconcile_rotation_with_live_session\(\)/ { f=1 }
@@ -46,9 +54,11 @@ extract_reconcile_fn() {
 # the historical inline (pre-extract trees) so T7/T8 inject still
 # targets production bytes.
 extract_adopt() {
-	local fn
+	local fn idx
+	idx=$(extract_index_fn "$1")
 	fn=$(extract_reconcile_fn "$1")
 	if [ -n "$fn" ]; then
+		[ -n "$idx" ] && printf '%s\n' "$idx"
 		printf '%s\n' "$fn"
 		echo '_reconcile_rotation_with_live_session'
 		return
@@ -470,6 +480,35 @@ PY
 	[ $? -ne 0 ] && ok "timeout wrap deleted -> T33 would fail" || bad "T34 NOT caught"
 	rm -f "$INJ"
 fi
+
+echo "T35: status Server without ISP suffix matches catalog tag with AT&T"
+OUT=$(ACTIVE="Los Angeles" CANDS="${DEDICATED}AT&T|Los Angeles|Atlanta" \
+	STATUS_OUT="  Server:      $DEDICATED" \
+	ROT_FILE_CONTENT="$(printf 'Los Angeles	1')" run_adopt)
+[ "$OUT" = "$DEDICATED|0|$DEDICATED	0|1" ] && ok "ISP-suffix catalog matches live Server" || bad "T35 wrong: $OUT"
+
+echo "T36: bug-inject -- exact-only membership must fail T35"
+INJ=$(mktemp /tmp/rp_inj_isp_XXXXXX)
+python3 - "$WATCHDOG" "$INJ" << 'PYEOF'
+import sys
+from pathlib import Path
+src, dst = sys.argv[1], sys.argv[2]
+s = Path(src).read_text()
+start = s.find("_node_candidate_index() {")
+assert start >= 0, "helper missing"
+end = s.find("\n}", start)
+body = s[start:end]
+# drop the IPv4 fallback so only exact equality remains
+needle = '_ip=$(printf'
+assert needle in body, "ip fallback missing"
+new_body = body.split(needle, 1)[0] + "return 1\n"
+Path(dst).write_text(s[:start] + new_body + s[end:])
+PYEOF
+OUT=$(ACTIVE="Los Angeles" CANDS="${DEDICATED}AT&T|Los Angeles|Atlanta" \
+	STATUS_OUT="  Server:      $DEDICATED" \
+	ROT_FILE_CONTENT="$(printf 'Los Angeles	1')" run_adopt "$INJ")
+[ "$OUT" = "Los Angeles|1|Los Angeles	1|0" ] && ok "IP fallback deleted -> T35 would keep stale" || bad "T36 NOT caught: $OUT"
+rm -f "$INJ"
 
 echo
 echo "PASS=$PASS FAIL=$FAIL"

@@ -107,6 +107,39 @@ mapfile -t cands6 < <(catalog_full | run_parser "$PY")
 node6=$(validate_node "United States(65.195.35.200)" "${cands6[@]}")
 [ "$node6" = "United States(65.195.35.200)" ] && ok "NODE stays pinned" || bad "NODE became: $node6"
 
+echo "T8: ISP suffix after IPv4 parens is stripped (status Server: has no AT&T)"
+catalog_isp() {
+	printf '  \xf0\x9f\x94\x92 United States(%d.%d.%d.%d)AT&T  \n' 198 51 100 7
+	printf '  \xf0\x9f\x94\x92 Washington(%d.%d.%d.%d)  \n' 203 0 113 8
+}
+out8=$(catalog_isp | run_parser "$PY")
+want8="United States($(printf '%d.%d.%d.%d' 198 51 100 7))"
+printf '%s\n' "$out8" | grep -qx "$want8" \
+	&& ok "AT&T suffix stripped to status form" \
+	|| bad "ISP tag: $(printf '%s' "$out8" | head -1)"
+printf '%s\n' "$out8" | grep -q 'AT&T' && bad "AT&T leaked into candidates" || ok "AT&T not in candidates"
+printf '%s\n' "$out8" | grep -qx "Washington($(printf '%d.%d.%d.%d' 203 0 113 8))" \
+	&& ok "unsuffixed dedicated tag unchanged" \
+	|| bad "Washington tag mangled"
+
+echo "T9: bug-inject -- dropping ISP-suffix strip must fail T8"
+INJ9=$(mktemp /tmp/node_sync_isp_XXXXXX)
+python3 - "$WATCHDOG" "$INJ9" << 'PYEOF'
+import sys
+from pathlib import Path
+src, dst = sys.argv[1], sys.argv[2]
+s = Path(src).read_text()
+old = '        tag = re.sub(r"(\\(\\d+(?:\\.\\d+){3}\\))\\s*[A-Za-z&+].*$", r"\\1", tag)\n'
+assert s.count(old) == 1, "strip line missing"
+Path(dst).write_text(s.replace(old, "", 1))
+PYEOF
+PY9=$(extract_python "$INJ9")
+out9=$(catalog_isp | run_parser "$PY9")
+printf '%s\n' "$out9" | grep -q 'AT&T' \
+	&& ok "strip deleted -> AT&T remains (caught)" \
+	|| bad "T9 NOT caught: $out9"
+rm -f "$INJ9"
+
 # ---------- bug-inject: the lock branch IS the fix under test ----------
 # Swap the lock codepoint for a lookalike glyph: parser stays syntactically
 # valid but the dedicated branch never matches (same inject style as the
