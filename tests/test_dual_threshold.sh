@@ -418,6 +418,129 @@ else
 	ok "T25 G1 healthy no miss log and preserves verdict"
 fi
 
+# Edge-only degraded logging: log on enter and on leave, not every slow
+# probe.  A 75h soak at 5-7s currently reprints "egress degraded" each
+# health cycle; the band itself is working (T2/T10/T14).  These cases
+# exercise the product helper twice in one process so the latch is visible.
+run_egress_pair() {
+	local first="$1" second="$2"
+	local d
+	d=$(mktemp -d)
+	mkdir -p "$d/bin"
+	cat > "$d/bin/curl" <<SHIM
+#!/bin/sh
+n=0
+[ -f "$d/n" ] && n=\$(cat "$d/n")
+n=\$((n + 1))
+echo "\$n" > "$d/n"
+# One _check_tunnel_egress call probes 3 URLs and keeps the fastest.
+# First three curls belong to the first call, the rest to the second.
+if [ "\$n" -le 3 ]; then
+	echo "$first"
+	exit 0
+fi
+echo "$second"
+exit 0
+SHIM
+	chmod +x "$d/bin/curl"
+	PATH="$d/bin:$PATH" bash -c "
+		$CONSTS
+		log() { echo \"LOG: \$*\"; }
+		$EGRESS_FN
+		$FLOAT_FN
+		_check_tunnel_egress
+		echo RC1=\$?
+		_check_tunnel_egress
+		echo RC2=\$?
+	" 2>/dev/null
+	rm -rf "$d"
+}
+
+run_egress_triple() {
+	local first="$1" second="$2" third="$3"
+	local d
+	d=$(mktemp -d)
+	mkdir -p "$d/bin"
+	cat > "$d/bin/curl" <<SHIM
+#!/bin/sh
+n=0
+[ -f "$d/n" ] && n=\$(cat "$d/n")
+n=\$((n + 1))
+echo "\$n" > "$d/n"
+# Call 1: 3 curls. Call 2: up to 6 (empty _best_t retries a second
+# pass). Call 3: the rest.
+if [ "\$n" -le 3 ]; then
+	echo "$first"
+	exit 0
+fi
+if [ "\$n" -le 9 ]; then
+	echo "$second"
+	exit 0
+fi
+echo "$third"
+exit 0
+SHIM
+	chmod +x "$d/bin/curl"
+	PATH="$d/bin:$PATH" bash -c "
+		$CONSTS
+		log() { echo \"LOG: \$*\"; }
+		$EGRESS_FN
+		$FLOAT_FN
+		_check_tunnel_egress
+		echo RC1=\$?
+		_check_tunnel_egress
+		echo RC2=\$?
+		_check_tunnel_egress
+		echo RC3=\$?
+	" 2>/dev/null
+	rm -rf "$d"
+}
+
+echo "T26: two slow answers in one process -> one enter log, two rc=2"
+OUT26=$(run_egress_pair "204 12.0" "204 12.0")
+enter_n=$(printf '%s\n' "$OUT26" | grep -c 'LOG: egress degraded: best target' || true)
+leave_n=$(printf '%s\n' "$OUT26" | grep -c 'LOG: egress recovered:' || true)
+if echo "$OUT26" | grep -q 'RC1=2' && echo "$OUT26" | grep -q 'RC2=2' \
+	&& [ "$enter_n" = "1" ] && [ "$leave_n" = "0" ]; then
+	ok "T26 stay-degraded logs once"
+else
+	bad "T26 stay-degraded: enter=$enter_n leave=$leave_n out=$OUT26"
+fi
+
+echo "T27: slow then fast in one process -> enter then recovered"
+OUT27=$(run_egress_pair "204 12.0" "204 1.5")
+enter_n=$(printf '%s\n' "$OUT27" | grep -c 'LOG: egress degraded: best target' || true)
+leave_n=$(printf '%s\n' "$OUT27" | grep -c 'LOG: egress recovered:' || true)
+if echo "$OUT27" | grep -q 'RC1=2' && echo "$OUT27" | grep -q 'RC2=0' \
+	&& [ "$enter_n" = "1" ] && [ "$leave_n" = "1" ]; then
+	ok "T27 leave-degraded logs recovered"
+else
+	bad "T27 leave-degraded: enter=$enter_n leave=$leave_n out=$OUT27"
+fi
+
+echo "T28: slow then dead in one process -> enter, no recovered, rc=1"
+OUT28=$(run_egress_pair "204 12.0" "000 30.0")
+enter_n=$(printf '%s\n' "$OUT28" | grep -c 'LOG: egress degraded: best target' || true)
+leave_n=$(printf '%s\n' "$OUT28" | grep -c 'LOG: egress recovered:' || true)
+if echo "$OUT28" | grep -q 'RC1=2' && echo "$OUT28" | grep -q 'RC2=1' \
+	&& [ "$enter_n" = "1" ] && [ "$leave_n" = "0" ]; then
+	ok "T28 leave-to-dead clears latch without recovered"
+else
+	bad "T28 leave-to-dead: enter=$enter_n leave=$leave_n out=$OUT28"
+fi
+
+echo "T29: slow then dead then fast -> no recovered (latch cleared on dead)"
+OUT29=$(run_egress_triple "204 12.0" "000 30.0" "204 1.5")
+enter_n=$(printf '%s\n' "$OUT29" | grep -c 'LOG: egress degraded: best target' || true)
+leave_n=$(printf '%s\n' "$OUT29" | grep -c 'LOG: egress recovered:' || true)
+if echo "$OUT29" | grep -q 'RC1=2' && echo "$OUT29" | grep -q 'RC2=1' \
+	&& echo "$OUT29" | grep -q 'RC3=0' \
+	&& [ "$enter_n" = "1" ] && [ "$leave_n" = "0" ]; then
+	ok "T29 dead clears latch; healthy stays silent"
+else
+	bad "T29 dead-then-healthy: enter=$enter_n leave=$leave_n out=$OUT29"
+fi
+
 echo
 echo "RESULT: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

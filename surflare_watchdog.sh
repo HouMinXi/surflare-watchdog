@@ -109,6 +109,7 @@ EGRESS_STREAK_STATE="/run/surflare_egress_streak"  # "<count> <ts> <auth_count>"
 EGRESS_DEGRADED_TIMEOUT=5              # seconds: a probe answered slower than this is "degraded" (slow-but-usable)
 EGRESS_DEAD_TIMEOUT=15                 # seconds: no target answered within this is "dead" (user-path outage)
 _BAND_WARNED=0                         # run-scoped: band-inversion warning logged once, not per probe
+_EGRESS_DEGRADED=0                      # run-scoped: 1 while last egress probe was in the slow band
 TPROXY_NFT_STAMP="/run/surflare_tproxy_nft.stamp"  # md5 of /etc/surflare-lan-tproxy.nft at last _restore_tproxy
 NODE_HEALTH_FILE="/var/run/surflare_node_health.json"
 NODE_ERR_ROTATE_THRESHOLD=50    # current-node outbound error count to trigger proactive rotation
@@ -2886,7 +2887,8 @@ _egress_auth_bump() {
 # and bought a rotation every 4th flap).
 #   0 = healthy  (some target answered within EGRESS_DEGRADED_TIMEOUT)
 #   2 = degraded (some target answered, but slower than EGRESS_DEGRADED_TIMEOUT;
-#                 logs and observability see it, the streak does not count it)
+#                 logs the enter edge and the leave-to-healthy edge;
+#                 leave-to-dead is silent. the streak does not count it)
 #   1 = dead     (no target answered within EGRESS_DEAD_TIMEOUT)
 # Called after primary health check succeeds to detect the blind spot where
 # the tunnel is up but egress is dead.
@@ -2925,12 +2927,23 @@ _check_tunnel_egress() {
 		[ "$_attempt" -lt 2 ] && sleep 1
 	done
 	if [ -z "$_best_t" ]; then
+		# Drop the slow-band latch so a later healthy probe stays
+		# silent (no recovered from a dead window) and a later
+		# degraded probe logs a fresh enter.
+		_EGRESS_DEGRADED=0
 		return 1
 	fi
 	if _float_lte "$_best_t" "$EGRESS_DEGRADED_TIMEOUT"; then
+		if [ "${_EGRESS_DEGRADED:-0}" -eq 1 ]; then
+			log "egress recovered: best target ${_best_t}s (was above ${EGRESS_DEGRADED_TIMEOUT}s)"
+			_EGRESS_DEGRADED=0
+		fi
 		return 0
 	fi
-	log "egress degraded: best target ${_best_t}s (threshold ${EGRESS_DEGRADED_TIMEOUT}s)"
+	if [ "${_EGRESS_DEGRADED:-0}" -ne 1 ]; then
+		log "egress degraded: best target ${_best_t}s (threshold ${EGRESS_DEGRADED_TIMEOUT}s)"
+		_EGRESS_DEGRADED=1
+	fi
 	return 2
 }
 
