@@ -24,8 +24,17 @@ fi
 # if the dedicated listing disappears from `surflare nodes` (subscription
 # lapse or retirement), NODE validation in _sync_node_candidates degrades
 # to the first city automatically.
-NODE="United States(65.195.35.200)"
-NODE_CANDIDATES=("United States(65.195.35.200)" "Chicago" "Miami" "Atlanta" "Los Angeles" "Dallas" "New York")  # fallback order; _sync_node_candidates rebuilds from `surflare nodes` at startup (dedicated IPs list in their own section and land first)
+# NODE is the catalog BASE name (no ISP suffix): the AT&T row was renamed
+# upstream 2026-09 and matching stays suffix-tolerant; connect resolves the
+# exact catalog row via _resolve_node_catalog_name.
+NODE="United States(12.104.10.184)"
+# Hardcoded fallback holds CITIES ONLY.  A dedicated label here creates
+# false membership when the catalog sync fails at startup: the pin checks
+# would "find" it against unverified data and connect with a base name the
+# CLI cannot resolve to a renamed row, producing a config sing-box refuses
+# to start (FATAL, measured 2026-09-24).  The safe degraded mode for a
+# failed startup sync is city rotation plus the deferred-pin retry.
+NODE_CANDIDATES=("Chicago" "Miami" "Atlanta" "Los Angeles" "Dallas" "New York")  # fallback order; _sync_node_candidates rebuilds from `surflare nodes` at startup (dedicated IPs list in their own section and land first)
 # Connection mode: loaded from /etc/surflare/mode.conf if present,
 # otherwise resolved from PLATFORM (router->rule, laptop->global).
 # Deploying surflare_watchdog.sh no longer resets the mode setting.
@@ -43,6 +52,7 @@ TRANSIT_CANDIDATES=("Dallas" "Chicago" "Atlanta" "Miami" "New York")  # US-only;
 TRANSIT_CONNECT_TIMEOUT=12             # max seconds for surflare connect per candidate
 TRANSIT_ROUTE_READY_TIMEOUT=15        # max seconds to poll for routing readiness after connect
 TRANSIT_PROBE_SETTLE=20              # seconds of quiet time for tunnel handshake after routing ready
+DED_PIN_RETRY_WINDOW=600             # post-start window to keep re-trying the catalog for the dedicated pin
 CHECK_INTERVAL=30                     # Exit IP check interval in seconds
 DEGRADED_INTERVAL=10                  # Shortened interval when degraded (transient/fail > 0)
 FAILBACK_THRESHOLD=3                  # Consecutive OK checks before leaving DEGRADED
@@ -601,6 +611,7 @@ PROXY_LOG="/var/log/surflare/surflare-proxy.log"
 SURFLARE_CLI_LOG="/var/log/surflare/surflare.log"
 PROXY_LOG_RATE_SEC=60
 PROXY_ERR_STATE="/run/surflare_proxy_err_count"
+DED_NAME_MAP="/run/surflare_ded_name_map"  # base<TAB>exact catalog names for dedicated rows, written by _sync_node_candidates
 PROXY_ERR_THRESHOLD=10  # higher than 503's 5: general errors are noisier
 PROXY_LOG_LOGGER_TIMEOUT=1
 AUTH_EXPIRED_FILE="/run/surflare_auth_expired"
@@ -626,8 +637,9 @@ AUTH_EXPIRED_FILE="/run/surflare_auth_expired"
 # through _rotate_node).  Without the loop call, a long-lived watchdog
 # keeps a stale cursor until the next restart.
 #
-# Catalog dedicated rows may trail an ISP suffix that status Server:
-# omits. Exact match first; else the IPv4 inside parens.
+# Catalog dedicated rows may trail an ISP suffix ("AT&T"); status Server:
+# may carry it or omit it depending on CLI version (both measured).  Exact
+# match first; else the IPv4 inside parens.
 _node_candidate_index() {
 	local _want="$1" _i _cand _ip _cip
 	[ -n "$_want" ] || return 1
@@ -650,6 +662,45 @@ _node_candidate_index() {
 	return 1
 }
 
+# _resolve_node_catalog_name <node>: echo the exact catalog row name to
+# dial for a dedicated (ip) label.  The surflare CLI matches --node
+# against the catalog row EXACTLY: connecting with the base name after
+# the upstream rename ("United States(12.104.10.184)" gained "AT&T")
+# builds a config whose transit urltest has no members, and sing-box
+# refuses to start (FATAL "missing tags", measured 2026-09-24).  Base
+# names stay canonical for status/matching; connect must dial the row.
+# Resolution order: the map written by the last successful sync, then
+# one fresh bounded catalog read.  Cities and unresolvable labels pass
+# through unchanged -- a failed lookup must never block city rotation.
+_resolve_node_catalog_name() {
+	local _want="$1" _ip _base _exact _raw
+	_ip=$(printf '%s' "$_want" | sed -n 's/.*(\([0-9][0-9.]*[0-9]\)).*/\1/p')
+	if [ -z "$_ip" ]; then
+		printf '%s\n' "$_want"
+		return 0
+	fi
+	if [ -f "$DED_NAME_MAP" ]; then
+		while IFS="$(printf '	')" read -r _base _exact; do
+			if [ "$_base" = "$_want" ] && [ -n "$_exact" ]; then
+				printf '%s\n' "$_exact"
+				return 0
+			fi
+		done < "$DED_NAME_MAP"
+	fi
+	_raw=$(timeout 15 surflare nodes 2>/dev/null) || _raw=""
+	if [ -n "$_raw" ]; then
+		# Anchor on the IP; strip the lock marker and any column run
+		# (2+ spaces) so a future latency column cannot ride along.
+		_exact=$(printf '%s\n' "$_raw" | grep -F "($_ip)" | head -1 \
+			| sed 's/^[^A-Za-z]*//;s/  .*//;s/[[:space:]]*$//')
+		if [ -n "$_exact" ]; then
+			printf '%s\n' "$_exact"
+			return 0
+		fi
+	fi
+	printf '%s\n' "$_want"
+}
+
 _reconcile_rotation_with_live_session() {
 	# _active_node/_node_idx are script-level on purpose: this
 	# function exists to realign them.  Do not local them.
@@ -663,7 +714,7 @@ _reconcile_rotation_with_live_session() {
 	if [ -n "$_adopted_node" ] && [ "$_adopted_node" != "$_active_node" ]; then
 		_ai=$(_node_candidate_index "$_adopted_node") && _afound=1 || _afound=0
 		if [ "$_afound" -eq 1 ]; then
-			log "Adopt reconcile: rotation ${_active_node} -> live session ${_adopted_node} ($((_ai + 1))/${#NODE_CANDIDATES[@]})"
+			log "Adopt reconcile: rotation ${_active_node} -> live session ${NODE_CANDIDATES[$_ai]} ($((_ai + 1))/${#NODE_CANDIDATES[@]})"
 			_active_node="$_adopted_node"
 			_node_idx=$_ai
 			if ! printf '%s	%d\n' "$_active_node" "$_node_idx" > "${ROTATION_STATE}.tmp" 2>/dev/null || \
@@ -672,6 +723,54 @@ _reconcile_rotation_with_live_session() {
 			fi
 		else
 			log "WARN: adopted node '${_adopted_node}' not in NODE_CANDIDATES, keeping restored rotation ${_active_node}"
+		fi
+	fi
+}
+
+# _maybe_retry_ded_pin: deferred dedicated-pin retry.  Startup can run
+# before the surflare catalog is reachable (boot race measured
+# 2026-09-24: PPPoE up at t+20s, catalog not yet answering at t+25s, so
+# the pin failed the membership check and the session fell through to
+# city rotation, landing on Miami).  When the startup sync failed, the
+# pin stays pending and each main-loop tick re-tries the sync; once the
+# catalog loads and still lists the pin, assert it exactly once.
+_maybe_retry_ded_pin() {
+	[ "${_ded_pin_pending:-0}" -eq 1 ] || return 0
+	# Seed the pre-rotation node snapshot when no rotation has run yet so
+	# the already-active gate knows what the live session is on (a manual
+	# connect during the deferred window must not cause a blip).
+	if [ -z "${_prev_active_node:-}" ] && [ -n "${_active_node:-}" ]; then
+		_prev_active_node="$_active_node"
+	fi
+	if [ "$(date +%s)" -ge "${_ded_pin_deadline:-0}" ]; then
+		_ded_pin_pending=0
+		log "WARN: dedicated pin '${NODE}' unresolved after ${DED_PIN_RETRY_WINDOW:-600}s window, staying on rotation"
+		return 0
+	fi
+	# Do not stack a pin attempt on top of an active failure/reconnect.
+	[ "${fail_count:-0}" -eq 0 ] || return 0
+	local _pin_want="$NODE" _pin_idx
+	if _sync_node_candidates; then
+		_ded_pin_pending=0
+		if _pin_idx=$(_node_candidate_index "$_pin_want"); then
+			_active_node="$_pin_want"
+			_node_idx="$_pin_idx"
+			# Reconnect only when the live session is NOT already on the pin
+			# (a manual connect during the deferred window must not blip).
+			if [ "$_prev_active_node" = "$_pin_want" ]; then
+				log "Catalog reachable; deferred pin '${_pin_want}' already active, no reconnect"
+			else
+				log "Catalog reachable; asserting deferred dedicated pin '${_pin_want}'"
+				# Persist the asserted pin so a crash before the next
+				# rotation cannot leave the file claiming a stale city.
+				if ! printf '%s\t%d\n' "$_active_node" "$_node_idx" > "${ROTATION_STATE}.tmp" 2>/dev/null || \
+				   ! mv "${ROTATION_STATE}.tmp" "$ROTATION_STATE" 2>/dev/null; then
+					log "WARN: deferred pin: failed to persist rotation state to $ROTATION_STATE"
+				fi
+				connect_vpn
+			fi
+		else
+			log "WARN: catalog synced but dedicated pin '${_pin_want}' not listed (retired?), pin dropped"
 		fi
 	fi
 }
@@ -4833,8 +4932,10 @@ probe_best_transit() {
 			continue
 		fi
 		log "Probing transit candidate: ${node} (${_probe_idx}/${_probe_total})"
+		local _probe_node
+		_probe_node=$(_resolve_node_catalog_name "${_active_node:-$NODE}")
 		if ! timeout "$TRANSIT_CONNECT_TIMEOUT" surflare connect \
-			--node "${_active_node:-$NODE}" --mode "${MODE:-global}" \
+			--node "$_probe_node" --mode "${MODE:-global}" \
 			--transit "$node" --daemon >/dev/null 2>&1 9>&- 200>&-; then
 			log "Probe ${node}: connect failed"
 			cleanup_probe_state
@@ -5421,6 +5522,12 @@ connect_vpn() {
 			_ks_was_armed=1
 			log "connect_vpn: killswitch output unarmed for API access"
 		fi
+		# The CLI matches --node against the catalog row literally; a
+		# renamed dedicated row (ISP suffix) makes a base-name connect
+		# generate a config sing-box refuses to start.  Resolve after
+		# the killswitch unarm above so the fallback catalog read can
+		# reach the API; the sync-written map needs no access at all.
+		use_node=$(_resolve_node_catalog_name "$use_node")
 		log "Connecting to ${use_node} mode=${MODE:-global} transit=${effective_transit:-off} (daemon mode)..."
 		# Raise fd limit before spawning the proxy process.  procd_set_param
 		# limits in init.d sets rlimit on the watchdog script, but
@@ -5987,19 +6094,25 @@ done
 # the city sections, so they enter the candidate list first and win the NODE
 # fallback slot. Country plus parenthesized address is the connect --node
 # tag (unlike cities, no (xN) strip). Trailing ISP text after the IPv4
-# parens (AT&T on the 12.104 dedicated row) is display-only: status
-# Server: omits it, so the parser strips it or adopt never matches.
+# parens (AT&T on the 12.104 dedicated row) is display-only: matching
+# strips it (status Server: may or may not carry it), and connect dials
+# the exact row via the map this function writes.
 _sync_node_candidates() {
-	command -v surflare >/dev/null 2>&1 || return 0
-	command -v python3 >/dev/null 2>&1 || return 0
+	command -v surflare >/dev/null 2>&1 || return 1
+	command -v python3 >/dev/null 2>&1 || return 1
 	# `surflare nodes` is a network call (loads the full catalog); cap it so
 	# a hung API cannot block daemon startup. Capture the output and require
 	# a clean exit so a timeout/kill (partial output) falls back to the
 	# hardcoded list instead of overwriting it with truncated data.
+	# Returns 0 only when the catalog was actually loaded; callers use the
+	# rc to tell "catalog says the pin is gone" from "catalog unreachable".
 	local _raw _us
-	_raw=$(timeout 15 surflare nodes 2>/dev/null) || return 0
+	_raw=$(timeout 15 surflare nodes 2>/dev/null) || return 1
 	# PYTHONUTF8=1 forces UTF-8 stdin so the flag emoji parses regardless of
 	# the system locale (the daemon runs under procd where LC_ALL may be C).
+	# Dedicated rows print as "base<TAB>exact": the exact row name is what
+	# --node must dial (the CLI matches the catalog row literally), the
+	# suffix-stripped base is what status/matching compares against.
 	_us=$(PYTHONUTF8=1 python3 -c '
 import sys, re
 seen = set()
@@ -6007,9 +6120,18 @@ for line in sys.stdin:
     if "\U0001F512" in line:
         tag = line.split("\U0001F512", 1)[1].strip()
         tag = re.sub(r"(\(\d+(?:\.\d+){3}\))\s*[A-Za-z&+].*$", r"\1", tag)
-        if tag and tag not in seen:
-            seen.add(tag)
-            print(tag)
+        m = re.match(r"^(.*?\((\d+(?:\.\d+){3})\))([A-Za-z&+]*).*$", tag)
+        if not m:
+            continue
+        base = m.group(1)
+        exact = m.group(1) + m.group(3)
+        if base and base not in seen:
+            seen.add(base)
+            # stdout stays one candidate per line (base name) so the
+            # candidate contract is unchanged; the exact catalog row
+            # rides a marker line the shell splits into the name map.
+            print(base)
+            print("\t1\t" + m.group(2) + "\t" + m.group(3))
         continue
     if "\U0001F1FA\U0001F1F8" not in line:
         continue
@@ -6018,15 +6140,38 @@ for line in sys.stdin:
     if city and city not in seen:
         seen.add(city)
         print(city)
-' <<< "$_raw") || return 0
-	[ -n "$_us" ] || return 0
-	local _arr=() _c
+' <<< "$_raw") || return 1
+	[ -n "$_us" ] || return 1
+	local _arr=() _map=() _c _rest _b _x
 	while IFS= read -r _c; do
-		[ -n "$_c" ] && _arr+=("$_c")
+		[ -n "$_c" ] || continue
+		case "$_c" in
+		$'\t'1$'\t'*)
+			_rest="${_c#$'\t'1$'\t'}"
+			_ip="${_rest%%$'\t'*}"
+			_suf="${_rest#*$'\t'}"
+			_b="${_arr[-1]}"
+			case "$_b" in *"($_ip)") _x="${_b}${_suf}"; _map+=("${_b}$'\t'${_x}") ;; esac
+			;;
+		*)
+			_arr+=("$_c")
+			;;
+		esac
 	done <<< "$_us"
-	[ "${#_arr[@]}" -gt 0 ] || return 0
+	[ "${#_arr[@]}" -gt 0 ] || return 1
 	NODE_CANDIDATES=("${_arr[@]}")
 	log "Synced NODE_CANDIDATES from surflare (${#_arr[@]} nodes, dedicated first): ${_arr[*]}"
+	# Persist the dedicated base->exact name map for connect-time resolution.
+	# Atomic-ish: write temp then rename so a reader never sees a half file.
+	# A successful sync with NO dedicated rows must clear the map: a stale
+	# entry would let connect dial an exact name the catalog retired.
+	if [ "${#_map[@]}" -gt 0 ]; then
+		if printf '%s\n' "${_map[@]}" > "${DED_NAME_MAP}.tmp" 2>/dev/null; then
+			mv "${DED_NAME_MAP}.tmp" "$DED_NAME_MAP" 2>/dev/null || true
+		fi
+	else
+		rm -f "$DED_NAME_MAP" "${DED_NAME_MAP}.tmp" 2>/dev/null || true
+	fi
 	# If the configured NODE was retired from the live list, fall back to the
 	# first candidate so connect_vpn does not try a node surflare will reject.
 	local _valid=0
@@ -6034,6 +6179,7 @@ for line in sys.stdin:
 		[ "$_c" = "$NODE" ] && { _valid=1; break; }
 	done
 	[ "$_valid" -eq 1 ] || NODE="${NODE_CANDIDATES[0]}"
+	return 0
 }
 
 # Clean up orphaned trace table from previous SIGKILL
@@ -6063,6 +6209,8 @@ _node_err_cooldown_until=0
 _node_err_rotate_ts=0
 _node_err_consecutive=0
 _prev_active_node=""
+_ded_pin_pending=0                     # 1 = dedicated pin deferred until the catalog is reachable
+_ded_pin_deadline=0                    # epoch when the deferred-pin window closes
 # effective_transit is refreshed before each consumer (_rotate_node, proactive
 # node-error rotation, startup observability) so a transit change made by
 # connect_vpn mid-run is reflected.
@@ -6074,8 +6222,11 @@ _fw4_last_restart_ts=0
 FW4_RESTART_COOLDOWN=900      # 15 min, avoid thrashing repeated restarts
 # Sync NODE_CANDIDATES from the live surflare catalog and validate the
 # configured NODE against it (falls back to the hardcoded list above if the
-# CLI is unavailable, times out, or returns no US node).
-_sync_node_candidates
+# CLI is unavailable, times out, or returns no US node).  The rc feeds the
+# deferred-pin decision: a FAILED sync means "catalog unreachable, pin may
+# still be valid", a successful one means the listing is authoritative.
+_startup_catalog_sync=0
+_sync_node_candidates && _startup_catalog_sync=1
 _active_node="$NODE"
 _node_idx=0
 # Locate the configured NODE in the catalog so a fileless start (or an
@@ -6139,9 +6290,19 @@ if [[ $NODE =~ \([0-9]+\.[0-9.]+\) ]]; then
 		fi
 		_active_node="$NODE"
 	else
-		# Subscription lapse or catalog drift; the unified
-		# membership check below decides what is safe to dial.
-		log "WARN: pinned NODE '${NODE}' not in NODE_CANDIDATES, ignoring pin"
+		if [ "${_startup_catalog_sync:-0}" -eq 1 ]; then
+			# Subscription lapse or catalog drift; the unified
+			# membership check below decides what is safe to dial.
+			log "WARN: pinned NODE '${NODE}' not in NODE_CANDIDATES, ignoring pin"
+		else
+			# Catalog unreachable at startup (boot race measured
+			# 2026-09-24: PPPoE negotiated but the API not yet
+			# answering at t+25s).  Do NOT drop operator intent --
+			# defer the pin and let the main loop re-try the sync.
+			_ded_pin_pending=1
+			_ded_pin_deadline=$(( $(date +%s) + ${DED_PIN_RETRY_WINDOW:-600} ))
+			log "Catalog sync unavailable at startup; dedicated pin '${NODE}' deferred up to ${DED_PIN_RETRY_WINDOW:-600}s"
+		fi
 	fi
 fi
 # Any configured NODE the catalog no longer lists must not be dialed.
@@ -6434,7 +6595,7 @@ _stop_surflare_proxy() {
 # Killswitch + tproxy rules persist across restart (they target :10800).
 _start_surflare_proxy() {
 	surflare connect \
-		--node "${_active_node:-$NODE}" --mode "${MODE:-global}" \
+		--node "$(_resolve_node_catalog_name "${_active_node:-$NODE}")" --mode "${MODE:-global}" \
 		--transit auto --daemon >/dev/null 2>&1 || true
 	# Wait for local state: process + :10800 + nft table + ip rule.
 	local _wait=0
@@ -6805,6 +6966,10 @@ while true; do
 	# the last city until the next watchdog restart.  Status is the
 	# only source -- the CLI session log lags daemon reconnects.
 	_reconcile_rotation_with_live_session
+
+	# Deferred dedicated pin: startup ran before the catalog was
+	# reachable; assert the pin once the sync succeeds (bounded window).
+	_maybe_retry_ded_pin
 
 	health=$(check_vpn_health)
 
