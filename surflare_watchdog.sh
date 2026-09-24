@@ -5571,6 +5571,7 @@ connect_vpn() {
 			while [ "$_ready_wait" -lt "$CONNECT_SETTLE" ]; do
 				if check_vpn_local_state; then
 					log "Local state ready after ${_ready_wait}s, waiting for data-plane..."
+					_raise_proxy_fd_limit
 					break
 				fi
 				sleep 1
@@ -6593,6 +6594,20 @@ _stop_surflare_proxy() {
 
 # _start_surflare_proxy: restart the proxy with the current node/mode.
 # Killswitch + tproxy rules persist across restart (they target :10800).
+# _raise_proxy_fd_limit: lift the proxy's nofile cap after (re)start.
+# The wrapper starts it at 65535; a misbehaving client or an upstream
+# regression can burn that in hours.  262144 buys the watchdog time to
+# catch the growth (fd probes + reconnect) instead of dropping traffic
+# with EMFILE.  Best effort: prlimit on the running pid only.
+_raise_proxy_fd_limit() {
+	local _pp
+	_pp=$(pgrep -f "surflare-proxy[.]real run" | head -1)
+	[ -n "$_pp" ] || return 0
+	prlimit --pid "$_pp" --nofile=262144:262144 2>/dev/null \
+		&& log "proxy fd limit raised to 262144 (pid ${_pp})" \
+		|| true
+}
+
 _start_surflare_proxy() {
 	surflare connect \
 		--node "$(_resolve_node_catalog_name "${_active_node:-$NODE}")" --mode "${MODE:-global}" \
@@ -6600,7 +6615,10 @@ _start_surflare_proxy() {
 	# Wait for local state: process + :10800 + nft table + ip rule.
 	local _wait=0
 	while [ "$_wait" -lt "$SURFLARE_UPGRADE_SETTLE" ]; do
-		check_vpn_local_state && return 0
+		if check_vpn_local_state; then
+			_raise_proxy_fd_limit
+			return 0
+		fi
 		sleep 3
 		_wait=$((_wait + 3))
 	done
