@@ -128,6 +128,18 @@ table inet sw_lan_tproxy {
         # QUIC reject below.  QUIC versions never have 0xFEFD at this offset.
         iifname "br-lan" meta nfproto ipv4 udp dport 443 @th,72,16 0xfefd return
 
+        # Loop guard: a LAN client that misconfigures a proxy at the
+        # router's tproxy port dials :10800 as its proxy destination.
+        # Without this return, sing-box routes the private-dst connection
+        # to its direct outbound, which dials the listen port itself --
+        # the hairpin re-enters this chain and loops accept->dial->accept
+        # forever, leaking 2 sockets + 2 pipes per iteration (measured
+        # 2026-09-25: ~50/s to the 65535 cap from one retrying client).
+        iifname "br-lan" meta nfproto ipv4 meta l4proto tcp \
+            ip daddr 192.168.100.1 tcp dport 10800 return
+        iifname "br-lan" meta nfproto ipv6 meta l4proto tcp \
+            ip6 daddr fe80::/10 tcp dport 10800 return
+
         # TCP tproxy: all remaining LAN TCP to surflare-proxy (IPv4)
         # Use bare port (:10800) to preserve the original destination IP.
         # Explicit 127.0.0.1:10800 causes sing-box to reject the connection
