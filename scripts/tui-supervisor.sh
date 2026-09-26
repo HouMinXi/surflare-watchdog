@@ -29,7 +29,10 @@ PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 CONF=/etc/surflare/dedicated.conf
 SOCK=/tmp/tui.sock
-# One instance at a time: pin_dedicated spans ~25s and cron fires every
+TUI_LOG=/tmp/tui_supervisor_tui.log
+# One instance at a time: pin_dedicated spans up to ~55s in the worst
+# case (6s spawn + 12s x expect gates + 40 steps x 0.6s + settle +
+# 12s connect) and cron fires every
 # minute; a slow TUI could otherwise let two runs overlap on SOCK/FAILS.
 LOCK=/run/tui_supervisor.lock
 exec 9>"$LOCK"
@@ -46,14 +49,12 @@ _conf_get() {
 }
 ENABLED=$(_conf_get ENABLED)
 DED_NODE=$(_conf_get DED_NODE)
-DED_SEARCH=$(_conf_get DED_SEARCH)
 GRACE_S=$(_conf_get GRACE_S)
 STORM_ROT_MIN=$(_conf_get STORM_ROT_MIN)
 STORM_WINDOW_S=$(_conf_get STORM_WINDOW_S)
 [ "$ENABLED" = "1" ] || exit 0
 [ -n "$DED_NODE" ] || exit 0
 GRACE_S=${GRACE_S:-300}
-DED_SEARCH=${DED_SEARCH:-65.195}
 STORM_ROT_MIN=${STORM_ROT_MIN:-2}
 STORM_WINDOW_S=${STORM_WINDOW_S:-600}
 
@@ -77,27 +78,73 @@ if [ -n "$_rot" ] && [ -n "$_r0" ] && [ "$_r0" != "0" ] \
 	exit 0
 fi
 
-# Navigate a fresh TUI to the dedicated node via the server-list search
-# box: open server selection, type the search text (list filters to the
-# node), move past the two fixed list header rows onto the first result,
-# select it. Selecting a server connects immediately.
+# Navigate a fresh TUI to the dedicated node by reading the screen:
+# open server selection, then step the cursor down one row at a time,
+# re-reading the captured pty log after each step, until the cursor
+# marker (▸) sits on the row containing DED_NODE (the paren form
+# "Name(ip)" -- the search-key/verify-key split used a looser substring
+# that could match a sibling dedicated node; one key kills that whole
+# ambiguity class). Selecting a row connects immediately.
+#
+# WHY NOT THE SEARCH BOX: surflare v4.3.1's server-list search field
+# only accepts mouse focus -- typing into it via the pty does nothing
+# (measured 2026-09-26: placeholder stays, list never filters). The old
+# search-filter-then-arrow assumption landed the cursor on the first
+# dedicated row, which is whichever IP surflare happens to list first,
+# Screen-stepping is list-order independent: retired IPs that
+# drop off the list just shift the row count and the loop re-finds
+# the target row.
+# WHY THE LOGFILE, NOT expect_out: the TUI redraws only the rows that
+# change, so an expect on the page title times out once the title
+# scrolls out of the lookback window and expect_out comes back empty
+# (measured). The spawn logfile is cumulative: the last line carrying
+# the cursor marker is always the current cursor row.
+_cursor_row() {
+	grep "▸" "$TUI_LOG" 2>/dev/null | tail -1
+}
+
 pin_dedicated() {
 	sexpect -s "$SOCK" kill 2>/dev/null
-	rm -f "$SOCK"
+	rm -f "$SOCK" "$TUI_LOG"
 	pkill -x surflare 2>/dev/null
 	sleep 1
-	sexpect -s "$SOCK" spawn -nohup -T xterm surflare >/dev/null 2>&1 || return 1
+	sexpect -s "$SOCK" spawn -nohup -T xterm -logf "$TUI_LOG" surflare >/dev/null 2>&1 || return 1
 	sleep 6
 	sexpect -s "$SOCK" expect -t 10 "服务器" >/dev/null 2>&1 || return 1
 	sexpect -s "$SOCK" send -cr
 	sleep 2
-	sexpect -s "$SOCK" expect -t 5 "搜索" >/dev/null 2>&1 || return 1
-	sexpect -s "$SOCK" send "$DED_SEARCH"
-	sleep 2
-	sexpect -s "$SOCK" send -c "\x1b[B"
+	sexpect -s "$SOCK" expect -t 5 "选择服务器" >/dev/null 2>&1 || return 1
+
+	# Step the cursor down, re-reading the cursor row after each
+	# keypress, until it sits on the target row. The cursor starts on
+	# the first list row ("← 返回"); MAX_STEPS bounds the walk so a
+	# missing/renamed node cannot loop forever (the list is long; the
+	# dedicated section is always near the top).
+	# shellcheck disable=SC3043  # local is supported by busybox ash
+	local steps=0 row
+	# shellcheck disable=SC3043
+	local MAX_STEPS=40
+	while :; do
+		row=$(_cursor_row)
+		case "$row" in
+			*"$DED_NODE"*) break ;;
+		esac
+		[ "$steps" -ge "$MAX_STEPS" ] && return 1
+		sexpect -s "$SOCK" send -c "\x1b[B"
+		steps=$((steps + 1))
+		sleep 0.6
+	done
+	# Redraw lag: the cursor row seen at the break may be a stale frame
+	# from before the last keypress (the TUI redraws only changed rows).
+	# Re-read once after a settle delay and require the match to hold;
+	# otherwise we would Enter the neighbor row. Fail (the next cron
+	# minute retries fresh) rather than connect blind.
 	sleep 1
-	sexpect -s "$SOCK" send -c "\x1b[B"
-	sleep 1
+	case "$(_cursor_row)" in
+		*"$DED_NODE"*) ;;
+		*) return 1 ;;
+	esac
+
 	sexpect -s "$SOCK" send -cr
 	sleep 12
 	# -F: the node tag contains dots and parens, not a regex
@@ -141,7 +188,16 @@ fi
 
 srv=$(surflare status 2>/dev/null | grep "Server:" | head -1 | sed "s/.*Server: *//;s/ *\$//")
 
-if [ "$srv" = "$DED_NODE" ]; then
+# Substring, not equality: the status line renders the node with an
+# operator suffix ("United States(12.104.12.149)AT&T") while DED_NODE
+# carries only the "Name(ip)" form, so an exact match never fires and a
+# healthy dedicated session would be re-pinned every GRACE_S window.
+case "$srv" in
+	*"$DED_NODE"*) srv_is_dedicated=1 ;;
+	*) srv_is_dedicated=0 ;;
+esac
+
+if [ "$srv_is_dedicated" = "1" ]; then
 	rm -f "$STAMP"
 	if pgrep -x surflare >/dev/null; then
 		clear_fail

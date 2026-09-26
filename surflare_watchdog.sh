@@ -629,7 +629,7 @@ AUTH_EXPIRED_FILE="/run/surflare_auth_expired"
 # asked for; overwriting it from a stale session log is the 17:56
 # regression.
 #
-# Parse matches tui-supervisor.sh:142 (grep Server: + sed).  timeout 5
+# Parse matches tui-supervisor.sh (grep Server: + sed).  timeout 5
 # matches connect_vpn's status budget.
 #
 # Called from adopt (proxy outlived this watchdog) AND from the main
@@ -709,7 +709,7 @@ _reconcile_rotation_with_live_session() {
 	# Fail-closed: a hung or missing CLI must not rewrite the cursor
 	# from some other source.
 	[ "$_status_rc" -eq 0 ] || return 0
-	# Same parse as scripts/tui-supervisor.sh:142.
+	# Same parse as scripts/tui-supervisor.sh (grep Server: + sed).
 	_adopted_node=$(printf '%s\n' "$_status_out" | grep "Server:" | head -1 | sed "s/.*Server: *//;s/ *$//")
 	if [ -n "$_adopted_node" ] && [ "$_adopted_node" != "$_active_node" ]; then
 		_ai=$(_node_candidate_index "$_adopted_node") && _afound=1 || _afound=0
