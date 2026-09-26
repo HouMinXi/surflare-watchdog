@@ -104,16 +104,28 @@ _cursor_row() {
 }
 
 pin_dedicated() {
+	# Tell the watchdog this gap is a pin, not a lost tunnel.  The
+	# watchdog holds the exit while the file is in the future and
+	# resumes normal recovery once it expires.  90s covers one pin
+	# (measured worst case ~55s) without masking a pin that dies.
+	# Every failure path must drop the marker: the process is already
+	# dead, and a marker left behind hides the next real outage.
+	date -d "+90 seconds" +%s > /run/surflare_ded_pin_until 2>/dev/null || \
+		echo $(( $(date +%s) + 90 )) > /run/surflare_ded_pin_until
+	# pin_abort's own return only leaves pin_abort.  Callers must
+	# follow it with "|| return" (and a break inside the loop) or the
+	# walk continues and sends Enter after the process is already dead.
+	pin_abort() { rm -f /run/surflare_ded_pin_until; return 1; }
 	sexpect -s "$SOCK" kill 2>/dev/null
 	rm -f "$SOCK" "$TUI_LOG"
 	pkill -x surflare 2>/dev/null
 	sleep 1
-	sexpect -s "$SOCK" spawn -nohup -T xterm -logf "$TUI_LOG" surflare >/dev/null 2>&1 || return 1
+	sexpect -s "$SOCK" spawn -nohup -T xterm -logf "$TUI_LOG" surflare >/dev/null 2>&1 || { pin_abort || return; }
 	sleep 6
-	sexpect -s "$SOCK" expect -t 10 "服务器" >/dev/null 2>&1 || return 1
+	sexpect -s "$SOCK" expect -t 10 "服务器" >/dev/null 2>&1 || { pin_abort || return; }
 	sexpect -s "$SOCK" send -cr
 	sleep 2
-	sexpect -s "$SOCK" expect -t 5 "选择服务器" >/dev/null 2>&1 || return 1
+	sexpect -s "$SOCK" expect -t 5 "选择服务器" >/dev/null 2>&1 || { pin_abort || return; }
 
 	# Step the cursor down, re-reading the cursor row after each
 	# keypress, until it sits on the target row. The cursor starts on
@@ -129,7 +141,7 @@ pin_dedicated() {
 		case "$row" in
 			*"$DED_NODE"*) break ;;
 		esac
-		[ "$steps" -ge "$MAX_STEPS" ] && return 1
+		[ "$steps" -ge "$MAX_STEPS" ] && { pin_abort || return; }
 		sexpect -s "$SOCK" send -c "\x1b[B"
 		steps=$((steps + 1))
 		sleep 0.6
@@ -142,13 +154,13 @@ pin_dedicated() {
 	sleep 1
 	case "$(_cursor_row)" in
 		*"$DED_NODE"*) ;;
-		*) return 1 ;;
+		*) pin_abort || return ;;
 	esac
 
 	sexpect -s "$SOCK" send -cr
 	sleep 12
 	# -F: the node tag contains dots and parens, not a regex
-	surflare status 2>/dev/null | grep -Fq "$DED_NODE"
+	surflare status 2>/dev/null | grep -Fq "$DED_NODE" || { pin_abort || return; }
 }
 
 note() { logger -t tui-supervisor "$1"; }

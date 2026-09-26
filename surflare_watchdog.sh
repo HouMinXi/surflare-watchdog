@@ -737,6 +737,21 @@ _reconcile_rotation_with_live_session() {
 	fi
 }
 
+# _pin_in_progress: true while the supervisor's dedicated pin is
+# inside its declared window.  The supervisor writes the expiry
+# before it kills the surflare process; the gap that follows is a
+# pin, not a lost tunnel.  A missing, unreadable or non-numeric file
+# is not a pin, so a real outage still reconnects.
+_pin_in_progress() {
+	local _until
+	[ -f "${PIN_UNTIL:-/run/surflare_ded_pin_until}" ] || return 1
+	_until=$(cat "${PIN_UNTIL:-/run/surflare_ded_pin_until}" 2>/dev/null)
+	case "$_until" in
+		*[!0-9]*|"") return 1 ;;
+	esac
+	[ "$_until" -gt "$(date +%s)" ]
+}
+
 # _maybe_retry_ded_pin: deferred dedicated-pin retry.  Startup can run
 # before the surflare catalog is reachable (boot race measured
 # 2026-09-24: PPPoE up at t+20s, catalog not yet answering at t+25s, so
@@ -7026,23 +7041,33 @@ while true; do
 	if [ "$health" = "LOCAL_FAIL" ]; then
 		# Local VPN state lost (process/nftables/routing gone) -- definitive failure,
 		# no network uncertainty. Skip accumulation and force reconnect immediately.
-		log "Local VPN state lost (process/nftables/routing), triggering immediate reconnect"
-		if nft list table inet surflare >/dev/null 2>&1; then
-			nft flush table inet surflare 2>/dev/null || true
-			nft delete table inet surflare 2>/dev/null || true
-			_stale=0
-			while ip rule del fwmark 0x1 lookup 100 2>/dev/null; do _stale=$((_stale+1)); done
-			while ip -6 rule del fwmark 0x1 lookup 100 2>/dev/null; do _stale=$((_stale+1)); done
-			ip route flush table 100 2>/dev/null || true
-			log "Flushed stale nftables/routing (${_stale} rule(s))"
+		# A dedicated pin kills the surflare process on purpose and the
+		# reconcile raises the hold from its expiry file.  Forcing a
+		# reconnect here rotates to a city node and tears the pin down
+		# (measured 2026-09-27: pin at 01:15, state lost 11s earlier,
+		# rotated Los Angeles -> Atlanta).  The hold expires with the
+		# file, so a pin that never comes back still reconnects.
+		if _pin_in_progress; then
+			log "Local VPN state lost during dedicated pin, holding exit ${_active_node}"
+		else
+			log "Local VPN state lost (process/nftables/routing), triggering immediate reconnect"
+			if nft list table inet surflare >/dev/null 2>&1; then
+				nft flush table inet surflare 2>/dev/null || true
+				nft delete table inet surflare 2>/dev/null || true
+				_stale=0
+				while ip rule del fwmark 0x1 lookup 100 2>/dev/null; do _stale=$((_stale+1)); done
+				while ip -6 rule del fwmark 0x1 lookup 100 2>/dev/null; do _stale=$((_stale+1)); done
+				ip route flush table 100 2>/dev/null || true
+				log "Flushed stale nftables/routing (${_stale} rule(s))"
+			fi
+			_export_diag_state "$health"
+			_run_advisory_diagnosis "$health" "" "$_auth_expired_this_cycle"
+			_send_diagnosis_alert "$health"
+			transient_count=0
+			_cn_consecutive=0
+			_healthy_consecutive=0
+			fail_count=$FAIL_THRESHOLD
 		fi
-		_export_diag_state "$health"
-		_run_advisory_diagnosis "$health" "" "$_auth_expired_this_cycle"
-		_send_diagnosis_alert "$health"
-		transient_count=0
-		_cn_consecutive=0
-		_healthy_consecutive=0
-		fail_count=$FAIL_THRESHOLD
 
 	elif [ "$health" = "TCP_BLOCK" ]; then
 		if _control_probe; then
