@@ -19,15 +19,25 @@ fi
 #                     /etc/systemd/system-sleep/surflare-resume.sh
 # View logs    : sudo dmesg | grep surflare_watchdog
 
-# Dedicated exit first: a non-shared IP keeps API providers from throttling
-# us for other tenants on shared exits. US cities stay behind it as fallback;
-# if the dedicated listing disappears from `surflare nodes` (subscription
-# lapse or retirement), NODE validation in _sync_node_candidates degrades
-# to the first city automatically.
-# NODE is the catalog BASE name (no ISP suffix): the AT&T row was renamed
-# upstream 2026-09 and matching stays suffix-tolerant; connect resolves the
-# exact catalog row via _resolve_node_catalog_name.
-NODE="United States(12.104.10.184)"
+# NODE is the catalog BASE name (no ISP suffix).  The live value lives
+# in /etc/surflare/dedicated.conf as DED_NODE, same file the TUI
+# supervisor reads, so a dedicated-IP change is one config edit and
+# survives the next script deploy.  A hardcoded default here goes stale
+# the moment the provider retires the address: startup then treats the
+# dead label as operator intent and overrides a good saved rotation
+# (2026-09-27: script still named 12.104.10.184 after the move to
+# 12.104.12.149, and the restart pinned the retired row).
+# ENABLED=0 or a missing/empty DED_NODE means the subscription lapsed:
+# fall back to the first US city, which NODE validation already does.
+NODE="Chicago"
+if [ -f /etc/surflare/dedicated.conf ]; then
+	_ded_en=$(grep -E '^[[:space:]]*ENABLED=' /etc/surflare/dedicated.conf 2>/dev/null | tail -1 | cut -d= -f2- | tr -d "\"'\r")
+	_ded_node=$(grep -E '^[[:space:]]*DED_NODE=' /etc/surflare/dedicated.conf 2>/dev/null | tail -1 | cut -d= -f2- | tr -d "\"'\r")
+	if [ "$_ded_en" = "1" ] && [ -n "$_ded_node" ]; then
+		NODE="$_ded_node"
+	fi
+	unset _ded_en _ded_node
+fi
 # Hardcoded fallback holds CITIES ONLY.  A dedicated label here creates
 # false membership when the catalog sync fails at startup: the pin checks
 # would "find" it against unverified data and connect with a base name the
