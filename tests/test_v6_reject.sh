@@ -51,15 +51,15 @@ check_template() {
 	fi
 
 	# T5: bypass devices v6 return sits BEFORE the reject too.
-	# (rule template only: global has no bypass_devices6 set.)
-	if grep -q 'bypass_devices6' "$f"; then
-		local bp_line
-		bp_line=$(grep -n 'ip6 saddr @bypass_devices6 return' "$f" | head -1 | cut -d: -f1)
-		if [ -n "$bp_line" ] && [ -n "$reject_line" ] && [ "$bp_line" -lt "$reject_line" ]; then
-			ok "$mode: bypass_devices6 return (line $bp_line) precedes v6 reject"
-		else
-			bad "$mode: bypass_devices6 order wrong: bp=[$bp_line] reject=[$reject_line]"
-		fi
+	# Both templates: the watchdog flushes bypass_devices6
+	# unconditionally, so the set and its return must exist in both
+	# modes or bypass devices' v6 traffic has no escape.
+	local bp_line
+	bp_line=$(grep -n 'ip6 saddr @bypass_devices6 return' "$f" | head -1 | cut -d: -f1)
+	if [ -n "$bp_line" ] && [ -n "$reject_line" ] && [ "$bp_line" -lt "$reject_line" ]; then
+		ok "$mode: bypass_devices6 return (line $bp_line) precedes v6 reject"
+	else
+		bad "$mode: bypass_devices6 order wrong: bp=[$bp_line] reject=[$reject_line]"
 	fi
 }
 

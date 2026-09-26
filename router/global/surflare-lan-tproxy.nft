@@ -12,6 +12,13 @@ table inet sw_lan_tproxy {
         type ipv4_addr;
     }
 
+    # IPv6 twin of bypass_devices: the watchdog flushes and repopulates
+    # this set unconditionally (same code path in both modes), so the
+    # set must exist or bypass devices' v6 traffic has no escape.
+    set bypass_devices6 {
+        type ipv6_addr;
+    }
+
     set auto_bypass {
         type ipv4_addr;
         size 64;
@@ -98,6 +105,7 @@ table inet sw_lan_tproxy {
 
         # Static bypass (bypass-macs.conf devices via watchdog)
         iifname "br-lan" ip saddr @bypass_devices return
+        iifname "br-lan" ip6 saddr @bypass_devices6 return
 
         # Dynamic bypass: devices already detected as corporate VPN
         iifname "br-lan" ip saddr @auto_bypass return
