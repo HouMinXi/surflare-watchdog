@@ -860,7 +860,7 @@ Not needed on standard Linux (compiled in by default).
 
 In addition to the standard binary/service installation, `install.sh`
 copies `surflare-lan-tproxy.nft` to `/etc/surflare-lan-tproxy.nft`.
-The watchdog loads this file via `_install_lan_tproxy()` after every VPN
+The watchdog loads this file via `_restore_tproxy()` after every VPN
 connect, so the rule is automatically re-applied on reconnect or restart.
 
 ### LAN bypass mechanisms

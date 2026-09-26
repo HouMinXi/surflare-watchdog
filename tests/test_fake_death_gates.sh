@@ -204,7 +204,9 @@ done
 echo "T11: tproxy rules carry ct mark 0x100 in both nft variants"
 for f in router/rule/surflare-lan-tproxy.nft router/global/surflare-lan-tproxy.nft; do
 	n=$(grep -c "ct mark set 0x00000100" "$f" 2>/dev/null || echo 0)
-	case "$n" in 2) ok "$f: both tproxy rules marked" ;; *) bad "$f: $n ct-mark lines (want 2)" ;; esac
+	# v4 tproxy is the only ct-mark carrier: v6 TCP is rejected
+	# (relay pool is v4-only), so exactly 1 mark per template.
+	case "$n" in 1) ok "$f: v4 tproxy rule marked" ;; *) bad "$f: $n ct-mark lines (want 1)" ;; esac
 done
 
 echo "T12: bpftool probe -- the double-zero pattern is gone"

@@ -6,7 +6,7 @@ Scripts and config for N100 mini-PC running iStoreOS or OpenWrt (procd init).
 
 | File | Purpose |
 |------|---------|
-| `rule/surflare-lan-tproxy.nft` | `table inet` dual-stack tproxy (rule mode). LAN TCP to surflare-proxy; UDP/443 reject after `cn_direct` return. Watchdog loads `cn_direct`/`cn6_direct` in both modes. |
+| `rule/surflare-lan-tproxy.nft` | `table inet` tproxy (rule mode). v4 LAN TCP to surflare-proxy; v6 TCP rejected (relays are v4-only); UDP/443 reject after `cn_direct` return. Watchdog loads `cn_direct`/`cn6_direct` in both modes. |
 | `global/surflare-lan-tproxy.nft` | Same table structure (global mode). Same `cn_direct`/`cn6_direct` load. |
 | `rule/bypass-macs.conf` | Mode-specific bypass config. N100 live still lists .11/.17/.120 even in rule mode (AnyConnect + BT). |
 | `global/bypass-macs.conf` | Mode-specific bypass config: devices needing full CN ISP direct (e.g. Thunder). **WARNING: bypassed devices have NO VPN protection.** |
@@ -86,7 +86,7 @@ Cross-validation methodology:
 | Constraint | Reason |
 |---|---|
 | `CONNECT_SETTLE=20` | N100 chnroute load (3917 prefixes) + pppoe + TCP handshake takes >10s |
-| `table inet` with `meta nfproto` | Dual-stack tproxy; `meta nfproto ipv4`/`ipv6` prevents cross-family matching |
+| `table inet` with `meta nfproto` | v4 tproxy + v6 rejects in one table; `meta nfproto ipv4`/`ipv6` prevents cross-family matching |
 | `tproxy ip to 127.0.0.1:10800` | Bare `:10800` silently fails for LAN forwarded packets |
 | `pgrep surflare-proxy` (no `-x`) | busybox `pgrep -x` always returns 1 |
 | `coreutils-paste` required | busybox has no `paste`; installed via opkg by install.sh |

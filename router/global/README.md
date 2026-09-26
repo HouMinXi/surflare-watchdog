@@ -105,7 +105,7 @@ LAN device (TCP/QUIC/DNS)
 |   7. DTLS 1.2 UDP/443 0xFEFD? ----> auto_bypass, return  |
 |   7b. gmail_smtp tcp/465,587? ----> return (ISP direct) |
 |   8. IPv4 TCP? ---> tproxy ip to :10800   (mark 0x1)     |
-|   9. IPv6 TCP? ---> tproxy ip6 to :10800  (mark 0x1)     |
+|   9. IPv6 TCP? ---> reject (tcp reset; relays are v4-only)|
 |  10. IPv4 QUIC? --> reject (ICMP port-unreachable)        |
 |  11. IPv6 QUIC? --> reject (ICMPv6 port-unreachable)      |
 |  12. other UDP? --> fall through (accept)                 |
@@ -173,7 +173,7 @@ Router process (opkg, curl, SSH)
 |-------|--------|-------|----------|------|
 | `surflare_moat` | inet | prerouting | raw | WAN TCP FIN/RST monitor (window 78, log only) |
 | `dns_enforce` | ip | prerouting | mangle-20 | Force LAN DNS through router (silent reject) |
-| `sw_lan_tproxy` | inet | prerouting | mangle-10 | Dual-stack LAN TCP tproxy + QUIC reject + cn_direct bypass |
+| `sw_lan_tproxy` | inet | prerouting | mangle-10 | v4 LAN TCP tproxy + v6 TCP fast-reject + QUIC reject + cn_direct bypass |
 | `surflare` | inet | output, prerouting | mangle | Router traffic routing + cn_ipv4 accept |
 | `killswitch` | inet | forward | filter-10 | LAN leak protection + IP audit log |
 | `killswitch` | inet | output | filter+20 | Router leak protection (policy drop) |
