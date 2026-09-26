@@ -2405,7 +2405,28 @@ _restore_tproxy() {
 # 'tproxy.*10800' pattern is the same one _tombstone_tproxy matches on.
 _lan_tproxy_needs_restore() {
 	nft list table inet sw_lan_tproxy >/dev/null 2>&1 || return 0
-	! nft list chain inet sw_lan_tproxy prerouting 2>/dev/null | grep -q 'tproxy.*10800'
+	if ! nft list chain inet sw_lan_tproxy prerouting 2>/dev/null | grep -q 'tproxy.*10800'; then
+		return 0
+	fi
+	# Template drift: a hot-replaced /etc/surflare-lan-tproxy.nft
+	# (scp deploy, no restart) leaves live rules stale until the next
+	# restart, because the md5 stamp was only compared at startup.
+	# Throttled to hourly -- the health tick is 30s and md5sum forks.
+	local _now _last _cur _saved
+	_now=$(date +%s)
+	_last=${_tproxy_md5_check_ts:-0}
+	if [ $((_now - _last)) -ge 3600 ] && command -v md5sum >/dev/null 2>&1; then
+		_tproxy_md5_check_ts=$_now
+		_cur=$(md5sum /etc/surflare-lan-tproxy.nft 2>/dev/null | awk '{print $1}')
+		# cat first, same as the startup compare: awk of an empty
+		# path reads stdin and would stall the health tick.
+		_saved=$(cat "$TPROXY_NFT_STAMP" 2>/dev/null | awk '{print $1}')
+		if [ -n "$_cur" ] && [ "$_cur" != "$_saved" ]; then
+			log "tproxy template changed on disk, reloading"
+			return 0
+		fi
+	fi
+	return 1
 }
 
 # Enter storm-protection cooldown. Called from the three storm trigger

@@ -110,4 +110,73 @@ else
     bad "injection(wrong-port): sed produced no change"
 fi
 
+
+# --- teeth 3: template md5 drift (hot-replaced nft file) ----------------
+# Case D: live tproxy shape is healthy but the on-disk template hash
+# differs from the stamp -> must restore.  Case E: hashes match -> must
+# not.  The stamp and template live under TMP so the real /etc and /run
+# are never touched; the helper's literal paths are retargeted with sed
+# (a user namespace cannot bind-mount system directories).
+mkdir -p "$TMP/etc" "$TMP/run"
+cp router/rule/surflare-lan-tproxy.nft "$TMP/etc/surflare-lan-tproxy.nft"
+md5sum "$TMP/etc/surflare-lan-tproxy.nft" > "$TMP/run/stamp.match"
+echo "deadbeefdeadbeefdeadbeefdeadbeef  /etc/surflare-lan-tproxy.nft" > "$TMP/run/stamp.drift"
+
+run_drift() {  # $1 = stamp file, $2 = helper, $3 = log
+    # unshare -Urn cannot bind-mount system dirs, so retarget the
+    # helper's literal paths at the TMP fixtures instead.
+    local _h="$TMP/helper.retarget.sh"
+    sed -e "s|/etc/surflare-lan-tproxy.nft|$TMP/etc/surflare-lan-tproxy.nft|"         -e "s|\"\$TPROXY_NFT_STAMP\"|$1|" "$2" > "$_h"
+    $NS sh -c '
+        . "$1"
+        nft add table inet sw_lan_tproxy &&
+        nft add chain inet sw_lan_tproxy prerouting { type filter hook prerouting priority 0\; } &&
+        nft add rule inet sw_lan_tproxy prerouting iifname "br-lan" meta l4proto tcp tproxy ip to :10800 meta mark set 0x1 accept ||
+            exit 99
+        _lan_tproxy_needs_restore
+    ' _ "$_h" >"$3" 2>&1
+}
+
+rc=0; run_drift "$TMP/run/stamp.drift" "$TMP/helper.sh" "$TMP/D.log" || rc=$?
+[ "$rc" = 0 ] && ok "D: template md5 drift -> needs restore" \
+              || { bad "D: drifted template not detected (rc=$rc)"; cat "$TMP/D.log"; }
+rc=0; run_drift "$TMP/run/stamp.match" "$TMP/helper.sh" "$TMP/E.log" || rc=$?
+[ "$rc" = 1 ] && ok "E: template md5 match -> no restore" \
+              || { bad "E: matching template should NOT restore (rc=$rc)"; cat "$TMP/E.log"; }
+
+# Injection: strip the md5 comparison out of the extracted helper.  Case D
+# must then say "no restore" -- if it still restores, the new assertion is
+# passing for some other reason and has no teeth.
+awk '/^_lan_tproxy_needs_restore\(\)/,/^}/' "$WD" \
+    | sed '/md5sum \/etc\/surflare-lan-tproxy.nft/,/fi$/d' > "$TMP/helper_nomd5.sh"
+if ! cmp -s "$TMP/helper.sh" "$TMP/helper_nomd5.sh" && sh -n "$TMP/helper_nomd5.sh"; then
+    rc=0; run_drift "$TMP/run/stamp.drift" "$TMP/helper_nomd5.sh" "$TMP/Dinj.log" || rc=$?
+    [ "$rc" = 1 ] && ok "injection(no-md5): D flipped as predicted" \
+                  || { bad "injection(no-md5): D did not flip -- suite toothless (rc=$rc)"; cat "$TMP/Dinj.log"; }
+else
+    bad "injection(no-md5): sed produced no valid change"
+fi
+
+# Empty stamp path must not read stdin.  awk of a quoted empty filename
+# blocks while stdin is held open; the health tick would stall.  Feed a
+# held-open stdin and require a return inside a few seconds.
+awk '/^_lan_tproxy_needs_restore\(\)/,/^}/' "$WD" \
+    | sed "s|/etc/surflare-lan-tproxy.nft|$TMP/etc/surflare-lan-tproxy.nft|" \
+    > "$TMP/helper_hold.sh"
+rc=0
+timeout 8 $NS sh -c '
+    . "$1"
+    TPROXY_NFT_STAMP=
+    nft add table inet sw_lan_tproxy &&
+    nft add chain inet sw_lan_tproxy prerouting { type filter hook prerouting priority 0\; } &&
+    nft add rule inet sw_lan_tproxy prerouting iifname "br-lan" meta l4proto tcp tproxy ip to :10800 meta mark set 0x1 accept ||
+        exit 99
+    _lan_tproxy_needs_restore
+' _ "$TMP/helper_hold.sh" >"$TMP/hold.log" 2>&1 < <(sleep 30) || rc=$?
+case "$rc" in
+    0|1) ok "F: empty stamp path returns with stdin held open (rc=$rc)" ;;
+    124) bad "F: empty stamp path blocked on stdin" ;;
+    *) bad "F: empty stamp path unexpected rc=$rc"; cat "$TMP/hold.log" ;;
+esac
+
 [ "$fail" -eq 0 ]
