@@ -173,10 +173,10 @@ else
         || bad "down-arrows ran past MAX_STEPS ($arrows)"
 fi
 
-# Settle re-read.  The cursor matches twice so the loop breaks, then the
-# re-read disagrees.  pin_dedicated must stop there.  The two Enter presses
-# are the menu; a third would be the connect Enter, which means the abort
-# fell through.  The harness is written by python because the extracted
+# Settle re-read.  The first cursor read matches, so the walk breaks.  The
+# settle re-read disagrees and pin_dedicated must stop there.  The one Enter
+# press is the menu; a second would be the connect Enter, which means the
+# abort fell through.  The harness is written by python because the extracted
 # function contains $(...) that an unquoted heredoc would expand.
 python3 - "$PD" "$TMP" <<'PYSTUB'
 import sys
