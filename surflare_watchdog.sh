@@ -4079,7 +4079,11 @@ _report_stats() {
 	if [ -f "$STORM_503_STATE" ]; then
 		read -r _s503_count _ _ < "$STORM_503_STATE" 2>/dev/null || _s503_count=0
 	fi
-	log "STATS: up=${_uptime_h}h reconn=${_stats_reconnects} rot=${_stats_rotations} 503=${_s503_count} degraded=${_stats_degraded:-none} node=${_sess_node:-?} exit=${_sess_exit:-?}"
+	# node comes from _active_node, which _reconcile realigns to the
+	# live Server: line every tick.  _sess_node is written once, at
+	# session start, and a pin-back moves the tunnel without a
+	# reconnect, so it keeps naming the city the session began on.
+	log "STATS: up=${_uptime_h}h reconn=${_stats_reconnects} rot=${_stats_rotations} 503=${_s503_count} degraded=${_stats_degraded:-none} node=${_active_node:-?} exit=${_sess_exit:-?}"
 	_stats_degraded=""
 	_stats_last_report=$_now
 }
