@@ -84,15 +84,15 @@ if ! flock -n 9; then
 fi
 
 log "Downloading BGP route lists..."
-if ! curl -fsSL --connect-timeout 30 "$V4_BGP_URL" -o "$TMP_DIR/v4_bgp.txt"; then
+if ! curl -fsSL --connect-timeout 30 --max-time 240 "$V4_BGP_URL" -o "$TMP_DIR/v4_bgp.txt"; then
     log "WARN: Failed to download IPv4 BGP routes"
 fi
-if ! curl -fsSL --connect-timeout 30 "$V6_BGP_URL" -o "$TMP_DIR/v6_bgp.txt"; then
+if ! curl -fsSL --connect-timeout 30 --max-time 240 "$V6_BGP_URL" -o "$TMP_DIR/v6_bgp.txt"; then
     log "WARN: Failed to download IPv6 BGP routes"
 fi
 
 log "Downloading APNIC delegated stats..."
-if ! curl -fsSL --connect-timeout 30 "$APNIC_URL" -o "$TMP_DIR/apnic.txt"; then
+if ! curl -fsSL --connect-timeout 30 --max-time 240 "$APNIC_URL" -o "$TMP_DIR/apnic.txt"; then
     log "WARN: Failed to download APNIC delegated stats"
 fi
 
@@ -182,21 +182,25 @@ else
     log "Cloud CDN extra: download window open (${ROUTE_UPDATER_LOCK})"
     # Heartbeat: refresh the lock mtime every 60s during long downloads so
     # the watchdog's mtime-based _route_updater_active() sees fresh activity.
-    # A SIGKILLed updater leaves the lock stale; the watchdog also checks
-    # pgrep -f surflare_route_updater and treats dead PID as inactive.
-    # Forge finding #4: the bare subshell ( ... ) above still has the
-    # parent script's argv in /proc/<pid>/cmdline, so pgrep -f matches
-    # the heartbeat even after the main script is SIGKILLed -- masking
-    # the dead-updater state for up to 60s. Use `setsid` to put the
-    # heartbeat in a new session with /proc/<pid>/cmdline == "sh" (or
-    # whatever exec replaces it), so pgrep -f 'surflare_route_updater'
-    # does not match.
+    # Heartbeat supervision notes (2026-10-02):
+    # - pgrep -f 'surflare_route_updater' DOES match this heartbeat: the
+    #   lock path /run/surflare_route_updater.lock is in its argv.  That
+    #   is accepted -- the watchdog's age gate needs ANY over-age match
+    #   (including an orphaned heartbeat) to break suppression, so the
+    #   heartbeat must be killable and short-lived, not invisible.
+    # Heartbeat must not outlive its parent: if the updater is SIGKILLed,
+    # the heartbeat would hold fd 9 forever and keep re-touching the lock,
+    # suppressing the watchdog and blocking the next day's run (probed
+    # 2026-10-02).  It now exits when either the lock disappears or the
+    # parent is gone.  PPID is passed as $2.
     setsid sh -c '
         while [ -f "$1" ]; do
             sleep 60
-            [ -f "$1" ] && touch "$1" 2>/dev/null || break
+            [ -f "$1" ] || break
+            kill -0 "$2" 2>/dev/null || break
+            touch "$1" 2>/dev/null || break
         done
-    ' sh "$ROUTE_UPDATER_LOCK" &
+    ' sh "$ROUTE_UPDATER_LOCK" $$ &
     _HEARTBEAT_PID=$!
 
     # -----------------------------------------------------------------
@@ -204,23 +208,21 @@ else
     # All launched simultaneously; wait collects results.
     # -----------------------------------------------------------------
     log "Cloud CDN extra: parallel RIPE downloads (5 main + 3 supplement ASNs)..."
-    curl -fsSL --connect-timeout 30 --max-time 300 \
-        "$RIPE_CONSIST_TENCENT"     -o "$TMP_DIR/consist_tencent.json"     &
-    curl -fsSL --connect-timeout 30 --max-time 300 \
-        "$RIPE_CONSIST_TENCENT_ACE" -o "$TMP_DIR/consist_tencent_ace.json" &
-    curl -fsSL --connect-timeout 30 --max-time 300 \
-        "$RIPE_CONSIST_ALIBABA"     -o "$TMP_DIR/consist_alibaba.json"     &
-    curl -fsSL --connect-timeout 30 --max-time 300 \
-        "$RIPE_CONSIST_ALICDN"      -o "$TMP_DIR/consist_alibabacdn.json"  &
-    curl -fsSL --connect-timeout 30 --max-time 300 \
-        "$RIPE_CONSIST_HUAWEI"      -o "$TMP_DIR/consist_huawei.json"      &
-    curl -fsSL --connect-timeout 30 --max-time 300 \
-        "$RIPE_CONSIST_ALIBABA_HZ"  -o "$TMP_DIR/consist_alibaba_hz.json"  &
-    curl -fsSL --connect-timeout 30 --max-time 300 \
-        "$RIPE_CONSIST_ALIBABA_SG"  -o "$TMP_DIR/consist_alibaba_sg.json"  &
-    curl -fsSL --connect-timeout 30 --max-time 300 \
-        "$RIPE_CONSIST_BYTEDANCE"   -o "$TMP_DIR/consist_bytedance.json"   &
-    wait
+    # One process starts every curl and reaps that pid with waitid.
+    # A shell wait in this script also collects the heartbeat, which
+    # exits only when the lock is removed (2026-10-02 P0: PID 29241
+    # wedged in do_wait for 4 days).
+    _ripe="$TMP_DIR/ripe_args"
+    : > "$_ripe"
+    printf '%s\t%s\n' "$RIPE_CONSIST_TENCENT"     "$TMP_DIR/consist_tencent.json"     >> "$_ripe"
+    printf '%s\t%s\n' "$RIPE_CONSIST_TENCENT_ACE" "$TMP_DIR/consist_tencent_ace.json" >> "$_ripe"
+    printf '%s\t%s\n' "$RIPE_CONSIST_ALIBABA"     "$TMP_DIR/consist_alibaba.json"     >> "$_ripe"
+    printf '%s\t%s\n' "$RIPE_CONSIST_ALICDN"      "$TMP_DIR/consist_alibabacdn.json"  >> "$_ripe"
+    printf '%s\t%s\n' "$RIPE_CONSIST_HUAWEI"      "$TMP_DIR/consist_huawei.json"      >> "$_ripe"
+    printf '%s\t%s\n' "$RIPE_CONSIST_ALIBABA_HZ"  "$TMP_DIR/consist_alibaba_hz.json"  >> "$_ripe"
+    printf '%s\t%s\n' "$RIPE_CONSIST_ALIBABA_SG"  "$TMP_DIR/consist_alibaba_sg.json"  >> "$_ripe"
+    printf '%s\t%s\n' "$RIPE_CONSIST_BYTEDANCE"   "$TMP_DIR/consist_bytedance.json"   >> "$_ripe"
+    python3 "$(dirname "$0")/ripe_fetch.py" "$_ripe"
 
     # Check main group; warn on any missing but only skip if all fail
     ripe_ok=true
@@ -252,10 +254,10 @@ else
         rest="${entry#*|}"
         primary="${rest%%|*}"
         fallback="${rest#*|}"
-        if curl -fsSL --connect-timeout 30 "$primary" \
+        if curl -fsSL --connect-timeout 30 --max-time 240 "$primary" \
                 -o "$TMP_DIR/cloud_${name}.txt" 2>/dev/null; then
             log "Source B ${name}: downloaded from primary"
-        elif curl -fsSL --connect-timeout 30 "$fallback" \
+        elif curl -fsSL --connect-timeout 30 --max-time 240 "$fallback" \
                 -o "$TMP_DIR/cloud_${name}.txt" 2>/dev/null; then
             log "WARN: Source B ${name}: primary failed, used jsDelivr fallback"
         else

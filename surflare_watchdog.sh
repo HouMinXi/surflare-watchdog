@@ -2703,15 +2703,53 @@ CONTROL_PROBE_TIMEOUT=3
 # Also check the updater PID is alive: a SIGKILLed updater leaves a stale
 # lock even with the heartbeat (heartbeat itself can be killed).  If the
 # process is gone, treat as inactive regardless of mtime.
+# Wedged updater (2026-10-02 P0): a curl without --max-time can park the
+# updater in do_wait forever while its heartbeat subshell keeps the lock
+# mtime fresh, so "lock fresh + process alive" never recovers.  A
+# working-children gate was tried and rejected: the updater's own
+# serial-curl and merge phases leave gaps with no live curl child, so a
+# children scan flips INACTIVE mid-legit-run and reconnects the tunnel
+# during a download (measured 13/19 samples, 2026-10-02 review).  The
+# only sound bound is age: legitimate runs are bounded by per-curl
+# --max-time flags (serial 3x240s + parallel 300s + validators, ~2500s
+# worst case), so suppression requires every matching process to be
+# younger than UPDATER_MAX_AGE_S (3600s).  A run older than the cap is
+# wedged no matter what else looks healthy; suppression lifts and the
+# health check runs.
 _route_updater_active() {
     local lock="/run/surflare_route_updater.lock"
     [ -f "$lock" ] || return 1
     _proc_alive surflare_route_updater >/dev/null 2>&1 || return 1
+    _updater_age_ok || return 1
     local mtime age
     mtime=$(stat -c '%Y' "$lock" 2>/dev/null) || return 1
     age=$(( $(date +%s) - mtime ))
     # NTP clock step can make age negative; treat as inactive (not active) then.
     [ "$age" -ge 0 ] && [ "$age" -lt 1800 ]
+}
+
+# _updater_age_ok: every live route_updater-matching process must be
+# younger than the age cap (3600s).  Matching is pgrep -f on the script
+# name -- which also matches the heartbeat (the lock path is in its
+# argv) and any orphan left by a SIGKILLed run; an orphan is precisely a
+# poisoned witness, so ANY over-age match breaks suppression.  Age comes
+# from /proc/<pid>/stat field 22 (starttime in clock ticks since boot);
+# no ps -o etime on busybox ash.  /proc starttime is always expressed in
+# USER_HZ units, fixed at 100 by the Linux ABI regardless of CONFIG_HZ.
+_updater_age_ok() {
+    # Overridable for tests; production default 3600s.
+    local max_age="${UPDATER_MAX_AGE_S:-3600}"
+    local p start uptime now_age
+    uptime=$(awk '{print int($1)}' /proc/uptime)
+    for p in $(pgrep -f 'surflare_route_updater' 2>/dev/null); do
+        start=$(awk '{print $22}' "/proc/$p/stat" 2>/dev/null) || continue
+        [ -n "$start" ] || continue
+        now_age=$(( uptime - start / 100 ))
+        if [ "$now_age" -gt "$max_age" ]; then
+            return 1
+        fi
+    done
+    return 0
 }
 
 _control_probe() {

@@ -60,15 +60,15 @@ TMP_DIR=$(mktemp -d /tmp/surflare_updater_XXXXXX)
 trap 'rm -rf "$TMP_DIR"' EXIT
 
 log "Downloading BGP route lists..."
-if ! curl -fsSL --connect-timeout 30 "$V4_BGP_URL" -o "$TMP_DIR/v4_bgp.txt"; then
+if ! curl -fsSL --connect-timeout 30 --max-time 240 "$V4_BGP_URL" -o "$TMP_DIR/v4_bgp.txt"; then
     log "WARN: Failed to download IPv4 BGP routes"
 fi
-if ! curl -fsSL --connect-timeout 30 "$V6_BGP_URL" -o "$TMP_DIR/v6_bgp.txt"; then
+if ! curl -fsSL --connect-timeout 30 --max-time 240 "$V6_BGP_URL" -o "$TMP_DIR/v6_bgp.txt"; then
     log "WARN: Failed to download IPv6 BGP routes"
 fi
 
 log "Downloading APNIC delegated stats..."
-if ! curl -fsSL --connect-timeout 30 "$APNIC_URL" -o "$TMP_DIR/apnic.txt"; then
+if ! curl -fsSL --connect-timeout 30 --max-time 240 "$APNIC_URL" -o "$TMP_DIR/apnic.txt"; then
     log "WARN: Failed to download APNIC delegated stats"
 fi
 
@@ -204,10 +204,10 @@ else
         rest="${entry#*|}"
         primary="${rest%%|*}"
         fallback="${rest#*|}"
-        if curl -fsSL --connect-timeout 30 "$primary" \
+        if curl -fsSL --connect-timeout 30 --max-time 240 "$primary" \
                 -o "$TMP_DIR/cloud_${name}.txt" 2>/dev/null; then
             log "Source B ${name}: downloaded from primary"
-        elif curl -fsSL --connect-timeout 30 "$fallback" \
+        elif curl -fsSL --connect-timeout 30 --max-time 240 "$fallback" \
                 -o "$TMP_DIR/cloud_${name}.txt" 2>/dev/null; then
             log "WARN: Source B ${name}: primary failed, used jsDelivr fallback"
         else
