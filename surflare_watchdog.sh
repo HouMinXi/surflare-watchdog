@@ -2370,7 +2370,8 @@ _restore_tproxy() {
 	_saved_bypass=$(nft list set inet sw_lan_tproxy bypass_devices 2>/dev/null \
 		| grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | tr '\n' ',' | sed 's/,$//')
 	_saved_bypass6=$(nft list set inet sw_lan_tproxy bypass_devices6 2>/dev/null \
-		| grep -oE '[0-9a-f:]+:[0-9a-f:]+' | grep -v '^fe80' | tr '\n' ',' | sed 's/,$//')
+		| grep -oE '([0-9a-fA-F]{0,4}:){2,7}[0-9a-fA-F]{0,4}(\.[0-9]{1,3}){0,4}' \
+		| grep -vi '^fe80' | tr '\n' ',' | sed 's/,$//')
 	_saved_auto=$(nft list set inet sw_lan_tproxy auto_bypass 2>/dev/null \
 		| grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | tr '\n' ',' | sed 's/,$//')
 	# Prepend destroy so the load is atomic: old table removed and new
@@ -7620,6 +7621,58 @@ while true; do
 	   ! nft list set inet sw_lan_tproxy bypass_devices 2>/dev/null | grep -qE '[0-9]+\.[0-9]'; then
 		log "bypass_devices empty (hotplug rebuild?), repopulating"
 		_update_bypass_devices
+	fi
+
+	# IPv6 prefixes change without a reconnect.  Compare the addresses
+	# the neighbor table has for the bypass MACs with the set, and
+	# refill when they differ.  An empty neighbor list is not a
+	# difference: the table is briefly empty while a host is quiet.
+	if [ -s "$BYPASS_LAN_MACS_FILE" ] && \
+	   nft list table inet sw_lan_tproxy >/dev/null 2>&1; then
+		_live6=$(ip -6 neigh show dev br-lan 2>/dev/null | awk '
+			BEGIN { IGNORECASE = 1 }
+			$1 ~ /^fe80/ { next }
+			{
+				line = " " toupper($0) " "
+				if (line !~ / (REACHABLE|STALE|DELAY|PROBE) /)
+					next
+				for (i = 1; i < NF; i++)
+					if ($i == "lladdr") addr[tolower($(i+1))] = addr[tolower($(i+1))] " " $1
+			}
+			END { for (m in addr) print m, addr[m] }')
+		_want6=""
+		while IFS= read -r _line; do
+			_mac=$(echo "$_line" | awk '{print tolower($1)}' | tr -d '\r')
+			case "$_mac" in '#'*|'') continue ;; esac
+			_hit=$(echo "$_live6" | awk -v m="$_mac" '$1==m{$1=""; print}')
+			[ -n "$_hit" ] && _want6="$_want6 $_hit"
+		done < "$BYPASS_LAN_MACS_FILE"
+		_have6=$(nft list set inet sw_lan_tproxy bypass_devices6 2>/dev/null) && _ok6=1 || _ok6=0
+		_havek=$(nft list set inet killswitch bypass_src6 2>/dev/null) && _okk=1 || _okk=0
+		_pat='([0-9a-fA-F]{0,4}:){2,7}[0-9a-fA-F]{0,4}(\.[0-9]{1,3}){0,4}'
+		_have6=$(printf '%s\n' "$_have6" | grep -oE "$_pat")
+		_havek=$(printf '%s\n' "$_havek" | grep -oE "$_pat")
+		_ws=$(echo "$_want6" | tr ' ' '\n' | grep . | sort -u | tr '\n' ' ')
+		_hs=$(echo "$_have6" | tr ' ' '\n' | grep . | sort -u | tr '\n' ' ')
+		_hk=$(echo "$_havek" | tr ' ' '\n' | grep . | sort -u | tr '\n' ' ')
+		# Each set is filled on its own.  An address can be in the tproxy
+		# set and still missing from the killswitch set, and the forward
+		# chain rejects it there.
+		_miss_t=""; _miss_k=""
+		for _a in $_ws; do
+			case " $_hs " in *" $_a "*) ;; *) _miss_t="$_miss_t $_a" ;; esac
+			case " $_hk " in *" $_a "*) ;; *) _miss_k="$_miss_k $_a" ;; esac
+		done
+		if [ "$_ok6" = 1 ] && [ -n "$_miss_t" ]; then
+			log "bypass_devices6 missing $_miss_t"
+			nft add element inet sw_lan_tproxy bypass_devices6 \
+				"{ $(echo $_miss_t | tr ' ' ',') }" 2>/dev/null || \
+				log "WARN: bypass_devices6 add failed ($_miss_t)"
+		fi
+		if [ "$_okk" = 1 ] && [ -n "$_miss_k" ]; then
+			nft add element inet killswitch bypass_src6 \
+				"{ $(echo $_miss_k | tr ' ' ',') }" 2>/dev/null || true
+		fi
 	fi
 
 	# Adaptive interval -- shorter poll when degraded for faster recovery.
