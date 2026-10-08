@@ -2481,6 +2481,29 @@ _enter_storm_cooldown() {
 	if [ -n "$_diag_server_ips" ]; then
 		echo "$_diag_server_ips" > "$_persist_v4" 2>/dev/null || true
 	fi
+	# Cooldown start as minutes-since-midnight.  The lift gate below
+	# compares the live session's "since" against it.  The CLI only
+	# prints HH:MM, so both sides are converted to minutes; a session
+	# "before" the start by more than 12h is treated as crossing
+	# midnight (the cooldown window is 600s, so a real out-of-band
+	# session is minutes away, never hours).  If date ever yields a
+	# non-HH:MM value the gate stays shut (hold) rather than guessing.
+	local _cool_start_hhmm
+	_cool_start_hhmm=$(date +%H:%M)
+	case "$_cool_start_hhmm" in
+		[0-9][0-9]:[0-9][0-9]) : ;;
+		*) _cool_start_hhmm="" ;;
+	esac
+	# reject trailing garbage: HH:MM must be the whole value
+	case "$_cool_start_hhmm" in
+		*[!0-9:]*|???*:*|*:*:*) _cool_start_hhmm="" ;;
+	esac
+	local _cool_start_min
+	if [ -n "$_cool_start_hhmm" ]; then
+		_cool_start_min=$(( 10#${_cool_start_hhmm%%:*} * 60 + 10#${_cool_start_hhmm##*:} ))
+	else
+		_cool_start_min=""
+	fi
 	# Flush server_ips so VPN server traffic is also blocked by killswitch
 	nft flush set inet killswitch server_ips 2>/dev/null || true
 	nft flush set inet killswitch server_ips6 2>/dev/null || true
@@ -2495,6 +2518,7 @@ _enter_storm_cooldown() {
 	local _storm_probe_interval=60
 	local _storm_remaining=$STORM_COOLING
 	local _storm_sleep _storm_dup _spid _storm_mem _ppid
+	local _storm_status _storm_status_rc
 	while [ "$_storm_remaining" -gt 0 ]; do
 		_storm_sleep=$(( _storm_remaining < _storm_probe_interval ? _storm_remaining : _storm_probe_interval ))
 		sleep "$_storm_sleep" &
@@ -2502,6 +2526,43 @@ _enter_storm_cooldown() {
 		_storm_remaining=$(( _storm_remaining - _storm_sleep ))
 		[ "$run_health_check_now" = 1 ] && break
 		if [ "$_storm_remaining" -gt 0 ]; then
+			# Cooldown exists to stop a flapping reconnect loop.  It must
+			# not outlive the tunnel: when someone (the GUI, tui-supervisor)
+			# connects out-of-band during cooldown, the storm that justified
+			# the cooldown is over.  The gate must NOT trust a bare
+			# "Connected" though: the storm's own session (PROXY_BROKEN,
+			# CGNAT connect-then-die, CN-exit paths) stays "Connected"
+			# through the whole cooldown -- lifting on it un-tombstones
+			# tproxy back onto a dead proxy and re-fuels the flapping loop
+			# (the 600s brake collapses to ~60s).  So require BOTH: the CLI
+			# reports Connected AND that session started AFTER this cooldown
+			# began (since > cool start).  A storm leftover reports the old
+			# since and the cooldown holds.
+			_storm_status_rc=0
+			_storm_status=$(timeout 5 surflare status 2>/dev/null) || _storm_status_rc=$?
+			_storm_since=""
+			if [ "$_storm_status_rc" -eq 0 ]; then
+				_storm_since=$(echo "$_storm_status" \
+					| sed -n 's/.*Status:.*Connected.*since[[:space:]]*\([0-9][0-9]:[0-9][0-9]\).*/\1/p' | head -1)
+			fi
+			if [ "$_storm_status_rc" -eq 0 ] && [ -n "$_storm_since" ] && [ -n "$_cool_start_min" ]; then
+				# minutes since midnight; a negative gap larger than 12h
+				# means the session crossed midnight after the cooldown
+				# started, so it is still the newer session
+				local _since_min _delta
+				_since_min=$(( 10#${_storm_since%%:*} * 60 + 10#${_storm_since##*:} ))
+				_delta=$(( _since_min - _cool_start_min ))
+				[ "$_delta" -lt -720 ] && _delta=$(( _delta + 1440 ))
+				if [ "$_delta" -gt 0 ]; then
+					log "Storm cooldown lifted early: live session connected out-of-band (since $_storm_since)"
+					# Remove the persisted window or a watchdog restart inside
+					# the remaining window re-imposes the cooldown with no
+					# session probe at all (startup sleep + resurrect-cron
+					# suppression), resurrecting the very harm this lift fixes.
+					rm -f /run/surflare_watchdog.storm_cool_until
+					break
+				fi
+			fi
 			_storm_dup=0
 			for _spid in $(pgrep -f 'surflare_watchdog\.sh$' 2>/dev/null); do
 				[ "$_spid" -eq "$$" ] && continue
