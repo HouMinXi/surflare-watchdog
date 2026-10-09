@@ -57,8 +57,8 @@ if [ -f /etc/surflare/mode.conf ]; then
 	_conf_mode=$(grep -E "^[[:space:]]*MODE=" /etc/surflare/mode.conf 2>/dev/null | tail -1 | cut -d= -f2- | tr -d "\"'")
 	[ -n "$_conf_mode" ] && MODE="$_conf_mode"
 fi
-TRANSIT="auto"                            # Transit server: "" = use TRANSIT_CANDIDATES (logged), "auto" = surflare picks (opaque)
-TRANSIT_CANDIDATES=("Dallas" "Chicago" "Atlanta" "Miami" "New York")  # US-only; KR/HK/TW exits trigger Bing cn redirect
+TRANSIT="Tokyo"                            # Transit server: "" = use TRANSIT_CANDIDATES (logged), "auto" = surflare picks (opaque)
+TRANSIT_CANDIDATES=("Tokyo" "Los Angeles" "Seoul")  # 2026-10-09 chain probe of all 16 auto-pool relays: Tokyo 5/5 avg 1.8s, LA 5/5 2.0s, Seoul 5/5 3.7s; HK members dead or flaky. Transit city only picks the middle hop, the exit IP is unchanged.
 TRANSIT_CONNECT_TIMEOUT=12             # max seconds for surflare connect per candidate
 TRANSIT_ROUTE_READY_TIMEOUT=15        # max seconds to poll for routing readiness after connect
 TRANSIT_PROBE_SETTLE=20              # seconds of quiet time for tunnel handshake after routing ready
