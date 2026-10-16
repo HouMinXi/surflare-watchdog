@@ -41,3 +41,10 @@ n100/config/settings.dat
 n100/config/wechat.conf
 .mcp.json
 scratch/
+
+# real credentials never enter git
+# (ded-exit.conf: template ships as ded-exit.conf.template;
+#  dedicated-tunnel.json: transition relay config, router-local only,
+#  retired by the ded-exit layer)
+router/services/surflare-dedicated/ded-exit.conf
+router/services/surflare-dedicated/dedicated-tunnel.json

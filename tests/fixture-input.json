@@ -1,0 +1,86 @@
+{
+  "dns": {
+    "servers": [
+      {
+        "tag": "dns_remote",
+        "address": "https://1.1.1.1/dns-query",
+        "detour": "mh_via_test"
+      },
+      {
+        "tag": "dns_local",
+        "address": "223.5.5.5",
+        "detour": "direct"
+      }
+    ],
+    "rules": [
+      {
+        "outbound": "any",
+        "server": "dns_local"
+      }
+    ],
+    "final": "dns_remote",
+    "strategy": "prefer_ipv4"
+  },
+  "inbounds": [
+    {
+      "type": "tproxy",
+      "tag": "tproxy-in",
+      "listen": "::",
+      "listen_port": 10800
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "urltest",
+      "tag": "mh_via_test",
+      "outbounds": [
+        "public_1",
+        "public_2"
+      ],
+      "url": "https://www.gstatic.com/generate_204",
+      "interval": "3m0s",
+      "tolerance": 50
+    },
+    {
+      "type": "vless",
+      "tag": "public_1",
+      "server": "198.51.100.10",
+      "server_port": 443,
+      "uuid": "00000000-0000-0000-0000-000000000001"
+    },
+    {
+      "type": "vless",
+      "tag": "public_2",
+      "server": "198.51.100.20",
+      "server_port": 443,
+      "uuid": "00000000-0000-0000-0000-000000000002"
+    },
+    {
+      "type": "direct",
+      "tag": "direct"
+    }
+  ],
+  "route": {
+    "rules": [
+      {
+        "protocol": "dns",
+        "action": "hijack-dns"
+      },
+      {
+        "ip_cidr": [
+          "10.0.0.0/8",
+          "172.16.0.0/12",
+          "192.168.0.0/16"
+        ],
+        "outbound": "direct"
+      },
+      {
+        "inbound": "tproxy-in",
+        "outbound": "direct"
+      }
+    ],
+    "final": "mh_via_test",
+    "auto_detect_interface": true,
+    "rule_set": []
+  }
+}

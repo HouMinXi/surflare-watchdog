@@ -1,0 +1,314 @@
+#!/bin/sh
+# surflare-ded-canary -- dedicated-egress layer health probe.
+#
+# Runs from cron every minute (deterministic, no LLM).  It performs an
+# end-to-end fetch through the injected canary inbound (127.0.0.1:20814,
+# which routes via ded-exit when EXIT_VIA_DED=1) and, on failure, a
+# carrier-path TCP connect to the dedicated SOCKS server to triage:
+#
+#   canary OK                        -> nothing to do
+#   proxy down (20814 not listening) -> nothing to do (the watchdog
+#                                     owns proxy restarts; flipping
+#                                     here would misdiagnose)
+#   SOCKS-layer fail (curl rc 97) or -> credential/triage path: TCP
+#   egress IP drift                  check; server reachable means
+#                                     credential revoked -> flip to 0
+#   other failures (timeout, TLS)    -> streak path only: after
+#                                     DED_FAIL_MINUTES consecutive
+#                                     minutes, assume endpoint
+#                                     reclaimed -> flip to 0
+#
+# Flipping = rewrite EXIT_VIA_DED in /etc/surflare/ded-exit.conf and
+# request one reconnect via the watchdog's reconnect request file; a
+# plain `surflare connect` fallback is NOT used to avoid fighting the
+# watchdog (double reconnects).  If the request file is absent the flip
+# still lands; the next watchdog-driven or user-driven reconnect picks
+# it up.
+#
+# The TCP triage connects via bash /dev/tcp (the outbound connect is
+# itself steered through the carrier by the OUTPUT tproxy guard rule;
+# see the triage comment below).  It MUST stay bash -- busybox ash has
+# no /dev/tcp and would report every probe as failed (verified on the
+# N100 live system).  bash 5.2 is installed there.
+#
+# State lives in /run (volatile): a router reboot forgets the failure
+# streak, which is the desired semantics (the canary re-diagnoses from
+# scratch after a reboot).
+#
+# Exit codes: 0 = healthy or action taken; 1 = unexpected internal
+# error (logged).  Never blocks: every network call is timeout-bounded.
+
+CONF="/etc/surflare/ded-exit.conf"
+STATE_DIR="/run/surflare-ded-canary"
+RECONNECT_FILE="/run/surflare_watchdog_reconnect_request"
+LOG_TAG="surflare-ded-canary"
+
+CANARY_URL="https://checkip.amazonaws.com"
+CANARY_URL_FALLBACK="https://api.ipify.org"
+CANARY_PORT=20814
+DED_FAIL_MINUTES=10
+PROBE_TIMEOUT=12
+
+log() {
+    # bounded: a hung syslog must not block the canary
+    timeout 5 logger -t "$LOG_TAG" "$*" 2>/dev/null || true
+}
+
+# ---- config ----------------------------------------------------------
+# Parse only the known keys; never source or eval the file (a corrupted
+# conf must not execute shell code as root).  Keep this parser in sync
+# with the copies in the surflare-proxy wrapper and surflare-ded-reattach.
+_ded_read_conf() {
+    EXIT_VIA_DED=""; DED_SERVER=""; DED_PORT=""; DED_USER=""; DED_PASS=""
+    [ -f "$1" ] || return 0
+    while IFS= read -r _l; do
+        case "$_l" in
+            EXIT_VIA_DED=*) EXIT_VIA_DED=${_l#EXIT_VIA_DED=} ;;
+            DED_SERVER=*)   DED_SERVER=${_l#DED_SERVER=} ;;
+            DED_PORT=*)     DED_PORT=${_l#DED_PORT=} ;;
+            DED_USER=*)     DED_USER=${_l#DED_USER=} ;;
+            DED_PASS=*)     DED_PASS=${_l#DED_PASS=} ;;
+        esac
+    done < "$1"
+    case "$EXIT_VIA_DED" in \"*\") EXIT_VIA_DED=${EXIT_VIA_DED#\"}; EXIT_VIA_DED=${EXIT_VIA_DED%\"} ;; esac
+    case "$DED_SERVER" in \"*\") DED_SERVER=${DED_SERVER#\"}; DED_SERVER=${DED_SERVER%\"} ;; esac
+    case "$DED_PORT" in \"*\") DED_PORT=${DED_PORT#\"}; DED_PORT=${DED_PORT%\"} ;; esac
+    case "$DED_USER" in \"*\") DED_USER=${DED_USER#\"}; DED_USER=${DED_USER%\"} ;; esac
+    case "$DED_PASS" in \"*\") DED_PASS=${DED_PASS#\"}; DED_PASS=${DED_PASS%\"} ;; esac
+}
+_ded_read_conf "$CONF"
+
+# IPv4-literal server + TCP port range.  Metacharacters or a hostname
+# here are invalid: the value reaches bash -c triage and jq's ip_cidr
+# guard rule ("$DS/32"); keep in sync with the wrapper's validator.
+_ded_conf_valid() {
+    case "$DED_PORT" in
+        ''|*[!0-9]*) return 1 ;;
+    esac
+    [ "$DED_PORT" -ge 1 ] && [ "$DED_PORT" -le 65535 ] || return 1
+    case "$DED_SERVER" in
+        ''|*[!0-9.]*) return 1 ;;
+    esac
+    _ifs=$IFS; IFS=.
+    # shellcheck disable=SC2086  # split on dots is the point; validated digits/dots only
+    set -- $DED_SERVER
+    IFS=$_ifs
+    [ $# -eq 4 ] || return 1
+    # template placeholders must never enable the layer
+    case "$DED_USER$DED_PASS" in *"<"*|*">"*) return 1 ;; esac
+    for _o in "$@"; do
+        case "$_o" in
+            ''|*[!0-9]*) return 1 ;;
+            # leading-zero octet ("01"...): Go's strict IP parser
+            # rejects these, so sing-box would FATAL on the guard CIDR
+            0?*) return 1 ;;
+        esac
+        [ "$_o" -le 255 ] || return 1
+    done
+    return 0
+}
+
+case "$EXIT_VIA_DED" in
+    1) ;;
+    *)
+        # A leftover streak from a previous enabled period would be
+        # counted on the first failure after re-enable and could skip
+        # the TCP triage.  The layer is off, so that history is stale.
+        rm -f "$STATE_DIR/fail_streak" 2>/dev/null
+        exit 0 ;;
+esac
+
+if ! _ded_conf_valid || [ -z "$DED_USER" ] || [ -z "$DED_PASS" ]; then
+    log "conf invalid or incomplete (IPv4 literal server, port 1-65535, non-empty credentials); wrapper owns the disable, canary inert"
+    exit 0
+fi
+
+# Overlap guard: busybox cron does not serialize runs, and a loaded
+# router can stretch one run past the minute.  If flock exists, take
+# a non-blocking lock and let a still-running previous instance win.
+mkdir -p "$STATE_DIR" 2>/dev/null
+if [ ! -d "$STATE_DIR" ] || [ ! -w "$STATE_DIR" ]; then
+    # without this the exec below kills the shell with no log line and
+    # the canary silently stops (POSIX: failed exec redirection exits
+    # the shell).  -w covers dir-exists-but-unwritable (fd creation
+    # for the lock file would fail the same way).
+    log "ERROR: STATE_DIR $STATE_DIR missing or unwritable (mkdir failed; /run read-only or full?) -- tick skipped"
+    exit 1
+fi
+if command -v flock >/dev/null 2>&1; then
+    # no "|| exit 0" here: in POSIX sh a failed exec redirection exits
+    # the shell outright (verified on busybox ash 1.36.1), so the clause
+    # would be unreachable dead code; the non-zero exit surfaces in cron
+    exec 9>"$STATE_DIR/lock" 2>/dev/null
+    flock -n 9 2>/dev/null || exit 0
+fi
+
+# ---- proxy-down guard --------------------------------------------------
+# If the canary inbound is not listening, the proxy itself is down;
+# the watchdog owns proxy restarts.  Flipping the layer here would
+# misdiagnose "proxy dead" as "credential revoked" (the direct-dial
+# TCP check below can succeed while the proxy is dead).  The listen
+# check reads /proc/net/tcp directly (col 2 = hex local_address,
+# col 4 = 0A for LISTEN) so it works on minimal builds without
+# netstat and matches any bind form (127.0.0.1 or 0.0.0.0).
+# A foreign service squatting on 20814 could defeat this guard, but
+# that port is dedicated to the wrapper-injected inbound; a squatter
+# would break the probe itself (wrong egress IP -> hard_fail) and be
+# visible in the WARN log rather than silently misdiagnosed.
+_listen_check() {
+    awk -v want="$(printf '%04X' "$1")" '
+        FNR > 1 { split($2, a, ":"); if (a[2] == want && $4 == "0A") { found = 1; exit } }
+        END { exit !found }
+    ' /proc/net/tcp /proc/net/tcp6 2>/dev/null
+}
+if ! _listen_check "$CANARY_PORT"; then
+    log "canary inbound not listening (proxy down?); watchdog owns restart, no flip"
+    exit 0
+fi
+
+# ---- probe: end-to-end via canary inbound ----------------------------
+# curl exit codes split the failure classes.  rc 97 = SOCKS5 layer
+# refused the connection: measured on the live N100 (curl 8.19.0)
+# against the real SOCKS server -- wrong password AND wrong username
+# both return 97, good credentials return 0.  28/35/60/7 etc are
+# timeout/TLS/connect errors that are NOT proof of a credential
+# problem and only feed the streak below.  The proxy-down case (20814
+# not listening) is handled separately so it is never misdiagnosed as
+# "credential rejected".
+hard_fail=0
+soft_fail=0
+egress_drift=0
+# Try the fallback endpoint before believing a failure: a single
+# provider-side block on the primary must not look like a dead layer.
+raw=$(curl -s --max-time "$PROBE_TIMEOUT" -x "socks5h://127.0.0.1:$CANARY_PORT" "$CANARY_URL" 2>/dev/null)
+curl_rc=$?
+if [ "$curl_rc" -ne 0 ] || [ -z "$raw" ]; then
+    raw=$(curl -s --max-time "$PROBE_TIMEOUT" -x "socks5h://127.0.0.1:$CANARY_PORT" "$CANARY_URL_FALLBACK" 2>/dev/null)
+    frc=$?
+    if [ "$frc" -eq 0 ] && [ -n "$raw" ]; then
+        curl_rc=0
+    elif [ "$frc" -eq 97 ] || [ "$curl_rc" -eq 97 ]; then
+        # a SOCKS-layer reject from EITHER attempt is hard evidence;
+        # do not let the other attempt's soft rc mask it
+        curl_rc=97
+    else
+        curl_rc=$frc
+    fi
+fi
+# Command substitution strips trailing newlines but NOT \r; an IP body
+# from a CRLF-served endpoint must be cleaned or it fails the IP-shape
+# check below and a healthy probe degrades into a soft-fail streak.
+canary_ip=$(printf '%s' "$raw" | head -c 64 | tr -d '\r\n')
+
+if [ "$curl_rc" -eq 0 ]; then
+    case "$canary_ip" in
+        "$DED_SERVER") ;;
+        "") soft_fail=1 ;;
+        *[!0-9.]*)
+            # Not an IP-shaped body (error page, interception, IPv6):
+            # the chain answered but said something unexpected -- not
+            # proof the dedicated binding is gone, so feed the streak.
+            log "WARN canary response not IP-shaped: $canary_ip"
+            soft_fail=1 ;;
+        *)  # IP-shaped but different: the SOCKS chain works yet exits
+            # a non-dedicated address -- the binding is gone.
+            log "WARN canary egress $canary_ip != $DED_SERVER"
+            hard_fail=1
+            egress_drift=1 ;;
+    esac
+else
+    case "$curl_rc" in
+        97) hard_fail=1 ;;
+        *)  soft_fail=1 ;;
+    esac
+fi
+
+if [ "$hard_fail" -eq 0 ] && [ "$soft_fail" -eq 0 ]; then
+    rm -f "$STATE_DIR/fail_streak" "$STATE_DIR/flip_failed" 2>/dev/null
+    exit 0
+fi
+
+# ---- triage: is the SOCKS server reachable? --------------------------
+# The connect is initiated from the router itself, so OUTPUT-chain
+# tproxy steers it through the carrier (the guard rule pins
+# DED_SERVER/32 to the carrier group) -- the signal is "carrier AND
+# server both alive", independent of SOCKS credentials (a bare TCP
+# connect never reaches SOCKS5 negotiation).  Carrier outage therefore
+# lands in the streak branch, not the credential branch.
+# Caveat measured on the live system: some carrier paths complete TCP
+# handshakes to unroutable addresses (middlebox proxying), so a "TCP
+# OK" here can err toward reachable -- worst case the layer flips off
+# immediately instead of waiting out the streak, which is the same
+# safe end state (plain relay fallback).
+# Server and port are passed as positional args ($1/$2) -- conf values
+# never enter the script string, so they cannot inject shell code.
+mkdir -p "$STATE_DIR" 2>/dev/null
+streak=$(cat "$STATE_DIR/fail_streak" 2>/dev/null)
+case "$streak" in ''|*[!0-9]*) streak=0 ;; esac
+streak=$((streak + 1))
+# a failed write (full tmpfs) would silently reset the streak every
+# minute and soft failures would never reach DED_FAIL_MINUTES
+echo "$streak" > "$STATE_DIR/fail_streak" || log "WARN: cannot persist fail streak under $STATE_DIR"
+
+if [ "$egress_drift" -eq 1 ]; then
+    # The full SOCKS round trip succeeded but exited a non-dedicated
+    # address: the chain and the server are both alive (proven by the
+    # round trip itself), only the dedicated binding is gone.  No TCP
+    # re-check needed -- flip with the drift-specific reason.
+    reason="dedicated egress binding lost (egress $canary_ip != $DED_SERVER)"
+elif [ "$hard_fail" -eq 1 ] && command -v bash >/dev/null 2>&1; then
+    # shellcheck disable=SC2016  # $1/$2 are the bash -c script's own positional args, deliberately not shell-expanded here
+    if timeout 8 bash -c 'echo > /dev/tcp/$1/$2' _ "$DED_SERVER" "$DED_PORT" 2>/dev/null; then
+        reason="socks credential rejected (canary fail rc=$curl_rc, server reachable)"
+    else
+        if [ "$streak" -ge "$DED_FAIL_MINUTES" ]; then
+            reason="dedicated endpoint unreachable for ${streak}m (assumed reclaimed)"
+        else
+            log "canary hard-fail streak=$streak tcp=FAIL (carrier or server; waiting)"
+            exit 0
+        fi
+    fi
+else
+    # soft-only failure, or bash absent (no /dev/tcp triage possible on
+    # stripped builds): streak path only; say so instead of silently
+    # reporting the endpoint unreachable
+    if [ "$hard_fail" -eq 1 ]; then
+        log "bash absent; TCP triage skipped, streak path only -- credential-reject detection degrades to DED_FAIL_MINUTES"
+    fi
+    if [ "$streak" -ge "$DED_FAIL_MINUTES" ]; then
+        reason="canary failing for ${streak}m (rc=$curl_rc, non-SOCKS errors), assumed endpoint reclaimed"
+    else
+        log "canary soft-fail streak=$streak rc=$curl_rc (waiting)"
+        exit 0
+    fi
+fi
+# ---- flip to 0 and request one reconnect -----------------------------
+# Verify the flip actually landed: if the rewrite failed (read-only
+# fs, permissions, disk full) the conf still says 1 and a reconnect
+# would restart the proxy with the broken layer -- and the next canary
+# minute would repeat the cycle forever.  On a failed flip, log CRIT
+# (rate-limited to once via a marker: syslog spam helps nobody) and do
+# NOT request a reconnect; the operator reads the conf by hand.
+# Keep the template's quoted form.  The reader strips one pair of
+# quotes, so the bare form also parses; the quoted form is what the
+# installed conf actually contains.
+sed -i 's/^EXIT_VIA_DED=.*/EXIT_VIA_DED="0"/' "$CONF" 2>/dev/null
+if grep -q '^EXIT_VIA_DED="0"$' "$CONF" 2>/dev/null; then
+    log "ded-exit DISABLED: $reason; flipping EXIT_VIA_DED=0"
+    rm -f "$STATE_DIR/fail_streak" "$STATE_DIR/flip_failed" 2>/dev/null
+    touch "$RECONNECT_FILE" 2>/dev/null
+else
+    if [ ! -f "$STATE_DIR/flip_failed" ]; then
+        log "CRIT: EXIT_VIA_DED flip FAILED (conf rewrite error), layer stays on; manual fix required: $reason"
+        : > "$STATE_DIR/flip_failed" 2>/dev/null
+    fi
+    # The conf could not be rewritten (read-only rootfs): fall back to
+    # the tmpfs force-off marker so the next proxy start lands layer-off
+    # anyway, then request the reconnect.  Only reconnect when the
+    # marker actually landed -- otherwise a reconnect would restart the
+    # proxy with the broken layer still on.  reattach clears the marker
+    # after a successful probe once the operator repairs the conf.
+    : > /run/surflare_ded_force_off 2>/dev/null
+    [ -f /run/surflare_ded_force_off ] && touch "$RECONNECT_FILE" 2>/dev/null
+fi
+exit 0

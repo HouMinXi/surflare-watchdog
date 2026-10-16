@@ -1,0 +1,310 @@
+#!/bin/sh
+# surflare-proxy wrapper: patches urltest tolerance/interval before
+# forwarding stdin JSON to the real binary.
+# md5-gate: auto-restores patched binary if surflare auto-update replaces it.
+
+# Raise fd limit before exec'ing the real binary.  procd_set_param
+# limits in init.d sets rlimit on the watchdog script, but surflare
+# connect --daemon daemonizes (fork+setsid) and reparents the proxy
+# to PID 1, breaking rlimit inheritance.  Setting ulimit here
+# (inside the wrapper, closest to exec) guarantees the proxy gets
+# 65535 regardless of daemonize behavior.
+# shellcheck disable=SC3045  # busybox ash supports ulimit -n (verified: proxy runs at 65535)
+ulimit -n 65535 2>/dev/null || true
+
+REAL_BIN="/usr/bin/surflare-proxy.real"
+FALLBACK_BIN="/usr/local/lib/surflare-proxy-patched"
+EXPECTED_MD5="6bb16751e4e81853b7381f0cbc98a592"
+TOLERANCE=300
+INTERVAL="60s"
+# Domains missing from surflare's proxy_rule_set that must go through VPN.
+# Without this, sing-box catch-all (rule 10: tproxy-in -> direct) routes
+# them direct -> CN IP exposed or TLS handshake reset on direct route.
+INJECT_DOMAINS="claude.com,claude.ai,google.com,gemini.google.com,grokipedia.com,ipinfo.io,models.dev"
+# Domains pinned to the direct outbound, bypassing the VPN.  Use case:
+# home-hosted services fronted by Cloudflare Tunnel (omni.minxihou.site)
+# -- through the US exit a LAN request crosses the Pacific twice, while
+# direct CF anycast lands on the same PoP cloudflared dials from home.
+DIRECT_DOMAINS="minxihou.site"
+
+# Dedicated-IP egress layer: when /etc/surflare/ded-exit.conf sets
+# EXIT_VIA_DED=1, every proxied flow is chained through the dedicated
+# SOCKS exit, carried by the carrier urltest group (relay arrival is
+# what binds the session to the dedicated egress IP).  Incomplete or
+# non-numeric config disables the layer -- fail safe to plain relay.
+# The conf is parsed key-by-key (case whitelist below); it is never
+# sourced or eval'd, so shell metacharacters in a corrupted conf are
+# inert strings.  Keep this parser in sync with the copies in
+# surflare-ded-canary and surflare-ded-reattach.
+_ded_read_conf() {
+    EXIT_VIA_DED=""; DED_SERVER=""; DED_PORT=""; DED_USER=""; DED_PASS=""
+    [ -f "$1" ] || return 0
+    while IFS= read -r _l; do
+        case "$_l" in
+            EXIT_VIA_DED=*) EXIT_VIA_DED=${_l#EXIT_VIA_DED=} ;;
+            DED_SERVER=*)   DED_SERVER=${_l#DED_SERVER=} ;;
+            DED_PORT=*)     DED_PORT=${_l#DED_PORT=} ;;
+            DED_USER=*)     DED_USER=${_l#DED_USER=} ;;
+            DED_PASS=*)     DED_PASS=${_l#DED_PASS=} ;;
+        esac
+    done < "$1"
+    # strip one pair of surrounding double quotes (template style)
+    case "$EXIT_VIA_DED" in \"*\") EXIT_VIA_DED=${EXIT_VIA_DED#\"}; EXIT_VIA_DED=${EXIT_VIA_DED%\"} ;; esac
+    case "$DED_SERVER" in \"*\") DED_SERVER=${DED_SERVER#\"}; DED_SERVER=${DED_SERVER%\"} ;; esac
+    case "$DED_PORT" in \"*\") DED_PORT=${DED_PORT#\"}; DED_PORT=${DED_PORT%\"} ;; esac
+    case "$DED_USER" in \"*\") DED_USER=${DED_USER#\"}; DED_USER=${DED_USER%\"} ;; esac
+    case "$DED_PASS" in \"*\") DED_PASS=${DED_PASS#\"}; DED_PASS=${DED_PASS%\"} ;; esac
+}
+_ded_read_conf /etc/surflare/ded-exit.conf
+case "$EXIT_VIA_DED" in
+	1) ;;
+	*) EXIT_VIA_DED="" ;;
+esac
+# Read-only-rootfs escape hatch: when the canary cannot rewrite the conf
+# it drops this tmpfs marker instead, and the next proxy start honors
+# layer-off.  The marker only ever forces OFF; when absent the conf is
+# authoritative.  reattach removes it after a successful probe.
+[ -f /run/surflare_ded_force_off ] && EXIT_VIA_DED=""
+# Validate the parsed values: DED_SERVER must be a dotted-quad IPv4
+# literal and DED_PORT a TCP port 1-65535.  A hostname would build a
+# malformed ip_cidr guard rule (jq appends "/32" blindly) and sing-box
+# FATALs at startup, killing the whole proxy; shell metacharacters
+# must never reach the canary's bash -c /dev/tcp triage either.  Any
+# violation disables the layer -- fail safe to plain relay.
+# Positional-parameter safety: the set -- inside _ded_conf_valid only
+# affects that function's own parameters.  Verified on the target
+# busybox ash (v1.36.1): the caller's $@ is restored on return, so
+# exec "$REAL_BIN" "$@" at the end of this wrapper receives the
+# original arguments intact.
+_ded_conf_valid() {
+	case "$DED_PORT" in
+		''|*[!0-9]*) return 1 ;;
+	esac
+	[ "$DED_PORT" -ge 1 ] && [ "$DED_PORT" -le 65535 ] || return 1
+	case "$DED_SERVER" in
+		''|*[!0-9.]*) return 1 ;;
+	esac
+	_ifs=$IFS; IFS=.
+	# shellcheck disable=SC2086  # split on dots is the point; validated digits/dots only
+	set -- $DED_SERVER
+	IFS=$_ifs
+	[ $# -eq 4 ] || return 1
+	# template placeholders must never enable the layer
+	case "$DED_USER$DED_PASS" in *"<"*|*">"*) return 1 ;; esac
+	for _o in "$@"; do
+		case "$_o" in
+			''|*[!0-9]*) return 1 ;;
+			# leading-zero octet ("01"...): Go's strict IP parser
+			# rejects these, so sing-box would FATAL on the guard CIDR
+			0?*) return 1 ;;
+		esac
+		[ "$_o" -le 255 ] || return 1
+	done
+	return 0
+}
+if [ -n "$EXIT_VIA_DED" ]; then
+	if ! _ded_conf_valid; then
+		EXIT_VIA_DED=""
+		timeout 5 logger -t surflare-proxy "wrapper: ded-exit conf invalid (need IPv4 literal server, port 1-65535), layer disabled" 2>/dev/null || true
+	elif [ -z "$DED_USER" ] || [ -z "$DED_PASS" ]; then
+		EXIT_VIA_DED=""
+		timeout 5 logger -t surflare-proxy "wrapper: ded-exit conf incomplete, layer disabled" 2>/dev/null || true
+	fi
+fi
+
+# md5-gate: detect and rollback surflare auto-update
+_md5=$(md5sum "$REAL_BIN" 2>/dev/null | cut -d" " -f1)
+if [ "$_md5" != "$EXPECTED_MD5" ] && [ -x "$FALLBACK_BIN" ]; then
+	_fb_md5=$(md5sum "$FALLBACK_BIN" 2>/dev/null | cut -d" " -f1)
+	if [ "$_fb_md5" = "$EXPECTED_MD5" ]; then
+		# Capture new binary before rollback for diff analysis
+		_au_bin="/tmp/surflare-proxy-autoupdate-$(date +%Y%m%d_%H%M%S)"
+		cp "$REAL_BIN" "$_au_bin" && chmod 600 "$_au_bin"
+		timeout 5 logger -t surflare-proxy "auto-update rolled back (new binary saved to /tmp)" 2>/dev/null || true
+		cp "$FALLBACK_BIN" "$REAL_BIN"
+	fi
+fi
+
+# Detect --config stdin among arguments
+_stdin=0
+for a in "$@"; do
+	case "$a" in
+		stdin) _stdin=1 ;;
+	esac
+done
+
+if [ "$_stdin" -eq 0 ]; then
+	exec "$REAL_BIN" "$@"
+fi
+
+# Two-stage: save stdin, patch with jq, feed to real binary
+_tmp=$(mktemp) || exit 1
+_patched=$(mktemp) || { rm -f "$_tmp"; exit 1; }
+chmod 600 "$_tmp" "$_patched"
+trap 'rm -f "$_tmp" "$_patched"' EXIT
+# POSIX shells (busybox ash included) do not run the EXIT trap when
+# killed by an untrapped signal; route the catchables through the same
+# cleanup so a SIGTERM mid-jq does not leak the temp files.  After the
+# final exec the traps die with the old image, so this only ever covers
+# the pre-exec window.
+trap 'rm -f "$_tmp" "$_patched"; exit 143' TERM INT HUP
+
+cat > "$_tmp"
+# Dump pre-patch config for debugging (routing rules, DNS, outbounds).
+# Overwritten on each proxy restart.  chmod 600: contains server IPs.
+# Unpatched stdin carries outbound passwords. Default off.
+[ -n "$SURFLARE_DEBUG" ] && cp "$_tmp" /tmp/singbox-config-dump.json && chmod 600 /tmp/singbox-config-dump.json
+
+# Credentials travel via the environment, not --arg: /proc/<pid>/cmdline
+# is world-readable for the jq process lifetime, /proc/<pid>/environ is
+# root-only.
+export DED_SERVER DED_PORT DED_USER DED_PASS
+# Design note: dns.servers[].detour stays on the carrier on purpose --
+# DNS is UDP and the ded-exit layer chains TCP proxy traffic only; UDP
+# keeps egressing via the carrier relay by design.
+if jq --argjson T "$TOLERANCE" --arg I "$INTERVAL" --arg D "$INJECT_DOMAINS" --arg DD "$DIRECT_DOMAINS" --arg DE "$EXIT_VIA_DED" '
+  .outbounds |= map(if .type == "urltest" then .tolerance = $T | .interval = $I else . end)
+  | .route.rule_set |= map(if .tag == "proxy_rule_set" then .rules |= map(
+      if .domain_suffix then
+        .domain_suffix |= (. + ($D | split(",")) | unique)
+      else . end
+    ) else . end)
+  | if .dns.servers then
+      .dns.servers |= map(
+        # sing-box 1.12 DNS migration: {"address":"..."} ->
+        # {"type":"<scheme>","server":"<host>"}.  default_domain_
+        # resolver = dns-direct (CN DNS, direct detour) so dial
+        # does not depend on VPN (chicken-and-egg with dns_remote).
+        if (.address // "") | test("^[a-zA-Z]+://") then
+          .type = (.address
+              | capture("^(?<t>[a-zA-Z]+)://").t
+              | ascii_downcase)
+          | .server = (.address
+              | sub("^[a-zA-Z]+://"; "")
+              | sub("^.*@"; "")
+              | sub("/.*$"; "")
+            )
+          | if (.server | test(":[0-9]+$")) then
+              .server_port = (.server
+                  | sub(".*:"; "") | tonumber)
+              | .server = (.server
+                  | sub(":[0-9]+$"; ""))
+            else . end
+          | del(.address)
+        elif .address then
+          .type = "udp"
+          | .server = .address
+          | if (.server | test(":[0-9]+$")) then
+              .server_port = (.server
+                  | sub(".*:"; "") | tonumber)
+              | .server = (.server
+                  | sub(":[0-9]+$"; ""))
+            else . end
+          | del(.address)
+        else . end
+      )
+      | .route.default_domain_resolver = (
+          .route.default_domain_resolver
+          // {"server": "dns-direct"}
+        )
+    else . end
+  # DIRECT_DOMAINS: pin domains to the direct outbound.  The rule is
+  # inserted before the FIRST tproxy-in rule, not near the catch-all:
+  # the surflare tproxy rules reference rule_sets whose ip_cidr entries
+  # (Cloudflare ranges included) would otherwise claim these domains
+  # for the VPN before a later rule ever sees them.  Sniffing runs in
+  # rule 0, so the sniffed domain is available at this position.
+  # Entries are stripped of whitespace; empty entries are dropped and
+  # an empty list inserts no rule at all.  Insertion is skipped when
+  # no tproxy-in rule exists, so a surflare config layout change fails
+  # safe (traffic stays on the VPN path).
+  | ($DD | split(",") | map(gsub("[ \t]"; ""))
+      | map(select(length > 0))) as $dd
+  | ([.route.rules | to_entries[]
+      | select(((.value.inbound // [])
+          | if type == "array" then . else [.] end
+          | any(. == "tproxy-in"))) | .key][0]
+     // -1) as $pos
+  | if ($dd | length) > 0 and $pos >= 0 then
+      .route.rules |= (.[0:$pos]
+        + [{domain_suffix: $dd, inbound: "tproxy-in", outbound: "direct"}]
+        + .[$pos:])
+    else . end
+  # Find the active VPN urltest by type, not by a historical tag prefix.
+  # Transit-pinned sessions use tags such as mh_via_Washington_to_Atlanta;
+  # prefix-matching mh_via_auto_to silently fell back to direct and reopened
+  # the catch-all leak whenever TRANSIT was pinned.  udp_ exclusion skips
+  # the UDP-over-socks helper groups.  If no urltest survives the filter,
+  # log loudly and keep the direct fallback (traffic must not blackhole).
+  | ([.outbounds[] | select(.type == "urltest" and ((.tag | startswith("udp_")) | not))][0].tag // "direct") as $vpn
+  | . as $cfg
+  | if $vpn == "direct" then
+      "surflare-proxy wrapper: WARN no urltest outbound found, catch-all stays direct (config layout changed?)" | stderr | $cfg
+    else $cfg end
+  | .route.rules[-1].outbound = $vpn
+  | .route.final = $vpn
+  # Dedicated-IP egress layer (EXIT_VIA_DED=1): append a socks outbound
+  # to the dedicated exit, detoured through the carrier group.  Relay
+  # arrival binds the dedicated egress IP; detour must never be direct
+  # (a direct-dialed socks egresses a generic NAT instead).  Repoint
+  # every rule that used the carrier group at ded-exit, then prepend a
+  # guard rule that keeps connections TO the socks server itself on the
+  # plain carrier -- without it any local forwarder pointing at the
+  # proxy recurses socks-in-socks through ded-exit.
+  | if $DE == "1" and $vpn != "direct" then
+      .outbounds += [{
+        "type": "socks",
+        "tag": "ded-exit",
+        "server": $ENV.DED_SERVER,
+        "server_port": ($ENV.DED_PORT | tonumber),
+        "username": $ENV.DED_USER,
+        "password": $ENV.DED_PASS,
+        "detour": $vpn
+      }]
+      | .route.rules |= map(if .outbound == $vpn then .outbound = "ded-exit" else . end)
+      | .route.rules = [{"ip_cidr": [$ENV.DED_SERVER + "/32"], "outbound": $vpn}] + .route.rules
+      | .route.final = "ded-exit"
+      # Canary inbound: loopback-only port whose traffic follows
+      # route.final (ded-exit).  surflare-ded-canary probes it every
+      # minute; a failure triages the layer and can flip EXIT_VIA_DED
+      # to 0.  Loopback-only: not reachable from the LAN.
+      | .inbounds += [{
+        "type": "mixed",
+        "tag": "ded-canary-in",
+        "listen": "127.0.0.1",
+        "listen_port": 20814
+      }]
+    else . end
+' < "$_tmp" > "$_patched"; then
+	# The credentials above are only needed by jq; drop them before
+	# exec'ing the long-lived proxy so they never sit in its
+	# /proc/<pid>/environ for the process lifetime.
+	unset DED_SERVER DED_PORT DED_USER DED_PASS
+	# Persist patched config for surflare-upgrade's check step (tests a
+	# new .real against the actual patched config before swapping).
+	# Overwritten on each proxy restart.  chmod 600: contains server IPs.
+	# Failure is non-fatal -- proxy must not break if /tmp is unwritable.
+	# atomic (temp + rename): a concurrent reattach reading the shared
+	# copy mid-write would parse truncated JSON and fail for a day
+	( umask 077; cp "$_patched" /tmp/singbox-config-patched.json.new \
+	  && chmod 600 /tmp/singbox-config-patched.json.new \
+	  && mv /tmp/singbox-config-patched.json.new /tmp/singbox-config-patched.json ) 2>/dev/null || true
+	# The in-filter jq `stderr` line lands on our stderr (journal);
+	# mirror it to syslog so the silent-direct-fallback regression is
+	# visible in logread without scraping daemon output.  Check the
+	# OUTCOME (.route.final == "direct"), not the selection mechanism --
+	# duplicating the selector here would drift when the filter changes.
+	# Bounded like every watchdog logger call: a hung syslog daemon must
+	# not block exec of the real proxy binary.
+	if jq -e '.route.final == "direct"' "$_patched" >/dev/null 2>&1; then
+		timeout 5 logger -t surflare-proxy "wrapper: no urltest outbound found, catch-all stays direct" 2>/dev/null || true
+	fi
+	exec < "$_patched"
+	rm -f "$_tmp" "$_patched"
+	exec "$REAL_BIN" "$@"
+else
+	# Abort: jq patch failed. Exec on unpatched stdin would reopen the catch-all leak.
+	timeout 5 logger -t surflare-proxy "wrapper: jq patch failed, aborting to prevent catch-all leak" 2>/dev/null || true
+	rm -f "$_tmp" "$_patched"
+	exit 1
+fi

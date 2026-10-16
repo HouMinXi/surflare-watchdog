@@ -1,0 +1,42 @@
+# ded-exit.conf -- dedicated-IP egress layer control (survives redeploys,
+# same mechanism as mode.conf / dedicated.conf). Read by the
+# surflare-proxy wrapper on every proxy start.
+#
+# EXIT_VIA_DED=1  all proxied flows chain through the dedicated SOCKS
+#                 exit, carried by the carrier urltest group (relay
+#                 arrival is what binds the session to the dedicated
+#                 egress IP; a direct-dialed socks egresses a generic
+#                 NAT instead, so detour must never be "direct").
+# EXIT_VIA_DED=0  layer disabled; the wrapper's jq filter output is
+#                 byte-identical to the pre-ded-exit filter (verified
+#                 by md5 in tests/ded-exit-inject.sh), i.e. plain relay.
+#
+# DED_SERVER/PORT/USER/PASS: the dedicated SOCKS endpoint sold by the
+# provider app.  Port must be numeric; incomplete or malformed config
+# disables the layer and logs to syslog (tag surflare-proxy) -- fail
+# safe to plain relay.
+#
+# Credential rotation: unknown cadence.  The canary
+# (surflare-ded-canary) detects a revoked credential on the next 1-minute probe tick
+# and flips EXIT_VIA_DED to 0; the daily re-attach probe flips it back
+# only after a shadow-instance probe succeeds.
+#
+# NOTE: this template contains NO credentials.  Deploy as
+# /etc/surflare/ded-exit.conf on the router with the real values from
+# the provider app (SOCKS5 Proxy card).  The real file must never be
+# committed to this repository.
+# DEPLOY: replace every <...> placeholder below with the real value
+# from the provider app before copying to the router.  Leftover
+# placeholders are rejected by the validator and the layer stays off.
+#
+# Values are taken verbatim to the end of the line -- no inline
+# comments after a value (the parser does not strip them and the
+# validator would reject the whole layer); put comments on their own
+# line.  A password may contain # safely when quoted normally.
+# Keys must start at column 0 -- a leading space or tab makes the
+# parser silently skip the line.
+EXIT_VIA_DED="0"
+DED_SERVER="<SOCKS server from provider app>"
+DED_PORT="<SOCKS port from provider app>"
+DED_USER="<SOCKS username from provider app>"
+DED_PASS="<SOCKS password from provider app>"

@@ -1,0 +1,276 @@
+#!/bin/sh
+# surflare-ded-reattach -- daily probe that re-enables the ded-exit
+# layer after the canary disabled it.
+#
+# Runs once daily from cron (04:30, deterministic).  Builds a shadow
+# proxy config from the LIVE patched config (/tmp/singbox-config-
+# patched.json, which the wrapper refreshes on every proxy start) with
+# a loopback-only mixed inbound on 127.0.0.1:20815, runs the real
+# binary against it, and performs one end-to-end fetch.  The shadow
+# outbound mirrors the production ded-exit injection EXACTLY -- socks
+# outbound with credentials AND detour through the carrier group
+# (relay arrival is what binds the dedicated egress; a direct-dialed
+# socks egresses a generic NAT).  The live proxy is never touched; the
+# shadow instance is killed even on abnormal exit (trap).
+#
+# Success: flip EXIT_VIA_DED back to 1 and request one reconnect.
+# Failure: log and leave the layer off; retry next day.
+#
+# Exit codes: 0 = probe ran (outcome logged); 1 = internal error
+# (e.g. no live config to build from).
+
+CONF="/etc/surflare/ded-exit.conf"
+# The canary flips this conf too; share ITS lock so a 04:30 reattach
+# cannot interleave with a canary flip inside the same minute.
+CANARY_LOCK_DIR="/run/surflare-ded-canary"
+PATCHED="/tmp/singbox-config-patched.json"
+SHADOW_DIR="/run/surflare-ded-reattach"
+SHADOW_CFG="$SHADOW_DIR/shadow.json"
+SHADOW_PORT=20815
+PROBE_URL="https://checkip.amazonaws.com"
+PROBE_URL_FALLBACK="https://api.ipify.org"
+REAL_BIN="/usr/bin/surflare-proxy.real"
+RECONNECT_FILE="/run/surflare_watchdog_reconnect_request"
+LOG_TAG="surflare-ded-reattach"
+
+log() { timeout 5 logger -t "$LOG_TAG" "$*" 2>/dev/null || true; }
+
+# Parse only the known keys; never source or eval the file (a corrupted
+# conf must not execute shell code as root).  Keep this parser in sync
+# with the copies in the surflare-proxy wrapper and surflare-ded-canary.
+_ded_read_conf() {
+    EXIT_VIA_DED=""; DED_SERVER=""; DED_PORT=""; DED_USER=""; DED_PASS=""
+    [ -f "$1" ] || return 0
+    while IFS= read -r _l; do
+        case "$_l" in
+            EXIT_VIA_DED=*) EXIT_VIA_DED=${_l#EXIT_VIA_DED=} ;;
+            DED_SERVER=*)   DED_SERVER=${_l#DED_SERVER=} ;;
+            DED_PORT=*)     DED_PORT=${_l#DED_PORT=} ;;
+            DED_USER=*)     DED_USER=${_l#DED_USER=} ;;
+            DED_PASS=*)     DED_PASS=${_l#DED_PASS=} ;;
+        esac
+    done < "$1"
+    case "$EXIT_VIA_DED" in \"*\") EXIT_VIA_DED=${EXIT_VIA_DED#\"}; EXIT_VIA_DED=${EXIT_VIA_DED%\"} ;; esac
+    case "$DED_SERVER" in \"*\") DED_SERVER=${DED_SERVER#\"}; DED_SERVER=${DED_SERVER%\"} ;; esac
+    case "$DED_PORT" in \"*\") DED_PORT=${DED_PORT#\"}; DED_PORT=${DED_PORT%\"} ;; esac
+    case "$DED_USER" in \"*\") DED_USER=${DED_USER#\"}; DED_USER=${DED_USER%\"} ;; esac
+    case "$DED_PASS" in \"*\") DED_PASS=${DED_PASS#\"}; DED_PASS=${DED_PASS%\"} ;; esac
+}
+# IPv4-literal server + TCP port range, same rules as the wrapper and
+# the canary: a hostname would build a malformed guard CIDR in the
+# shadow config below.  (The binary check gate would catch it too;
+# validating here keeps the log message honest.)
+_ded_conf_valid() {
+    case "$DED_PORT" in
+        ''|*[!0-9]*) return 1 ;;
+    esac
+    [ "$DED_PORT" -ge 1 ] && [ "$DED_PORT" -le 65535 ] || return 1
+    case "$DED_SERVER" in
+        ''|*[!0-9.]*) return 1 ;;
+    esac
+    _ifs=$IFS; IFS=.
+    # shellcheck disable=SC2086  # split on dots is the point; validated digits/dots only
+    set -- $DED_SERVER
+    IFS=$_ifs
+    [ $# -eq 4 ] || return 1
+    # template placeholders must never enable the layer
+    case "$DED_USER$DED_PASS" in *"<"*|*">"*) return 1 ;; esac
+    for _o in "$@"; do
+        case "$_o" in
+            ''|*[!0-9]*) return 1 ;;
+            # leading-zero octet ("01"...): Go's strict IP parser
+            # rejects these, so sing-box would FATAL on the guard CIDR
+            0?*) return 1 ;;
+        esac
+        [ "$_o" -le 255 ] || return 1
+    done
+    return 0
+}
+_ded_read_conf "$CONF"
+
+[ -n "$DED_SERVER" ] && [ -n "$DED_PORT" ] && [ -n "$DED_USER" ] && [ -n "$DED_PASS" ] || { log "reattach: conf incomplete"; exit 1; }
+_ded_conf_valid || { log "reattach: conf invalid (need IPv4 literal server, port 1-65535)"; exit 1; }
+[ -f "$PATCHED" ] || { log "reattach: no live patched config"; exit 1; }
+
+# Take the canary's lock.  The canary's worst-case hold is two
+# --max-time probes plus the TCP triage (~47s), so wait well past that
+# (90s); on timeout skip the run -- tomorrow retries.  Without flock
+# (minimal builds) proceed unlocked.
+if command -v flock >/dev/null 2>&1; then
+    mkdir -p "$CANARY_LOCK_DIR" 2>/dev/null
+    if [ ! -d "$CANARY_LOCK_DIR" ]; then
+        log "reattach: CANARY_LOCK_DIR $CANARY_LOCK_DIR unavailable (mkdir failed) -- skipping run"
+        exit 1
+    fi
+    # no "|| exit 0" on the exec: in POSIX sh a failed exec redirection
+    # exits the shell outright (verified on busybox ash 1.36.1), so the
+    # clause would be unreachable dead code
+    exec 9>"$CANARY_LOCK_DIR/lock" 2>/dev/null
+    flock -w 90 9 2>/dev/null || exit 0
+fi
+
+case "$EXIT_VIA_DED" in
+    1) exit 0 ;;   # already enabled; canary owns monitoring
+esac
+
+# ---- build shadow config (loopback-only test inbound) ----------------
+# jq program mirrors the wrapper's ded-exit injection so the shadow
+# probes the exact production chain shape (ded-exit with credentials
+# over carrier), not a simplified one.  Any leftover ded-exit outbound
+# from a pre-flip patched config is stripped first -- appending onto a
+# config that still carries one would create a duplicate tag and fail
+# the binary check gate below, locking the layer out for a full day.
+# Existing guard rules for the same server are stripped too: a patched
+# config generated in the OPEN state already carries one, and
+# prepending on top would duplicate it.
+# The shadow replaces ALL inbounds with its single loopback listener on
+# purpose: production listeners (tproxy :10800) must not exist in the
+# shadow, so nothing but the probe can route through it.
+mkdir -p "$SHADOW_DIR" 2>/dev/null
+export DED_SERVER DED_PORT DED_USER DED_PASS
+if ! jq \
+     '([.outbounds[] | select(.type == "urltest" and ((.tag | startswith("udp_")) | not))][0].tag // "direct") as $vpn
+      | if $vpn == "direct" then error("no carrier urltest in live config") else . end
+      | .outbounds |= map(select(.tag != "ded-exit"))
+      | .outbounds += [{"type":"socks","tag":"ded-exit","server":$ENV.DED_SERVER,"server_port":($ENV.DED_PORT|tonumber),"username":$ENV.DED_USER,"password":$ENV.DED_PASS,"detour":$vpn}]
+      | .route.rules |= map(if .outbound == $vpn then .outbound = "ded-exit" else . end)
+      | .route.rules |= map(select(.ip_cidr != [$ENV.DED_SERVER + "/32"]))
+      | .route.rules = [{"ip_cidr": [$ENV.DED_SERVER + "/32"], "outbound": $vpn}] + .route.rules
+      | .route.final = "ded-exit"
+      | .inbounds = [{"type":"mixed","tag":"shadow-in","listen":"127.0.0.1","listen_port":'"$SHADOW_PORT"'}]' \
+     "$PATCHED" > "$SHADOW_CFG" 2>"$SHADOW_DIR/.jq.err"; then
+    # surface jq's own diagnostic (e.g. "no carrier urltest in live
+    # config") -- swallowed stderr leaves the daily failure unexplained
+    log "reattach: shadow config build failed: $(head -c 200 "$SHADOW_DIR/.jq.err" 2>/dev/null)"
+    rm -f "$SHADOW_DIR/.jq.err"
+    exit 1
+fi
+rm -f "$SHADOW_DIR/.jq.err"
+# jq is the only consumer of the credentials; drop them before spawning
+# the shadow proxy so they never sit in its /proc/<pid>/environ.
+# DED_SERVER stays set: the probe-equality check below still needs it
+# (and it is the endpoint identity, not a secret -- it is baked into
+# the shadow config itself).
+unset DED_USER DED_PASS
+chmod 600 "$SHADOW_CFG"
+
+if ! "$REAL_BIN" check --config "$SHADOW_CFG" >/dev/null 2>&1; then
+    log "reattach: shadow config failed binary decode gate"
+    rm -f "$SHADOW_CFG"
+    exit 1
+fi
+
+# ---- run shadow + probe ----------------------------------------------
+# Kill a leftover shadow from a previous crashed run first: it holds
+# :20815 and would corrupt this probe.
+if [ -f "$SHADOW_DIR/shadow.pid" ]; then
+    # verify the pid still belongs to a surflare binary before killing:
+    # a recycled pid would terminate an unrelated process
+    _sp=$(cat "$SHADOW_DIR/shadow.pid" 2>/dev/null)
+    case "$(readlink "/proc/$_sp/exe" 2>/dev/null)" in
+        *surflare-proxy*) kill "$_sp" 2>/dev/null ;;
+    esac
+    rm -f "$SHADOW_DIR/shadow.pid"
+    sleep 1
+fi
+# A SIGKILL in the spawn->pidfile window leaves an orphan shadow that
+# holds :20815 with NO pidfile; the stale cleanup above cannot see it
+# and today's probe would be answered by yesterday's config.  Detect a
+# listener via /proc/net/tcp (col 2 hex port, col 4 0A=LISTEN), find
+# the owner by socket inode, and kill it only when its exe provably is
+# a surflare binary -- same identity guard as the pidfile path.
+if awk -v want="$(printf '%04X' "$SHADOW_PORT")" '
+    FNR > 1 { split($2, a, ":"); if (a[2] == want && $4 == "0A") { found = 1; exit } }
+    END { exit !found }
+' /proc/net/tcp /proc/net/tcp6 2>/dev/null; then
+    _ino=$(awk -v want="$(printf '%04X' "$SHADOW_PORT")" '
+        FNR > 1 { split($2, a, ":"); if (a[2] == want && $4 == "0A") { print $10; exit } }
+    ' /proc/net/tcp /proc/net/tcp6 2>/dev/null)
+    _opid=""
+    for _p in /proc/[0-9]*; do
+        [ -n "$_opid" ] && break
+        for _fd in "$_p"/fd/*; do
+            if [ "$(readlink "$_fd" 2>/dev/null)" = "socket:[$_ino]" ]; then
+                _opid=${_p#/proc/}
+                break
+            fi
+        done
+    done
+    if [ -n "$_opid" ]; then
+        case "$(readlink "/proc/$_opid/exe" 2>/dev/null)" in
+            *surflare-proxy*)
+                log "reattach: killing orphan shadow pid $_opid on :$SHADOW_PORT"
+                kill "$_opid" 2>/dev/null
+                sleep 1
+                ;;
+            *)
+                log "reattach: CRIT port $SHADOW_PORT held by non-surflare pid $_opid -- refusing to probe a stranger"
+                exit 1
+                ;;
+        esac
+    else
+        log "reattach: CRIT port $SHADOW_PORT listening but owner not found -- refusing to probe a stranger"
+        exit 1
+    fi
+fi
+# Install the cleanup trap BEFORE launching the shadow so no signal
+# window exists between spawn and trap registration; the pid is read
+# back from the pidfile at fire time (empty file -> kill is skipped,
+# file cleanup still runs).  EXIT alone does not fire on signal death
+# in busybox ash, so TERM/INT/HUP route through the same idempotent
+# cleanup; SIGKILL is uncatchable and is covered by the next day's
+# stale-pidfile cleanup above.
+# shellcheck disable=SC2329  # invoked indirectly as the EXIT/TERM/INT/HUP trap handler
+_shadow_cleanup() {
+    p=$(cat "$SHADOW_DIR/shadow.pid" 2>/dev/null)
+    [ -n "$p" ] && kill "$p" 2>/dev/null
+    rm -f "$SHADOW_CFG" "$SHADOW_DIR/shadow.pid"
+}
+trap _shadow_cleanup EXIT
+trap '_shadow_cleanup; exit 143' TERM INT HUP
+"$REAL_BIN" run --config "$SHADOW_CFG" >/dev/null 2>&1 &
+echo $! > "$SHADOW_DIR/shadow.pid"
+# Bounded readiness loop: a fixed sleep would false-negative on a
+# loaded router (proxy not yet listening -> probe fails -> layer
+# stays disabled a full day).  Probe early, retry each second, give
+# up after 10 attempts; the probe itself has its own timeout.
+ip=""
+i=0
+while [ $i -lt 10 ]; do
+    for u in "$PROBE_URL" "$PROBE_URL_FALLBACK"; do
+        ip=$(curl -s --max-time 8 -x "socks5h://127.0.0.1:$SHADOW_PORT" "$u" 2>/dev/null | head -c 64 | tr -d '\r\n')
+        [ -n "$ip" ] && break 2
+    done
+    i=$((i + 1))
+    sleep 1
+done
+# release :20815 before evaluating the result; the EXIT trap owns
+# the final pidfile/config cleanup
+kill "$(cat "$SHADOW_DIR/shadow.pid" 2>/dev/null)" 2>/dev/null
+
+if [ "$ip" = "$DED_SERVER" ]; then
+    # Verify the flip landed before requesting a reconnect: a silent
+    # sed failure would leave the layer off while the proxy restarts,
+    # and tomorrow's reattach would probe an already-enabled layer.
+    # Exact-match against DED_SERVER is deliberate: if the provider
+    # rotated the dedicated IP, the conf is stale and enabling it
+    # would route traffic to a stranger's endpoint -- stay disabled
+    # and let the operator update the conf.
+    # Keep the template's quoted form (EXIT_VIA_DED="1").  The reader
+    # strips one pair of quotes, so the bare form also parses, but a
+    # flip that drops the quotes drifts from the file the operator
+    # installed.
+    sed -i 's/^EXIT_VIA_DED=.*/EXIT_VIA_DED="1"/' "$CONF" 2>/dev/null
+    if grep -q '^EXIT_VIA_DED="1"$' "$CONF" 2>/dev/null; then
+        log "reattach: probe egress $ip OK -> EXIT_VIA_DED=1, reconnect requested"
+        # drop the canary's read-only-rootfs escape marker (if any) so
+        # the repaired conf is authoritative again
+        rm -f /run/surflare_ded_force_off 2>/dev/null
+        touch "$RECONNECT_FILE" 2>/dev/null
+    else
+        log "CRIT: reattach EXIT_VIA_DED=1 flip FAILED (conf rewrite error); layer stays off"
+    fi
+else
+    log "reattach: probe failed (egress=${ip:-none}), staying disabled"
+fi
+exit 0

@@ -1,0 +1,94 @@
+#!/bin/sh /etc/rc.common
+# surflare-dedicated -- dedicated-egress layer services.
+#
+# Starts nothing long-running itself.  Installs the canary cron entries
+# (every-minute health probe + daily 04:30 re-attach probe) at enable
+# time and removes them at disable time.  The proxy-side ded-exit
+# injection lives in the surflare-proxy wrapper (see router/surflare-proxy
+# and router/services/surflare-dedicated/ded-exit.conf); this service
+# only owns canary + reattach scheduling.
+#
+# The standalone :20812 forwarder that shipped in the first iteration
+# is retired: with ded-exit injected into the main proxy, the canary
+# inbound (127.0.0.1:20814) provides the same reachability signal
+# inside the single production process.
+
+# shellcheck disable=SC2034  # read by the OpenWrt rc.common/procd framework
+START=99
+# shellcheck disable=SC2034  # read by the OpenWrt rc.common/procd framework
+STOP=10
+
+CRON_CANARY='* * * * * /usr/local/sbin/surflare-ded-canary'
+CRON_REATTACH='30 4 * * * /usr/local/sbin/surflare-ded-reattach'
+CRON_TAG_BEGIN='# surflare-dedicated BEGIN'
+CRON_TAG_END='# surflare-dedicated END'
+
+# Drop any previous tagged cron block using full-line equality (awk
+# index of exact strings), not sed regex addresses: the tag contains
+# a "." that would otherwise act as a metacharacter, and a hand-edited
+# line between the tags must not silently widen the match.
+_cron_drop_block() {
+    # shellcheck disable=SC3043  # OpenWrt ash supports local
+    local f="$1"
+    [ -f "$f" ] || return 0
+    awk -v b="$CRON_TAG_BEGIN" -v e="$CRON_TAG_END" '
+        $0 == b { skip = 1; next }
+        $0 == e { skip = 0; next }
+        !skip { print }
+    ' "$f" > "$f.new" && mv "$f.new" "$f"
+}
+
+install_cron() {
+    # shellcheck disable=SC3043  # OpenWrt ash supports local
+    local f="/etc/crontabs/root"
+    touch "$f" || { timeout 5 logger -t surflare-dedicated "cannot write $f (read-only fs?); cron NOT installed"; return 1; }
+    # idempotent: drop any previous block first; abort if the drop
+    # failed, otherwise appending would stack a duplicate block
+    _cron_drop_block "$f" || { timeout 5 logger -t surflare-dedicated "cron block drop failed on $f; NOT appending"; return 1; }
+    {
+        echo "$CRON_TAG_BEGIN"
+        echo "$CRON_CANARY"
+        echo "$CRON_REATTACH"
+        echo "$CRON_TAG_END"
+    } >> "$f"
+    /etc/init.d/cron reload 2>/dev/null || /etc/init.d/cron restart 2>/dev/null || true
+    # a written-but-dead crond leaves the entries inert until the next
+    # manual restart -- surface a dead daemon instead of reporting a
+    # healthy start (same philosophy as the block-count check below)
+    # pidof matches the exact process name (comm): catches busybox crond
+    # and vixie cron, ignores lookalikes like a user-run "cron-helper"
+    pidof crond >/dev/null 2>&1 || pidof cron >/dev/null 2>&1 \
+        || { timeout 5 logger -t surflare-dedicated "cron daemon not running after reload; cron entries inert"; return 1; }
+    # verify the block actually landed; a full disk or RO remount makes
+    # every write above fail silently otherwise -- surface it to the
+    # init system instead of reporting a healthy start
+    # exactly one block: presence alone would miss a stacked duplicate
+    [ "$(grep -cF "$CRON_TAG_BEGIN" "$f")" -eq 1 ] || { timeout 5 logger -t surflare-dedicated "cron block count wrong after install; check $f"; return 1; }
+}
+
+remove_cron() {
+    # shellcheck disable=SC3043  # OpenWrt ash supports local
+    local f="/etc/crontabs/root"
+    [ -f "$f" ] || return 0
+    _cron_drop_block "$f"
+    /etc/init.d/cron reload 2>/dev/null || /etc/init.d/cron restart 2>/dev/null || true
+}
+
+start() {
+    # The probe scripts themselves are installed by the deploy runbook
+    # (they ship with the wrapper update, not with this init file);
+    # verify they exist so a cron line referencing a missing file
+    # cannot masquerade as a healthy start.
+    for s in /usr/local/sbin/surflare-ded-canary /usr/local/sbin/surflare-ded-reattach; do
+        [ -x "$s" ] || { timeout 5 logger -t surflare-dedicated "missing $s (deploy incomplete); not installing cron"; return 1; }
+    done
+    install_cron || return 1
+    timeout 5 logger -t surflare-dedicated "canary + reattach cron installed"
+    return 0
+}
+
+stop() {
+    remove_cron
+    timeout 5 logger -t surflare-dedicated "canary + reattach cron removed"
+    return 0
+}
