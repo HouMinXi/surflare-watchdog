@@ -44,10 +44,11 @@ description.
 - J3b: unquoted conf values parse like quoted ones
 - J6: layer ON + no carrier urltest -> graceful no-injection
 - J7: conf parser/validator identical across wrapper/canary/reattach
-- base port-80: bypass rule sits at rules[1] (right after the guard)
-  and keeps plain HTTP on the carrier -- the dedicated SOCKS refuses
-  port 80 with code=5
-- J10: port-80 bypass removed -> assertion red as expected
+- base bypass: Facebook 66.220.148.145/32 then port 80 sit immediately
+  before the first port-unconstrained ded-exit rule and stay on the
+  carrier. The dedicated SOCKS refuses that address on 443 and refuses
+  plain HTTP, both with code=5
+- J10: the paired bypass insert removed -> assertion red as expected
 - baseline: filter-old.jq matches its frozen md5
 - base canary-port assertion cross-references CANARY_PORT dynamically
 

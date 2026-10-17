@@ -48,13 +48,13 @@ else
     echo "FAIL base final"; fail=1
 fi
 
-# The dedicated SOCKS refuses plain HTTP (code=5, observed on live):
-# the bypass must sit right before the first port-unconstrained
-# ded-exit rule, so rules that already name a port (captive-portal
-# probes, DNS hijack) keep their own outbound.
+# The dedicated SOCKS refuses plain HTTP and one Facebook address on
+# 443 (66.220.148.145, code=5 on live).  Both bypasses sit immediately
+# before the first port-unconstrained ded-exit rule, address then port
+# 80, so rules that already name a port keep their own outbound.
 _p80=$(jq -r 'first(.route.rules | to_entries[] | select(.value.outbound == "ded-exit" and (.value | has("port") | not)) | .key)' /tmp/inj-base.json)
-if jq -e --argjson i "$_p80" '.route.rules[($i - 1)].port == [80] and .route.rules[($i - 1)].outbound != "ded-exit" and .route.rules[($i - 1)].outbound != "direct"' /tmp/inj-base.json >/dev/null; then
-    echo "PASS base: port-80 bypass sits before the first unconstrained ded-exit rule"
+if jq -e --argjson i "$_p80" '.route.rules[($i - 2)].ip_cidr == ["66.220.148.145/32"] and .route.rules[($i - 1)].port == [80] and .route.rules[($i - 1)].outbound != "ded-exit" and .route.rules[($i - 1)].outbound != "direct" and .route.rules[($i - 2)].outbound == .route.rules[($i - 1)].outbound' /tmp/inj-base.json >/dev/null; then
+    echo "PASS base: facebook and port-80 bypass sit before the first unconstrained ded-exit rule"
 else
     echo "FAIL base port80"; fail=1
 fi
