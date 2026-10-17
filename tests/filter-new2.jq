@@ -98,6 +98,13 @@
       }]
       | .route.rules |= map(if .outbound == $vpn then .outbound = "ded-exit" else . end)
       | .route.rules = [{"ip_cidr": [$ENV.DED_SERVER + "/32"], "outbound": $vpn}] + .route.rules
+      # Plain HTTP bypass: the dedicated SOCKS refuses port 80 with
+      # code=5 (observed on live).  Insert the bypass once, immediately
+      # before the first port-unconstrained ded-exit rule, so every
+      # rule that already names a port (captive-portal probes, DNS
+      # hijack) keeps its own outbound and only the catch-all is
+      # detoured to the carrier.
+      | .route.rules |= (first(to_entries[] | select(.value.outbound == "ded-exit" and (.value | has("port") | not)) | .key) as $i | .[0:$i] + [{"port": [80], "outbound": $vpn}] + .[$i:])
       | .route.final = "ded-exit"
       # Canary inbound: loopback-only port whose traffic follows
       # route.final (ded-exit).  surflare-ded-canary probes it every
