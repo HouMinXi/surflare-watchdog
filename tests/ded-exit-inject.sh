@@ -47,6 +47,30 @@ if jq -e '.route.final == "ded-exit"' /tmp/inj-base.json >/dev/null; then
 else
     echo "FAIL base final"; fail=1
 fi
+
+# The dedicated SOCKS refuses plain HTTP (code=5, observed on live):
+# the bypass must sit right before the first port-unconstrained
+# ded-exit rule, so rules that already name a port (captive-portal
+# probes, DNS hijack) keep their own outbound.
+_p80=$(jq -r 'first(.route.rules | to_entries[] | select(.value.outbound == "ded-exit" and (.value | has("port") | not)) | .key)' /tmp/inj-base.json)
+if jq -e --argjson i "$_p80" '.route.rules[($i - 1)].port == [80] and .route.rules[($i - 1)].outbound != "ded-exit" and .route.rules[($i - 1)].outbound != "direct"' /tmp/inj-base.json >/dev/null; then
+    echo "PASS base: port-80 bypass sits before the first unconstrained ded-exit rule"
+else
+    echo "FAIL base port80"; fail=1
+fi
+
+# --- J10: without the port-80 bypass rule the assertion above goes red
+# shellcheck disable=SC2016  # $i/$vpn are LITERAL jq tokens in the
+# filter file being edited, not shell expansions to perform
+sed '/first(to_entries\[\] | select(.value.outbound == "ded-exit"/,/ + .[\$$i:])/d' "$FILTER" > /tmp/filter-j10.jq
+jq --argjson T 300 --arg I 60s --arg D claude.com,claude.ai,google.com --arg DD minxihou.site \
+   --arg DE 1 \
+   -f /tmp/filter-j10.jq "$IN" > /tmp/inj-j10.json
+if jq -e --argjson i "$_p80" '.route.rules[($i - 1)].port == [80] and .route.rules[($i - 1)].outbound != "ded-exit"' /tmp/inj-j10.json >/dev/null; then
+    echo "FAIL J10: port-80 bypass still present after injection (injection ineffective)"; fail=1
+else
+    echo "PASS J10: port-80 bypass gone -> assertion correctly red"
+fi
 if jq -e '([.outbounds[] | select(.tag == "ded-exit" and .detour != null and .detour != "direct")] | length == 1) and ([.route.rules[] | select(.ip_cidr == ["'"$DED_IP"'/32"] and .outbound != "ded-exit")] | length == 1)' /tmp/inj-base.json >/dev/null; then
     echo "PASS base: ded-exit detours via carrier; guard rule stays on carrier"
 else
@@ -56,7 +80,7 @@ fi
 # --- J1: remove guard prepend ---------------------------------------
 # shellcheck disable=SC2016  # $ENV/$vpn are LITERAL jq tokens in the
 # filter file being edited, not shell expansions to perform
-sed 's#| .route.rules = \[{"ip_cidr": \[\$ENV\.DED_SERVER + "/32"\], "outbound": \$vpn}\] + .route.rules##' "$FILTER" > /tmp/filter-j1.jq
+sed 's#{"ip_cidr": \[\$ENV\.DED_SERVER + "/32"\], "outbound": \$vpn}##' "$FILTER" > /tmp/filter-j1.jq
 jq --argjson T 300 --arg I 60s --arg D claude.com,claude.ai,google.com --arg DD minxihou.site \
    --arg DE 1 \
    -f /tmp/filter-j1.jq "$IN" > /tmp/inj-j1.json
