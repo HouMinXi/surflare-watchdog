@@ -135,9 +135,10 @@ if ! jq \
       | .outbounds += [{"type":"socks","tag":"ded-exit","server":$ENV.DED_SERVER,"server_port":($ENV.DED_PORT|tonumber),"username":$ENV.DED_USER,"password":$ENV.DED_PASS,"detour":$vpn}]
       | .route.rules |= map(if .outbound == $vpn then .outbound = "ded-exit" else . end)
       | .route.rules |= map(select(.ip_cidr != [$ENV.DED_SERVER + "/32"]))
+      | .route.rules |= map(select(.ip_cidr != ["66.220.148.145/32"]))
       | .route.rules |= map(select(.port != [80]))
       | .route.rules = [{"ip_cidr": [$ENV.DED_SERVER + "/32"], "outbound": $vpn}] + .route.rules
-      | .route.rules |= (first(to_entries[] | select(.value.outbound == "ded-exit" and (.value | has("port") | not)) | .key) as $i | .[0:$i] + [{"port": [80], "outbound": $vpn}] + .[$i:])
+      | .route.rules |= (first(to_entries[] | select(.value.outbound == "ded-exit" and (.value | has("port") | not)) | .key) as $i | .[0:$i] + [{"ip_cidr": ["66.220.148.145/32"], "outbound": $vpn}, {"port": [80], "outbound": $vpn}] + .[$i:])
       | .route.final = "ded-exit"
       | .inbounds = [{"type":"mixed","tag":"shadow-in","listen":"127.0.0.1","listen_port":'"$SHADOW_PORT"'}]' \
      "$PATCHED" > "$SHADOW_CFG" 2>"$SHADOW_DIR/.jq.err"; then
