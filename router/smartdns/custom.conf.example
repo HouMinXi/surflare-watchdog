@@ -65,6 +65,7 @@ conf-file /etc/smartdns/force-foreign.conf
 
 # Gmail SMTP 465/587: resolved IPs go in gmail_smtp nftset (ISP direct).
 conf-file /etc/smartdns/gmail-smtp.conf
+conf-file /etc/smartdns/surflare-control.conf
 
 
 # -- Bing: force CN IP DIRECT path (VPN exit IPs trigger redirect loop) --

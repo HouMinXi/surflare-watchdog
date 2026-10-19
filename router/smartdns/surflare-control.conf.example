@@ -1,0 +1,46 @@
+# Surflare control plane (www.surflare.com / murk.surflare.com) --
+# WAN-direct from LAN clients, not through the VPN exit.
+#
+# Why: the control-plane host sits in Germany, not in the CN bypass
+# lists, so LAN 443 to it rides the tproxy into sing-box.  When the
+# tunnel is down sing-box RSTs those connections -- the web panel is
+# then unreachable from every LAN browser exactly when it is needed
+# (2026-10-02 outage).  The router's own CLI/probes are unaffected
+# (killswitch OUTPUT server_ips bypass + --interface pppoe-wan); note
+# that plain router-origin browser traffic to the panel is NOT covered
+# by the OUTPUT bypass (live A/B 2026-10-02: default route goes through
+# the dead vendor mark path) -- only the explicit probes are.
+#
+# Resolve via the domestic group, NOT the default foreign group: the
+# foreign group rides the tunnel, so during an outage SmartDNS would
+# SERVFAIL, the nftset would never fill (or expire), and the bypass
+# would die 1-2h into exactly the outage it exists for.  Domestic DoT
+# upstreams stay reachable WAN-direct during outages and hold the
+# record (verified: alidns DoH returns 154.26.183.46 for both names).
+#
+# SmartDNS writes resolved A records into surflare_control on both the
+# tproxy and killswitch tables.  The tproxy prerouting chain returns
+# that traffic to the WAN; the killswitch forward chain accepts it
+# (both natively in _install_killswitch and hot-added by
+# _ensure_surflare_control_ks in the watchdog).
+# speed-check-mode none: the control plane need not answer ping/80.
+#
+# murk.surflare.com note: dnsmasq answers murk from the router's
+# /etc/hosts pin and never forwards it to SmartDNS, so the murk
+# domain-rule below only fires for queries that reach SmartDNS directly
+# (:6053).  The LAN bypass still works today because www shares the
+# same IP; if the vendor ever splits the hosts, keep the /etc/hosts pin
+# and this rule in sync.
+#
+# TTL skew note: the vendor's A record TTL is 1-3s but the nftset
+# entry lives 1h, so a mid-window IP change is pinned up to 1h (same
+# trade as gmail_smtp; the control-plane IP is stable).
+#
+# Deploy: copy to /etc/smartdns/surflare-control.conf and add
+#   conf-file /etc/smartdns/surflare-control.conf
+# to custom.conf, then restart SmartDNS.  A LAN query for
+# www.surflare.com fills the sets.
+nameserver /www.surflare.com/domestic
+nameserver /murk.surflare.com/domestic
+domain-rules /www.surflare.com/ -speed-check-mode none -nftset #4:inet#sw_lan_tproxy#surflare_control,#4:inet#killswitch#surflare_control
+domain-rules /murk.surflare.com/ -speed-check-mode none -nftset #4:inet#sw_lan_tproxy#surflare_control,#4:inet#killswitch#surflare_control
