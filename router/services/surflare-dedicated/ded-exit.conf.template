@@ -3,13 +3,11 @@
 # surflare-proxy wrapper on every proxy start.
 #
 # EXIT_VIA_DED=1  all proxied flows chain through the dedicated SOCKS
-#                 exit, carried by the carrier urltest group (relay
-#                 arrival is what binds the session to the dedicated
-#                 egress IP; a direct-dialed socks egresses a generic
-#                 NAT instead, so detour must never be "direct").
-# EXIT_VIA_DED=0  layer disabled; the wrapper's jq filter output is
-#                 byte-identical to the pre-ded-exit filter (verified
-#                 by md5 in tests/ded-exit-inject.sh), i.e. plain relay.
+#                 exit.  Arrival path is the DED_VIA knob below.
+# EXIT_VIA_DED=0  layer disabled.
+#                 The wrapper's jq filter output is byte-identical
+#                 to the pre-ded-exit filter (verified by md5 in
+#                 tests/ded-exit-inject.sh), i.e. plain relay.
 #
 # DED_SERVER/PORT/USER/PASS: the dedicated SOCKS endpoint sold by the
 # provider app.  Port must be numeric; incomplete or malformed config
@@ -40,3 +38,12 @@ DED_SERVER="<SOCKS server from provider app>"
 DED_PORT="<SOCKS port from provider app>"
 DED_USER="<SOCKS username from provider app>"
 DED_PASS="<SOCKS password from provider app>"
+# DED_VIA selects how the socks outbound reaches the dedicated server:
+#   direct  dial it over the WAN (no carrier detour).  After the
+#           2026-10-18 power cycle the provider stopped honoring
+#           relay-arrival bindings -- carrier-detoured connections were
+#           refused with socks code=5 while direct arrivals kept the
+#           dedicated egress (evidence: logs 2026-10-18 20:42-21:47).
+#   carrier (or unset) historical behavior: detour through the carrier
+#           urltest group.
+DED_VIA="direct"

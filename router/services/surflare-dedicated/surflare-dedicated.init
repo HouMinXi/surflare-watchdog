@@ -20,6 +20,7 @@ STOP=10
 
 CRON_CANARY='* * * * * /usr/local/sbin/surflare-ded-canary'
 CRON_REATTACH='30 4 * * * /usr/local/sbin/surflare-ded-reattach'
+CRON_SUPERVISOR='* * * * * /usr/local/sbin/tui-supervisor.sh'
 CRON_TAG_BEGIN='# surflare-dedicated BEGIN'
 CRON_TAG_END='# surflare-dedicated END'
 
@@ -49,6 +50,13 @@ install_cron() {
         echo "$CRON_TAG_BEGIN"
         echo "$CRON_CANARY"
         echo "$CRON_REATTACH"
+        # The TUI supervisor is optional by design (a dedicated-IP
+        # subscription may lapse): install its line only when the
+        # script is deployed.  The standalone [ -x ] test here must
+        # NOT move into the mandatory existence loop in start() --
+        # there a missing script would also block the canary +
+        # reattach timers, leaving the dedicated exit unmonitored.
+        [ -x /usr/local/sbin/tui-supervisor.sh ] && echo "$CRON_SUPERVISOR"
         echo "$CRON_TAG_END"
     } >> "$f"
     /etc/init.d/cron reload 2>/dev/null || /etc/init.d/cron restart 2>/dev/null || true

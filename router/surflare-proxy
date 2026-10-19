@@ -40,7 +40,7 @@ DIRECT_DOMAINS="minxihou.site"
 # inert strings.  Keep this parser in sync with the copies in
 # surflare-ded-canary and surflare-ded-reattach.
 _ded_read_conf() {
-    EXIT_VIA_DED=""; DED_SERVER=""; DED_PORT=""; DED_USER=""; DED_PASS=""
+    EXIT_VIA_DED=""; DED_SERVER=""; DED_PORT=""; DED_USER=""; DED_PASS=""; DED_VIA=""
     [ -f "$1" ] || return 0
     while IFS= read -r _l; do
         case "$_l" in
@@ -49,6 +49,7 @@ _ded_read_conf() {
             DED_PORT=*)     DED_PORT=${_l#DED_PORT=} ;;
             DED_USER=*)     DED_USER=${_l#DED_USER=} ;;
             DED_PASS=*)     DED_PASS=${_l#DED_PASS=} ;;
+            DED_VIA=*)      DED_VIA=${_l#DED_VIA=} ;;
         esac
     done < "$1"
     # strip one pair of surrounding double quotes (template style)
@@ -57,6 +58,7 @@ _ded_read_conf() {
     case "$DED_PORT" in \"*\") DED_PORT=${DED_PORT#\"}; DED_PORT=${DED_PORT%\"} ;; esac
     case "$DED_USER" in \"*\") DED_USER=${DED_USER#\"}; DED_USER=${DED_USER%\"} ;; esac
     case "$DED_PASS" in \"*\") DED_PASS=${DED_PASS#\"}; DED_PASS=${DED_PASS%\"} ;; esac
+    case "$DED_VIA" in \"*\") DED_VIA=${DED_VIA#\"}; DED_VIA=${DED_VIA%\"} ;; esac
 }
 _ded_read_conf /etc/surflare/ded-exit.conf
 case "$EXIT_VIA_DED" in
@@ -161,7 +163,7 @@ cat > "$_tmp"
 # Credentials travel via the environment, not --arg: /proc/<pid>/cmdline
 # is world-readable for the jq process lifetime, /proc/<pid>/environ is
 # root-only.
-export DED_SERVER DED_PORT DED_USER DED_PASS
+export DED_SERVER DED_PORT DED_USER DED_PASS DED_VIA
 # Design note: dns.servers[].detour stays on the carrier on purpose --
 # DNS is UDP and the ded-exit layer chains TCP proxy traffic only; UDP
 # keeps egressing via the carrier relay by design.
@@ -247,23 +249,26 @@ if jq --argjson T "$TOLERANCE" --arg I "$INTERVAL" --arg D "$INJECT_DOMAINS" --a
   | .route.rules[-1].outbound = $vpn
   | .route.final = $vpn
   # Dedicated-IP egress layer (EXIT_VIA_DED=1): append a socks outbound
-  # to the dedicated exit, detoured through the carrier group.  Relay
-  # arrival binds the dedicated egress IP; detour must never be direct
-  # (a direct-dialed socks egresses a generic NAT instead).  Repoint
+  # to the dedicated exit.  Arrival path is the DED_VIA knob in
+  # ded-exit.conf: "direct" dials the socks server over the WAN
+  # (provider stopped honoring relay-arrival bindings after the
+  # 2026-10-18 power cycle: relay arrivals get refused with code=5
+  # while direct arrivals keep the dedicated egress); anything else
+  # keeps the historical carrier detour.  Repoint
   # every rule that used the carrier group at ded-exit, then prepend a
   # guard rule that keeps connections TO the socks server itself on the
   # plain carrier -- without it any local forwarder pointing at the
   # proxy recurses socks-in-socks through ded-exit.
   | if $DE == "1" and $vpn != "direct" then
-      .outbounds += [{
+      .outbounds += [({
         "type": "socks",
         "tag": "ded-exit",
         "server": $ENV.DED_SERVER,
         "server_port": ($ENV.DED_PORT | tonumber),
         "username": $ENV.DED_USER,
-        "password": $ENV.DED_PASS,
-        "detour": $vpn
-      }]
+        "password": $ENV.DED_PASS
+      } | if $ENV.DED_VIA == "direct" then .
+        else . + {"detour": $vpn} end)]
       | .route.rules |= map(if .outbound == $vpn then .outbound = "ded-exit" else . end)
       | .route.rules = [{"ip_cidr": [$ENV.DED_SERVER + "/32"], "outbound": $vpn}] + .route.rules
       # Plain HTTP bypass, plus one address the dedicated SOCKS refuses
@@ -289,7 +294,7 @@ if jq --argjson T "$TOLERANCE" --arg I "$INTERVAL" --arg D "$INJECT_DOMAINS" --a
 	# The credentials above are only needed by jq; drop them before
 	# exec'ing the long-lived proxy so they never sit in its
 	# /proc/<pid>/environ for the process lifetime.
-	unset DED_SERVER DED_PORT DED_USER DED_PASS
+	unset DED_SERVER DED_PORT DED_USER DED_PASS DED_VIA
 	# Persist patched config for surflare-upgrade's check step (tests a
 	# new .real against the actual patched config before swapping).
 	# Overwritten on each proxy restart.  chmod 600: contains server IPs.

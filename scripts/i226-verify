@@ -1,0 +1,200 @@
+#!/bin/sh
+# i226-verify -- online health check for the i225/i226 NVM fix.
+#
+# Verifies, without any power-off or live USB, that
+#   1. every igc port still runs the expected NVM firmware version
+#      (default 2032:88b6 = NVM 2.32; the pre-fix value was 2017:888d),
+#   2. each port's link state is reported (informational; a port may be
+#      legitimately unplugged),
+#   3. no NIC link flap occurred.  Two independent channels:
+#        a. dmesg "NIC Link is Down" timestamps inside the lookback
+#           window (gives timing, but the kernel ring can churn under
+#           log storms and silently drop old entries), and
+#        b. the monotonic /sys/class/net/<port>/carrier_changes counter
+#           delta since the previous run (immune to ring churn; needs
+#           the state file from the run before, so the first run after
+#           boot only records a baseline).  A counter lower than the
+#           stored one means the box rebooted: re-baseline, no verdict.
+#      The i226 NVM 2.17 defect flapped eth0 at random, mostly at
+#      night -- after the 2026-10-18 upgrade to 2.32 a flap is the
+#      recurrence signal.  A channel-B delta covers "since the
+#      previous run", not the --window minutes; the channels are
+#      complementary, not duplicate.
+#   4. error counters are reported for drift comparison.
+#
+# Usage:  i226-verify [--fw VERSION] [--window MIN] [--quiet]
+#         --fw       expected firmware-version string (default 2032:88b6)
+#         --window   flap lookback window in minutes (default 30)
+#         --quiet    only print the RESULT line
+#
+# Exit 0 = all hard checks pass (fw + flap).  Link-down ports and
+# error counters are informational and do not fail the run.
+#
+# Cron (hourly flap trace, no alert noise):
+#   5 * * * * /usr/local/sbin/i226-verify --window 65 --quiet
+
+EXPECT_FW="2032:88b6"
+WINDOW_MIN=30
+QUIET=0
+while [ $# -gt 0 ]; do
+    case "$1" in
+        # The value guard matters: with `--fw` as the last argument a
+        # bare `shift 2` cannot consume anything, $1 never changes and
+        # the loop spins forever.
+        --fw|--window)
+            [ $# -ge 2 ] || { echo "$1 requires a value" >&2; exit 2; }
+            _v="$2"
+            case "$1" in --fw) EXPECT_FW="$_v" ;; --window) WINDOW_MIN="$_v" ;; esac
+            shift 2 ;;
+        --quiet)  QUIET=1; shift ;;
+        *) echo "usage: $1 unknown (see header)" >&2; exit 2 ;;
+    esac
+done
+unset _v
+case "$WINDOW_MIN" in
+    ''|*[!0-9]*) echo "--window must be an integer number of minutes" >&2; exit 2 ;;
+esac
+
+# Discover igc-driven ports (i225/i226) instead of hard-coding names:
+# on a board with fewer populated ports, ethtool on a missing name
+# fails, fw reads empty and the run false-fails forever -- an hourly
+# cron would then raise a permanent alarm.
+PORTS=""
+for _n in /sys/class/net/*; do
+    _drv=""
+    [ -L "$_n/device/driver" ] && _drv=$(basename "$(readlink "$_n/device/driver")")
+    [ "$_drv" = "igc" ] && PORTS="$PORTS ${_n##*/}"
+done
+PORTS="${PORTS# }"
+STATE=/run/i226-verify.state
+now_s=$(cut -d. -f1 /proc/uptime)
+# An unreadable /proc/uptime (restricted container, very early boot)
+# must not fall through: an empty now_s makes cutoff negative and the
+# dmesg window then matches every event -- a false PASS.
+case "$now_s" in
+    ''|*[!0-9]*) echo "cannot read /proc/uptime" >&2; exit 2 ;;
+esac
+cutoff=$(( now_s - WINDOW_MIN * 60 ))
+fail=0
+out=""
+note() { [ "$QUIET" = "1" ] || printf '%s\n' "$1"; }
+
+if [ -z "$PORTS" ]; then
+    note "no igc-driven ports found; nothing to verify on this board"
+    echo "RESULT: PASS ports=none"
+    exit 0
+fi
+
+note "i226 online verify -- $(date '+%Y-%m-%d %H:%M') (window ${WINDOW_MIN}m)"
+
+# --- read live carrier counters and the previous baseline ---
+for eth in $PORTS; do
+    # --- firmware ---
+    fw=$(ethtool -i "$eth" 2>/dev/null | awk -F': ' '/^firmware-version/{print $2}')
+    if [ -z "$fw" ]; then
+        out="$out fw:$eth=unreadable"
+        fail=1
+        note "fw $eth UNREADABLE (ethtool -i failed)"
+    elif [ "$fw" != "$EXPECT_FW" ]; then
+        out="$out fw:$eth=$fw"
+        fail=1
+        note "fw $eth $fw MISMATCH (want $EXPECT_FW)"
+    else
+        out="$out fw:$eth=ok"
+        note "fw $eth $fw ok"
+    fi
+
+    # --- link (informational) ---
+    link=$(ethtool "$eth" 2>/dev/null | awk -F': *' '/Speed:/{s=$2} /Link detected:/{l=$2} END{print l" "s}')
+    out="$out link:$eth=$(printf '%s' "$link" | awk '{print ($1=="yes"?"up":"down")}')"
+    note "link $eth $link"
+
+    # --- error counters (informational) ---
+    crc=$(ethtool -S "$eth" 2>/dev/null | awk -F': ' '/rx_crc_errors/{print $2+0}')
+    txerr=$(ethtool -S "$eth" 2>/dev/null | awk -F': ' '/^ *tx_errors/{print $2+0}')
+    out="$out crc:$eth=${crc:-na} txerr:$eth=${txerr:-na}"
+    note "errs $eth rx_crc=${crc:-na} tx_errors=${txerr:-na}"
+done
+
+# --- flap channel A: dmesg events inside the window ---
+# Capture once (the per-port loops below reuse it) and check the exit
+# status: an unreadable dmesg must not masquerade as "zero flaps".
+_dmesg_out=$(dmesg 2>/dev/null); _dmesg_rc=$?
+flap_fail=0
+if [ "$_dmesg_rc" -ne 0 ]; then
+    out="$out flapwin:dmesg=unreadable"
+    note "dmesg unreadable (rc=$_dmesg_rc); channel A degraded, channel B carries the flap verdict"
+elif [ "$now_s" -lt $(( WINDOW_MIN * 60 )) ]; then
+    # Boot-window grace: uptime has not yet spanned the lookback, so a
+    # negative cutoff would count every event since boot as in-window.
+    # Boot-time link negotiation is not an NVM regression signal --
+    # mirror channel B's first-run baseline instead of failing.
+    out="$out flapwin:boot-window"
+    note "uptime ${now_s}s < window ${WINDOW_MIN}m since boot; channel A holds verdict until the window is covered"
+else
+    for eth in $PORTS; do
+        n=$(printf '%s\n' "$_dmesg_out" | awk -v eth="$eth" -v cut="$cutoff" '
+            $0 ~ "igc.*" eth ": NIC Link is Down" {
+                t = $0; sub(/^\[ */, "", t); sub(/\].*/, "", t)
+                if (t + 0 >= cut) c++
+            } END { print c + 0 }')
+        out="$out flapwin:$eth=$n"
+        if [ "$n" -gt 0 ]; then
+            flap_fail=1
+            note "flap $eth $n down-event(s) in last ${WINDOW_MIN}m -- NVM regression signal"
+        fi
+    done
+fi
+[ "$flap_fail" = "1" ] && fail=1
+note "flap dmesg summary (window ${WINDOW_MIN}m): $(printf '%s' "$out" | tr ' ' '\n' | grep '^flapwin:' | tr '\n' ' ')"
+
+# --- flap channel B: carrier_changes delta vs previous run ---
+cc_fail=0
+new_state=""
+for eth in $PORTS; do
+    now=$(cat /sys/class/net/$eth/carrier_changes 2>/dev/null)
+    old=$(awk -v p="$eth" '$1==p {print $2; found=1} END {if (!found) print ""}' "$STATE" 2>/dev/null)
+    # An unreadable counter is never persisted: storing a sentinel here
+    # would poison the next run's delta.  No stored line means the next
+    # run treats the port as baseline.  A legacy state file may still
+    # carry a -1 from the previous scheme: treat it as baseline too.
+    case "$now" in ''|*[!0-9]*) continue ;; esac
+    case "$old" in ''|*[!0-9]*) old="" ;; esac
+    new_state="$new_state$eth $now\n"
+    if [ -z "$old" ]; then
+        out="$out ccdelta:$eth=baseline"
+        continue
+    fi
+    delta=$(( now - old ))
+    if [ "$delta" -lt 0 ]; then
+        # Counter lower than stored = the box went down and came back
+        # between runs (both counters are monotonic per boot).
+        # Re-baseline with no verdict, exactly as the header documents.
+        out="$out ccdelta:$eth=baseline(restart)"
+        continue
+    fi
+    out="$out ccdelta:$eth=$delta"
+    if [ "$delta" -gt 0 ]; then
+        cc_fail=1
+        note "flap $eth carrier_changes +$delta since previous run (dmesg ring may have churned)"
+    fi
+done
+[ "$cc_fail" = "1" ] && fail=1
+# persist the new baseline (tmpfs: dies with the reboot, same as the
+# counters).  Temp+rename, never truncate-in-place: a manual run
+# overlapping the hourly cron could otherwise read a half-written file,
+# re-baseline every port and silently miss a flap from the gap.
+# '%b': interpret the \\n separators, never honor data-borne format specs.
+_state_tmp="${STATE}.new.$$"
+if printf '%b' "$new_state" > "$_state_tmp" 2>/dev/null; then
+    mv -f "$_state_tmp" "$STATE" 2>/dev/null || rm -f "$_state_tmp"
+fi
+unset _state_tmp
+
+if [ "$fail" = "0" ]; then
+    echo "RESULT: PASS $out"
+    exit 0
+else
+    echo "RESULT: FAIL $out"
+    exit 1
+fi

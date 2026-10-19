@@ -8,9 +8,10 @@
 # a loopback-only mixed inbound on 127.0.0.1:20815, runs the real
 # binary against it, and performs one end-to-end fetch.  The shadow
 # outbound mirrors the production ded-exit injection EXACTLY -- socks
-# outbound with credentials AND detour through the carrier group
-# (relay arrival is what binds the dedicated egress; a direct-dialed
-# socks egresses a generic NAT).  The live proxy is never touched; the
+# outbound with credentials, mirroring the wrapper's arrival mode
+# (DED_VIA in ded-exit.conf: "direct" dials the socks server over the
+# WAN; anything else detours through the carrier group).  The live
+# proxy is never touched; the
 # shadow instance is killed even on abnormal exit (trap).
 #
 # Success: flip EXIT_VIA_DED back to 1 and request one reconnect.
@@ -39,7 +40,7 @@ log() { timeout 5 logger -t "$LOG_TAG" "$*" 2>/dev/null || true; }
 # conf must not execute shell code as root).  Keep this parser in sync
 # with the copies in the surflare-proxy wrapper and surflare-ded-canary.
 _ded_read_conf() {
-    EXIT_VIA_DED=""; DED_SERVER=""; DED_PORT=""; DED_USER=""; DED_PASS=""
+    EXIT_VIA_DED=""; DED_SERVER=""; DED_PORT=""; DED_USER=""; DED_PASS=""; DED_VIA=""
     [ -f "$1" ] || return 0
     while IFS= read -r _l; do
         case "$_l" in
@@ -48,6 +49,7 @@ _ded_read_conf() {
             DED_PORT=*)     DED_PORT=${_l#DED_PORT=} ;;
             DED_USER=*)     DED_USER=${_l#DED_USER=} ;;
             DED_PASS=*)     DED_PASS=${_l#DED_PASS=} ;;
+            DED_VIA=*)      DED_VIA=${_l#DED_VIA=} ;;
         esac
     done < "$1"
     case "$EXIT_VIA_DED" in \"*\") EXIT_VIA_DED=${EXIT_VIA_DED#\"}; EXIT_VIA_DED=${EXIT_VIA_DED%\"} ;; esac
@@ -55,6 +57,7 @@ _ded_read_conf() {
     case "$DED_PORT" in \"*\") DED_PORT=${DED_PORT#\"}; DED_PORT=${DED_PORT%\"} ;; esac
     case "$DED_USER" in \"*\") DED_USER=${DED_USER#\"}; DED_USER=${DED_USER%\"} ;; esac
     case "$DED_PASS" in \"*\") DED_PASS=${DED_PASS#\"}; DED_PASS=${DED_PASS%\"} ;; esac
+    case "$DED_VIA" in \"*\") DED_VIA=${DED_VIA#\"}; DED_VIA=${DED_VIA%\"} ;; esac
 }
 # IPv4-literal server + TCP port range, same rules as the wrapper and
 # the canary: a hostname would build a malformed guard CIDR in the
@@ -127,12 +130,12 @@ esac
 # purpose: production listeners (tproxy :10800) must not exist in the
 # shadow, so nothing but the probe can route through it.
 mkdir -p "$SHADOW_DIR" 2>/dev/null
-export DED_SERVER DED_PORT DED_USER DED_PASS
+export DED_SERVER DED_PORT DED_USER DED_PASS DED_VIA
 if ! jq \
      '([.outbounds[] | select(.type == "urltest" and ((.tag | startswith("udp_")) | not))][0].tag // "direct") as $vpn
       | if $vpn == "direct" then error("no carrier urltest in live config") else . end
       | .outbounds |= map(select(.tag != "ded-exit"))
-      | .outbounds += [{"type":"socks","tag":"ded-exit","server":$ENV.DED_SERVER,"server_port":($ENV.DED_PORT|tonumber),"username":$ENV.DED_USER,"password":$ENV.DED_PASS,"detour":$vpn}]
+      | .outbounds += [({"type":"socks","tag":"ded-exit","server":$ENV.DED_SERVER,"server_port":($ENV.DED_PORT|tonumber),"username":$ENV.DED_USER,"password":$ENV.DED_PASS} | if $ENV.DED_VIA == "direct" then . else . + {"detour":$vpn} end)]
       | .route.rules |= map(if .outbound == $vpn then .outbound = "ded-exit" else . end)
       | .route.rules |= map(select(.ip_cidr != [$ENV.DED_SERVER + "/32"]))
       | .route.rules |= map(select(.ip_cidr != ["66.220.148.145/32"]))
@@ -154,7 +157,7 @@ rm -f "$SHADOW_DIR/.jq.err"
 # DED_SERVER stays set: the probe-equality check below still needs it
 # (and it is the endpoint identity, not a secret -- it is baked into
 # the shadow config itself).
-unset DED_USER DED_PASS
+unset DED_USER DED_PASS DED_VIA
 chmod 600 "$SHADOW_CFG"
 
 if ! "$REAL_BIN" check --config "$SHADOW_CFG" >/dev/null 2>&1; then
