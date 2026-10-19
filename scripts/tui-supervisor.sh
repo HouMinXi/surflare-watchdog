@@ -117,12 +117,56 @@ pin_dedicated() {
 	# walk continues and sends Enter after the process is already dead.
 	pin_abort() { rm -f /run/surflare_ded_pin_until; return 1; }
 	sexpect -s "$SOCK" kill 2>/dev/null
+	sleep 1
+	# kill terminates the child but leaves sexpect's daemon bound to
+	# $SOCK; unlinking the socket below orphans it (with unreaped
+	# zombie children).  Sweep daemons for this socket first so a
+	# long-lived router does not stack one pair per pin attempt
+	# (measured 2026-10-18: six stacked daemons after a reboot loop).
+	# ERE-escape the socket path: a dot inside it is a metacharacter
+	# and would match foreign sockets (e.g. /tmp/tui-sockX).
+	_sock_re=$(printf '%s' "$SOCK" | sed 's/[^a-zA-Z0-9_/-]/\\&/g')
+	pkill -f "sexpect -s $_sock_re( |$)" 2>/dev/null
 	rm -f "$SOCK" "$TUI_LOG"
 	pkill -x surflare 2>/dev/null
 	sleep 1
 	sexpect -s "$SOCK" spawn -nohup -T xterm -logf "$TUI_LOG" surflare >/dev/null 2>&1 || { pin_abort || return; }
 	sleep 6
-	sexpect -s "$SOCK" expect -t 10 "服务器" >/dev/null 2>&1 || { pin_abort || return; }
+	# A client reset (or a fresh install) opens the TUI on the language
+	# picker instead of the main menu -- measured after the 2026-10-18
+	# reboot: every pin timed out on the gate below while the TUI sat
+	# on "Select Language".  Pick Chinese (the menu labels this script
+	# navigates are Chinese), then re-apply the main-menu gate.
+	if ! sexpect -s "$SOCK" expect -t 8 "服务器" >/dev/null 2>&1; then
+		sexpect -s "$SOCK" expect -t 6 "选择语言" >/dev/null 2>&1 || { pin_abort || return; }
+		# The picker cursor starts on English (row 1) and Chinese is row
+		# 5, so it takes 4 down keys; the loop must run 5 check-first
+		# iterations or the row-5 check never happens (the 4-iteration
+		# version pressed the 4th down and exited without looking -- all
+		# pins through the picker path aborted).  One down key per send
+		# with a highlighted-row check before each step: a single burst
+		# of four escapes registered only one on the 2026-10-18 picker
+		# and the Enter after it saved Deutsch, a language no gate in
+		# this script can read.  Enter is pressed only when the cursor
+		# provably sits on Chinese.
+		_picker_ok=0
+		_k=0
+		while [ "$_k" -lt 6 ]; do
+			# 2000 bytes: the pty log is cumulative and the picker screen
+			# is a full redraw; 400 cut the highlight row on taller renders.
+			if tail -c 2000 "$TUI_LOG" 2>/dev/null | grep -q "▸ 中文"; then
+				_picker_ok=1
+				break
+			fi
+			sexpect -s "$SOCK" send -c "\x1b[B" >/dev/null 2>&1
+			sleep 1
+			_k=$((_k + 1))
+		done
+		[ "$_picker_ok" = "1" ] || { pin_abort || return; }
+		sexpect -s "$SOCK" send -cr >/dev/null 2>&1
+		sleep 3
+		sexpect -s "$SOCK" expect -t 10 "服务器" >/dev/null 2>&1 || { pin_abort || return; }
+	fi
 	sexpect -s "$SOCK" send -cr
 	sleep 2
 	sexpect -s "$SOCK" expect -t 5 "选择服务器" >/dev/null 2>&1 || { pin_abort || return; }

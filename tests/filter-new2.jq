@@ -79,23 +79,26 @@
   | .route.rules[-1].outbound = $vpn
   | .route.final = $vpn
   # Dedicated-IP egress layer (EXIT_VIA_DED=1): append a socks outbound
-  # to the dedicated exit, detoured through the carrier group.  Relay
-  # arrival binds the dedicated egress IP; detour must never be direct
-  # (a direct-dialed socks egresses a generic NAT instead).  Repoint
+  # to the dedicated exit.  Arrival path is the DED_VIA knob in
+  # ded-exit.conf: "direct" dials the socks server over the WAN
+  # (provider stopped honoring relay-arrival bindings after the
+  # 2026-10-18 power cycle: relay arrivals get refused with code=5
+  # while direct arrivals keep the dedicated egress); anything else
+  # keeps the historical carrier detour.  Repoint
   # every rule that used the carrier group at ded-exit, then prepend a
   # guard rule that keeps connections TO the socks server itself on the
   # plain carrier -- without it any local forwarder pointing at the
   # proxy recurses socks-in-socks through ded-exit.
   | if $DE == "1" and $vpn != "direct" then
-      .outbounds += [{
+      .outbounds += [({
         "type": "socks",
         "tag": "ded-exit",
         "server": $ENV.DED_SERVER,
         "server_port": ($ENV.DED_PORT | tonumber),
         "username": $ENV.DED_USER,
-        "password": $ENV.DED_PASS,
-        "detour": $vpn
-      }]
+        "password": $ENV.DED_PASS
+      } | if $ENV.DED_VIA == "direct" then .
+        else . + {"detour": $vpn} end)]
       | .route.rules |= map(if .outbound == $vpn then .outbound = "ded-exit" else . end)
       | .route.rules = [{"ip_cidr": [$ENV.DED_SERVER + "/32"], "outbound": $vpn}] + .route.rules
       # Plain HTTP bypass, plus one address the dedicated SOCKS refuses

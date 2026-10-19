@@ -59,7 +59,7 @@ log() {
 # conf must not execute shell code as root).  Keep this parser in sync
 # with the copies in the surflare-proxy wrapper and surflare-ded-reattach.
 _ded_read_conf() {
-    EXIT_VIA_DED=""; DED_SERVER=""; DED_PORT=""; DED_USER=""; DED_PASS=""
+    EXIT_VIA_DED=""; DED_SERVER=""; DED_PORT=""; DED_USER=""; DED_PASS=""; DED_VIA=""
     [ -f "$1" ] || return 0
     while IFS= read -r _l; do
         case "$_l" in
@@ -68,6 +68,7 @@ _ded_read_conf() {
             DED_PORT=*)     DED_PORT=${_l#DED_PORT=} ;;
             DED_USER=*)     DED_USER=${_l#DED_USER=} ;;
             DED_PASS=*)     DED_PASS=${_l#DED_PASS=} ;;
+            DED_VIA=*)      DED_VIA=${_l#DED_VIA=} ;;
         esac
     done < "$1"
     case "$EXIT_VIA_DED" in \"*\") EXIT_VIA_DED=${EXIT_VIA_DED#\"}; EXIT_VIA_DED=${EXIT_VIA_DED%\"} ;; esac
@@ -75,6 +76,7 @@ _ded_read_conf() {
     case "$DED_PORT" in \"*\") DED_PORT=${DED_PORT#\"}; DED_PORT=${DED_PORT%\"} ;; esac
     case "$DED_USER" in \"*\") DED_USER=${DED_USER#\"}; DED_USER=${DED_USER%\"} ;; esac
     case "$DED_PASS" in \"*\") DED_PASS=${DED_PASS#\"}; DED_PASS=${DED_PASS%\"} ;; esac
+    case "$DED_VIA" in \"*\") DED_VIA=${DED_VIA#\"}; DED_VIA=${DED_VIA%\"} ;; esac
 }
 _ded_read_conf "$CONF"
 
