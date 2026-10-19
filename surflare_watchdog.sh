@@ -1624,6 +1624,7 @@ _cleanup_on_startup() {
 		fi
 		_ensure_dns_enforce
 		_ensure_gmail_smtp_ks
+		_ensure_surflare_control_ks
 		# Unified tproxy restore guard (Problem A + Problem B):
 		#   B: table exists but no live tproxy rules (tombstoned) -- restore
 		#      so LAN traffic is not silently rejected while watchdog
@@ -1755,6 +1756,41 @@ _ensure_gmail_smtp_ks() {
 		[ "$_added" -eq 1 ] && log "Kill switch: gmail_smtp 465/587 accept armed"
 	else
 		log "WARN: gmail_smtp hot-add incomplete (v4/v6 accept missing)"
+	fi
+}
+
+# Hot-add surflare_control forward accept onto a live killswitch, mirroring
+# _ensure_gmail_smtp_ks.  The tproxy prerouting template already returns
+# control-plane traffic to the WAN; without this accept the killswitch
+# forward chain would reject it (policy drop).  IPv4 only: the control
+# plane is v4 (murk/www -> 154.26.183.46).
+_ensure_surflare_control_ks() {
+	[ "$PLATFORM" = "router" ] || return 0
+	nft list table inet killswitch >/dev/null 2>&1 || return 0
+	local _ks_fwd _need=1 _h _added=0
+	_ks_fwd=$(nft list chain inet killswitch forward 2>/dev/null)
+	echo "$_ks_fwd" | grep -q 'ip daddr @surflare_control accept' && _need=0
+	[ "$_need" -eq 0 ] && return 0
+	nft add set inet killswitch surflare_control \
+		'{ type ipv4_addr; flags interval, timeout; timeout 1h; }' \
+		2>/dev/null || true
+	# Insert before the first reject so the accept is reachable.
+	_h=$(nft -a list chain inet killswitch forward 2>/dev/null | \
+		awk '/reject with icmp/ { print $NF; exit }')
+	if [ -n "$_h" ]; then
+		nft insert rule inet killswitch forward handle "$_h" \
+			iifname "br-lan" ip daddr @surflare_control accept \
+			2>/dev/null && _added=1
+	else
+		nft add rule inet killswitch forward \
+			iifname "br-lan" ip daddr @surflare_control accept \
+			2>/dev/null && _added=1
+	fi
+	_ks_fwd=$(nft list chain inet killswitch forward 2>/dev/null)
+	if echo "$_ks_fwd" | grep -q 'ip daddr @surflare_control accept'; then
+		[ "$_added" -eq 1 ] && log "Kill switch: surflare_control accept armed"
+	else
+		log "WARN: surflare_control hot-add incomplete"
 	fi
 }
 
@@ -1965,6 +2001,12 @@ table inet killswitch {
 	# are accepted below.  SmartDNS fills the set; timeout 1h.
 	set gmail_smtp  { type ipv4_addr; flags interval, timeout; timeout 1h; }
 	set gmail_smtp6 { type ipv6_addr; flags interval, timeout; timeout 1h; }
+	# Surflare control plane (www/murk.surflare.com).  SmartDNS fills
+	# the set; paired with sw_lan_tproxy surflare_control.  Declared here
+	# so a fresh killswitch (crash path, reconnect path) accepts the
+	# control plane from the first packet instead of waiting for the next
+	# _ensure_surflare_control_ks healthy tick.
+	set surflare_control { type ipv4_addr; flags interval, timeout; timeout 1h; }
 	# CN domain nftset: SmartDNS adds resolved IPs when a CN domain
 	# resolves to a non-CN CDN IP (Cloudflare/Akamai/etc).  Allows
 	# LAN devices to reach CN content on foreign CDN directly without
@@ -2054,6 +2096,10 @@ table inet killswitch {
 		# would reject it.  Do not widen to 22/25.
 		iifname "br-lan" ip daddr @gmail_smtp tcp dport { 465, 587 } accept
 		iifname "br-lan" ip6 daddr @gmail_smtp6 tcp dport { 465, 587 } accept
+		# Surflare control plane: whole-host (no port limit) so the web
+		# panel stays reachable during a tunnel outage; tproxy prerouting
+		# returns this traffic to the WAN.
+		iifname "br-lan" ip daddr @surflare_control accept
 		# Private destinations from LAN (carrier IPs, app-internal VPNs)
 		# are not external leaks; accept like the output chain does.
 		iifname "br-lan" ip daddr @lan_ranges accept
@@ -5809,6 +5855,7 @@ connect_vpn() {
 			_install_killswitch
 		fi
 		_ensure_gmail_smtp_ks
+		_ensure_surflare_control_ks
 		_install_cn_dns_direct
 
 		exit 0
@@ -6547,6 +6594,7 @@ if ! nft list table inet killswitch >/dev/null 2>&1; then
 	fi
 fi
 _ensure_gmail_smtp_ks
+_ensure_surflare_control_ks
 _install_cn_dns_direct
 
 log "Startup nftables: killswitch=$(_table_exists killswitch) dns_enforce=$(_table_exists dns_enforce) surflare_moat=$(_table_exists surflare_moat)"
@@ -7368,6 +7416,7 @@ while true; do
 			fi
 		fi
 		_ensure_gmail_smtp_ks
+		_ensure_surflare_control_ks
 		_install_cn_dns_direct
 
 		# Tproxy health check: detect relay degradation invisible to tunnel probes.
