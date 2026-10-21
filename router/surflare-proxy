@@ -164,9 +164,10 @@ cat > "$_tmp"
 # is world-readable for the jq process lifetime, /proc/<pid>/environ is
 # root-only.
 export DED_SERVER DED_PORT DED_USER DED_PASS DED_VIA
-# Design note: dns.servers[].detour stays on the carrier on purpose --
-# DNS is UDP and the ded-exit layer chains TCP proxy traffic only; UDP
-# keeps egressing via the carrier relay by design.
+# Foreign DoH (dns_remote) is repointed at ded-exit inside the
+# EXIT_VIA_DED branch below. It is TCP, so it can ride the dedicated
+# socks, and the carrier urltest refuses those queries with code=5.
+# UDP resolvers stay on the carrier: ded-exit only chains TCP.
 if jq --argjson T "$TOLERANCE" --arg I "$INTERVAL" --arg D "$INJECT_DOMAINS" --arg DD "$DIRECT_DOMAINS" --arg DE "$EXIT_VIA_DED" '
   .outbounds |= map(if .type == "urltest" then .tolerance = $T | .interval = $I else . end)
   | .route.rule_set |= map(if .tag == "proxy_rule_set" then .rules |= map(
@@ -269,6 +270,18 @@ if jq --argjson T "$TOLERANCE" --arg I "$INTERVAL" --arg D "$INJECT_DOMAINS" --a
         "password": $ENV.DED_PASS
       } | if $ENV.DED_VIA == "direct" then .
         else . + {"detour": $vpn} end)]
+      # Foreign DoH (dns_remote, type https) was pinned to the carrier
+      # urltest. The carrier now refuses those queries (socks5 code=5),
+      # so each lookup waits out the exchange deadline. DoH is TCP, so
+      # it can ride ded-exit, which dials the dedicated socks directly
+      # and still hides the name from the ISP. UDP resolvers stay on
+      # the carrier: ded-exit only chains TCP. Closed layer (EXIT_VIA_DED
+      # off) never reaches this branch, so the legacy filter stays
+      # byte-identical.
+      | if .dns.servers then
+          .dns.servers |= map(if .tag == "dns_remote" and .type == "https"
+            then .detour = "ded-exit" else . end)
+        else . end
       | .route.rules |= map(if .outbound == $vpn then .outbound = "ded-exit" else . end)
       | .route.rules = [{"ip_cidr": [$ENV.DED_SERVER + "/32"], "outbound": $vpn}] + .route.rules
       # Plain HTTP bypass, plus one address the dedicated SOCKS refuses
