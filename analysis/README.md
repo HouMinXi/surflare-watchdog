@@ -45,7 +45,13 @@ The transit list is dynamic (server-side assignment per connect session).
 dns-direct:  223.5.5.5:53 (UDP) via detour=direct
              -> surflare internal domains, captive portal, default fallback
 
-dns_remote:  https://1.1.1.1/dns-query (DoH) via detour=mh_via_auto_to_Los_Angeles
+dns_remote:  https://1.1.1.1/dns-query (DoH). Vendor config pins its
+             detour to the carrier urltest. With the dedicated layer on,
+             the wrapper and the reattach shadow repoint that detour to
+             ded-exit: the carrier refuses the lookups (socks5 code=5)
+             and DoH is TCP, so it can ride the dedicated socks. UDP
+             resolvers stay on the carrier. Layer off leaves the vendor
+             detour untouched.
              -> proxy_rule_set domains from tproxy-in (all foreign DNS)
 ```
 

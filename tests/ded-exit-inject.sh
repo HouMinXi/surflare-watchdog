@@ -47,6 +47,22 @@ if jq -e '.route.final == "ded-exit"' /tmp/inj-base.json >/dev/null; then
 else
     echo "FAIL base final"; fail=1
 fi
+# Foreign DoH rides ded-exit only while the layer is on. UDP resolvers
+# keep the carrier detour, and a closed layer leaves every detour as
+# the vendor set it.
+if jq -e '[.dns.servers[] | select(.tag == "dns_remote" and .type == "https" and .detour == "ded-exit")] | length == 1' /tmp/inj-base.json >/dev/null; then
+    echo "PASS base: dns_remote DoH detours via ded-exit"
+else
+    echo "FAIL base dns_remote detour"; fail=1
+fi
+jq --argjson T 300 --arg I 60s --arg D claude.com,claude.ai,google.com --arg DD minxihou.site \
+   --arg DE "" \
+   -f "$FILTER" "$IN" > /tmp/inj-closed-dns.json
+if jq -e '[.dns.servers[] | select(.tag == "dns_remote" and .detour == "ded-exit")] | length == 0' /tmp/inj-closed-dns.json >/dev/null; then
+    echo "PASS base: closed layer leaves dns_remote on its vendor detour"
+else
+    echo "FAIL base closed dns_remote"; fail=1
+fi
 
 # The dedicated SOCKS refuses plain HTTP and one Facebook address on
 # 443 (66.220.148.145, code=5 on live).  Both bypasses sit immediately
@@ -88,6 +104,19 @@ if jq -e '.route.rules[0].ip_cidr == ["'"$DED_IP"'/32"]' /tmp/inj-j1.json >/dev/
     echo "FAIL J1: guard rule still present after injection (injection ineffective)"; fail=1
 else
     echo "PASS J1: guard rule gone -> assertion correctly red"
+fi
+
+# --- J11: drop the dns_remote detour repoint. The assertion above
+# must go red, proving it checks this line and not a side effect.
+# shellcheck disable=SC2016  # jq tokens in the filter, not shell
+sed 's#.detour = "ded-exit"##' "$FILTER" > /tmp/filter-j11.jq
+jq --argjson T 300 --arg I 60s --arg D claude.com,claude.ai,google.com --arg DD minxihou.site \
+   --arg DE 1 \
+   -f /tmp/filter-j11.jq "$IN" > /tmp/inj-j11.json
+if jq -e '[.dns.servers[] | select(.tag == "dns_remote" and .type == "https" and .detour == "ded-exit")] | length == 1' /tmp/inj-j11.json >/dev/null; then
+    echo "FAIL J11: dns_remote still on ded-exit after injection (injection ineffective)"; fail=1
+else
+    echo "PASS J11: dns_remote detour gone -> assertion correctly red"
 fi
 
 # --- J2: remove canary inbound ---------------------------------------
@@ -230,6 +259,39 @@ elif jq \
     fi
 else
     echo "FAIL J4: could not run extracted reattach jq program"; fail=1
+fi
+
+# --- J4b: the reattach copy of the dns_remote repoint must have
+# teeth. Strip it from a copy of the script and re-run the same
+# topology compare; it has to come back drifted.
+reattach_bad=$(mktemp)
+sed 's#.detour = "ded-exit"##' "$reattach" > "$reattach_bad"
+awk -v sq="'" -v rp="${_sport:-20815}" '
+    !p && index($0, ("     " sq "([.outbounds")) == 1 {
+        p = 1
+        $0 = substr($0, 7)
+    }
+    p {
+        e = index($0, (sq " "))
+        if (e > 0) {
+            $0 = substr($0, 1, e - 1)
+            s = sq "\"" "$SHADOW_PORT" "\"" sq
+            i = index($0, s)
+            if (i > 0)
+                $0 = substr($0, 1, i - 1) rp substr($0, i + length(s))
+            print
+            exit
+        }
+        print
+    }
+' "$reattach_bad" > /tmp/reattach-prog-bad.jq
+rm -f "$reattach_bad"
+if jq -f /tmp/reattach-prog-bad.jq /tmp/inj-closed.json > /tmp/inj-j4b.json 2>/dev/null \
+   && [ "$(jq -cS 'del(.inbounds)' /tmp/inj-base.json | md5sum | cut -d' ' -f1)" \
+      = "$(jq -cS 'del(.inbounds)' /tmp/inj-j4b.json | md5sum | cut -d' ' -f1)" ]; then
+    echo "FAIL J4b: dropping the reattach dns_remote repoint still matches (toothless)"; fail=1
+else
+    echo "PASS J4b: reattach dns_remote repoint has teeth"
 fi
 
 # --- A1: closed-state equivalence (EXIT_VIA_DED off => the patched
