@@ -4,11 +4,14 @@ Custom artifacts deployed to the N100 router that don't fit in the main
 watchdog script. Everything here is reproducible from source.
 
 The surflare-proxy wrapper is NOT here despite the name of this directory.
-It lives at `scripts/surflare-proxy-wrapper.sh` and that is the copy that
-gets deployed to `/usr/bin/surflare-proxy`. A second copy used to sit in
-this directory calling itself the canonical source; it stopped being
-updated on 2026-07-19 and was removed. If you need to confirm which file
-is live, compare md5 against the router rather than trusting a path.
+It lives at `router/surflare-proxy`, and that is the copy deployed to
+`/usr/bin/surflare-proxy`: on 2026-10-25 the router ran md5
+`6640e40f42f07d903da187279db928d4`, byte-identical to that file. A second copy
+at `scripts/surflare-proxy-wrapper.sh` drifted out of sync, was never
+deployed, and has been removed -- this paragraph used to name that one as the
+deployed file, which is how a test came to grade a copy nobody ran. To see
+which file is live, compare md5 against the router rather than trusting a
+path.
 
 ## patches/
 

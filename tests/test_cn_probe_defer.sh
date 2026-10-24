@@ -215,25 +215,36 @@ esac
 # T7 regression: the full watchdog parses, the wrapper carries the
 # user-facing domains, and transit-pinned configs select their urltest
 # outbound instead of silently falling back to direct.
-_wrapper_domains=$(grep -m1 '^INJECT_DOMAINS=' scripts/surflare-proxy-wrapper.sh | cut -d'"' -f2)
+_wrapper_domains=$(grep -m1 '^INJECT_DOMAINS=' router/surflare-proxy | cut -d'"' -f2)
 # Extract the wrapper's jq filter verbatim (between the single-quoted
 # invocation and the redirect) and its --arg values, so the test exercises
 # the exact deployed filter rather than a re-typed copy.
-_filter_start=$(grep -n "^if jq --argjson" scripts/surflare-proxy-wrapper.sh | head -1 | cut -d: -f1)
-_filter_end=$(grep -n "^' < \"\$_tmp\" > \"\$_patched\"; then$" scripts/surflare-proxy-wrapper.sh | head -1 | cut -d: -f1)
-_T=$(grep -m1 '^TOLERANCE=' scripts/surflare-proxy-wrapper.sh | cut -d= -f2)
-_I=$(grep -m1 '^INTERVAL=' scripts/surflare-proxy-wrapper.sh | cut -d'"' -f2)
-_DD=$(grep -m1 '^DIRECT_DOMAINS=' scripts/surflare-proxy-wrapper.sh | cut -d'"' -f2)
+_filter_start=$(grep -n "^if jq --argjson" router/surflare-proxy | head -1 | cut -d: -f1)
+_filter_end=$(grep -n "^' < \"\$_tmp\" > \"\$_patched\"; then$" router/surflare-proxy | head -1 | cut -d: -f1)
+_T=$(grep -m1 '^TOLERANCE=' router/surflare-proxy | cut -d= -f2)
+_I=$(grep -m1 '^INTERVAL=' router/surflare-proxy | cut -d'"' -f2)
+_DD=$(grep -m1 '^DIRECT_DOMAINS=' router/surflare-proxy | cut -d'"' -f2)
 _patched=$(mktemp)
 if [ -n "$_filter_start" ] && [ -n "$_filter_end" ] && [ "$_filter_end" -gt "$_filter_start" ]; then
     _span=$((_filter_end - _filter_start - 1))
     if [ "$_span" -lt 20 ] || [ "$_span" -gt 200 ]; then
-        _vpn_tag="extract-suspicious-span=$_span"
+        # Every variable the assertion below reads must exist: unset ones are
+        # not "empty", they abort the script under set -u and the rest of the
+        # suite silently stops running.
+        _vpn_tag="extract-suspicious-span=$_span" _final="" _catchall="" _jq_ok=0
     else
-        sed -n "$((_filter_start + 1)),$((_filter_end - 1))p" scripts/surflare-proxy-wrapper.sh > "$_patched.jq"
-        jq --argjson T "$_T" --arg I "$_I" --arg D "$_wrapper_domains" --arg DD "$_DD" \
+        sed -n "$((_filter_start + 1)),$((_filter_end - 1))p" router/surflare-proxy > "$_patched.jq"
+        # The filter takes five arguments, not four: leaving one out makes jq
+        # refuse to compile the program, every variable below reads empty, and
+        # the assertion compares empty to empty and passes.
+        _DE=$(grep -m1 '^EXIT_VIA_DED=' router/surflare-proxy | cut -d'"' -f2)
+        if jq --argjson T "$_T" --arg I "$_I" --arg D "$_wrapper_domains" --arg DD "$_DD" --arg DE "$_DE" \
             -f "$_patched.jq" \
-            < tests/fixtures/singbox-transit-pinned.json > "$_patched" 2>/dev/null
+            < tests/fixtures/singbox-transit-pinned.json > "$_patched" 2>/dev/null; then
+            _jq_ok=1
+        else
+            _jq_ok=0
+        fi
         _vpn_tag=$(jq -r '[.outbounds[] | select(.type == "urltest")][0].tag // "direct"' "$_patched" 2>/dev/null)
         _final=$(jq -r '.route.final' "$_patched" 2>/dev/null)
         _catchall=$(jq -r '.route.rules[-1].outbound' "$_patched" 2>/dev/null)
@@ -242,6 +253,8 @@ else
     _vpn_tag="extract-failed" _final="" _catchall=""
 fi
 if bash -n "$WATCHDOG" \
+   && [ "${_jq_ok:-0}" -eq 1 ] \
+   && [ -n "$_vpn_tag" ] && [ -n "$_final" ] && [ -n "$_catchall" ] \
    && grep -q 'claude.ai' <<<"$_wrapper_domains" \
    && grep -q 'google.com' <<<"$_wrapper_domains" \
    && grep -q 'gemini.google.com' <<<"$_wrapper_domains" \
@@ -262,7 +275,7 @@ _else=$(awk '
 	in_jq && /^else$/ { in_else=1; next }
 	in_else && /^fi$/ { exit }
 	in_else { print }
-' scripts/surflare-proxy-wrapper.sh)
+' router/surflare-proxy)
 # shellcheck disable=SC2016  # grep for the literal exec "$REAL_BIN"; expand would empty the needle
 if [ -z "$_else" ]; then
 	bad T8 "could not extract jq else branch"
@@ -277,16 +290,30 @@ else
 fi
 
 # T9: pre-patch dump must be gated; unpatched JSON carries passwords.
-if grep -n 'singbox-config-dump.json' scripts/surflare-proxy-wrapper.sh | grep -q SURFLARE_DEBUG; then
+if grep -n 'singbox-config-dump.json' router/surflare-proxy | grep -q SURFLARE_DEBUG; then
 	ok "T9 dump gated on SURFLARE_DEBUG"
 elif awk '
 	/SURFLARE_DEBUG/ { gated=1 }
 	/singbox-config-dump.json/ { dump=1; if (gated) ok=1 }
 	END { exit(ok ? 0 : 1) }
-' scripts/surflare-proxy-wrapper.sh; then
+' router/surflare-proxy; then
 	ok "T9 dump gated on SURFLARE_DEBUG"
 else
 	bad T9 "dump of unpatched config is unconditional (passwords in /tmp)"
+fi
+
+# One wrapper, and the test grades the one that is deployed.  A second copy
+# used to sit in scripts/ and this test graded that copy, so a change to the
+# file the router actually runs went ungraded.
+if [ -e scripts/surflare-proxy-wrapper.sh ]; then
+	bad "T10 a second proxy wrapper exists" "delete scripts/surflare-proxy-wrapper.sh"
+else
+	ok "T10 there is exactly one proxy wrapper"
+fi
+if grep -q 'router/surflare-proxy' "$0"; then
+	ok "T11 the test grades the deployed wrapper"
+else
+	bad "T11 the test does not name the deployed wrapper" "grade router/surflare-proxy"
 fi
 
 echo
