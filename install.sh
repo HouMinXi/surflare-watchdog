@@ -90,6 +90,10 @@ if [ "$INIT" = "procd" ]; then
     #   sexpect           -- PTY-based login (password not in /proc cmdline)
     install -m 755 "$REPO/router/surflare_route_updater.sh" \
         /usr/local/sbin/surflare_route_updater.sh
+    # The updater hands its RIPE fetches to this helper; without it every
+    # nightly run loses that source and still exits 0.
+    install -m 755 "$REPO/router/ripe_fetch.py" \
+        /usr/local/sbin/ripe_fetch.py
     install -m 755 "$REPO/cross_validate_cloud_cdn.py" \
         /usr/local/sbin/cross_validate_cloud_cdn.py
     opkg install \
@@ -113,7 +117,11 @@ else
     # Laptop (Fedora/RHEL/systemd) -- additional diagnostic tools
     install -m 755 "$REPO/laptop/surflare_early_detector.sh" /usr/local/sbin/surflare_early_detector.sh
     install -m 755 "$REPO/laptop/surflare_node_probe.sh"     /usr/local/sbin/surflare_node_probe.sh
-    install -m 755 "$REPO/laptop/surflare_route_updater.sh"  /usr/local/sbin/surflare_route_updater.sh
+    # One updater serves both platforms: the laptop copy was a stale fork of
+    # this one, without the instance lock, the download-window signal the
+    # watchdog reads, or the per-pid reaper, and it drifted for months.
+    install -m 755 "$REPO/router/surflare_route_updater.sh"  /usr/local/sbin/surflare_route_updater.sh
+    install -m 755 "$REPO/router/ripe_fetch.py"              /usr/local/sbin/ripe_fetch.py
     # Cloud CDN validator: required by surflare_route_updater.sh for extra bypass CIDRs
     install -m 755 "$REPO/cross_validate_cloud_cdn.py" \
         /usr/local/sbin/cross_validate_cloud_cdn.py

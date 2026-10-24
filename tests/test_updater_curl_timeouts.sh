@@ -56,8 +56,21 @@ grep -q -- '--max-time' router/ripe_fetch.py \
 grep -q 'os.waitid(os.P_PID' router/ripe_fetch.py \
     && ok "router: fetcher reaps each pid individually" \
     || bad "router: fetcher does not reap per pid (a shared wait would collect siblings)"
-# laptop copy: 8 curls (same fetches, no lock/heartbeat machinery)
-check_curls laptop/surflare_route_updater.sh 8
+# One updater for both platforms.  There used to be a laptop fork of this
+# script carrying its own copies of the same fetches, missing the instance
+# lock and the download-window signal, and it drifted for months until the two
+# disagreed by 104 lines.  Assert the fork cannot come back.
+if [ -e laptop/surflare_route_updater.sh ]; then
+	bad "a second route updater exists on the laptop side"
+else
+	ok "there is exactly one route updater"
+fi
+n_installs=$(grep -c 'install -m 755 "$REPO/router/surflare_route_updater.sh"' install.sh)
+if [ "$n_installs" -eq 2 ]; then
+	ok "both install branches deploy the same updater"
+else
+	bad "the updater is installed by ${n_installs} branch(es); expected 2"
+fi
 
 echo "FAIL=$fail"
 exit $fail
