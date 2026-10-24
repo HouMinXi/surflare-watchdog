@@ -958,6 +958,7 @@ _startup_cleanup_dns_fallback() {
 	_dns_fallback_active=0
 	_dns_fallback_gw=""
 	rm -f "$DNS_STUCK_FILE"
+	rm -f /run/surflare_self_dial_guard.*.note 2>/dev/null || true
 }
 
 # surflare drops all ICMP/ICMPv6 in output to prevent tunnel leaks.
@@ -999,6 +1000,142 @@ _cleanup_surflare_icmp_lan() {
 			| grep -F "$pat" | awk '/handle /{print $NF}' | head -1)
 		[ -n "$h" ] && nft delete rule inet surflare output handle "$h" 2>/dev/null
 	done
+}
+
+# surflare's generated route sends ip_is_private traffic out `direct` before
+# anything else, so a connection arriving at the tproxy inbound with a
+# loopback destination is dialled straight back into the same listener and
+# the loop feeds itself -- no external traffic behind it (measured: 9,759 new
+# connections/second, one core pinned by an otherwise idle proxy).  Drop that
+# loopback dial at the head of the output chain, ahead of the chain's own
+# mark rules.
+#
+# Re-applied at every point that rebuilds the table: each `surflare connect`
+# path (connect_vpn, the transit probe, the upgrade/rollback restart) and the
+# healthy tick, because surflare recreates its table on start and the rule
+# goes with it.  The tick alone would not be enough -- the loop pins a core,
+# which keeps probes failing, which keeps the verdict unhealthy, so a guard
+# that waits for "healthy" waits for the symptom to go away by itself.
+#
+# The selector matches any locally-originated dial to a local address on the
+# tproxy port, not only 127.0.0.1.  The listener answers none of them (a SOCKS
+# greeting gets no reply, from this host or from the LAN), so a stray copy
+# blocks nothing that was working, and no teardown counterpart is needed: the
+# table belongs to the proxy and dies with it.
+#
+# The rule carries a comment and the comment is the dedup key: nft renders a
+# bare `counter` as `counter packets N bytes N`, so matching the rule text
+# would never hit and the tick would append a fresh copy every pass.
+_SELF_DIAL_TAG="watchdog-tproxy-self-dial"
+# State lives in a file, not a shell variable: connect_vpn's body runs inside
+# a subshell and probe_best_transit is called through command substitution, so
+# a variable would be read and written in copies and "report once" would decay
+# into "report once per call".  The name carries the process id so a fresh
+# watchdog starts with a clean slate instead of inheriting a stale latch.
+_SELF_DIAL_NOTE="${_SELF_DIAL_NOTE:-/run/surflare_self_dial_guard.$$.note}"
+
+# The note is a latch, never a command: refuse to follow a symlink and refuse
+# anything that is not a regular file (a FIFO here would block the loop).
+_self_dial_note_read() {
+	[ -f "$_SELF_DIAL_NOTE" ] && [ ! -L "$_SELF_DIAL_NOTE" ] || return 0
+	cat "$_SELF_DIAL_NOTE" 2>/dev/null || true
+}
+
+_self_dial_note_set() {
+	local tmp="${_SELF_DIAL_NOTE}.tmp"
+	( umask 077; printf '%s' "$1" > "$tmp" ) 2>/dev/null && \
+		mv -f "$tmp" "$_SELF_DIAL_NOTE" 2>/dev/null || rm -f "$tmp" 2>/dev/null
+}
+
+_self_dial_note_clear() {
+	rm -f "$_SELF_DIAL_NOTE" 2>/dev/null || true
+}
+
+# Report a condition once per distinct cause.  $1 is what gets latched, $2 is
+# what gets said; keeping them separate stops the latch key and the message
+# from having to agree word for word.
+_self_dial_report() {
+	[ "$1" = "$(_self_dial_note_read)" ] && return 0
+	log "WARN: tproxy self-dial guard: $2"
+	_self_dial_note_set "$1"
+}
+
+# Handles only mean something inside one generation of the table: surflare
+# destroys and recreates inet surflare on every start and the new table hands
+# the same numbers out again, so a listing taken a moment ago can name someone
+# else's rule.  Re-read the chain and confirm the line still carries our tag
+# before deleting; the extra read only happens when there is something to
+# delete.
+_self_dial_delete_tagged() {
+	local h="$1" now err
+	now=$(nft -a list chain inet surflare output 2>/dev/null) || return 0
+	printf '%s\n' "$now" | grep -F "comment \"$_SELF_DIAL_TAG\"" \
+		| grep -q "# handle $h\$" || return 0
+	if err=$(nft delete rule inet surflare output handle "$h" 2>&1); then
+		return 0
+	fi
+	_self_dial_report "delete-failed-$h" \
+		"could not remove stale copy $h: ${err%%$'\n'*}"
+}
+
+_patch_surflare_self_dial_guard() {
+	# -a is not decoration: handles only appear in the listing when it is
+	# passed, and every decision below keys on them.
+	local listing err tagged our_line our_handle head_handle stale first
+	# No separate existence probe: asking for the whole table first dumps every
+	# set element (103 KB at real chnroute size) and costs more than the rest of
+	# this function put together, while a missing table fails the chain listing
+	# the same way and lands in the branch below.
+	if ! listing=$(nft -a list chain inet surflare output 2>/dev/null); then
+		err=$(nft -a list chain inet surflare output 2>&1 >/dev/null | head -1)
+		# An nft that dies without a word must not be filed under "the chain
+		# is not there yet", which is the one cause that resolves itself.
+		[ -z "$err" ] && err="(nft failed with no output)"
+		if printf '%s' "$err" | grep -qi 'no such file\|does not exist'; then
+			_self_dial_report "no-chain" "output chain missing, not applied"
+		else
+			_self_dial_report "chain unreadable: $err" "chain unreadable: $err"
+		fi
+		return 0
+	fi
+	# The rule must be ours, on our selector, on our port, still dropping, and
+	# first in the chain: other components insert their accepts at the head
+	# after us, and an accept above this drop hands the self-dial back to the
+	# tunnel.
+	tagged=$(printf '%s\n' "$listing" | grep -F "comment \"$_SELF_DIAL_TAG\"" \
+		| sed -n 's/.*# handle \([0-9]*\).*/\1/p')
+	our_line=$(printf '%s\n' "$listing" | grep -F "comment \"$_SELF_DIAL_TAG\"" \
+		| grep -F "oifname \"lo\"" | grep -E 'tcp dport 10800([[:space:]]|$)' \
+		| grep ' drop' | head -1)
+	our_handle=""
+	[ -n "$our_line" ] && our_handle=$(printf '%s\n' "$our_line" \
+		| sed -n 's/.*# handle \([0-9]*\).*/\1/p')
+	# The chain's own handle arrives on a line that contains "{ # handle";
+	# a rule line never does, even when the rule uses a set literal.
+	head_handle=$(printf '%s\n' "$listing" | grep '# handle' | grep -v '{ # handle' \
+		| head -1 | sed -n 's/.*# handle \([0-9]*\).*/\1/p')
+	# Copies that are not ours any more (an earlier revision, a hand edit, a
+	# racing caller) are removed on every pass, including the healthy one:
+	# they would otherwise be shadowed by the head drop and stay forever.
+	for stale in $tagged; do
+		[ "$stale" = "$our_handle" ] && continue
+		_self_dial_delete_tagged "$stale"
+	done
+	if [ -n "$our_handle" ]; then
+		[ "$our_handle" = "$head_handle" ] && {
+			_self_dial_note_clear
+			return 0
+		}
+		_self_dial_delete_tagged "$our_handle"
+	fi
+	if err=$(nft insert rule inet surflare output oifname "lo" tcp dport 10800 \
+			counter drop comment "$_SELF_DIAL_TAG" 2>&1); then
+		_self_dial_note_clear
+		return 0
+	fi
+	first="${err%%$'\n'*}"
+	[ -z "$first" ] && first="(nft failed with no output)"
+	_self_dial_report "$first" "insert failed: $first"
 }
 
 _setup_kernel_moat() {
@@ -5150,6 +5287,9 @@ probe_best_transit() {
 			cleanup_probe_state
 			continue
 		fi
+		# The candidate proxy is serving the LAN for the whole settle window;
+		# guard it now rather than relying on a healthy tick that may not come.
+		_patch_surflare_self_dial_guard
 		sleep "$TRANSIT_PROBE_SETTLE"
 		_update_server_endpoint
 		_update_killswitch_server_ips
@@ -5747,6 +5887,11 @@ connect_vpn() {
 			_reinstall_killswitch_output
 			log "connect_vpn: killswitch output reinstalled after connect"
 		fi
+		# Immediately, before the settle poll and before either settle
+		# branch: the LAN is already pointed at this proxy, and the legacy
+		# branch returns without passing any other call site.  No-ops while
+		# the table or its output chain is still missing.
+		_patch_surflare_self_dial_guard
 		# Load CN output bypass immediately after Phase 1 table creation.
 		# surflare connect has already created inet surflare with the output
 		# chain catchall (mark->reroute->tproxy).  Without cn_output, CN
@@ -5768,6 +5913,7 @@ connect_vpn() {
 				if check_vpn_local_state; then
 					log "Local state ready after ${_ready_wait}s, waiting for data-plane..."
 					_raise_proxy_fd_limit
+					_patch_surflare_self_dial_guard
 					break
 				fi
 				sleep 1
@@ -6384,6 +6530,7 @@ for line in sys.stdin:
 nft delete table inet watchdog_trace 2>/dev/null || true
 _startup_cleanup_dns_fallback
 _patch_surflare_icmp_lan
+_patch_surflare_self_dial_guard
 
 fail_count=0
 reconnect_count=0
@@ -6815,6 +6962,7 @@ _start_surflare_proxy() {
 	while [ "$_wait" -lt "$SURFLARE_UPGRADE_SETTLE" ]; do
 		if check_vpn_local_state; then
 			_raise_proxy_fd_limit
+			_patch_surflare_self_dial_guard
 			return 0
 		fi
 		sleep 3
@@ -7040,6 +7188,10 @@ _maybe_upgrade_surflare() {
 	return 0
 }
 while true; do
+	# Unconditional, above the health gate: the self-dial loop is what makes
+	# the verdict unhealthy, so a guard that only runs on a healthy cycle
+	# waits for its own symptom to clear.  Silent while the proxy is absent.
+	_patch_surflare_self_dial_guard
 	# Diagnostic mode: pause without tearing down protections.
 	# SIGUSR2 toggles _diag_mode; while active, the loop sleeps
 	# and skips all health checks/reconnects.  nft tables stay up.
@@ -7135,6 +7287,7 @@ while true; do
 				_block_unreachable_doh
 				_update_bypass_devices
 				_patch_surflare_icmp_lan
+				_patch_surflare_self_dial_guard
 				_record_connect "${_active_node}" "${new_health}"
 				_start_proxy_log_monitor
 			else
@@ -7397,6 +7550,7 @@ while true; do
 		fi
 		_remove_dns_fallback
 		_patch_surflare_icmp_lan
+		_patch_surflare_self_dial_guard
 
 		# Ensure sw_lan_tproxy is loaded AND in tproxy shape on every
 		# healthy tick.  Table missing: first-connect load.  Table
@@ -7691,6 +7845,7 @@ while true; do
 					fi
 					_update_bypass_devices
 					_patch_surflare_icmp_lan
+					_patch_surflare_self_dial_guard
 					_record_connect "${_active_node}" "${new_health}"
 					_start_proxy_log_monitor
 				else

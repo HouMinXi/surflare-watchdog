@@ -1,0 +1,2 @@
+	printf '%s\n' "$now" | grep -F "comment \"$_SELF_DIAL_TAG\"" \
+		| grep -q "# handle $h\$" || return 0

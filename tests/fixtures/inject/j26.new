@@ -1,0 +1,2 @@
+	nft list table inet surflare >/dev/null 2>&1 || return 0
+	if ! listing=$(nft -a list chain inet surflare output 2>/dev/null); then
