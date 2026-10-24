@@ -86,6 +86,11 @@ _line_congested_since=0                # epoch timestamp of the first congested 
 _hold_exit_node=0                      # 1 = next reconnect keeps the exit (relay-path evidence)
 DIAG_SACK_THRESHOLD=20                # % of packets with SACK blocks to flag transit degradation
 DISCONNECT_SETTLE=1                   # seconds after surflare disconnect before killing processes
+# The CLI can hang; when it does, the tombstone is already in place and the LAN
+# stays blocked until this returns.  Everything else in this script that calls
+# the CLI is bounded, so these are too.
+DISCONNECT_TIMEOUT=30                 # seconds before surflare disconnect is abandoned
+DISCONNECT_KILL_GRACE=5               # then SIGKILL: a TERM-ignoring CLI would otherwise wait forever
 CONNECT_SETTLE=20                     # seconds after surflare connect --daemon for VPN to establish
 DATAPLANE_SETTLE=60                       # max seconds to wait for data-plane ping after local state ready
 LAST_REFRESH_FILE="/run/surflare_last_refresh"  # timestamp of last watchdog-initiated auth refresh (debug only)
@@ -235,7 +240,7 @@ else
 #   flock         -> util-linux   (all major distros)
 #   surflare/surflare-proxy -> from surflare installation
 # Note: nm-online is optional (NetworkManager package); falls back to sleep 15s.
-for cmd in curl killall pgrep flock surflare surflare-proxy python3 ss jq; do
+for cmd in curl killall pgrep flock timeout surflare surflare-proxy python3 ss jq; do
 	if ! command -v "$cmd" >/dev/null 2>&1; then
 		echo "<3>surflare_watchdog: missing dependency: ${cmd}, exiting" >/dev/kmsg
 		exit 1
@@ -248,11 +253,62 @@ done
 # Placed immediately after dependency check (flock verified) and
 # before any other init code, so duplicate instances exit before
 # producing log noise (nm-online warning, etc.).
-exec 9>/run/surflare_watchdog.singleton.lock
-if ! flock -n 9; then
+# Singleton enforcement as a function so the test harness can drive the real
+# code with its own lock and pidfile instead of a copy of it.
+_enforce_singleton() {
+	local lock="${_SINGLETON_LOCK:-/run/surflare_watchdog.singleton.lock}"
+	local pidfile="${_SINGLETON_PIDFILE:-/run/surflare_watchdog.pid}"
+	# A failed open is not a held lock: filing both under "another instance is
+	# running" made a read-only /run look like a healthy single instance.
+	if ! : > "$lock" 2>/dev/null; then
+		echo "<3>surflare_watchdog: cannot create singleton lock $lock" >/dev/kmsg 2>/dev/null
+		exit 1
+	fi
+	exec 9>"$lock"
+	flock -n 9 && return 0
+	# The wake hook runs from systemd-sleep while the daemon is normally
+	# alive, and the daemon holds this lock, so the hook used to die here
+	# before doing anything.  It must not work around the lock either: the
+	# daemon owns the nft state, and two writers is the situation this lock
+	# exists to prevent.  Hand the wake-up to the running instance instead --
+	# SIGUSR1 breaks its sleep and makes it run a health check, which is what
+	# decides whether a reconnect is needed.
+	# Only `post` has work to hand over.  On `pre` the network is still up and
+	# the daemon is about to be frozen: a health check there can restart a
+	# reconnect and leave it half-done across the suspend.
+	case "$1" in
+	pre)
+		# Nothing to do before a suspend.  Exiting non-zero here would be
+		# logged as a failed hook by systemd, and signalling the daemon would
+		# restart a reconnect that the freeze is about to interrupt.
+		exit 0
+		;;
+	post)
+		local _wd_pid
+		_wd_pid=$(cat "$pidfile" 2>/dev/null)
+		# SIGUSR1 terminates by default, so an unvalidated pid is a way to
+		# kill whoever inherited that number.  The pidfile is rewritten late
+		# in startup while this guard runs early, so a stale pid here is a
+		# real case, not a theoretical one.  0 and 1 are refused outright:
+		# one signals the caller's own process group, the other init.
+		case "$_wd_pid" in
+		''|*[!0-9]*|0|1) _wd_pid="" ;;
+		esac
+		if [ -n "$_wd_pid" ] && [ -r "/proc/$_wd_pid/cmdline" ] && \
+		   tr '\0' ' ' < "/proc/$_wd_pid/cmdline" 2>/dev/null | grep -q 'surflare_watchdog'; then
+			kill -USR1 "$_wd_pid" 2>/dev/null || true
+			echo "<6>surflare_watchdog: wake hook handed to the running instance" >/dev/kmsg 2>/dev/null
+		else
+			echo "<4>surflare_watchdog: wake hook found no live watchdog to hand to" >/dev/kmsg 2>/dev/null
+		fi
+		exit 0
+		;;
+	esac
 	echo "<3>surflare_watchdog: another instance is running, exiting" >/dev/kmsg 2>/dev/null
 	exit 1
-fi
+}
+
+_enforce_singleton "${1:-}"
 
 # expect is only needed for interactive password auth (CREDENTIALS_DIRECTORY path).
 # Router deployments use token-based auth and rarely have expect installed.
@@ -267,6 +323,57 @@ log() {
 	# to /dev/kmsg under procd (OpenWrt), causing printk ratelimit floods.
 	# echo builtin does a single write() and works correctly.
 	echo "<6>surflare_watchdog: $*" >/dev/kmsg
+}
+
+# Read a prefix list and emit only entries that are a bare address or CIDR.
+# Two reasons this is not cosmetic: the lists are downloaded from remote
+# origins, so their text must never reach nft's parser as syntax; and nft
+# rejects the whole batch when one element is malformed, which would take the
+# entire CN bypass down over a single bad line.  Dropped entries are counted
+# and logged so a shrinking list is visible.
+_filter_prefixes() {
+	local f="$1" fam="$2" pat entries dropped kept kept_n total_n
+	[ -f "$f" ] || return 0
+	entries=$(grep -v '^#' "$f" 2>/dev/null | tr -d ' \t\r' | grep -v '^$')
+	[ -z "$entries" ] && return 0
+	# IPv6 cannot be checked by shape: ":::", "::1::" and "1:2:3:4:5:6:7:8:9"
+	# all look like addresses, all are rejected by nft, and nft aborts the
+	# whole element batch over any one of them -- which silently skips the CN
+	# bypass for that refresh.  python3 is already a dependency of this
+	# script and ipaddress applies the same grammar nft does.
+	if [ "$fam" = "6" ] && command -v python3 >/dev/null 2>&1; then
+		kept=$(printf '%s\n' "$entries" | python3 -c '
+import ipaddress, sys
+out = []
+for line in sys.stdin:
+    s = line.strip()
+    if not s:
+        continue
+    try:
+        net = ipaddress.ip_network(s, strict=False)
+    except ValueError:
+        continue
+    if net.version == 6:
+        out.append(s)
+sys.stdout.write(",".join(out))
+')
+		kept_n=$(printf '%s' "$kept" | tr ',' '\n' | grep -c .)
+		total_n=$(printf '%s\n' "$entries" | grep -c .)
+		dropped=$(( total_n - kept_n ))
+		[ "$dropped" -gt 0 ] && \
+			log "WARN: ${f}: dropped ${dropped} entries that are not valid prefixes"
+		printf '%s' "$kept"
+		return 0
+	fi
+	case "$fam" in
+	4) pat='^((25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])\.){3}(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])(/(3[0-2]|[12]?[0-9]))?$' ;;
+	6) pat='^[0-9A-Fa-f:]*:[0-9A-Fa-f:.]*(/(12[0-8]|[0-9]{1,2}))?$' ;;
+	*) return 0 ;;
+	esac
+	dropped=$(printf '%s\n' "$entries" | grep -vcE "$pat")
+	[ "${dropped:-0}" -gt 0 ] && \
+		log "WARN: ${f}: dropped ${dropped} entries that are not valid prefixes"
+	printf '%s\n' "$entries" | grep -E "$pat" | paste -sd, -
 }
 
 fi  # end of _SOURCE_ONLY guard (skip dependency checks and system init)
@@ -1294,7 +1401,7 @@ _setup_chnroute() {
 			local tmp_nft
 tmp_nft=$(mktemp /tmp/cn_ipv4.XXXXXX)
 			local _v4_data
-			_v4_data=$(grep -v '^#' "$cn_v4_file" | grep -v '^[[:space:]]*$' | paste -sd, -)
+			_v4_data=$(_filter_prefixes "$cn_v4_file" 4)
 			if [ -z "$_v4_data" ]; then
 				log "WARN: ${cn_v4_file} has no valid CIDRs, skipping surflare cn_ipv4"
 			else
@@ -1330,7 +1437,7 @@ tmp_nft=$(mktemp /tmp/cn_ipv4.XXXXXX)
 			local tmp_nft_v6
 tmp_nft_v6=$(mktemp /tmp/cn_ipv6.XXXXXX)
 			local _v6_data
-			_v6_data=$(grep -v '^#' "$cn_v6_file" | grep -v '^[[:space:]]*$' | paste -sd, -)
+			_v6_data=$(_filter_prefixes "$cn_v6_file" 6)
 			if [ -z "$_v6_data" ]; then
 				log "WARN: ${cn_v6_file} has no valid CIDRs, skipping surflare cn_ipv6"
 			else
@@ -1362,8 +1469,7 @@ tmp_nft_v6=$(mktemp /tmp/cn_ipv6.XXXXXX)
 			log "Cloud CDN extra: ${extra_count} CIDRs (${extra_date}) -> surflare cn_ipv4"
 			local tmp_extra="/tmp/cn_v4_extra_$$.nft"
 			local _extra_data
-			_extra_data=$(grep -v '^#' "$cn_v4_extra_file" | \
-				grep -v '^[[:space:]]*$' | paste -sd, -)
+			_extra_data=$(_filter_prefixes "$cn_v4_extra_file" 4)
 			if [ -z "$_extra_data" ]; then
 				log "WARN: ${cn_v4_extra_file} has no valid CIDRs"
 			else
@@ -1391,7 +1497,7 @@ _ks_batch=$(mktemp /tmp/ks_bypass_all.XXXXXX)
 		local _cn_count _cn_date _ks_v4
 		_cn_count=$(grep -vc '^#' "$cn_v4_file" 2>/dev/null || echo 0)
 		_cn_date=$(stat -c '%y' "$cn_v4_file" 2>/dev/null | cut -d' ' -f1)
-		_ks_v4=$(grep -v '^#' "$cn_v4_file" | grep -v '^[[:space:]]*$' | paste -sd, -)
+		_ks_v4=$(_filter_prefixes "$cn_v4_file" 4)
 		if [ -n "$_ks_v4" ]; then
 			{
 				printf 'flush set inet killswitch bypass_ipv4\n'
@@ -1405,14 +1511,13 @@ _ks_batch=$(mktemp /tmp/ks_bypass_all.XXXXXX)
 	# Cloud CDN extra: additive to bypass_ipv4 (same batch, no separate flush).
 	if [ -f "$cn_v4_extra_file" ]; then
 		local _ks_extra
-		_ks_extra=$(grep -v '^#' "$cn_v4_extra_file" | \
-			grep -v '^[[:space:]]*$' | paste -sd, -)
+		_ks_extra=$(_filter_prefixes "$cn_v4_extra_file" 4)
 		[ -n "$_ks_extra" ] && \
 			printf 'add element inet killswitch bypass_ipv4 { %s }\n' "$_ks_extra" >> "$_ks_batch"
 	fi
 	if [ -f "$cn_v6_file" ]; then
 		local _ks_v6
-		_ks_v6=$(grep -v '^#' "$cn_v6_file" | grep -v '^[[:space:]]*$' | paste -sd, -)
+		_ks_v6=$(_filter_prefixes "$cn_v6_file" 6)
 		if [ -n "$_ks_v6" ]; then
 			{
 				printf 'flush set inet killswitch bypass_ipv6\n'
@@ -1470,7 +1575,7 @@ _load_tproxy_cn_direct() {
 		log "WARN: ${cn_v4_file} missing, cn_direct will be empty"
 	if [ -f "$cn_v4_file" ]; then
 		local _v4_cidrs
-		_v4_cidrs=$(grep -v '^#' "$cn_v4_file" | grep -v '^[[:space:]]*$' | paste -sd, -)
+		_v4_cidrs=$(_filter_prefixes "$cn_v4_file" 4)
 		if [ -n "$_v4_cidrs" ]; then
 			{
 				printf 'flush set inet sw_lan_tproxy cn_direct\n'
@@ -1483,8 +1588,7 @@ _load_tproxy_cn_direct() {
 	fi
 	if [ -f "$cn_v4_extra_file" ]; then
 		local _extra_cidrs
-		_extra_cidrs=$(grep -v '^#' "$cn_v4_extra_file" | \
-			grep -v '^[[:space:]]*$' | paste -sd, -)
+		_extra_cidrs=$(_filter_prefixes "$cn_v4_extra_file" 4)
 		[ -n "$_extra_cidrs" ] && \
 			printf 'add element inet sw_lan_tproxy cn_direct { %s }\n' "$_extra_cidrs" >> "$_batch"
 	fi
@@ -1493,7 +1597,7 @@ _load_tproxy_cn_direct() {
 		log "WARN: ${cn_v6_file} missing, cn6_direct will be empty"
 	if [ -f "$cn_v6_file" ]; then
 		local _v6_cidrs
-		_v6_cidrs=$(grep -v '^#' "$cn_v6_file" | grep -v '^[[:space:]]*$' | paste -sd, -)
+		_v6_cidrs=$(_filter_prefixes "$cn_v6_file" 6)
 		if [ -n "$_v6_cidrs" ]; then
 			{
 				printf 'flush set inet sw_lan_tproxy cn6_direct\n'
@@ -1823,7 +1927,7 @@ _cleanup_on_startup() {
 		if [ -n "$_cool_target" ] && [ "$_cool_target" -gt "$_now" ] 2>/dev/null; then
 			_remaining=$((_cool_target - _now))
 			log "Storm cool in progress; sleeping ${_remaining}s before main loop"
-			sleep "$_remaining" &
+			sleep "$_remaining" 9>&- 200>&- &
 			storm_sleep_pid=$!; wait "$storm_sleep_pid" || true
 			storm_sleep_pid=""
 		fi
@@ -2348,7 +2452,7 @@ NFTEOF
 	[ -f "$cn_v6_file" ] || { [ -f "$_bundled_cn_v6" ] && cn_v6_file="$_bundled_cn_v6"; }
 	if [ -f "$cn_v4_file" ]; then
 		local bypass_v4
-		bypass_v4=$(grep -v '^#' "$cn_v4_file" | grep -v '^[[:space:]]*$' | paste -sd, -)
+		bypass_v4=$(_filter_prefixes "$cn_v4_file" 4)
 		if [ -n "$bypass_v4" ]; then
 			nft add element inet killswitch bypass_ipv4 "{ $bypass_v4 }" 2>/dev/null || \
 				log "WARN: failed to load bypass_ipv4"
@@ -2356,7 +2460,7 @@ NFTEOF
 	fi
 	if [ -f "$cn_v6_file" ]; then
 		local bypass_v6
-		bypass_v6=$(grep -v '^#' "$cn_v6_file" | grep -v '^[[:space:]]*$' | paste -sd, -)
+		bypass_v6=$(_filter_prefixes "$cn_v6_file" 6)
 		if [ -n "$bypass_v6" ]; then
 			nft add element inet killswitch bypass_ipv6 "{ $bypass_v6 }" 2>/dev/null || \
 				log "WARN: failed to load bypass_ipv6"
@@ -2365,8 +2469,7 @@ NFTEOF
 	local _ks_extra="/etc/surflare/cn_ipv4_extra.txt"
 	if [ -f "$_ks_extra" ]; then
 		local extra_v4
-		extra_v4=$(grep -v '^#' "$_ks_extra" \
-			| grep -v '^[[:space:]]*$' | paste -sd, -)
+		extra_v4=$(_filter_prefixes "$_ks_extra" 4)
 		if [ -n "$extra_v4" ]; then
 			nft add element inet killswitch bypass_ipv4 "{ $extra_v4 }" 2>/dev/null || \
 				log "WARN: failed to load cloud CDN extra bypass_ipv4"
@@ -2704,7 +2807,7 @@ _enter_storm_cooldown() {
 	local _storm_status _storm_status_rc
 	while [ "$_storm_remaining" -gt 0 ]; do
 		_storm_sleep=$(( _storm_remaining < _storm_probe_interval ? _storm_remaining : _storm_probe_interval ))
-		sleep "$_storm_sleep" &
+		sleep "$_storm_sleep" 9>&- 200>&- &
 		storm_sleep_pid=$!; wait "$storm_sleep_pid"; storm_sleep_pid=""
 		_storm_remaining=$(( _storm_remaining - _storm_sleep ))
 		[ "$run_health_check_now" = 1 ] && break
@@ -3347,7 +3450,7 @@ _exempt_cn_output() {
 	# Batch-load all CIDRs from cn_ipv4.txt
 	if [ -f "$cn_v4_file" ]; then
 		local _v4_cidrs
-		_v4_cidrs=$(grep -v '^#' "$cn_v4_file" | grep -v '^[[:space:]]*$' | paste -sd, -)
+		_v4_cidrs=$(_filter_prefixes "$cn_v4_file" 4)
 		if [ -n "$_v4_cidrs" ]; then
 			{
 				printf 'flush set inet surflare cn_output\n'
@@ -5238,7 +5341,7 @@ maybe_reprobe_transit() {
 }
 
 cleanup_probe_state() {
-	surflare disconnect >/dev/null 2>&1
+	timeout -k "$DISCONNECT_KILL_GRACE" "$DISCONNECT_TIMEOUT" surflare disconnect >/dev/null 2>&1
 	killall surflare-proxy 2>/dev/null
 	_stop_proxy_log_monitor
 	wait_for_exit surflare-proxy
@@ -5730,7 +5833,7 @@ connect_vpn() {
 		_tombstone_tproxy
 
 		log "Tombstoning tproxy, disconnecting, flushing nftables..."
-		if ! surflare disconnect 2>/dev/null; then
+		if ! timeout -k "$DISCONNECT_KILL_GRACE" "$DISCONNECT_TIMEOUT" surflare disconnect 2>/dev/null; then
 			log "disconnect returned non-zero (may not have been connected), continuing cleanup..."
 		fi
 		sleep "$DISCONNECT_SETTLE"
@@ -5873,6 +5976,11 @@ connect_vpn() {
 		ulimit -n 65535 2>/dev/null || true
 		if ! _ensure_wrapper; then
 			log "FATAL: wrapper restore failed, aborting connect to prevent traffic leak"
+			# Leaving here without the re-arm keeps the output chain unarmed:
+			# the forward chain still blocks the LAN, but the router itself
+			# would route outside the tunnel, and _killswitch_armed is still 1
+			# so no tick would repair it.
+			[ "$_ks_was_armed" -eq 1 ] && _reinstall_killswitch_output
 			return 1
 		fi
 		if ! surflare connect --node "$use_node" \
@@ -6079,7 +6187,7 @@ EOF
 	fi
 
 	tcpdump -i "nflog:$_trace_group" -w "$_trace_pcap" \
-		2>"${_trace_pcap}.err" &
+		2>"${_trace_pcap}.err" 9>&- 200>&- &
 	_trace_tcpdump_pid=$!
 
 	local ready=0 _si=0
@@ -6865,6 +6973,7 @@ _check_new_binary() {
 	_SURFLARE_NEW_CLI=""
 	_SURFLARE_NEW_MD5=""
 	local _cfg="/tmp/singbox-config-patched.json"
+	local _candidate_sha=""
 	if [ ! -f "$_cfg" ]; then
 		log "surflare-upgrade: WARN no patched config at ${_cfg} (proxy not restarted yet?)"
 		return 1
@@ -6905,8 +7014,16 @@ _check_new_binary() {
 		return 1
 	fi
 	chmod +x "$_new_real" 2>/dev/null || true
+	# The release manifest carries a version and a filename and nothing else,
+	# so this download is trusted only because it arrived over TLS.  That is
+	# the vendor's gap to close, not something a local check can invent.  What
+	# can be done here: record the digest of exactly what is about to run
+	# BEFORE running it (so the log names the binary, not just the version),
+	# and bound the run so a binary that hangs cannot stall the tick.
+	_candidate_sha=$(sha256sum "$_new_real" 2>/dev/null | awk '{print $1}')
+	log "surflare-upgrade: candidate v${_SURFLARE_NEW_VER} sha256=${_candidate_sha:-unavailable} (manifest is unsigned)"
 	# Test config compatibility: does the new binary accept the patched config?
-	if ! "$_new_real" check -c "$_cfg" >/dev/null 2>&1; then
+	if ! timeout 60 "$_new_real" check -c "$_cfg" >/dev/null 2>&1; then
 		log "surflare-upgrade: new binary rejects current config (check failed)"
 		rm -rf "$_tmpdir"
 		return 1
@@ -6922,7 +7039,7 @@ _check_new_binary() {
 # _stop_surflare_proxy: stop the running proxy cleanly, then SIGKILL leftover.
 # The wrapper/.real is ETXTBSY while running -- must stop before swapping.
 _stop_surflare_proxy() {
-	surflare disconnect >/dev/null 2>&1 || true
+	timeout -k "$DISCONNECT_KILL_GRACE" "$DISCONNECT_TIMEOUT" surflare disconnect >/dev/null 2>&1 || true
 	local _wait=0
 	while [ "$_wait" -lt 10 ]; do
 		_proc_alive surflare-proxy >/dev/null 2>&1 || break
@@ -6956,7 +7073,7 @@ _raise_proxy_fd_limit() {
 _start_surflare_proxy() {
 	surflare connect \
 		--node "$(_resolve_node_catalog_name "${_active_node:-$NODE}")" --mode "${MODE:-global}" \
-		--transit auto --daemon >/dev/null 2>&1 || true
+		--transit auto --daemon >/dev/null 2>&1 9>&- 200>&- || true
 	# Wait for local state: process + :10800 + nft table + ip rule.
 	local _wait=0
 	while [ "$_wait" -lt "$SURFLARE_UPGRADE_SETTLE" ]; do
@@ -7196,7 +7313,7 @@ while true; do
 	# SIGUSR2 toggles _diag_mode; while active, the loop sleeps
 	# and skips all health checks/reconnects.  nft tables stay up.
 	if [ "${_diag_mode:-0}" -eq 1 ]; then
-		sleep "$CHECK_INTERVAL" & storm_sleep_pid=$!
+		sleep "$CHECK_INTERVAL" 9>&- 200>&- & storm_sleep_pid=$!
 		wait "$storm_sleep_pid" || true
 		storm_sleep_pid=""
 		continue
@@ -7204,7 +7321,7 @@ while true; do
 	# Change 6: probe defer guard -- skip entire cycle when node_probe holds the session
 	if _probe_active; then
 		log "node_probe active; deferring health check + reactions this cycle"
-		sleep "$CHECK_INTERVAL" & storm_sleep_pid=$!
+		sleep "$CHECK_INTERVAL" 9>&- 200>&- & storm_sleep_pid=$!
 		wait "$storm_sleep_pid" || true
 		storm_sleep_pid=""
 		continue
@@ -7244,17 +7361,17 @@ while true; do
 		record_crash
 		if crash_rate_exceeded; then
 			log "Crash cascade: ${CRASH_MAX_PER_WINDOW} crashes in ${CRASH_WINDOW}s, cooldown ${CRASH_EXTENDED_COOLDOWN}s"
-			sleep "$CRASH_EXTENDED_COOLDOWN" &
+			sleep "$CRASH_EXTENDED_COOLDOWN" 9>&- 200>&- &
 			storm_sleep_pid=$!; wait "$storm_sleep_pid"; storm_sleep_pid=""
 			_crash_timestamps=""
 			continue
 		fi
 		log "iwlwifi crash detected, waiting ${CRASH_COOLDOWN}s for stabilization"
-		sleep "$CRASH_COOLDOWN" &
+		sleep "$CRASH_COOLDOWN" 9>&- 200>&- &
 		storm_sleep_pid=$!; wait "$storm_sleep_pid"; storm_sleep_pid=""
 		if recent_wifi_crash 10; then
 			log "Firmware still crashing after cooldown, deferring reconnect"
-			sleep "$CHECK_INTERVAL" & storm_sleep_pid=$!; wait "$storm_sleep_pid"; storm_sleep_pid=""
+			sleep "$CHECK_INTERVAL" 9>&- 200>&- & storm_sleep_pid=$!; wait "$storm_sleep_pid"; storm_sleep_pid=""
 			continue
 		fi
 		log "Firmware stable, triggering VPN reconnect"
@@ -7302,7 +7419,7 @@ while true; do
 				_enter_storm_cooldown "post-crash"
 			fi
 		fi
-		sleep "$CHECK_INTERVAL" & storm_sleep_pid=$!; wait "$storm_sleep_pid"; storm_sleep_pid=""
+		sleep "$CHECK_INTERVAL" 9>&- 200>&- & storm_sleep_pid=$!; wait "$storm_sleep_pid"; storm_sleep_pid=""
 		continue
 	fi
 
@@ -7788,7 +7905,7 @@ while true; do
 				rm -f /run/surflare_auth_fail_signal
 				if [ "$_signal_type" = "subscription" ]; then
 					log "Subscription expired, entering 1h cooldown (reconnect will not help)"
-					sleep 3600 &
+					sleep 3600 9>&- 200>&- &
 					storm_sleep_pid=$!; wait "$storm_sleep_pid" || true; storm_sleep_pid=""
 					continue
 				elif [ "$_signal_type" = "fatal" ]; then
@@ -7950,7 +8067,7 @@ while true; do
 		_dg_elapsed=0
 		storm_sleep_pid=""
 		while [ "$_dg_elapsed" -lt "$DEGRADED_INTERVAL" ]; do
-			sleep 2 & storm_sleep_pid=$!
+			sleep 2 9>&- 200>&- & storm_sleep_pid=$!
 			wait "$storm_sleep_pid" || true
 			storm_sleep_pid=""
 			_dg_elapsed=$((_dg_elapsed + 2))
@@ -7961,7 +8078,7 @@ while true; do
 			fi
 		done
 	else
-		sleep "$CHECK_INTERVAL" & storm_sleep_pid=$!
+		sleep "$CHECK_INTERVAL" 9>&- 200>&- & storm_sleep_pid=$!
 		wait "$storm_sleep_pid" || true
 		storm_sleep_pid=""
 	fi
