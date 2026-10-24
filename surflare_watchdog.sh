@@ -1912,8 +1912,11 @@ _cleanup_on_startup() {
 	fi
 	# dns_enforce lives outside the killswitch table; ensure it exists.
 	_ensure_dns_enforce
-	ip rule del fwmark 0x1 lookup 100 2>/dev/null || true
-	ip -6 rule del fwmark 0x1 lookup 100 2>/dev/null || true
+	# There can be more than one: the reconnect path drains a loop of them
+	# below, so a single delete here leaves a stale rule steering marked
+	# traffic into table 100 after the tunnel is gone.
+	while ip rule del fwmark 0x1 lookup 100 2>/dev/null; do :; done
+	while ip -6 rule del fwmark 0x1 lookup 100 2>/dev/null; do :; done
 	# F13: respect an in-progress storm cool across a restart.  If the
 	# persisted cool-until timestamp is in the future, sleep the
 	# remaining window before re-entering the main loop.  This prevents
@@ -2207,6 +2210,21 @@ NFTEOF
 		nft destroy table inet surflare_boot_lock 2>/dev/null || true
 		log "Boot lock removed: killswitch output reinstalled"
 	fi
+}
+
+# The flag records that the install last succeeded, not that the rules are
+# still there.  A manual `nft flush ruleset`, a partially applied fw4 reload or
+# another writer removing the table leaves the chain gone while the flag still
+# says armed -- and every repair site is gated on the flag, so the LAN stays
+# outside the tunnel until the next reconnect.  Ask the ruleset instead, and
+# only pay for the install when the cheap answer is "gone".
+_killswitch_needs_install() {
+	[ "$_killswitch_armed" -eq 0 ] && return 0
+	if [ -z "$(nft list chain inet killswitch forward 2>/dev/null)" ]; then
+		_killswitch_armed=0
+		return 0
+	fi
+	return 1
 }
 
 _install_killswitch() {
@@ -2889,7 +2907,16 @@ _enter_storm_cooldown() {
 	# devices are blocked by the REJECT rules.  If routing is also
 	# broken, the next health check detects PROXY_BROKEN and triggers
 	# a proper reconnect with full routing rebuild.
-	_restore_tproxy
+	#
+	# Only if something is actually listening.  A cooldown cut short by a
+	# SIGUSR1 wake, or one that ends while the proxy is still down, would
+	# otherwise point every LAN connection at a closed port -- REJECT at least
+	# fails fast, and the next health check rebuilds the route properly.
+	if ss -ltn 2>/dev/null | grep -qE ':10800(\s|$)'; then
+		_restore_tproxy
+	else
+		log "Storm cooldown ended with no listener on :10800; keeping the tombstone until the proxy is back"
+	fi
 }
 
 # Populate the bypass_devices set in sw_lan_tproxy.
@@ -5811,6 +5838,11 @@ _handle_proactive_node_rotation() {
 }
 
 connect_vpn() {
+	# A reconnect is a new session: the PROXY_BROKEN confirmation window was
+	# measured against the tunnel that just went away, so carrying its start
+	# time into the next cycle makes the window look already expired and the
+	# reconnect skips the confirmation it exists to require.
+	_pb_grace_since=0
 	# flock prevents concurrent calls from watchdog loop and systemd-sleep post hook
 	(
 		flock -n 9 || {
@@ -6378,8 +6410,8 @@ _full_teardown() {
 	nft delete table ip dns_enforce 2>/dev/null
 	nft delete table inet surflare 2>/dev/null
 	nft delete table inet surflare_moat 2>/dev/null
-	ip rule del fwmark 0x1 lookup 100 2>/dev/null
-	ip -6 rule del fwmark 0x1 lookup 100 2>/dev/null
+	while ip rule del fwmark 0x1 lookup 100 2>/dev/null; do :; done
+	while ip -6 rule del fwmark 0x1 lookup 100 2>/dev/null; do :; done
 	rm -f /run/surflare_watchdog.killswitch_ready
 	rm -f /run/surflare_watchdog.storm_cool_until
 	rm -f "$STORM_503_STATE" "${STORM_503_STATE}.tmp"
@@ -7391,7 +7423,7 @@ while true; do
 				transient_count=0
 				_remove_dns_fallback
 				_update_server_endpoint
-				if [ "$_killswitch_armed" -eq 0 ]; then
+				if _killswitch_needs_install; then
 					if _install_killswitch; then
 						_killswitch_armed=1
 					else
@@ -7679,7 +7711,7 @@ while true; do
 			_restore_tproxy
 			_update_bypass_devices
 		fi
-		if [ "$_killswitch_armed" -eq 0 ]; then
+		if _killswitch_needs_install; then
 			if _install_killswitch; then
 				_killswitch_armed=1
 			else
@@ -7943,7 +7975,7 @@ while true; do
 					_healthy_consecutive=0
 					_remove_dns_fallback
 					_update_server_endpoint
-					if [ "$_killswitch_armed" -eq 0 ]; then
+					if _killswitch_needs_install; then
 						if _install_killswitch; then
 							_killswitch_armed=1
 						else
