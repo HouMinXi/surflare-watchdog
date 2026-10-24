@@ -62,6 +62,9 @@ stop() {
 }
 
 stop_service() {
+    # Reset per call: an ash init process can run more than one stop, and a
+    # stale flag would report a failure that did not happen.
+    _td_failed=0
     if [ -f /run/surflare_restarting ]; then
         # Restart: signal watchdog to do modular teardown (keep killswitch).
         # Marker must exist BEFORE procd sends SIGTERM so cleanup() sees it.
@@ -84,7 +87,7 @@ stop_service() {
         # the killswitch only needs to stay active during the disconnect
         # API call, which has now completed.
         timeout 8 surflare disconnect >/dev/null 2>&1 || true
-        _full_teardown
+        _full_teardown || _td_failed=1
         killall surflare-proxy 2>/dev/null || true
         killall sexpect 2>/dev/null || true
         killall -9 surflare 2>/dev/null || true
@@ -117,22 +120,25 @@ stop_service() {
     if [ -f /run/surflare_restarting ]; then
         logger -t surflare-watchdog "Service stopped for restart (killswitch preserved)"
     else
-        logger -t surflare-watchdog "Service stopped: all nft tables removed"
+        if [ "${_td_failed:-0}" -eq 1 ]; then
+            logger -t surflare-watchdog "Service stopped: TEARDOWN FAILED -- nftables state may remain"
+        else
+            logger -t surflare-watchdog "Service stopped: all nft tables removed"
+        fi
     fi
 }
 
-# DUPLICATE: also defined in surflare_watchdog.sh _full_teardown(). Sync changes.
+# The daemon owns the table list, the state files and the rule drain; this is
+# the only caller of that path, not a second implementation of it.  The copy
+# that used to live here had drifted: it still deleted one fwmark rule where
+# the daemon drains a loop, and it left the 503 counter behind.
+# The status matters: a teardown that did not run must not be reported as one
+# that did.
 _full_teardown() {
-    nft delete table inet killswitch 2>/dev/null
-    nft delete table inet cn_dns_direct 2>/dev/null
-    nft delete table inet sw_lan_tproxy 2>/dev/null
-    nft delete table ip dns_enforce 2>/dev/null
-    nft delete table inet surflare 2>/dev/null
-    nft delete table inet surflare_moat 2>/dev/null
-    ip rule del fwmark 0x1 lookup 100 2>/dev/null
-    ip -6 rule del fwmark 0x1 lookup 100 2>/dev/null
-    rm -f /run/surflare_watchdog.killswitch_ready
-    rm -f /run/surflare_watchdog.storm_cool_until
+    "$SCRIPT" --teardown || {
+        logger -t surflare-watchdog "ERROR: teardown failed (rc=$?); nftables state may remain"
+        return 1
+    }
 }
 
 extra_command "deadman" "Remove orphan killswitch if watchdog is dead"
@@ -146,7 +152,10 @@ deadman() {
         return 0
     fi
     if nft list table inet killswitch >/dev/null 2>&1; then
-        _full_teardown
-        logger -t surflare-deadman "Orphan killswitch removed (watchdog not running)"
+        if _full_teardown; then
+            logger -t surflare-deadman "Orphan killswitch removed (watchdog not running)"
+        else
+            logger -t surflare-deadman "ERROR: could not remove the orphan killswitch; LAN stays blocked"
+        fi
     fi
 }

@@ -70,7 +70,13 @@ CALLS="$(grep -c '^[[:space:]]*_install_cn_dns_direct$' "$WD")"
 [ "$CALLS" -eq 6 ] && ok "6 call sites" || bad "call sites=$CALLS want 6"
 grep -q '^_install_cn_dns_direct() {' "$WD" && ok "function defined" || bad "function missing"
 grep -q 'nft delete table inet cn_dns_direct' "$WD" && ok "teardown in watchdog" || bad "teardown missing in watchdog"
-grep -q 'nft delete table inet cn_dns_direct' "$PROCD" && ok "teardown in procd" || bad "teardown missing in procd"
+# The init script used to carry its own copy of the teardown; it now asks the
+# daemon for it, so what matters is that a stop can still remove the table.
+if grep -q 'nft delete table inet cn_dns_direct' "$PROCD" || grep -q '"\$SCRIPT" --teardown' "$PROCD"; then
+	ok "teardown of cn_dns_direct reachable from procd"
+else
+	bad "procd cannot tear down cn_dns_direct"
+fi
 bash -n "$WD" && ok "bash -n watchdog" || bad "bash -n watchdog"
 bash -n "$PROCD" && ok "bash -n procd" || bad "bash -n procd"
 

@@ -240,12 +240,17 @@ else
 #   flock         -> util-linux   (all major distros)
 #   surflare/surflare-proxy -> from surflare installation
 # Note: nm-online is optional (NetworkManager package); falls back to sleep 15s.
-for cmd in curl killall pgrep flock timeout surflare surflare-proxy python3 ss jq; do
-	if ! command -v "$cmd" >/dev/null 2>&1; then
-		echo "<3>surflare_watchdog: missing dependency: ${cmd}, exiting" >/dev/kmsg
-		exit 1
-	fi
-done
+# --teardown is what the init script calls to clean up after a broken install,
+# which is exactly when a dependency is likely to be gone; it needs nft and ip
+# and nothing else, so it is not gated here.
+if [ "${1:-}" != "--teardown" ]; then
+	for cmd in curl killall pgrep flock timeout surflare surflare-proxy python3 ss jq; do
+		if ! command -v "$cmd" >/dev/null 2>&1; then
+			echo "<3>surflare_watchdog: missing dependency: ${cmd}, exiting" >/dev/kmsg
+			exit 1
+		fi
+	done
+fi
 
 # Singleton enforcement: prevent multiple watchdog instances.
 # Each instance independently sends alerts and modifies nftables,
@@ -256,6 +261,10 @@ done
 # Singleton enforcement as a function so the test harness can drive the real
 # code with its own lock and pidfile instead of a copy of it.
 _enforce_singleton() {
+	# --teardown is asked for by the init script's stop path and by deadman
+	# while the daemon is still alive and holding this lock; refusing it here
+	# would make the request impossible.
+	[ "${1:-}" = "--teardown" ] && return 0
 	local lock="${_SINGLETON_LOCK:-/run/surflare_watchdog.singleton.lock}"
 	local pidfile="${_SINGLETON_PIDFILE:-/run/surflare_watchdog.pid}"
 	# A failed open is not a held lock: filing both under "another instance is
@@ -6331,11 +6340,24 @@ if [ "$1" = "post" ]; then
 fi
 
 # Reject unknown arguments to prevent accidental daemon start
-if [ -n "$1" ]; then
+_TEARDOWN_REQUESTED=0
+case "${1:-}" in
+'')
+	;;
+--teardown)
+	# Answered once the functions it calls are defined, and deliberately
+	# before the instance lock and the pidfile write below: the init script's
+	# stop path and its deadman run this while the daemon is still alive and
+	# holding both.  Rejected here it becomes dead code that logs success.
+	_TEARDOWN_REQUESTED=1
+	;;
+*)
 	echo "Usage: $0              (daemon mode)" >&2
 	echo "       $0 pre|post     (called automatically by systemd-sleep)" >&2
+	echo "       $0 --teardown   (called by the init script and its deadman)" >&2
 	exit 2
-fi
+	;;
+esac
 
 # === Daemon mode (started manually with no arguments) ===
 
@@ -6392,8 +6414,11 @@ cleanup() {
 		killall -9 surflare 2>/dev/null || true
 		killall surflare_route_updater.sh 2>/dev/null || true
 	else
-		_full_teardown
-		log "Stop: full teardown"
+		if _full_teardown; then
+			log "Stop: full teardown"
+		else
+			log "WARN: full teardown left nftables state behind"
+		fi
 		killall surflare-proxy 2>/dev/null || true
 		killall sexpect 2>/dev/null || true
 		killall -9 surflare 2>/dev/null || true
@@ -6415,7 +6440,26 @@ _full_teardown() {
 	rm -f /run/surflare_watchdog.killswitch_ready
 	rm -f /run/surflare_watchdog.storm_cool_until
 	rm -f "$STORM_503_STATE" "${STORM_503_STATE}.tmp"
+	# Every delete above is best-effort, so a teardown that changed nothing
+	# still exited 0 and its caller reported a clean stop.  Ask what is left.
+	local _tables _left
+	# An empty answer and an unanswerable question both look like "no tables"
+	# if the query's own status is thrown away -- and unanswerable is exactly
+	# the broken-install case this check exists for.
+	if ! _tables=$(nft list tables 2>/dev/null); then
+		return 1
+	fi
+	_left=$(printf '%s\n' "$_tables" | grep -cE 'table (inet killswitch|inet cn_dns_direct|inet sw_lan_tproxy|ip dns_enforce|inet surflare|inet surflare_moat)$') || true
+	[ "${_left:-0}" -eq 0 ] || return 1
+	return 0
 }
+
+if [ "${_TEARDOWN_REQUESTED:-0}" -eq 1 ]; then
+	# The status is the whole point of the call: the init script and deadman
+	# only learn that tables survived if this exits non-zero.
+	_full_teardown || exit 1
+	exit 0
+fi
 
 trap 'log "watchdog stopped"; cleanup; exit 0' INT TERM
 trap 'cleanup' EXIT
