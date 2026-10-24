@@ -9,8 +9,18 @@ STOP=10
 
 SCRIPT=/usr/local/sbin/surflare_watchdog.sh
 RESTART_MARKER=/run/surflare_watchdog.restart
+# Read by the early detector and by the resurrect cron in install.sh, both
+# of which treat it as "the user stopped this on purpose, leave it down".
+# Nothing wrote it until now, so a deliberate stop was undone by the next
+# five-minute cron tick.
+STOPPED_MARKER=/run/surflare_watchdog.stopped
+# Set by restart() for the duration of a restart, so stop_service can tell
+# "take it down" from "bounce it".
+RESTARTING_FLAG=${RESTARTING_FLAG:-/run/surflare_restarting}
 
 start_service() {
+    # A start undoes a previous deliberate stop.
+    rm -f "$STOPPED_MARKER"
     procd_open_instance
     procd_set_param command "$SCRIPT"
     procd_set_param respawn 3600 5 10
@@ -30,7 +40,7 @@ start_service() {
 }
 
 restart() {
-    touch /run/surflare_restarting || {
+    touch "$RESTARTING_FLAG" || {
         logger -t surflare-watchdog "WARN: failed to create restart marker"
         return 1
     }
@@ -48,7 +58,7 @@ restart() {
         _waited=$((_waited + 1))
     done
     start "$@"
-    rm -f /run/surflare_restarting
+    rm -f "$RESTARTING_FLAG"
 }
 
 # Override rc.common's stop(): call stop_service for cleanup, then
@@ -65,7 +75,7 @@ stop_service() {
     # Reset per call: an ash init process can run more than one stop, and a
     # stale flag would report a failure that did not happen.
     _td_failed=0
-    if [ -f /run/surflare_restarting ]; then
+    if [ -f "$RESTARTING_FLAG" ]; then
         # Restart: signal watchdog to do modular teardown (keep killswitch).
         # Marker must exist BEFORE procd sends SIGTERM so cleanup() sees it.
         touch "$RESTART_MARKER"
@@ -80,7 +90,11 @@ stop_service() {
     # These run BEFORE procd kills the watchdog, so VPN and nftables are
     # cleaned up while the watchdog is still alive (it will exit via
     # procd's SIGTERM shortly after).
-    if [ ! -f /run/surflare_restarting ]; then
+    if [ ! -f "$RESTARTING_FLAG" ]; then
+        # Record the stop before tearing anything down: if the teardown below
+        # hangs or the box dies, the cron must still know this was deliberate.
+        # A restart deliberately does not reach here.
+        touch "$STOPPED_MARKER"
         # Stop VPN tunnel and proxy.  Disconnect first (may involve
         # network, needs timeout) so surflare can clean up server-side
         # state.  Tear down nftables immediately after disconnect --
@@ -117,7 +131,7 @@ stop_service() {
         rm -f "$RESTART_MARKER"
     fi
     rm -f /run/surflare_watchdog.pid
-    if [ -f /run/surflare_restarting ]; then
+    if [ -f "$RESTARTING_FLAG" ]; then
         logger -t surflare-watchdog "Service stopped for restart (killswitch preserved)"
     else
         if [ "${_td_failed:-0}" -eq 1 ]; then
