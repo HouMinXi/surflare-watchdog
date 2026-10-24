@@ -110,12 +110,12 @@ pin_dedicated() {
 	# (measured worst case ~55s) without masking a pin that dies.
 	# Every failure path must drop the marker: the process is already
 	# dead, and a marker left behind hides the next real outage.
-	date -d "+90 seconds" +%s > /run/surflare_ded_pin_until 2>/dev/null || \
-		echo $(( $(date +%s) + 90 )) > /run/surflare_ded_pin_until
+	date -d "+90 seconds" +%s > "${SURFLARE_DED_PIN_FILE:-/run/surflare_ded_pin_until}" 2>/dev/null || \
+		echo $(( $(date +%s) + 90 )) > "${SURFLARE_DED_PIN_FILE:-/run/surflare_ded_pin_until}"
 	# pin_abort's own return only leaves pin_abort.  Callers must
 	# follow it with "|| return" (and a break inside the loop) or the
 	# walk continues and sends Enter after the process is already dead.
-	pin_abort() { rm -f /run/surflare_ded_pin_until; return 1; }
+	pin_abort() { rm -f "${SURFLARE_DED_PIN_FILE:-/run/surflare_ded_pin_until}"; return 1; }
 	sexpect -s "$SOCK" kill 2>/dev/null
 	sleep 1
 	# kill terminates the child but leaves sexpect's daemon bound to

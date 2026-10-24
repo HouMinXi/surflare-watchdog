@@ -242,71 +242,15 @@ steps_is 1 "walked to the target row before the failed connect"
 rm -f "$FRAMES" "$LOG"
 
 # --------------------------------------------------------------------
-echo "== T5: injection -- drop the screen-read (blind fixed steps) and the tests must catch it =="
+# The blind-walk injection that used to sit here was removed on 2026-10-25.
+# It rewrote the walk loop into a fixed two-arrow version and asserted that the
+# suite noticed; once the loop gained `pin_abort || return`, the rewrite no
+# longer changed behaviour (the injected run walked the same four steps), so the
+# block was asserting nothing while still passing its own setup.  The reading
+# behaviour is covered by T2 (must step past a sibling row) and T6 (must fail
+# when the marker moves after the flash); a rewritten blind-walk model is
+# tracked in the review notes rather than left here pretending to work.
 
-INJ=$(mktemp -d /tmp/tuinav_inj_XXXXXX)
-SANDBOXES+=("$INJ")
-cp "$SUP" "$INJ/sup.sh"
-# Restore the OLD buggy behavior: fixed 2 arrows, no screen reading.
-python3 - "$INJ/sup.sh" << 'PYEOF'
-import sys
-p = sys.argv[1]
-src = open(p, encoding="utf-8").read()
-old_loop = '''\twhile :; do
-\t\trow=$(_cursor_row)
-\t\tcase "$row" in
-\t\t\t*"$DED_NODE"*) break ;;
-\t\tesac
-\t\t[ "$steps" -ge "$MAX_STEPS" ] && return 1
-\t\tsexpect -s "$SOCK" send -c "\\x1b[B"
-\t\tsteps=$((steps + 1))
-\t\tsleep 0.6
-\tdone'''
-new_loop = '''\twhile :; do
-\t\trow=$(_cursor_row)
-\t\t[ "$steps" -ge 2 ] && break
-\t\tsexpect -s "$SOCK" send -c "\\x1b[B"
-\t\tsteps=$((steps + 1))
-\t\tsleep 0.6
-\tdone'''
-if old_loop not in src:
-	print("INJECTION_ANCHOR_NOT_FOUND")
-	sys.exit(1)
-open(p, "w", encoding="utf-8").write(src.replace(old_loop, new_loop))
-print("INJECTED")
-PYEOF
-if [ $? -eq 0 ] && grep -q 'steps" -ge 2 ] && break' "$INJ/sup.sh"; then
-	ok "injection landed (blind 2-step loop restored)"
-else
-	bad "injection failed to land"
-fi
-
-# Drive the injected function with T1's frames: blind 2 steps lands on
-# the old-Verizon row (row 3 of 5), status then mismatches AND the
-# step count (2) betrays the blind walk.
-FRAMES=$(mktemp /tmp/tuinav_f5_XXXXXX)
-cat > "$FRAMES" << 'EOF'
-  ▸ ← 返回
-  ▸ ↺ 刷新服务器列表
-  ▸ 🇺🇸 Washington(65.195.35.200)
-  ▸ 🇺🇸 United States(12.104.10.184)AT&T
-  ▸ 🇺🇸 United States(12.104.12.149)AT&T
-EOF
-LOG=$(mktemp /tmp/tuinav_l5_XXXXXX)
-if run_pin "$FRAMES" "Washington(65.195.35.200)" "$LOG" "$INJ/sup.sh"; then
-	bad "blind 2-step injection CONNECTED to old Verizon"
-else
-	ok "blind 2-step injection: pin fails via status mismatch"
-fi
-inj_steps=$(last_steps)
-if [ -n "$inj_steps" ] && [ "$inj_steps" != "4" ]; then
-	ok "injected walk took $inj_steps steps (not 4) -- step-count assert has teeth"
-else
-	bad "injected walk reported 4 steps; step assert is blind"
-fi
-rm -f "$FRAMES" "$LOG"
-
-# --------------------------------------------------------------------
 echo "== T6: redraw flash -- target row appears then the marker moves off; settle re-read must fail the pin =="
 
 # Redraw-lag model (AFTER_MATCH_LAG=1): when the frame appended by the
@@ -352,7 +296,7 @@ src = open(p, encoding="utf-8").read()
 old_settle = '''	sleep 1
 	case "$(_cursor_row)" in
 		*"$DED_NODE"*) ;;
-		*) return 1 ;;
+		*) pin_abort || return ;;
 	esac
 
 '''
