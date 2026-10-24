@@ -38,16 +38,24 @@ check_curls() {  # $1=file $2=min-expected
 # requirement is per curl call site, and the helper's single curl site
 # covers all 8 RIPE targets.
 check_curls router/surflare_route_updater.sh 5
-# The 8 RIPE targets themselves must all be wired through the helper:
-# a dropped ripe_fetch call silently skips an ASN (WARN-only path).
-# The 8 RIPE targets must all go through the one-arg helper (any name).
-n_ripe=$(sed -n '/_curl_pids="\$_curl_pids/,$p' router/surflare_route_updater.sh | grep -cE '^[[:space:]]*[a-z_]+ "\$RIPE_CONSIST')
-[ "$n_ripe" -eq 8 ] && ok "router: all 8 RIPE targets wired through the helper" \
-    || bad "router: expected 8 helper calls for RIPE targets, found $n_ripe"
-# PID collection must happen at spawn time inside the helper.
-grep -q '_curl_pids="$_curl_pids $!"' router/surflare_route_updater.sh \
-    && ok "router: curl PIDs collected at spawn" \
-    || bad "router: PID collection missing (wait would collect nothing or everything)"
+# The parallel RIPE fetch moved out of the shell: the updater writes a
+# tab-separated url/path list and hands it to ripe_fetch.py, because a shell
+# `wait` also collects the heartbeat process (2026-10-02: a PID wedged in
+# do_wait for four days).  Assert the current shape, not the retired one.
+n_ripe=$(grep -cE '"\$RIPE_CONSIST_[A-Z_]+"' router/surflare_route_updater.sh)
+[ "$n_ripe" -eq 8 ] && ok "router: all 8 RIPE targets reach the fetcher" \
+    || bad "router: expected 8 RIPE targets in the argument list, found $n_ripe"
+grep -q 'ripe_fetch.py' router/surflare_route_updater.sh \
+    && ok "router: the parallel fetch goes through ripe_fetch.py" \
+    || bad "router: ripe_fetch.py is not invoked; the parallel fetch has no reaper"
+# Each curl in the fetcher needs its own ceiling, and each child needs its own
+# reap: a shared shell wait is what collected the heartbeat.
+grep -q -- '--max-time' router/ripe_fetch.py \
+    && ok "router: fetcher curls carry --max-time" \
+    || bad "router: fetcher curls have no --max-time"
+grep -q 'os.waitid(os.P_PID' router/ripe_fetch.py \
+    && ok "router: fetcher reaps each pid individually" \
+    || bad "router: fetcher does not reap per pid (a shared wait would collect siblings)"
 # laptop copy: 8 curls (same fetches, no lock/heartbeat machinery)
 check_curls laptop/surflare_route_updater.sh 8
 
