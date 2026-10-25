@@ -454,5 +454,20 @@ for _f in surflare_watchdog.sh router/global/surflare-lan-tproxy.nft router/rule
     fi
 done
 
+# The two tproxy templates describe the same table and they have drifted
+# before: one carried the post-reconnect burst guard and the other did not, so
+# the same box behaved differently depending on the mode it was installed in.
+strip_c() { grep -v '^[[:space:]]*#' "$1" | sed '/^[[:space:]]*$/d'; }
+if strip_c router/rule/surflare-lan-tproxy.nft > "$TMP/rule.flat" 2>/dev/null &&
+	strip_c router/global/surflare-lan-tproxy.nft > "$TMP/global.flat" 2>/dev/null; then
+	if diff -q "$TMP/rule.flat" "$TMP/global.flat" >/dev/null; then
+		ok "the two tproxy templates are identical apart from comments"
+	else
+		bad "the tproxy templates have drifted apart: $(diff "$TMP/rule.flat" "$TMP/global.flat" | head -4 | tr '\n' ' ')"
+	fi
+else
+	bad "could not read both tproxy templates"
+fi
+
 echo "FAIL=$fail"
 exit $fail

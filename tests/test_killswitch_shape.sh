@@ -40,7 +40,9 @@ case "$1 $2" in
 	[ -f "$NFT_PRESENT" ] && printf 'table inet killswitch\n'
 	exit 0 ;;
 "list chain")
-	[ -f "$NFT_PRESENT" ] || exit 1
+	# The table can exist with its forward chain deleted, so this reads its own
+	# state file rather than the table's.
+	[ -f "${NFT_CHAIN:-$NFT_PRESENT}" ] || exit 1
 	printf 'table inet killswitch {\n\tchain forward {\n\t\tcounter packets 0 bytes 0\n\t}\n}\n'
 	exit 0 ;;
 esac
@@ -49,7 +51,7 @@ EOS
 chmod +x "$TMP/bin/nft"
 
 drive() { # $1 = initial armed flag, $2 = present file, prints "<rc> <armed>"
-	PATH="$TMP/bin:$PATH" NFT_CALLS="$TMP/calls" NFT_PRESENT="$2" NFT_BROKEN="${3:-0}" \
+	PATH="$TMP/bin:$PATH" NFT_CALLS="$TMP/calls" NFT_PRESENT="$2" NFT_BROKEN="${3:-0}" NFT_CHAIN="${4:-$2}" \
 		bash -c '
 		. "$1/fn.sh"
 		_killswitch_armed=$2
@@ -118,6 +120,17 @@ got=$(drive 1 "$TMP/absent" 1)
 case "$got" in
 "1 1") ok "an unanswerable nft leaves the killswitch armed" ;;
 *) bad "an unanswerable nft was read as a missing chain (got $got)" ;;
+esac
+
+# table there, forward chain deleted: nothing blocks anything, so this is the
+# state the install path exists for.  The table list answers, which is what
+# separates it from an nft that cannot talk.
+touch "$TMP/present"
+rm -f "$TMP/absent"
+got=$(drive 1 "$TMP/present" 0 "$TMP/absent")
+case "$got" in
+"0 0") ok "a deleted forward chain triggers a reinstall" ;;
+*) bad "a deleted forward chain left the flag alone (got $got)" ;;
 esac
 
 echo "RESULT: $pass passed, $fail failed"

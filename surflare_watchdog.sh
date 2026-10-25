@@ -2225,7 +2225,7 @@ NFTEOF
 # only pay for the install when the cheap answer is "gone".
 _killswitch_needs_install() {
 	[ "$_killswitch_armed" -eq 0 ] && return 0
-	local _tables
+	local _tables _chain
 	# A missing chain and an nft that cannot answer both exit non-zero, and only
 	# one of them means "install it".  The table listing separates them: a
 	# rebuild cannot be undone cheaply -- it resets every tproxied flow on the
@@ -2235,6 +2235,14 @@ _killswitch_needs_install() {
 		return 1
 	fi
 	if ! printf '%s\n' "$_tables" | grep -qx 'table inet killswitch'; then
+		_killswitch_armed=0
+		return 0
+	fi
+	# The table can be there with its forward chain deleted, and then nothing
+	# blocks anything.  The table list answered above, so a chain query that
+	# fails now is a missing chain, not an nft that cannot talk.
+	if ! _chain=$(nft list chain inet killswitch forward 2>/dev/null) ||
+		[ -z "$_chain" ]; then
 		_killswitch_armed=0
 		return 0
 	fi

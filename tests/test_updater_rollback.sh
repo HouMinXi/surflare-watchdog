@@ -237,5 +237,20 @@ else
 	bad "the absent-snapshot path logged nothing: $(tail -2 "$TMP/events")"
 fi
 
+# --- case 8: a failed restart ends with a start attempt -----------------
+# restart is stop then start; when it fails inside the start the unit is
+# inactive with the old binaries back on disk and nothing running.
+reset_state
+write_installer "proxy-new"
+make_stubs "$TMP/installer.sh"
+touch "$TMP/restart_fail"
+rm -f "$TMP/proxy_up"
+run_updater
+if grep -q 'SYSTEMCTL: start surflare-watchdog' "$TMP/events"; then
+	ok "a start is attempted after the rollback"
+else
+	bad "the box was left with no daemon after a failed restart: $(grep SYSTEMCTL "$TMP/events" | tr '\n' ' ')"
+fi
+
 echo "RESULT: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]
