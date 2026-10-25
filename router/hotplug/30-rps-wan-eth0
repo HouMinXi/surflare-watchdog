@@ -1,0 +1,18 @@
+#!/bin/sh
+# Spread WAN receive work across cpu1-3.
+#
+# eth0 rx-0 carries most of the downstream traffic and its IRQ is pinned to
+# cpu0, so cpu0 did both the receive and the forwarding and sat at 83% while
+# the other three cores idled at 5-15%. RPS on that queue only moves the
+# software processing; the hardware IRQ stays where it is.
+#
+# Applied 2026-10-25 after three measured windows: busiest-idlest core spread
+# 78 -> 11/16/29 at 1070-1173 Mbit/s, no drops.
+#
+# Rollback: rm /etc/hotplug.d/net/30-rps-wan-eth0 and
+#   echo 0 > /sys/class/net/eth0/queues/rx-0/rps_cpus
+
+[ "$ACTION" = "add" ] || [ "$ACTION" = "register" ] || exit 0
+[ -e /sys/class/net/eth0/queues/rx-0/rps_cpus ] || exit 0
+echo e > /sys/class/net/eth0/queues/rx-0/rps_cpus
+logger -t rps-wan "eth0 rx-0 rps_cpus set to $(cat /sys/class/net/eth0/queues/rx-0/rps_cpus)"

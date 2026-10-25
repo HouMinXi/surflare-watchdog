@@ -40,6 +40,10 @@ chmod +x "$TMP/bin/ssh"
 		/usr/local/sbin/surflare_rps_assert.sh
 	printf '%s  %s\n' "$(md5sum router/services/procd/surflare-rps-assert | cut -d' ' -f1)" \
 		/etc/init.d/surflare-rps-assert
+	printf '%s  %s\n' "$(md5sum router/hotplug/30-rps-wan-eth0 | cut -d' ' -f1)" \
+		/etc/hotplug.d/net/30-rps-wan-eth0
+	printf '%s  %s\n' "$(md5sum router/sysctl/13-netdev-backlog.conf | cut -d' ' -f1)" \
+		/etc/sysctl.d/13-netdev-backlog.conf
 } > "$TMP/match.txt"
 
 drive() { # $1 = remote file, $2 = optional ssh that fails

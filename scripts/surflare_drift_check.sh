@@ -28,20 +28,9 @@ done
 REPO=$(cd "$(dirname "$0")/.." && pwd)
 cd "$REPO" || exit 2
 
-pairs="
-surflare_watchdog.sh:/usr/local/sbin/surflare_watchdog.sh
-surflare_l4_probe.sh:/usr/local/sbin/surflare_l4_probe.sh
-surflare_log_health.sh:/usr/local/sbin/surflare_log_health.sh
-surflare-update.sh:/usr/local/sbin/surflare-update.sh
-cross_validate_routes.py:/usr/local/sbin/cross_validate_routes.py
-setup_auth.sh:/usr/local/sbin/setup_auth.sh
-router/services/procd/surflare-watchdog:/etc/init.d/surflare-watchdog
-router/surflare_route_updater.sh:/usr/local/sbin/surflare_route_updater.sh
-router/ripe_fetch.py:/usr/local/sbin/ripe_fetch.py
-router/${MODE}/surflare-lan-tproxy.nft:/etc/surflare-lan-tproxy.nft
-scripts/surflare_rps_assert.sh:/usr/local/sbin/surflare_rps_assert.sh
-router/services/procd/surflare-rps-assert:/etc/init.d/surflare-rps-assert
-"
+LIST="$REPO/scripts/installed-files.list"
+[ -f "$LIST" ] || { echo "FATAL: $LIST missing" >&2; exit 2; }
+pairs=$(grep -v "^#" "$LIST" | grep -v "^$" | sed "s|@MODE@|$MODE|")
 
 remotes=""
 for p in $pairs; do

@@ -155,6 +155,13 @@ DEPLOY
             echo "WARN: other installed files differ from this tree; run"
             echo "      $(dirname "$0")/surflare_drift_check.sh --remote $N100"
         fi
+        # A deploy that survives a reboot can still vanish at the next
+        # firmware upgrade, which keeps only the paths named in
+        # /etc/sysupgrade.conf and /lib/upgrade/keep.d.
+        if ! "$(dirname "$0")/surflare_upgrade_audit.sh" --remote "$N100" >/dev/null 2>&1; then
+            echo "WARN: some installed files would not survive a firmware upgrade; run"
+            echo "      $(dirname "$0")/surflare_upgrade_audit.sh --remote $N100"
+        fi
     else
         echo "WARN: watchdog not running after ${DEPLOY_WAIT}s"
         if ssh -n "$N100" "test -f '${REMOTE_WATCHDOG}.prev'"; then
