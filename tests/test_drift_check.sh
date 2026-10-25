@@ -38,6 +38,8 @@ chmod +x "$TMP/bin/ssh"
 		/etc/surflare-lan-tproxy.nft
 	printf '%s  %s\n' "$(md5sum scripts/surflare_rps_assert.sh | cut -d' ' -f1)" \
 		/usr/local/sbin/surflare_rps_assert.sh
+	printf '%s  %s\n' "$(md5sum router/services/procd/surflare-rps-assert | cut -d' ' -f1)" \
+		/etc/init.d/surflare-rps-assert
 } > "$TMP/match.txt"
 
 drive() { # $1 = remote file, $2 = optional ssh that fails
