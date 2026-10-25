@@ -39,9 +39,25 @@ case "$1 $2" in
 "list tables")
 	[ -f "$NFT_PRESENT" ] && printf 'table inet killswitch\n'
 	exit 0 ;;
+"list table")
+	# The whole table in one dump: chains, and the rules that actually block.
+	[ -f "$NFT_PRESENT" ] || exit 1
+	printf 'table inet killswitch {\n'
+	if [ -f "${NFT_CHAIN:-$NFT_PRESENT}" ]; then
+		printf '\tchain forward {\n\t\ttype filter hook forward priority filter - 10; policy accept;\n'
+		[ -f "${NFT_FORWARD_RULES:-${NFT_CHAIN:-$NFT_PRESENT}}" ] &&
+			printf '\t\ttcp dport 853 reject\n'
+		printf '\t}\n'
+	fi
+	if [ -f "${NFT_OUTPUT:-$NFT_PRESENT}" ]; then
+		printf '\tchain output {\n\t\ttype filter hook output priority filter - 10; policy accept;\n'
+		[ -f "${NFT_OUTPUT_RULES:-${NFT_OUTPUT:-$NFT_PRESENT}}" ] &&
+			printf '\t\tudp dport 53 reject\n'
+		printf '\t}\n'
+	fi
+	printf '}\n'
+	exit 0 ;;
 "list chain")
-	# The table can exist with its forward chain deleted, so this reads its own
-	# state file rather than the table's.
 	[ -f "${NFT_CHAIN:-$NFT_PRESENT}" ] || exit 1
 	printf 'table inet killswitch {\n\tchain forward {\n\t\tcounter packets 0 bytes 0\n\t}\n}\n'
 	exit 0 ;;
@@ -51,7 +67,7 @@ EOS
 chmod +x "$TMP/bin/nft"
 
 drive() { # $1 = initial armed flag, $2 = present file, prints "<rc> <armed>"
-	PATH="$TMP/bin:$PATH" NFT_CALLS="$TMP/calls" NFT_PRESENT="$2" NFT_BROKEN="${3:-0}" NFT_CHAIN="${4:-$2}" \
+	PATH="$TMP/bin:$PATH" NFT_CALLS="$TMP/calls" NFT_PRESENT="$2" NFT_BROKEN="${3:-0}" NFT_CHAIN="${4:-$2}" NFT_FORWARD_RULES="${5:-}" NFT_OUTPUT="${6:-}" NFT_OUTPUT_RULES="${7:-}" \
 		bash -c '
 		. "$1/fn.sh"
 		_killswitch_armed=$2
@@ -131,6 +147,24 @@ got=$(drive 1 "$TMP/present" 0 "$TMP/absent")
 case "$got" in
 "0 0") ok "a deleted forward chain triggers a reinstall" ;;
 *) bad "a deleted forward chain left the flag alone (got $got)" ;;
+esac
+
+# A chain whose header is there but whose rules were flushed blocks nothing;
+# nft prints the header either way, so presence alone is not the question.
+touch "$TMP/present"
+rm -f "$TMP/none"
+got=$(drive 1 "$TMP/present" 0 "" "$TMP/none")
+case "$got" in
+"0 0") ok "an empty forward chain triggers a reinstall" ;;
+*) bad "an empty forward chain read as installed (got $got)" ;;
+esac
+
+# The output chain is the router-originated half of the block; losing it while
+# forward survives leaves that path open.
+got=$(drive 1 "$TMP/present" 0 "" "" "$TMP/none")
+case "$got" in
+"0 0") ok "a missing output chain triggers a reinstall" ;;
+*) bad "a missing output chain read as installed (got $got)" ;;
 esac
 
 echo "RESULT: $pass passed, $fail failed"

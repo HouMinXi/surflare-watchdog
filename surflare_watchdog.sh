@@ -2225,24 +2225,31 @@ NFTEOF
 # only pay for the install when the cheap answer is "gone".
 _killswitch_needs_install() {
 	[ "$_killswitch_armed" -eq 0 ] && return 0
-	local _tables _chain
-	# A missing chain and an nft that cannot answer both exit non-zero, and only
-	# one of them means "install it".  The table listing separates them: a
-	# rebuild cannot be undone cheaply -- it resets every tproxied flow on the
-	# LAN -- so an unanswerable nft leaves the flag alone.
+	local _tables _table
+	# Presence first: a missing table and an nft that cannot answer both return
+	# non-zero from every query, and only one of them means "install it".  The
+	# table list is the cheap question that separates them.
 	if ! _tables=$(nft list tables 2>/dev/null); then
-		log "WARN: could not read the nftables table list; leaving the killswitch flag alone"
+		log "WARN: could not read the nftables table list; leaving the flag alone"
 		return 1
 	fi
 	if ! printf '%s\n' "$_tables" | grep -qx 'table inet killswitch'; then
 		_killswitch_armed=0
 		return 0
 	fi
-	# The table can be there with its forward chain deleted, and then nothing
-	# blocks anything.  The table list answered above, so a chain query that
-	# fails now is a missing chain, not an nft that cannot talk.
-	if ! _chain=$(nft list chain inet killswitch forward 2>/dev/null) ||
-		[ -z "$_chain" ]; then
+	# Then contents.  A chain that exists with no rules looks present to
+	# anything that only checks for its header, and an empty forward chain
+	# blocks nothing, so both chains have to carry the reject that blocks.
+	if ! _table=$(nft list table inet killswitch 2>/dev/null); then
+		log "WARN: could not read the killswitch table; leaving the flag alone"
+		return 1
+	fi
+	if ! printf '%s\n' "$_table" | awk '
+		/^[[:space:]]*chain (forward|output)[[:space:]]*\{/ { c = $2; next }
+		c != "" && /^[[:space:]]*\}[[:space:]]*$/ { c = ""; next }
+		c != "" && /reject/ { seen[c] = 1 }
+		END { exit !(seen["forward"] && seen["output"]) }
+	'; then
 		_killswitch_armed=0
 		return 0
 	fi
