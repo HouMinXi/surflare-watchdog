@@ -94,7 +94,16 @@ hash_cli_after=$(file_hash "$CLI_BIN")
 proxy_running() {
 	local i=0
 	while [ "$i" -lt "$READY_TIMEOUT" ]; do
-		if pgrep -f surflare-proxy >/dev/null 2>&1; then
+		# Anything whose argv mentions the name answers a substring match: the
+		# watchdog's own log tail, the log health check, an operator watching
+		# the log.  Ask the proxy's port instead, which is what "running"
+		# means for a service the updater has just replaced.
+		# The port is the service's identity; the exact process name covers the
+		# moment between exec and listen.  `pgrep -f` would also count a log
+		# tail or the watchdog's own monitor, which is how a dead proxy kept a
+		# broken release.
+		if (exec 3<>/dev/tcp/127.0.0.1/10800) 2>/dev/null ||
+			pgrep -x surflare-proxy >/dev/null 2>&1; then
 			return 0
 		fi
 		sleep 1
@@ -141,7 +150,13 @@ if [ "$hash_proxy_before" != "$hash_proxy_after" ] || [ "$hash_cli_before" != "$
 		_rb=0
 		restore_snapshot || _rb=$?
 		case "$_rb" in
-		0) log "Restored binaries from ${snap_dir}" ;;
+		0)
+			log "Restored binaries from ${snap_dir}"
+			# restart is stop then start: when it fails inside the start the
+			# unit is left inactive, with the binaries rolled back and nothing
+			# running.  The daily timer is a day away.
+			systemctl start "$SERVICE" || log "ERROR: could not start the watchdog after rollback"
+			;;
 		2) log "ERROR: no snapshot to roll back to" ;;
 		*) : ;;  # restore_snapshot already logged what failed
 		esac
