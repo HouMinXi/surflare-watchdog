@@ -164,6 +164,8 @@ for r in rule global; do
     case "$_probe" in
         HIT)  ok "$tname: a packet reaches the control return" ;;
         MISS) bad "$tname: a rule before the control return stops the packet" ;;
+        SETUP_FAIL|LOAD_FAIL)
+            bad "$tname: the probe could not run ($_probe), so the template is unverified" ;;
         *)    bad "$tname: packet probe inconclusive ($_probe)" ;;
     esac
 done
