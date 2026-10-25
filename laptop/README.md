@@ -8,7 +8,7 @@ Scripts and service files for Fedora, RHEL, or any systemd-based distribution.
 |------|---------|
 | `surflare_early_detector.sh` | TCP degradation sensor via `ss` cwnd/rto/backoff. Sends SIGUSR1 to watchdog. Requires NetworkManager (`nm-online`). |
 | `surflare_node_probe.sh` | Manual diagnostic probe: L4 RTT, L7 TTFB, exit country, GFW signal analysis. Needs tcpdump + root SO_MARK. |
-| `surflare_route_updater.sh` | Updates CN route lists (cn_ipv4.txt, cn_ipv6.txt) from chnroute. |
+| `surflare_route_updater.sh` | Installed from `router/`, not kept here: one script for both hosts. Updates CN route lists (cn_ipv4.txt, cn_ipv6.txt) from chnroute. |
 | `services/systemd/` | systemd units: watchdog, early-detector, route-updater timer, update timer. |
 | `services/openrc/` | OpenRC init scripts (Alpine, Gentoo). |
 | `services/runit/` | runit service directories (Void Linux). |
