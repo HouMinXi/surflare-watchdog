@@ -31,7 +31,8 @@ start_service() {
     # Raise fd limit for the watchdog script.  Note: on iStoreOS 24.10.7
     # (procd 2026.03.14) this parameter is silently ignored; the actual
     # fix for surflare-proxy is the ulimit in the wrapper script
-    # (scripts/surflare-proxy-wrapper.sh).  Kept as forward-compat for
+    # (router/surflare-proxy, installed as /usr/bin/surflare-proxy).
+    # Kept as forward-compat for
     # future OpenWrt versions that support procd limits.
     procd_set_param limits nofile="65535 65535"
     procd_set_param stdout 1
@@ -162,7 +163,11 @@ deadman() {
     if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
         return 0
     fi
-    if pgrep -f surflare_watchdog.sh >/dev/null 2>&1; then
+    # Ask the singleton lock, not the command line.  Matching argv counts any
+    # fork of the daemon -- including the very orphan this function exists to
+    # clean up after -- so an orphan-only machine reads as "alive" and its
+    # killswitch is never removed.
+    if ! flock -n /run/surflare_watchdog.singleton.lock true 2>/dev/null; then
         return 0
     fi
     if nft list table inet killswitch >/dev/null 2>&1; then
