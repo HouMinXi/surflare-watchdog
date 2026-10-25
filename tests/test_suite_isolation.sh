@@ -76,7 +76,7 @@ fi
 # The runner's reported status must survive the echo that follows it. Under a
 # non-POSIX shell, `printf ... "$(basename ...)" "$?"` runs the substitution
 # first and every test records a pass.
-if grep -qE '^\s*rc=\$\?' scripts/run-tests.sh; then
+if grep -qE '^[[:space:]]*rc[[:space:]]*=[[:space:]]*\$\?' scripts/run-tests.sh; then
 	ok "the runner captures each test's status before any substitution"
 else
 	bad "the runner reads \$? after a command substitution, which hides failures"

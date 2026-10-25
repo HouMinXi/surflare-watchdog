@@ -33,6 +33,7 @@ LIST="$REPO/scripts/installed-files.list"
 [ -f "$LIST" ] || { echo "FATAL: $LIST missing" >&2; exit 2; }
 
 TMP=$(mktemp -d)
+TMPLIST="$TMP/pairs"
 trap 'rm -rf "$TMP"' EXIT
 
 # shellcheck disable=SC2086  # a fixed command line, not user input
@@ -61,7 +62,8 @@ covered() {
 
 lost=0
 kept=0
-for p in $(grep -v '^#' "$LIST" | grep -v '^$' | sed "s|@MODE@|$MODE|"); do
+grep -v '^#' "$LIST" | grep -v '^$' | sed "s|@MODE@|$MODE|" > "$TMPLIST" || true
+while IFS= read -r p; do
 	remote_path=${p#*:}
 	if covered "$remote_path"; then
 		printf '%-46s %s\n' "$remote_path" kept
@@ -70,7 +72,7 @@ for p in $(grep -v '^#' "$LIST" | grep -v '^$' | sed "s|@MODE@|$MODE|"); do
 		printf '%-46s %s\n' "$remote_path" "WOULD-BE-LOST"
 		lost=$((lost + 1))
 	fi
-done
+done < "$TMPLIST"
 
 if [ "$lost" -eq 0 ]; then
 	echo "RESULT: an upgrade would keep all $kept files"

@@ -1,4 +1,5 @@
 #!/bin/sh
+# shellcheck disable=SC2016  # command strings are expanded on the remote host
 # Rebuild the router from this tree.
 #
 # A reboot keeps the box. A minor sysupgrade keeps what /etc/sysupgrade.conf
@@ -47,9 +48,14 @@ mode_for() {
 	esac
 }
 
+PAIRFILE=$(mktemp) || exit 2
+trap 'rm -f "$PAIRFILE"' EXIT INT TERM
 failed=0
 count=0
-for p in $pairs; do
+# The list goes through a file, not a pipe: a loop on the right of a pipe runs
+# in a subshell and every count it increments is discarded.
+printf '%s\n' "$pairs" > "$PAIRFILE"
+while IFS= read -r p; do
 	local_path=${p%%:*}
 	remote_path=${p#*:}
 	mode=$(mode_for "$remote_path")
@@ -69,7 +75,7 @@ for p in $pairs; do
 	fi
 	$SSH_CMD -n "$REMOTE" "chmod $mode '$remote_path'" >/dev/null 2>&1 || \
 		{ echo "FAILED: chmod $remote_path" >&2; failed=$((failed + 1)); }
-done
+done < "$PAIRFILE"
 
 # The services and cron lines are part of the install: a file in place but not
 # enabled is the state this box was in for months with a stale updater.

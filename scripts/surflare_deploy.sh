@@ -151,17 +151,41 @@ DEPLOY
         # loud when the rest has drifted: on 2026-10-25 the router was carrying
         # an updater four months older than the tree, and every deploy until
         # then had reported success.
-        if ! "$(dirname "$0")/surflare_drift_check.sh" --remote "$N100" >/dev/null 2>&1; then
-            echo "WARN: other installed files differ from this tree; run"
-            echo "      $(dirname "$0")/surflare_drift_check.sh --remote $N100"
-        fi
+        # A bare failing command aborts under set -e, which is how this check
+        # first turned a successful deploy into exit 2.  Capture it instead.
+        chk=0
+        "$(dirname "$0")/surflare_drift_check.sh" --remote "$N100" >/dev/null 2>&1 || chk=$?
+        case $chk in
+            0) ;;
+            2)
+                # "could not check" is not "nothing to report".  A missing ssh or
+                # an unreachable box would otherwise read as a clean bill.
+                echo "WARN: could not check the box against this tree (tool exit 2)"
+                ;;
+            126|127)
+                echo "WARN: the drift check is missing or not executable; nothing was compared"
+                ;;
+            *)
+                echo "WARN: other installed files differ from this tree; run"
+                echo "      $(dirname "$0")/surflare_drift_check.sh --remote $N100"
+                ;;
+        esac
         # A deploy that survives a reboot can still vanish at the next
         # firmware upgrade, which keeps only the paths named in
         # /etc/sysupgrade.conf and /lib/upgrade/keep.d.
-        if ! "$(dirname "$0")/surflare_upgrade_audit.sh" --remote "$N100" >/dev/null 2>&1; then
-            echo "WARN: some installed files would not survive a firmware upgrade; run"
-            echo "      $(dirname "$0")/surflare_upgrade_audit.sh --remote $N100"
-        fi
+        chk=0
+        "$(dirname "$0")/surflare_upgrade_audit.sh" --remote "$N100" >/dev/null 2>&1 || chk=$?
+        case $chk in
+            0) ;;
+            2)  echo "WARN: could not check what an upgrade would keep (tool exit 2)" ;;
+            126|127)
+                echo "WARN: the upgrade audit is missing or not executable; nothing was checked"
+                ;;
+            *)
+                echo "WARN: some installed files would not survive a firmware upgrade; run"
+                echo "      $(dirname "$0")/surflare_upgrade_audit.sh --remote $N100"
+                ;;
+        esac
     else
         echo "WARN: watchdog not running after ${DEPLOY_WAIT}s"
         if ssh -n "$N100" "test -f '${REMOTE_WATCHDOG}.prev'"; then

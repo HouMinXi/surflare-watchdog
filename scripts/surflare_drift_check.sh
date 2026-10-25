@@ -33,9 +33,11 @@ LIST="$REPO/scripts/installed-files.list"
 pairs=$(grep -v "^#" "$LIST" | grep -v "^$" | sed "s|@MODE@|$MODE|")
 
 remotes=""
-for p in $pairs; do
+while IFS= read -r p; do
 	remotes="$remotes ${p#*:}"
-done
+done <<EOF
+$pairs
+EOF
 
 # shellcheck disable=SC2086  # the list is built above, one path per word
 remote_raw=$($SSH_CMD -n "$REMOTE" "md5sum $remotes" 2>/dev/null) || remote_raw=""
@@ -46,7 +48,7 @@ fi
 
 drift=0
 missing=0
-for p in $pairs; do
+while IFS= read -r p; do
 	local_path=${p%%:*}
 	remote_path=${p#*:}
 	if [ ! -f "$local_path" ]; then
@@ -55,7 +57,7 @@ for p in $pairs; do
 		continue
 	fi
 	local_md5=$(md5sum "$local_path" | cut -d' ' -f1)
-	remote_md5=$(printf '%s\n' "$remote_raw" | awk -v f="$remote_path" '$2 == f { print $1; exit }')
+	remote_md5=$(printf '%s\n' "$remote_raw" | awk -v f="$remote_path" '$NF == f { print $1; exit }')
 	if [ -z "$remote_md5" ]; then
 		printf '%-46s %s\n' "$remote_path" "MISSING-ON-BOX"
 		missing=$((missing + 1))
@@ -65,7 +67,9 @@ for p in $pairs; do
 		printf '%-46s %s\n' "$remote_path" "DRIFT ${remote_md5} -> ${local_md5}"
 		drift=$((drift + 1))
 	fi
-done
+done <<EOF
+$pairs
+EOF
 
 if [ "$drift" -eq 0 ] && [ "$missing" -eq 0 ]; then
 	echo "RESULT: box matches this tree"

@@ -58,7 +58,7 @@ fi
 : > "$TMP/keep-dir"
 rc=$(drive "$TMP/keep-dir" 2>/dev/null)
 if [ "$rc" -eq 2 ]; then
-	ok "an empty keep list is treated as unreadable, not as a pass"
+	ok "a keep list that reads back empty exits 2 instead of calling everything lost"
 else
 	bad "an empty keep list returned rc=$rc"
 fi

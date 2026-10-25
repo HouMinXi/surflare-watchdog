@@ -12,7 +12,21 @@
 # Rollback: rm /etc/hotplug.d/net/30-rps-wan-eth0 and
 #   echo 0 > /sys/class/net/eth0/queues/rx-0/rps_cpus
 
+QUEUE=${QUEUE:-/sys/class/net/eth0/queues/rx-0/rps_cpus}
+
 [ "$ACTION" = "add" ] || [ "$ACTION" = "register" ] || exit 0
-[ -e /sys/class/net/eth0/queues/rx-0/rps_cpus ] || exit 0
-echo e > /sys/class/net/eth0/queues/rx-0/rps_cpus
-logger -t rps-wan "eth0 rx-0 rps_cpus set to $(cat /sys/class/net/eth0/queues/rx-0/rps_cpus)"
+[ -e "$QUEUE" ] || exit 0
+
+# A write that is refused, or accepted and then silently dropped, is the same
+# outcome as never having run: the queue stays on one core. Read it back and say
+# which of the two happened, because the log is the only place this shows up.
+if echo e 2>/dev/null > "$QUEUE"; then
+	now=$(cat "$QUEUE" 2>/dev/null)
+	if [ "$now" = "e" ]; then
+		logger -t rps-wan "eth0 rx-0 rps_cpus set to $now"
+	else
+		logger -t rps-wan "WARN: rps_cpus write accepted but reads '$now', wanted 'e'"
+	fi
+else
+	logger -t rps-wan "WARN: could not write rps_cpus, still '$(cat "$QUEUE" 2>/dev/null)'"
+fi

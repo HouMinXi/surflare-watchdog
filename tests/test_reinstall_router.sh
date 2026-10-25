@@ -38,6 +38,15 @@ if [ "$rc" -eq 0 ] && [ "$n_out" -eq "$n_list" ]; then
 else
 	bad "dry run planned $n_out of $n_list files (rc=$rc)"
 fi
+
+# The per-file lines above are printed inside the loop.  The summary is counted
+# inside it too, and a loop on the right of a pipe keeps that count to itself.
+n_sum=$(sed -n 's/.*dry run, \([0-9]*\) files would be installed.*/\1/p' "$TMP/out")
+if [ "$n_sum" = "$n_list" ]; then
+	ok "the summary counts what the loop actually did ($n_sum)"
+else
+	bad "the summary reported $n_sum of $n_list files"
+fi
 if [ ! -s "$TMP/calls" ]; then
 	ok "a dry run touches nothing"
 else

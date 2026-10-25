@@ -43,8 +43,19 @@ else
 	bad "the init script does not call the assert"
 fi
 
+# A procd trigger re-runs start_service.  A call outside it would satisfy the
+# check above and never fire on an interface event, which is the whole point.
+body=$(sed -n '/^start_service()/,/^}/p' "$SUT")
+# shellcheck disable=SC2016  # the needle is the init script's own text
+if printf '%s\n' "$body" | grep -qF 'QUIET= "$ASSERT"'; then
+	ok "the call sits inside start_service, which a trigger re-runs"
+else
+	bad "the assert is not called from start_service, so a trigger re-runs nothing"
+fi
+
 # It must be silent-free at boot: an init script that fails when the queue is
 # absent would block the boot sequence.
+# shellcheck disable=SC2016  # the needle is the init script's own text
 if grep -q '\[ -x "$ASSERT" \] || return 0' "$SUT"; then
 	ok "a missing assert script is survivable at boot"
 else

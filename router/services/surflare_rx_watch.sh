@@ -42,7 +42,10 @@ printf '%s\n' "$now" > "$STATE"
 # First run just records the baseline; there is no delta to report yet.
 [ -n "$prev" ] || exit 0
 
+set -f          # the state line is split on purpose; a '*' in it is data
+# shellcheck disable=SC2086  # splitting is the point of the line below
 set -- $prev
+set +f
 d_missed=$((missed - $1))
 d_fifo=$((fifo - $2))
 d_soft=$((soft - $4))

@@ -49,7 +49,9 @@ chmod +x "$TMP/bin/ssh"
 } > "$TMP/match.txt"
 
 drive() { # $1 = remote file, $2 = optional ssh that fails
-	PATH="$TMP/bin:$PATH" FAKE_REMOTE="$1" SSH_CMD="${2:-ssh}" bash "$CHECK" > "$TMP/out" 2>&1
+	# MODE is explicit: the checksums above are built from router/rule/, and
+	# relying on the SUT default would make a changed default look like drift.
+	PATH="$TMP/bin:$PATH" FAKE_REMOTE="$1" SSH_CMD="${2:-ssh}" MODE=rule bash "$CHECK" > "$TMP/out" 2>&1
 	echo $?
 }
 

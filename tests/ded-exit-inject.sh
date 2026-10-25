@@ -403,7 +403,7 @@ j8run=$(mktemp)
     printf 'SHADOW_PORT=%s\n' "${_sport:-20815}"
     printf "jq '"
     cat "$rawprog"
-    printf "' /tmp/dedex.$$/inj-closed.json > /tmp/dedex.$$/inj-j8.json\n"
+    printf '%s\n' "' /tmp/dedex.$$/inj-closed.json > /tmp/dedex.$$/inj-j8.json"
 } > "$j8run"
 if sh "$j8run" 2>/dev/null    && [ "$(jq -r '.inbounds[0].listen_port | type' /tmp/dedex.$$/inj-j8.json 2>/dev/null)" = "number" ]; then
     echo "PASS J8: production quoting yields numeric listen_port"

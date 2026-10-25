@@ -25,7 +25,7 @@ DEBUG = os.environ.get("CP_DEBUG") == "1"
 def note(msg):
     """Timing and outcome, only when someone is asking why a probe lied."""
     if DEBUG:
-        sys.stderr.write("[cp %.3f] %s\n" % (time.time(), msg))
+        sys.stderr.write(f"[cp {time.time():.3f}] {msg}\n")
         sys.stderr.flush()
 
 
@@ -62,8 +62,7 @@ def main():
     ):
         done = sh(*cmd)
         if done.returncode != 0:
-            note("parent setup failed: %s -> %s"
-                 % (" ".join(cmd), done.stderr.strip()[:160]))
+            note(f"parent setup failed: {' '.join(cmd)} -> {done.stderr.strip()[:160]}")
             print("SETUP_FAIL")
             return
     # Listen on the control address.  The SYN reaches it only if no
@@ -81,9 +80,9 @@ def main():
     loaded = subprocess.run(
         ["nft", "-f", "-"], input=src, capture_output=True, text=True,
         check=False)
-    note("template loaded rc=%s" % loaded.returncode)
+    note(f"template loaded rc={loaded.returncode}")
     if loaded.returncode != 0:
-        note("nft refused it: %s" % loaded.stderr.strip()[:200])
+        note(f"nft refused it: {loaded.stderr.strip()[:200]}")
         print("LOAD_FAIL")
         return
     sh("nft", "add", "element", "inet", "sw_lan_tproxy",
@@ -115,8 +114,7 @@ def main():
         ):
             done = sh(*cmd)
             if done.returncode != 0:
-                note("child setup failed: %s -> %s"
-                     % (" ".join(cmd), done.stderr.strip()[:160]))
+                note(f"child setup failed: {' '.join(cmd)} -> {done.stderr.strip()[:160]}")
                 os.write(seen_w, verdict)
                 os._exit(0)
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -125,22 +123,21 @@ def main():
         try:
             sock.connect(("203.0.113.10", 443))
             verdict = b"C"
-            note("child connected in %.3fs" % (time.time() - t_connect))
+            note(f"child connected in {time.time() - t_connect:.3f}s")
         except ConnectionRefusedError:
             verdict = b"R"
-            note("child refused after %.3fs" % (time.time() - t_connect))
+            note(f"child refused after {time.time() - t_connect:.3f}s")
         except TimeoutError:
             # TimeoutError is an OSError subclass, so this has to come first:
             # silence is what a dropped packet looks like, and calling it a
             # broken sandbox would replace a real MISS with an excuse.
             verdict = b"T"
-            note("child saw silence for %.3fs" % (time.time() - t_connect))
+            note(f"child saw silence for {time.time() - t_connect:.3f}s")
         except OSError as exc:
             # ENETUNREACH and friends mean the sandbox is wrong, not the
             # template.  Only a timeout is silence, and only silence is a drop.
             verdict = b"U"
-            note("child connect failed after %.3fs: %r"
-                 % (time.time() - t_connect, exc))
+            note(f"child connect failed after {time.time() - t_connect:.3f}s: {exc!r}")
         os.write(seen_w, verdict)
         os._exit(0)
     os.close(ready_w)
@@ -150,7 +147,7 @@ def main():
     os.close(ready_r)
     moved = sh("ip", "link", "set", "veth1", "netns", str(pid))
     if moved.returncode != 0:
-        note("handover failed: %s" % moved.stderr.strip()[:160])
+        note(f"handover failed: {moved.stderr.strip()[:160]}")
         os.close(go_w)
         os.waitpid(pid, 0)
         print("SETUP_FAIL")
@@ -159,7 +156,7 @@ def main():
     os.close(go_w)
     t_wait = time.time()
     os.waitpid(pid, 0)
-    note("child exited after %.3fs" % (time.time() - t_wait))
+    note(f"child exited after {time.time() - t_wait:.3f}s")
     child_saw = os.read(seen_r, 1)
     os.close(seen_r)
 
@@ -167,10 +164,10 @@ def main():
     try:
         conn, _ = listener.accept()
         conn.close()
-        note("accepted %.3fs after the child exited" % (time.time() - t_accept))
+        note(f"accepted {time.time() - t_accept:.3f}s after the child exited")
         print("HIT")
     except TimeoutError:
-        note("nothing to accept %.3fs after the child exited" % (time.time() - t_accept))
+        note(f"nothing to accept {time.time() - t_accept:.3f}s after the child exited")
         if child_saw == b"U":
             print("SETUP_FAIL")
         else:

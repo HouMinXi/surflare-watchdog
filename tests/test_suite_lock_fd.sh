@@ -42,7 +42,10 @@ wait "$child2" 2>/dev/null
 exec 9>&-
 
 # And the runner must actually use it where it starts tests.
-if grep -qE '9>&-' scripts/run-tests.sh; then
+# Anchored to the invocation: a comment that mentions the redirection must not
+# satisfy a check about it being used.
+# shellcheck disable=SC2016  # $t is a regex literal here, not a variable
+if grep -qE '^[[:space:]]*timeout [0-9]+ sh "\$t".*9>&-' scripts/run-tests.sh; then
 	ok "the runner closes the lock descriptor on every test it starts"
 else
 	bad "the runner leaks its lock descriptor to every test"
