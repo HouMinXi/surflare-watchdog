@@ -39,6 +39,7 @@ router/services/procd/surflare-watchdog:/etc/init.d/surflare-watchdog
 router/surflare_route_updater.sh:/usr/local/sbin/surflare_route_updater.sh
 router/ripe_fetch.py:/usr/local/sbin/ripe_fetch.py
 router/${MODE}/surflare-lan-tproxy.nft:/etc/surflare-lan-tproxy.nft
+scripts/surflare_rps_assert.sh:/usr/local/sbin/surflare_rps_assert.sh
 "
 
 remotes=""

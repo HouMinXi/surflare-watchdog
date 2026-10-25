@@ -36,6 +36,8 @@ chmod +x "$TMP/bin/ssh"
 		/usr/local/sbin/ripe_fetch.py
 	printf '%s  %s\n' "$(md5sum router/rule/surflare-lan-tproxy.nft | cut -d' ' -f1)" \
 		/etc/surflare-lan-tproxy.nft
+	printf '%s  %s\n' "$(md5sum scripts/surflare_rps_assert.sh | cut -d' ' -f1)" \
+		/usr/local/sbin/surflare_rps_assert.sh
 } > "$TMP/match.txt"
 
 drive() { # $1 = remote file, $2 = optional ssh that fails
