@@ -31,10 +31,22 @@ fi
 git status --porcelain 2>/dev/null | sort > "$BEFORE_FILE"
 
 for t in tests/test_*.sh; do
+	# Run each test with the interpreter its shebang names.  Forcing sh made
+	# every bash test a syntax error under dash, and a syntax error looks
+	# exactly like the skip convention handled below.
+	case "$(head -1 "$t")" in
+	*bash*) interp="bash" ;;
+	*) interp="sh" ;;
+	esac
+	# Parse before running: "cannot parse" must never be reported as "skipped".
+	if ! "$interp" -n "$t" 2> "$LOGS/$(basename "$t").log"; then
+		printf '%s %s\n' "$(basename "$t")" "3" >> "$RESULTS"
+		continue
+	fi
 	# 9>&- is not decoration: a test that leaves a background child (a curl
 	# against a blackhole address, a sleep) hands it the lock descriptor, and
 	# that child outlives the run and blocks every later one.
-	timeout 240 sh "$t" > "$LOGS/$(basename "$t").log" 2>&1 9>&-
+	timeout 240 "$interp" "$t" > "$LOGS/$(basename "$t").log" 2>&1 9>&-
 	# Capture before any substitution: `printf ... "$(basename ...)" "$?"`
 	# expands the command first, and under a non-POSIX shell that resets $?
 	# to zero -- every test then records a pass.
@@ -48,6 +60,11 @@ while read -r name rc; do
 	case "$rc" in
 	0) ;;
 	2) skip=$((skip + 1)); printf '%-46s SKIP\n' "$name" ;;
+	3)
+		hard=$((hard + 1))
+		printf '%-46s PARSE-ERROR\n' "$name"
+		[ -f "$LOGS/$name.log" ] && tail -n 6 "$LOGS/$name.log" | sed 's/^/    /'
+		;;
 	*)
 		hard=$((hard + 1))
 		printf '%-46s rc=%s\n' "$name" "$rc"

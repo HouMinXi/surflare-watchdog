@@ -72,6 +72,7 @@ fi
 
 # Any event other than add/register is ignored.
 : > "$TMP/log"
+: > "$TMP/q2"
 hook "$TMP/q2" remove
 if [ ! -s "$TMP/log" ]; then
 	ok "a non-add event is ignored"

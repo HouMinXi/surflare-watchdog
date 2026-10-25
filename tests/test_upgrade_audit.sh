@@ -26,16 +26,15 @@ drive() { # $1 = keep file, $2 = ssh command
 	echo $?
 }
 
-# A box that keeps the whole of /usr/local/sbin and the three /etc paths.
-cat > "$TMP/keep-all" <<'EOF'
-# comment
-/usr/local/sbin/
-/etc/init.d/surflare-watchdog
-/etc/init.d/surflare-rps-assert
-/etc/hotplug.d/net/30-rps-wan-eth0
-/etc/sysctl.d/13-netdev-backlog.conf
-/etc/surflare-lan-tproxy.nft
-EOF
+# A box that keeps the whole of /usr/local/sbin and every path the list names
+# outside it.  Derived from installed-files.list, so adding a file there cannot
+# make this fixture silently describe the wrong box.
+{
+	echo "# comment"
+	echo "/usr/local/sbin/"
+	grep -v '^#' scripts/installed-files.list | grep -v '^$' |
+		cut -d: -f2 | grep -vE '^/usr/local/sbin/'
+} > "$TMP/keep-all"
 rc=$(drive "$TMP/keep-all")
 if [ "$rc" -eq 0 ] && grep -q 'would keep all' "$TMP/out"; then
 	ok "a box that keeps everything is reported as safe"

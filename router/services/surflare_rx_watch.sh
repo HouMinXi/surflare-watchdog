@@ -29,7 +29,23 @@ fifo=$(read_stat rx_fifo_errors)
 carrier=$(cat "$SYSFS/carrier_changes" 2>/dev/null || echo 0)
 # softnet column 2 counts packets dropped because the backlog was full, which is
 # the software-side counterpart of a NIC ring miss.
-soft=$(awk '{s += $2} END {print s + 0}' /proc/net/softnet_stat 2>/dev/null || echo 0)
+# /proc/net/softnet_stat prints every column in hex.  Reading it as decimal
+# reported 10 where the file said 10 (16) for a quiet CPU and 41410 for a busy
+# one, i.e. a number that never matched what the file actually contained.
+SOFTNET="${SOFTNET:-/proc/net/softnet_stat}"
+soft=$(awk '
+	function hex2dec(h,   i, d, n, c) {
+		n = 0; h = tolower(h)
+		for (i = 1; i <= length(h); i++) {
+			c = index("0123456789abcdef", substr(h, i, 1)) - 1
+			if (c < 0) return n
+			n = n * 16 + c
+		}
+		return n
+	}
+	{ s += hex2dec($2) }
+	END { print s + 0 }
+' "$SOFTNET" 2>/dev/null || echo 0)
 
 prev=""
 [ -f "$STATE" ] && prev=$(cat "$STATE" 2>/dev/null)

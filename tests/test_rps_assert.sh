@@ -66,5 +66,17 @@ else
 fi
 chmod 644 "$QUEUE"
 
+# QUIET=1 is what the boot-time init passes.  With an empty prefix -- the way
+# it was written first -- the guard `[ -n "$QUIET" ]` is false and every
+# interface event writes a log line.
+: > "$TMP/logged"
+printf '0\n' > "$QUEUE"
+rc=$(drive env QUIET=1)
+if [ "$rc" -eq 0 ] && [ "$(cat "$QUEUE")" = e ] && [ ! -s "$TMP/logged" ]; then
+	ok "QUIET=1 repairs without logging, which is what boot passes"
+else
+	bad "QUIET=1 did not stay quiet (rc=$rc, value=$(cat "$QUEUE"), log=$(cat "$TMP/logged" 2>/dev/null))"
+fi
+
 echo "RESULT: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]

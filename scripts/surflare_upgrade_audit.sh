@@ -65,6 +65,7 @@ kept=0
 grep -v '^#' "$LIST" | grep -v '^$' | sed "s|@MODE@|$MODE|" > "$TMPLIST" || true
 while IFS= read -r p; do
 	remote_path=${p#*:}
+	remote_path=${remote_path%%:*}
 	if covered "$remote_path"; then
 		printf '%-46s %s\n' "$remote_path" kept
 		kept=$((kept + 1))

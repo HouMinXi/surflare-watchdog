@@ -10,15 +10,17 @@
 # packet_steering uses, delayed past its own 1 s debounce so ours runs second.
 #
 # Rollback: /etc/init.d/surflare_rps_assert disable && rm /etc/init.d/surflare_rps_assert
+# shellcheck disable=SC2034  # /etc/rc.common reads START and USE_PROCD
 START=99
 
+# shellcheck disable=SC2034  # same: read by the procd loader
 USE_PROCD=1
 
 ASSERT=/usr/local/sbin/surflare_rps_assert.sh
 
 start_service() {
 	[ -x "$ASSERT" ] || return 0
-	QUIET= "$ASSERT"
+	QUIET=1 "$ASSERT"
 }
 
 service_triggers() {

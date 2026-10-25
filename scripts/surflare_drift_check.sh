@@ -34,13 +34,18 @@ pairs=$(grep -v "^#" "$LIST" | grep -v "^$" | sed "s|@MODE@|$MODE|")
 
 remotes=""
 while IFS= read -r p; do
-	remotes="$remotes ${p#*:}"
+	remote_path=${p#*:}
+	remotes="$remotes ${remote_path%%:*}"
 done <<EOF
 $pairs
 EOF
 
 # shellcheck disable=SC2086  # the list is built above, one path per word
-remote_raw=$($SSH_CMD -n "$REMOTE" "md5sum $remotes" 2>/dev/null) || remote_raw=""
+# The exit status is not the answer: busybox and GNU md5sum both print the
+# checksums they could read and exit 1 when one path is absent.  Keeping the
+# output is what lets a missing file become MISSING-ON-BOX instead of a tool
+# failure, which is the case a half-finished scp actually produces.
+remote_raw=$($SSH_CMD -n "$REMOTE" "md5sum $remotes" 2>/dev/null)
 if [ -z "$remote_raw" ]; then
 	echo "FATAL: could not read checksums from $REMOTE" >&2
 	exit 2
@@ -51,6 +56,7 @@ missing=0
 while IFS= read -r p; do
 	local_path=${p%%:*}
 	remote_path=${p#*:}
+	remote_path=${remote_path%%:*}
 	if [ ! -f "$local_path" ]; then
 		printf '%-46s %s\n' "$local_path" "ABSENT-IN-TREE"
 		drift=$((drift + 1))

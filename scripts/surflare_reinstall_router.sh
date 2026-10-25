@@ -41,12 +41,6 @@ cd "$REPO" || exit 2
 pairs=$(grep -v '^#' "$LIST" | grep -v '^$' | sed "s|@MODE@|$MODE|")
 
 # A sysctl drop-in is data; everything else this tree installs is executable.
-mode_for() {
-	case "$1" in
-	/etc/sysctl.d/*) echo 644 ;;
-	*) echo 755 ;;
-	esac
-}
 
 PAIRFILE=$(mktemp) || exit 2
 trap 'rm -f "$PAIRFILE"' EXIT INT TERM
@@ -58,7 +52,8 @@ printf '%s\n' "$pairs" > "$PAIRFILE"
 while IFS= read -r p; do
 	local_path=${p%%:*}
 	remote_path=${p#*:}
-	mode=$(mode_for "$remote_path")
+	mode=${remote_path#*:}
+	remote_path=${remote_path%%:*}
 	count=$((count + 1))
 	if [ ! -f "$local_path" ]; then
 		echo "MISSING IN TREE: $local_path" >&2
@@ -88,10 +83,21 @@ enrol "enable surflare-watchdog at boot" \
 	'/etc/init.d/surflare-watchdog enable'
 enrol "enable the receive-spread assert at boot" \
 	'/etc/init.d/surflare-rps-assert enable'
+enrol "record receive drops every five minutes" \
+	'crontab -l 2>/dev/null | grep -q surflare_rx_watch || (crontab -l 2>/dev/null; echo "*/5 * * * * /usr/local/sbin/surflare_rx_watch.sh >> /dev/null 2>&1") | crontab -'
 enrol "keep the rps assert in cron every five minutes" \
 	'crontab -l 2>/dev/null | grep -q surflare_rps_assert || (crontab -l 2>/dev/null; echo "*/5 * * * * /usr/local/sbin/surflare_rps_assert.sh >> /dev/null 2>&1") | crontab -'
+# /usr/local/sbin and /etc/config are kept wholesale by the base image, so only
+# the rest needs a line.  The list is derived from installed-files.list: the
+# hand-written version had five entries while the audit checked fifteen.
+keep_paths=$(printf '%s\n' "$pairs" | cut -d: -f2 | grep -vE '^/usr/local/sbin/|^/etc/config/')
+# /etc/surflare/ holds site configuration this tree does not carry (the MAC
+# bypass list), so the directory is kept even though no file in it is installed.
+keep_paths="$keep_paths /etc/surflare/"
 enrol "keep the deployed files across a sysupgrade" \
-	'for f in /etc/init.d/surflare-rps-assert /etc/hotplug.d/net/30-rps-wan-eth0 /etc/sysctl.d/13-netdev-backlog.conf /etc/surflare-lan-tproxy.nft /etc/surflare/; do grep -qxF "$f" /etc/sysupgrade.conf || echo "$f" >> /etc/sysupgrade.conf; done'
+	"for f in $keep_paths; do grep -qxF \"\$f\" /etc/sysupgrade.conf || echo \"\$f\" >> /etc/sysupgrade.conf; done"
+enrol "warn when the site MAC list is missing" \
+	'test -e /etc/surflare/bypass-macs.conf || echo "WARN: /etc/surflare/bypass-macs.conf is not on this box; restore it from your backup before using AnyConnect"'
 enrol "apply the backlog setting now" \
 	'sysctl -p /etc/sysctl.d/13-netdev-backlog.conf'
 enrol "assert the receive spread now" \
@@ -106,8 +112,10 @@ if [ -n "$DRY_RUN" ]; then
 	echo "RESULT: dry run, $count files would be installed"
 	exit 0
 fi
+# The check has to come before anything that starts a service: a box that took
+# half the files is not a box to restart.
 if [ "$failed" -ne 0 ]; then
-	echo "RESULT: $failed steps failed out of $count files" >&2
+	echo "RESULT: $failed steps failed out of $count files; nothing was started" >&2
 	exit 1
 fi
 echo "RESULT: $count files installed and the services enrolled"

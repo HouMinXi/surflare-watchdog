@@ -101,7 +101,11 @@ def main():
         os.close(ready_r)
         os.close(go_w)
         os.close(seen_r)
-        libc.unshare(CLONE_NEWNET)
+        if libc.unshare(CLONE_NEWNET) != 0:
+            # Still in the parent's namespace: the link handover below would
+            # move the peer somewhere the child cannot see it.
+            os.write(seen_w, b"U")
+            os._exit(0)
         os.write(ready_w, b"r")
         os.close(ready_w)
         os.read(go_r, 1)
@@ -170,8 +174,15 @@ def main():
         note(f"nothing to accept {time.time() - t_accept:.3f}s after the child exited")
         if child_saw == b"U":
             print("SETUP_FAIL")
-        else:
+        elif child_saw in (b"C", b"R"):
+            # It connected or was refused, yet nothing arrived here: that is a
+            # verdict on the template, not on the probe.
             print("MISS")
+        elif child_saw == b"T":
+            print("MISS")
+        else:
+            # No report at all: the child died before it could say anything.
+            print("SETUP_FAIL")
 
 
 if __name__ == "__main__":

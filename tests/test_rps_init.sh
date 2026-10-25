@@ -47,7 +47,7 @@ fi
 # check above and never fire on an interface event, which is the whole point.
 body=$(sed -n '/^start_service()/,/^}/p' "$SUT")
 # shellcheck disable=SC2016  # the needle is the init script's own text
-if printf '%s\n' "$body" | grep -qF 'QUIET= "$ASSERT"'; then
+if printf '%s\n' "$body" | grep -qF 'QUIET=1 "$ASSERT"'; then
 	ok "the call sits inside start_service, which a trigger re-runs"
 else
 	bad "the assert is not called from start_service, so a trigger re-runs nothing"
