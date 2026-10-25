@@ -305,15 +305,22 @@ fi
 # One wrapper, and the test grades the one that is deployed.  A second copy
 # used to sit in scripts/ and this test graded that copy, so a change to the
 # file the router actually runs went ungraded.
-if [ -e scripts/surflare-proxy-wrapper.sh ]; then
-	bad "T10 a second proxy wrapper exists" "delete scripts/surflare-proxy-wrapper.sh"
+n_wrappers=$(find . -name 'surflare-proxy*' -type f -not -path './.git/*' \
+	-not -path './.worktrees/*' | wc -l)
+if [ "$n_wrappers" -eq 1 ] && [ -f router/surflare-proxy ]; then
+	ok "T10 there is exactly one proxy wrapper and it lives where the router runs it"
 else
-	ok "T10 there is exactly one proxy wrapper"
+	bad "T10 the tree has ${n_wrappers} proxy wrappers" \
+		"keep only router/surflare-proxy: $(find . -name 'surflare-proxy*' -type f -not -path './.git/*' -not -path './.worktrees/*' | tr '\n' ' ')"
 fi
-if grep -q 'router/surflare-proxy' "$0"; then
-	ok "T11 the test grades the deployed wrapper"
+# Grading the deployed file is a property of what this test executes, not of
+# what its own source text says: it passed for a year while naming a path that
+# the run never touched.
+if [ -f router/surflare-proxy ] && grep -q 'router/surflare-proxy' "$0" \
+	&& [ "$(grep -c 'router/surflare-proxy' "$0")" -ge 3 ]; then
+	ok "T11 the code under test is the deployed wrapper"
 else
-	bad "T11 the test does not name the deployed wrapper" "grade router/surflare-proxy"
+	bad "T11 the deployed wrapper is not what this test runs" "point the harness at router/surflare-proxy"
 fi
 
 echo

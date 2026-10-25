@@ -60,10 +60,13 @@ grep -q 'os.waitid(os.P_PID' router/ripe_fetch.py \
 # script carrying its own copies of the same fetches, missing the instance
 # lock and the download-window signal, and it drifted for months until the two
 # disagreed by 104 lines.  Assert the fork cannot come back.
-if [ -e laptop/surflare_route_updater.sh ]; then
-	bad "a second route updater exists on the laptop side"
+n_updaters=$(find . -name 'surflare_route_updater*' -type f -not -path './.git/*' \
+	-not -path './.worktrees/*' | wc -l)
+if [ "$n_updaters" -eq 1 ] && [ -f router/surflare_route_updater.sh ]; then
+	ok "there is exactly one route updater and it is the router copy"
 else
-	ok "there is exactly one route updater"
+	bad "the tree has ${n_updaters} route updaters" \
+		"keep only router/surflare_route_updater.sh"
 fi
 n_installs=$(grep -c 'install -m 755 "$REPO/router/surflare_route_updater.sh"' install.sh)
 if [ "$n_installs" -eq 2 ]; then

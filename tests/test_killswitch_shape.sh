@@ -34,14 +34,22 @@ mkdir -p "$TMP/bin"
 cat > "$TMP/bin/nft" <<'EOS'
 #!/bin/bash
 printf '%s\n' "$*" >> "$NFT_CALLS"
-[ -f "$NFT_PRESENT" ] || exit 1
-printf 'table inet killswitch {\n\tchain forward {\n\t\tcounter packets 0 bytes 0\n\t}\n}\n'
-exit 0
+[ "${NFT_BROKEN:-0}" = 1 ] && exit 1
+case "$1 $2" in
+"list tables")
+	[ -f "$NFT_PRESENT" ] && printf 'table inet killswitch\n'
+	exit 0 ;;
+"list chain")
+	[ -f "$NFT_PRESENT" ] || exit 1
+	printf 'table inet killswitch {\n\tchain forward {\n\t\tcounter packets 0 bytes 0\n\t}\n}\n'
+	exit 0 ;;
+esac
+exit 1
 EOS
 chmod +x "$TMP/bin/nft"
 
 drive() { # $1 = initial armed flag, $2 = present file, prints "<rc> <armed>"
-	PATH="$TMP/bin:$PATH" NFT_CALLS="$TMP/calls" NFT_PRESENT="$2" \
+	PATH="$TMP/bin:$PATH" NFT_CALLS="$TMP/calls" NFT_PRESENT="$2" NFT_BROKEN="${3:-0}" \
 		bash -c '
 		. "$1/fn.sh"
 		_killswitch_armed=$2
@@ -104,6 +112,13 @@ if grep -E '\[ "\$_killswitch_armed" -eq 0 \]' "$WD" | grep -qv 'return 0'; then
 else
 	ok "every repair site asks _killswitch_needs_install"
 fi
+
+# nft that cannot answer either question: not the same as a missing chain.
+got=$(drive 1 "$TMP/absent" 1)
+case "$got" in
+"1 1") ok "an unanswerable nft leaves the killswitch armed" ;;
+*) bad "an unanswerable nft was read as a missing chain (got $got)" ;;
+esac
 
 echo "RESULT: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]

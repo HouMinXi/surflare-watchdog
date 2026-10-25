@@ -20,7 +20,7 @@ bad() { echo "FAIL: $*"; fail=$((fail + 1)); }
 
 if ! unshare -Urmn true 2>/dev/null; then
 	echo "SKIP: user namespaces unavailable, cannot exercise the daemon"
-	echo "RESULT: 0 passed, 0 failed"
+	echo "RESULT: SKIP - nothing was verified"
 	exit 2
 fi
 
