@@ -91,5 +91,18 @@ else
 	bad "only $guarded guarded spawns found -- the pattern or the code changed shape"
 fi
 
+# fd 9 is the singleton lock and fd 200 the instance lock.  A subshell that
+# re-points fd 9 -- the reconnect mutex does -- must not carry fd 200 into it:
+# a SIGKILL there leaves an orphan holding the instance lock, which the next
+# daemon needs and which also gates the reaper that would have killed it.
+unguarded=$(awk '
+	/) 9>"/ && $0 !~ /200>&-/ { print FNR ": " $0 }
+' "$SRC")
+if [ -z "$unguarded" ]; then
+	ok "every subshell that re-points fd 9 closes the instance descriptor"
+else
+	bad "a subshell re-points fd 9 without closing fd 200: $unguarded"
+fi
+
 echo "RESULT: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]
