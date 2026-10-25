@@ -1772,12 +1772,8 @@ _cleanup_on_startup() {
 		fi
 	fi
 
-	# 2. Stale lock file: always remove on startup.  The lock only matters
-	#    while the watchdog is running; a fresh start must not be blocked.
-	if [ -f "$LOCK_FILE" ]; then
-		rm -f "$LOCK_FILE"
-		log "Crash recovery: removed stale lock file"
-	fi
+	# The lock file is never removed: unlinking it lets the next process lock a
+	# different inode while a survivor still holds the old one.
 
 	# 3. Zombie surflare processes: a hard crash during reconnect leaves
 	#    defunct [surflare] processes that procd does not reap.  Their
@@ -2229,7 +2225,16 @@ NFTEOF
 # only pay for the install when the cheap answer is "gone".
 _killswitch_needs_install() {
 	[ "$_killswitch_armed" -eq 0 ] && return 0
-	if [ -z "$(nft list chain inet killswitch forward 2>/dev/null)" ]; then
+	local _tables
+	# A missing chain and an nft that cannot answer both exit non-zero, and only
+	# one of them means "install it".  The table listing separates them: a
+	# rebuild cannot be undone cheaply -- it resets every tproxied flow on the
+	# LAN -- so an unanswerable nft leaves the flag alone.
+	if ! _tables=$(nft list tables 2>/dev/null); then
+		log "WARN: could not read the nftables table list; leaving the killswitch flag alone"
+		return 1
+	fi
+	if ! printf '%s\n' "$_tables" | grep -qx 'table inet killswitch'; then
 		_killswitch_armed=0
 		return 0
 	fi
@@ -6154,7 +6159,7 @@ connect_vpn() {
 		_install_cn_dns_direct
 
 		exit 0
-	) 9>"$LOCK_FILE"
+	) 9>"$LOCK_FILE" 200>&-
 	return $?
 }
 
