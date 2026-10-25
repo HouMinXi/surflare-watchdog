@@ -45,7 +45,7 @@ exec 9>&-
 # Anchored to the invocation: a comment that mentions the redirection must not
 # satisfy a check about it being used.
 # shellcheck disable=SC2016  # $t is a regex literal here, not a variable
-if grep -qE '^[[:space:]]*timeout [0-9]+ .*"\$t".*9>&-' scripts/run-tests.sh; then
+if grep -qE '^[[:space:]]*timeout .*"\$t".*9>&-' scripts/run-tests.sh; then
 	ok "the runner closes the lock descriptor on every test it starts"
 else
 	bad "the runner leaks its lock descriptor to every test"

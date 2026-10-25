@@ -13,17 +13,32 @@ set -u
 REPO=$(cd "$(dirname "$0")/.." && pwd)
 cd "$REPO" || exit 2
 
-LOCK="${TMPDIR:-/tmp}/surflare-suite.lock"
-exec 9>"$LOCK"
+# Lock the repository directory itself.  A lock file under TMPDIR is only a
+# lock while every caller agrees on TMPDIR: a second run with a different one
+# took the "free" lock and ran alongside the first.
+LOCK="$REPO"
+exec 9<"$LOCK"
 if ! flock -n 9; then
-	echo "FATAL: another suite run holds $LOCK; wait for it or stop it" >&2
+	echo "FATAL: another suite run holds the lock on $LOCK; wait for it or stop it" >&2
 	exit 2
 fi
 
 RESULTS=$(mktemp) || exit 2
 BEFORE_FILE=$(mktemp) || exit 2
 LOGS=$(mktemp -d) || exit 2
-trap 'rm -rf "$RESULTS" "$BEFORE_FILE" "$LOGS"' EXIT INT TERM
+# A signal has to reach the test that is running.  Without this the runner sat
+# in wait while an outer timeout counted down, so the real bound was that
+# timeout plus however long the current test felt like taking -- and a test
+# blocked on a pty ignored TERM outright.
+CURRENT=""
+cleanup() { rm -rf "$RESULTS" "$BEFORE_FILE" "$LOGS"; }
+on_signal() {
+	[ -n "$CURRENT" ] && kill "$CURRENT" 2>/dev/null
+	cleanup
+	exit 130
+}
+trap cleanup EXIT
+trap on_signal INT TERM
 
 if [ -n "$(git status --porcelain 2>/dev/null)" ]; then
 	echo "NOTE: the tree is already dirty; a change below is not attributable" >&2
@@ -46,11 +61,14 @@ for t in tests/test_*.sh; do
 	# 9>&- is not decoration: a test that leaves a background child (a curl
 	# against a blackhole address, a sleep) hands it the lock descriptor, and
 	# that child outlives the run and blocks every later one.
-	timeout 240 "$interp" "$t" > "$LOGS/$(basename "$t").log" 2>&1 9>&-
+	timeout -k 5 240 "$interp" "$t" > "$LOGS/$(basename "$t").log" 2>&1 9>&- &
+	CURRENT=$!
+	wait "$CURRENT"
 	# Capture before any substitution: `printf ... "$(basename ...)" "$?"`
 	# expands the command first, and under a non-POSIX shell that resets $?
 	# to zero -- every test then records a pass.
 	rc=$?
+	CURRENT=""
 	printf '%s %s\n' "$(basename "$t")" "$rc" >> "$RESULTS"
 done
 
