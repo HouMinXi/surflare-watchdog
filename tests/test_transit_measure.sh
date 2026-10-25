@@ -289,9 +289,13 @@ vcheck "St.Petersburg" && ok "dots inside valid"     || bad "dots-inside rejecte
 vcheck "back\\slash" && bad "backslash accepted" || ok "backslash rejected"
 vcheck "tab	name"   && bad "tab accepted"       || ok "tab rejected"
 # single quotes on purpose: the LITERAL $() string must be rejected
+# The probe name is per-run: a fixed one is left behind by any earlier run and
+# then reports an injection that this run never made.
+INJ_NAME="tm_inject_$$"
 # shellcheck disable=SC2016
-vcheck '$(touch /tmp/tm_inject_XXXX)' && bad "dollar accepted" || ok "dollar rejected"
-ls /tmp/tm_inject_XXXX >/dev/null 2>&1 && bad "injection side effect" || true
+vcheck "\$(touch /tmp/$INJ_NAME)" && bad "dollar accepted" || ok "dollar rejected"
+ls "/tmp/$INJ_NAME" >/dev/null 2>&1 && bad "injection side effect" || true
+rm -f "/tmp/$INJ_NAME"
 
 echo "T28: sample filenames -- ' ' maps to '+' and cannot collide with '_'"
 S1=$(printf 'New York' | tr ' ' '+')

@@ -18,7 +18,7 @@ if [ "$EUID" -ne 0 ]; then
     exit 1
 fi
 
-OUTDIR="/tmp/probe_rca_$(date +%Y%m%d_%H%M%S)"
+OUTDIR="/tmp/probe_rca_$(date +%Y%m%d_%H%M%S)_$$"
 mkdir -p "$OUTDIR"
 SUMMARY="$OUTDIR/summary.txt"
 
