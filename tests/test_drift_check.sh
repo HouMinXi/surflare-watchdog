@@ -40,6 +40,8 @@ chmod +x "$TMP/bin/ssh"
 		/usr/local/sbin/surflare_rps_assert.sh
 	printf '%s  %s\n' "$(md5sum router/services/procd/surflare-rps-assert | cut -d' ' -f1)" \
 		/etc/init.d/surflare-rps-assert
+	printf '%s  %s\n' "$(md5sum router/services/surflare_rx_watch.sh | cut -d' ' -f1)" \
+		/usr/local/sbin/surflare_rx_watch.sh
 	printf '%s  %s\n' "$(md5sum router/hotplug/30-rps-wan-eth0 | cut -d' ' -f1)" \
 		/etc/hotplug.d/net/30-rps-wan-eth0
 	printf '%s  %s\n' "$(md5sum router/sysctl/13-netdev-backlog.conf | cut -d' ' -f1)" \

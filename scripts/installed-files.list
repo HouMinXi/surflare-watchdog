@@ -14,5 +14,6 @@ router/surflare_route_updater.sh:/usr/local/sbin/surflare_route_updater.sh
 router/ripe_fetch.py:/usr/local/sbin/ripe_fetch.py
 router/@MODE@/surflare-lan-tproxy.nft:/etc/surflare-lan-tproxy.nft
 scripts/surflare_rps_assert.sh:/usr/local/sbin/surflare_rps_assert.sh
+router/services/surflare_rx_watch.sh:/usr/local/sbin/surflare_rx_watch.sh
 router/hotplug/30-rps-wan-eth0:/etc/hotplug.d/net/30-rps-wan-eth0
 router/sysctl/13-netdev-backlog.conf:/etc/sysctl.d/13-netdev-backlog.conf

@@ -15,6 +15,10 @@
 # See README.md for how to capture a raw config as input.
 
 set -u
+# One directory per run: two copies of this harness used to share fixed
+# names in /tmp and clobber each other, which reads as a flaky assertion.
+mkdir -p /tmp/dedex.$$ || exit 1
+trap 'rm -rf /tmp/dedex.$$' EXIT INT TERM
 FILTER="$(dirname "$0")/filter-new2.jq"
 # Default input is the committed hermetic fixture; pass a captured
 # raw config path for full realism (see README).
@@ -28,8 +32,8 @@ fail=0
 # --- baseline assertions (must hold on the pristine filter) ----------
 jq --argjson T 300 --arg I 60s --arg D claude.com,claude.ai,google.com --arg DD minxihou.site \
    --arg DE 1 \
-   -f "$FILTER" "$IN" > /tmp/inj-base.json
-if jq -e '.route.rules[0].ip_cidr == ["'"$DED_IP"'/32"] and .route.rules[0].outbound != "ded-exit"' /tmp/inj-base.json >/dev/null; then
+   -f "$FILTER" "$IN" > /tmp/dedex.$$/inj-base.json
+if jq -e '.route.rules[0].ip_cidr == ["'"$DED_IP"'/32"] and .route.rules[0].outbound != "ded-exit"' /tmp/dedex.$$/inj-base.json >/dev/null; then
     echo "PASS base: guard rule present and not ded-exit"
 else
     echo "FAIL base guard"; fail=1
@@ -37,12 +41,12 @@ fi
 # read the canary port so this assertion cross-references the two
 # hardcoded copies (filter vs canary script) and fails on either drift
 _cport=$(sed -n "s/^CANARY_PORT=//p" "$(dirname "$0")/../router/services/surflare-dedicated/surflare-ded-canary" | head -1)
-if jq -e --argjson cp "${_cport:-0}" '[.inbounds[] | select(.tag == "ded-canary-in" and .listen == "127.0.0.1" and .listen_port == $cp)] | length == 1' /tmp/inj-base.json >/dev/null; then
+if jq -e --argjson cp "${_cport:-0}" '[.inbounds[] | select(.tag == "ded-canary-in" and .listen == "127.0.0.1" and .listen_port == $cp)] | length == 1' /tmp/dedex.$$/inj-base.json >/dev/null; then
     echo "PASS base: canary inbound present"
 else
     echo "FAIL base canary"; fail=1
 fi
-if jq -e '.route.final == "ded-exit"' /tmp/inj-base.json >/dev/null; then
+if jq -e '.route.final == "ded-exit"' /tmp/dedex.$$/inj-base.json >/dev/null; then
     echo "PASS base: route.final is ded-exit when the layer is on"
 else
     echo "FAIL base final"; fail=1
@@ -50,15 +54,15 @@ fi
 # Foreign DoH rides ded-exit only while the layer is on. UDP resolvers
 # keep the carrier detour, and a closed layer leaves every detour as
 # the vendor set it.
-if jq -e '[.dns.servers[] | select(.tag == "dns_remote" and .type == "https" and .detour == "ded-exit")] | length == 1' /tmp/inj-base.json >/dev/null; then
+if jq -e '[.dns.servers[] | select(.tag == "dns_remote" and .type == "https" and .detour == "ded-exit")] | length == 1' /tmp/dedex.$$/inj-base.json >/dev/null; then
     echo "PASS base: dns_remote DoH detours via ded-exit"
 else
     echo "FAIL base dns_remote detour"; fail=1
 fi
 jq --argjson T 300 --arg I 60s --arg D claude.com,claude.ai,google.com --arg DD minxihou.site \
    --arg DE "" \
-   -f "$FILTER" "$IN" > /tmp/inj-closed-dns.json
-if jq -e '[.dns.servers[] | select(.tag == "dns_remote" and .detour == "ded-exit")] | length == 0' /tmp/inj-closed-dns.json >/dev/null; then
+   -f "$FILTER" "$IN" > /tmp/dedex.$$/inj-closed-dns.json
+if jq -e '[.dns.servers[] | select(.tag == "dns_remote" and .detour == "ded-exit")] | length == 0' /tmp/dedex.$$/inj-closed-dns.json >/dev/null; then
     echo "PASS base: closed layer leaves dns_remote on its vendor detour"
 else
     echo "FAIL base closed dns_remote"; fail=1
@@ -68,8 +72,8 @@ fi
 # 443 (66.220.148.145, code=5 on live).  Both bypasses sit immediately
 # before the first port-unconstrained ded-exit rule, address then port
 # 80, so rules that already name a port keep their own outbound.
-_p80=$(jq -r 'first(.route.rules | to_entries[] | select(.value.outbound == "ded-exit" and (.value | has("port") | not)) | .key)' /tmp/inj-base.json)
-if jq -e --argjson i "$_p80" '.route.rules[($i - 2)].ip_cidr == ["66.220.148.145/32"] and .route.rules[($i - 1)].port == [80] and .route.rules[($i - 1)].outbound != "ded-exit" and .route.rules[($i - 1)].outbound != "direct" and .route.rules[($i - 2)].outbound == .route.rules[($i - 1)].outbound' /tmp/inj-base.json >/dev/null; then
+_p80=$(jq -r 'first(.route.rules | to_entries[] | select(.value.outbound == "ded-exit" and (.value | has("port") | not)) | .key)' /tmp/dedex.$$/inj-base.json)
+if jq -e --argjson i "$_p80" '.route.rules[($i - 2)].ip_cidr == ["66.220.148.145/32"] and .route.rules[($i - 1)].port == [80] and .route.rules[($i - 1)].outbound != "ded-exit" and .route.rules[($i - 1)].outbound != "direct" and .route.rules[($i - 2)].outbound == .route.rules[($i - 1)].outbound' /tmp/dedex.$$/inj-base.json >/dev/null; then
     echo "PASS base: facebook and port-80 bypass sit before the first unconstrained ded-exit rule"
 else
     echo "FAIL base port80"; fail=1
@@ -78,16 +82,16 @@ fi
 # --- J10: without the port-80 bypass rule the assertion above goes red
 # shellcheck disable=SC2016  # $i/$vpn are LITERAL jq tokens in the
 # filter file being edited, not shell expansions to perform
-sed '/first(to_entries\[\] | select(.value.outbound == "ded-exit"/,/ + .[\$$i:])/d' "$FILTER" > /tmp/filter-j10.jq
+sed '/first(to_entries\[\] | select(.value.outbound == "ded-exit"/,/ + .[\$$i:])/d' "$FILTER" > /tmp/dedex.$$/filter-j10.jq
 jq --argjson T 300 --arg I 60s --arg D claude.com,claude.ai,google.com --arg DD minxihou.site \
    --arg DE 1 \
-   -f /tmp/filter-j10.jq "$IN" > /tmp/inj-j10.json
-if jq -e --argjson i "$_p80" '.route.rules[($i - 1)].port == [80] and .route.rules[($i - 1)].outbound != "ded-exit"' /tmp/inj-j10.json >/dev/null; then
+   -f /tmp/dedex.$$/filter-j10.jq "$IN" > /tmp/dedex.$$/inj-j10.json
+if jq -e --argjson i "$_p80" '.route.rules[($i - 1)].port == [80] and .route.rules[($i - 1)].outbound != "ded-exit"' /tmp/dedex.$$/inj-j10.json >/dev/null; then
     echo "FAIL J10: port-80 bypass still present after injection (injection ineffective)"; fail=1
 else
     echo "PASS J10: port-80 bypass gone -> assertion correctly red"
 fi
-if jq -e '([.outbounds[] | select(.tag == "ded-exit" and .detour != null and .detour != "direct")] | length == 1) and ([.route.rules[] | select(.ip_cidr == ["'"$DED_IP"'/32"] and .outbound != "ded-exit")] | length == 1)' /tmp/inj-base.json >/dev/null; then
+if jq -e '([.outbounds[] | select(.tag == "ded-exit" and .detour != null and .detour != "direct")] | length == 1) and ([.route.rules[] | select(.ip_cidr == ["'"$DED_IP"'/32"] and .outbound != "ded-exit")] | length == 1)' /tmp/dedex.$$/inj-base.json >/dev/null; then
     echo "PASS base: ded-exit detours via carrier; guard rule stays on carrier"
 else
     echo "FAIL base detour/guard"; fail=1
@@ -96,11 +100,11 @@ fi
 # --- J1: remove guard prepend ---------------------------------------
 # shellcheck disable=SC2016  # $ENV/$vpn are LITERAL jq tokens in the
 # filter file being edited, not shell expansions to perform
-sed 's#{"ip_cidr": \[\$ENV\.DED_SERVER + "/32"\], "outbound": \$vpn}##' "$FILTER" > /tmp/filter-j1.jq
+sed 's#{"ip_cidr": \[\$ENV\.DED_SERVER + "/32"\], "outbound": \$vpn}##' "$FILTER" > /tmp/dedex.$$/filter-j1.jq
 jq --argjson T 300 --arg I 60s --arg D claude.com,claude.ai,google.com --arg DD minxihou.site \
    --arg DE 1 \
-   -f /tmp/filter-j1.jq "$IN" > /tmp/inj-j1.json
-if jq -e '.route.rules[0].ip_cidr == ["'"$DED_IP"'/32"]' /tmp/inj-j1.json >/dev/null; then
+   -f /tmp/dedex.$$/filter-j1.jq "$IN" > /tmp/dedex.$$/inj-j1.json
+if jq -e '.route.rules[0].ip_cidr == ["'"$DED_IP"'/32"]' /tmp/dedex.$$/inj-j1.json >/dev/null; then
     echo "FAIL J1: guard rule still present after injection (injection ineffective)"; fail=1
 else
     echo "PASS J1: guard rule gone -> assertion correctly red"
@@ -109,11 +113,11 @@ fi
 # --- J11: drop the dns_remote detour repoint. The assertion above
 # must go red, proving it checks this line and not a side effect.
 # shellcheck disable=SC2016  # jq tokens in the filter, not shell
-sed 's#.detour = "ded-exit"##' "$FILTER" > /tmp/filter-j11.jq
+sed 's#.detour = "ded-exit"##' "$FILTER" > /tmp/dedex.$$/filter-j11.jq
 jq --argjson T 300 --arg I 60s --arg D claude.com,claude.ai,google.com --arg DD minxihou.site \
    --arg DE 1 \
-   -f /tmp/filter-j11.jq "$IN" > /tmp/inj-j11.json
-if jq -e '[.dns.servers[] | select(.tag == "dns_remote" and .type == "https" and .detour == "ded-exit")] | length == 1' /tmp/inj-j11.json >/dev/null; then
+   -f /tmp/dedex.$$/filter-j11.jq "$IN" > /tmp/dedex.$$/inj-j11.json
+if jq -e '[.dns.servers[] | select(.tag == "dns_remote" and .type == "https" and .detour == "ded-exit")] | length == 1' /tmp/dedex.$$/inj-j11.json >/dev/null; then
     echo "FAIL J11: dns_remote still on ded-exit after injection (injection ineffective)"; fail=1
 else
     echo "PASS J11: dns_remote detour gone -> assertion correctly red"
@@ -121,11 +125,11 @@ fi
 
 # --- J2: remove canary inbound ---------------------------------------
 # shellcheck disable=SC2016  # same: literal jq fragments, not shell text
-sed 's#| .inbounds += \[{##; s#"type": "mixed",##; s#"tag": "ded-canary-in",##; s#"listen": "127.0.0.1",##; s#"listen_port": '"${_cport:-20814}"'##; s#      }]##' "$FILTER" > /tmp/filter-j2.jq
+sed 's#| .inbounds += \[{##; s#"type": "mixed",##; s#"tag": "ded-canary-in",##; s#"listen": "127.0.0.1",##; s#"listen_port": '"${_cport:-20814}"'##; s#      }]##' "$FILTER" > /tmp/dedex.$$/filter-j2.jq
 jq --argjson T 300 --arg I 60s --arg D claude.com,claude.ai,google.com --arg DD minxihou.site \
    --arg DE 1 \
-   -f /tmp/filter-j2.jq "$IN" > /tmp/inj-j2.json 2>/tmp/j2err.txt
-if jq -e '[.inbounds[] | select(.tag == "ded-canary-in")] | length == 1' /tmp/inj-j2.json >/dev/null 2>&1; then
+   -f /tmp/dedex.$$/filter-j2.jq "$IN" > /tmp/dedex.$$/inj-j2.json 2>/tmp/dedex.$$/j2err.txt
+if jq -e '[.inbounds[] | select(.tag == "ded-canary-in")] | length == 1' /tmp/dedex.$$/inj-j2.json >/dev/null 2>&1; then
     echo "FAIL J2: canary inbound still present after injection (injection ineffective)"; fail=1
 else
     echo "PASS J2: canary inbound gone -> assertion correctly red"
@@ -213,7 +217,7 @@ rm -rf "$_sd"
 # must equal wrapper(de1) with only the inbounds differing (canary-in
 # vs shadow-in). -----------------------------------------------
 reattach="$(dirname "$0")/../router/services/surflare-dedicated/surflare-ded-reattach"
-prog=/tmp/reattach-prog.jq
+prog=/tmp/dedex.$$/reattach-prog.jq
 # Extract the embedded single-quoted jq program: starts at the line
 # "     '([.outbounds", ends at the first "' " (closing shell quote)
 # on its last line; the '"$SHADOW_PORT"' shell interpolation inside
@@ -243,15 +247,15 @@ awk -v sq="'" -v rp="${_sport:-20815}" '
 ' "$reattach" > "$prog"
 jq --argjson T 300 --arg I 60s --arg D claude.com,claude.ai,google.com --arg DD minxihou.site \
    --arg DE "" \
-   -f "$FILTER" "$IN" > /tmp/inj-closed.json
+   -f "$FILTER" "$IN" > /tmp/dedex.$$/inj-closed.json
 # sanity: whitespace drift in the reattach file would make the awk
 # extract an empty/stale program; fail loudly with the root cause
 if ! grep -q '(\[.outbounds' "$prog" 2>/dev/null; then
     echo "FAIL J4: extracted reattach program is empty or malformed (extraction missed the jq program -- reformat of surflare-ded-reattach?)"; fail=1
 elif jq \
-      -f "$prog" /tmp/inj-closed.json > /tmp/inj-j4.json 2>/dev/null; then
-    a=$(jq -cS 'del(.inbounds)' /tmp/inj-base.json | md5sum | cut -d' ' -f1)
-    b=$(jq -cS 'del(.inbounds)' /tmp/inj-j4.json | md5sum | cut -d' ' -f1)
+      -f "$prog" /tmp/dedex.$$/inj-closed.json > /tmp/dedex.$$/inj-j4.json 2>/dev/null; then
+    a=$(jq -cS 'del(.inbounds)' /tmp/dedex.$$/inj-base.json | md5sum | cut -d' ' -f1)
+    b=$(jq -cS 'del(.inbounds)' /tmp/dedex.$$/inj-j4.json | md5sum | cut -d' ' -f1)
     if [ "$a" = "$b" ]; then
         echo "PASS J4: reattach shadow topology identical to wrapper (ex-inbounds)"
     else
@@ -284,11 +288,11 @@ awk -v sq="'" -v rp="${_sport:-20815}" '
         }
         print
     }
-' "$reattach_bad" > /tmp/reattach-prog-bad.jq
+' "$reattach_bad" > /tmp/dedex.$$/reattach-prog-bad.jq
 rm -f "$reattach_bad"
-if jq -f /tmp/reattach-prog-bad.jq /tmp/inj-closed.json > /tmp/inj-j4b.json 2>/dev/null \
-   && [ "$(jq -cS 'del(.inbounds)' /tmp/inj-base.json | md5sum | cut -d' ' -f1)" \
-      = "$(jq -cS 'del(.inbounds)' /tmp/inj-j4b.json | md5sum | cut -d' ' -f1)" ]; then
+if jq -f /tmp/dedex.$$/reattach-prog-bad.jq /tmp/dedex.$$/inj-closed.json > /tmp/dedex.$$/inj-j4b.json 2>/dev/null \
+   && [ "$(jq -cS 'del(.inbounds)' /tmp/dedex.$$/inj-base.json | md5sum | cut -d' ' -f1)" \
+      = "$(jq -cS 'del(.inbounds)' /tmp/dedex.$$/inj-j4b.json | md5sum | cut -d' ' -f1)" ]; then
     echo "FAIL J4b: dropping the reattach dns_remote repoint still matches (toothless)"; fail=1
 else
     echo "PASS J4b: reattach dns_remote repoint has teeth"
@@ -310,7 +314,7 @@ fi
 # --- J5: tests/filter-new2.jq must stay byte-identical to the jq
 # program embedded in the wrapper (README contract, now enforced) ---
 wrapper="$(dirname "$0")/../router/surflare-proxy"
-wprog=/tmp/wrapper-prog.jq
+wprog=/tmp/dedex.$$/wrapper-prog.jq
 awk -v sq="'" '
     index($0, "if jq --argjson T ") == 1 { p = 1; next }
     p && index($0, (sq " < " "\"" "$_tmp" "\"")) == 1 { exit }
@@ -323,11 +327,11 @@ else
 fi
 
 # --- J6: layer ON but no carrier urltest -> graceful no-injection ---
-jq '.outbounds |= map(select(.type != "urltest"))' "$IN" > /tmp/inj-noutest.json
+jq '.outbounds |= map(select(.type != "urltest"))' "$IN" > /tmp/dedex.$$/inj-noutest.json
 jq --argjson T 300 --arg I 60s --arg D claude.com,claude.ai,google.com --arg DD minxihou.site \
    --arg DE 1 \
-   -f "$FILTER" /tmp/inj-noutest.json > /tmp/inj-j6.json 2>/dev/null
-if jq -e '([.outbounds[] | select(.tag == "ded-exit")] | length == 0) and (.route.final != "ded-exit")' /tmp/inj-j6.json >/dev/null 2>&1; then
+   -f "$FILTER" /tmp/dedex.$$/inj-noutest.json > /tmp/dedex.$$/inj-j6.json 2>/dev/null
+if jq -e '([.outbounds[] | select(.tag == "ded-exit")] | length == 0) and (.route.final != "ded-exit")' /tmp/dedex.$$/inj-j6.json >/dev/null 2>&1; then
     echo "PASS J6: no carrier -> no ded-exit injected, final not ded-exit"
 else
     echo "FAIL J6: ded-exit injected without a carrier"; fail=1
@@ -399,22 +403,22 @@ j8run=$(mktemp)
     printf 'SHADOW_PORT=%s\n' "${_sport:-20815}"
     printf "jq '"
     cat "$rawprog"
-    printf "' /tmp/inj-closed.json > /tmp/inj-j8.json\n"
+    printf "' /tmp/dedex.$$/inj-closed.json > /tmp/dedex.$$/inj-j8.json\n"
 } > "$j8run"
-if sh "$j8run" 2>/dev/null    && [ "$(jq -r '.inbounds[0].listen_port | type' /tmp/inj-j8.json 2>/dev/null)" = "number" ]; then
+if sh "$j8run" 2>/dev/null    && [ "$(jq -r '.inbounds[0].listen_port | type' /tmp/dedex.$$/inj-j8.json 2>/dev/null)" = "number" ]; then
     echo "PASS J8: production quoting yields numeric listen_port"
 else
     echo "FAIL J8: reattach listen_port is not numeric under production quoting"; fail=1
 fi
 # J8-control (defect injection): the identical assertion must go RED
 # for a string-typed port -- otherwise J8 has no teeth
-jq -n --arg p "${_sport:-20815}" '{"inbounds":[{"listen_port":$p}]}' > /tmp/inj-j8c.json
-if [ "$(jq -r '.inbounds[0].listen_port | type' /tmp/inj-j8c.json)" = "number" ]; then
+jq -n --arg p "${_sport:-20815}" '{"inbounds":[{"listen_port":$p}]}' > /tmp/dedex.$$/inj-j8c.json
+if [ "$(jq -r '.inbounds[0].listen_port | type' /tmp/dedex.$$/inj-j8c.json)" = "number" ]; then
     echo "FAIL J8-control: string port reported numeric -- assertion toothless"; fail=1
 else
     echo "PASS J8-control: string port correctly reported as string (red-as-expected)"
 fi
-rm -f "$rawprog" "$j8run" /tmp/inj-j8.json /tmp/inj-j8c.json
+rm -f "$rawprog" "$j8run" /tmp/dedex.$$/inj-j8.json /tmp/dedex.$$/inj-j8c.json
 
 # --- J9: the legacy rules[-1] repoint must hit the terminal catch-all,
 # never the private-IP bypass.  Production's last rule is the tproxy-in
@@ -425,7 +429,7 @@ _j9check() {
     jq -e '[.route.rules[] | select(.ip_cidr != null and (.ip_cidr | index("10.0.0.0/8")))][0].outbound == "direct"' "$1" >/dev/null 2>&1 \
         && jq -e '.route.rules[-1].outbound == "mh_via_test"' "$1" >/dev/null 2>&1
 }
-if _j9check /tmp/inj-closed.json; then
+if _j9check /tmp/dedex.$$/inj-closed.json; then
     echo "PASS J9: private-IP bypass stays direct, catch-all repointed to carrier"
 else
     echo "FAIL J9: rules[-1] repoint hit the wrong rule (fixture shape regression)"; fail=1
@@ -433,13 +437,13 @@ fi
 # J9-control (defect injection): a repoint that hit the private-IP
 # bypass instead must make the check go RED
 jq '.route.rules |= map(if .ip_cidr != null then .outbound = "mh_via_test" else . end)' \
-    /tmp/inj-closed.json > /tmp/inj-j9c.json
-if _j9check /tmp/inj-j9c.json; then
+    /tmp/dedex.$$/inj-closed.json > /tmp/dedex.$$/inj-j9c.json
+if _j9check /tmp/dedex.$$/inj-j9c.json; then
     echo "FAIL J9-control: misdirected repoint not flagged -- assertion toothless"; fail=1
 else
     echo "PASS J9-control: misdirected repoint flagged (red-as-expected)"
 fi
-rm -f /tmp/inj-j9c.json
+rm -f /tmp/dedex.$$/inj-j9c.json
 
 if [ "$fail" -eq 0 ]; then
     echo "=== ALL INJECTION CHECKS RED-AS-EXPECTED ==="
