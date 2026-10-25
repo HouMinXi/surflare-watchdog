@@ -91,19 +91,27 @@ fi
 hash_proxy_after=$(file_hash "$PROXY_BIN")
 hash_cli_after=$(file_hash "$CLI_BIN")
 
+_proxy_listening() {
+	# The listener is the service.  The proxy binds an IPv6 wildcard, which an
+	# IPv4 /dev/tcp probe cannot reach, so ask the socket table and accept
+	# either family.
+	if command -v ss >/dev/null 2>&1; then
+		ss -ltn 2>/dev/null | grep -qE '[:.]10800[[:space:]]' && return 0
+	elif command -v netstat >/dev/null 2>&1; then
+		netstat -ltn 2>/dev/null | grep -q ':10800' && return 0
+	fi
+	# Between exec and the first listen there is no socket yet, and the kernel
+	# truncates a process name to fifteen characters, so the exact name of the
+	# wrapper does not match.  The binary's own name does, and no log reader
+	# carries it -- `surflare-proxy.log` in a tail's arguments does not contain
+	# `surflare-proxy.real`.
+	pgrep -f 'surflare-proxy\.real' >/dev/null 2>&1
+}
+
 proxy_running() {
 	local i=0
 	while [ "$i" -lt "$READY_TIMEOUT" ]; do
-		# Anything whose argv mentions the name answers a substring match: the
-		# watchdog's own log tail, the log health check, an operator watching
-		# the log.  Ask the proxy's port instead, which is what "running"
-		# means for a service the updater has just replaced.
-		# The port is the service's identity; the exact process name covers the
-		# moment between exec and listen.  `pgrep -f` would also count a log
-		# tail or the watchdog's own monitor, which is how a dead proxy kept a
-		# broken release.
-		if (exec 3<>/dev/tcp/127.0.0.1/10800) 2>/dev/null ||
-			pgrep -x surflare-proxy >/dev/null 2>&1; then
+		if _proxy_listening; then
 			return 0
 		fi
 		sleep 1

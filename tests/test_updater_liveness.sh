@@ -2,8 +2,14 @@
 # The updater calls a release good when the proxy is running, so "running" has
 # to mean the service and not any process that happens to mention it.  It used
 # to ask `pgrep -f surflare-proxy`, which a log tail, the watchdog's own
-# monitor and the log health check all satisfy -- so a release that never came
-# up kept the check green and was left installed.
+# monitor and the log health check all satisfy, so a release that never came up
+# kept the check green and was left installed.
+#
+# Two details came off the router itself: it binds an IPv6 wildcard, so an IPv4
+# connect is refused while the proxy is serving, and the kernel truncates a
+# process name to fifteen characters, so the wrapper's exact name does not
+# match.  The check reads the socket table, and falls back to the binary's own
+# name for the moment between exec and the first listen.
 set -u
 cd "$(dirname "$0")/.." || exit 1
 SUT=${SUT:-surflare-update.sh}
@@ -14,66 +20,51 @@ bad() { echo "FAIL: $*"; fail=$((fail + 1)); }
 
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
-mkdir -p "$TMP/bin"
-sed -n '/^proxy_running() {/,/^}/p' "$SUT" > "$TMP/pr.sh"
-if [ ! -s "$TMP/pr.sh" ]; then
+mkdir -p "$TMP/bin" "$TMP/bin_listen" "$TMP/bin_real"
+sed -n '/^_proxy_listening() {/,/^}/p;/^proxy_running() {/,/^}/p' "$SUT" > "$TMP/pr.sh"
+if ! grep -q '^proxy_running()' "$TMP/pr.sh"; then
 	bad "could not extract proxy_running from $SUT"
 	echo "RESULT: $pass passed, $fail failed"
 	exit 1
 fi
 
-# A command line that mentions the proxy, but is not the proxy.
-cat > "$TMP/bin/pgrep" <<'EOS'
-#!/bin/bash
-# `-x` means "this exact process name", which the argv-only process is not.
-for a in "$@"; do [ "$a" = "-x" ] && exit 1; done
-exit 0
-EOS
-chmod +x "$TMP/bin/pgrep"
+# A process whose command line mentions the proxy log is not the proxy.
+printf '#!/bin/bash\nexit 1\n' > "$TMP/bin/pgrep"
+printf '#!/bin/bash\nexit 0\n' > "$TMP/bin/ss"
+printf '#!/bin/bash\nexit 0\n' > "$TMP/bin/netstat"
 
-drive() { # $1 = READY_TIMEOUT
-	PATH="$TMP/bin:$PATH" READY_TIMEOUT="$1" bash -c '. "$1"; proxy_running' _ "$TMP/pr.sh" >/dev/null 2>&1
+# The binary itself answers the fallback, matching only its own name.
+printf '#!/bin/bash\nfor a in "$@"; do case "$a" in *surflare-proxy*real*) exit 0;; esac; done\nexit 1\n' \
+	> "$TMP/bin_real/pgrep"
+
+# A listening socket, as the router reports one.
+printf '#!/bin/bash\nprintf "LISTEN 0 1 127.0.0.1:10800 0.0.0.0:*\\n"\n' > "$TMP/bin_listen/ss"
+chmod +x "$TMP/bin/"* "$TMP/bin_listen/"* "$TMP/bin_real/"*
+
+drive() { # $1 = PATH prefix
+	PATH="$1:$PATH" READY_TIMEOUT=1 bash -c '. "$1"; proxy_running' _ "$TMP/pr.sh" >/dev/null 2>&1
 	echo $?
 }
 
-if [ -n "${LISTEN_HELPER:-}" ] && command -v "$LISTEN_HELPER" >/dev/null 2>&1; then :; fi
-
-# Nothing on :10800 and a process whose argv merely mentions the proxy.
-if command -v python3 >/dev/null 2>&1 &&
-	python3 -c 'import socket,sys
-s=socket.socket()
-try:
-    s.bind(("127.0.0.1",10800)); s.close(); sys.exit(0)
-except OSError:
-    sys.exit(1)' 2>/dev/null; then
-	got=$(drive 1)
-	if [ "$got" -ne 0 ]; then
-		ok "a command line that mentions the proxy is not a running proxy"
-	else
-		bad "an argv match was accepted as a running proxy"
-	fi
+got=$(drive "$TMP/bin")
+if [ "$got" -ne 0 ]; then
+	ok "no listener and no binary means the proxy is down"
 else
-	bad "port 10800 is occupied, cannot test the closed-port case"
+	bad "an argv mention was accepted as a running proxy"
 fi
 
-# A real listener on the port the proxy uses.
-if command -v python3 >/dev/null 2>&1; then
-	python3 -c 'import socket,time
-s=socket.socket(); s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)
-s.bind(("127.0.0.1",10800)); s.listen(1)
-time.sleep(8)' >/dev/null 2>&1 &
-	listener=$!
-	sleep 1
-	got=$(drive 1)
-	kill "$listener" 2>/dev/null
-	wait "$listener" 2>/dev/null
-	if [ "$got" -eq 0 ]; then
-		ok "a listening port counts as a running proxy"
-	else
-		bad "a listening proxy was reported as down"
-	fi
+got=$(drive "$TMP/bin_listen")
+if [ "$got" -eq 0 ]; then
+	ok "a listening socket counts as a running proxy"
 else
-	echo "SKIP: no python3, cannot open the port"
+	bad "a listening proxy was reported as down"
+fi
+
+got=$(drive "$TMP/bin_real")
+if [ "$got" -eq 0 ]; then
+	ok "the binary's own name covers the gap before it listens"
+else
+	bad "the binary's own name was not accepted"
 fi
 
 echo "RESULT: $pass passed, $fail failed"
