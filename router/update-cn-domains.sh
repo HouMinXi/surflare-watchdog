@@ -1,55 +1,45 @@
-#!/bin/bash
-# Weekly CN domain list update for SmartDNS
-set -e
-DEST="/etc/smartdns/domain-set/cn_domains.conf"
-TMP="/tmp/cn_domains_new.conf"
-URL="https://raw.githubusercontent.com/felixonmars/dnsmasq-china-list/master/accelerated-domains.china.conf"
-MIRROR="https://cdn.jsdelivr.net/gh/felixonmars/dnsmasq-china-list@master/accelerated-domains.china.conf"
+#!/bin/sh
+# Daily update of CN domain list from felixonmars/dnsmasq-china-list.
+# Converts dnsmasq format to SmartDNS nameserver + flat domain-set.
+# Appends local-cn.txt (learned + manual) after felixonmars base.
+URL="${URL:-https://raw.githubusercontent.com/felixonmars/dnsmasq-china-list/master/accelerated-domains.china.conf}"
+DEST_DIR="${DEST_DIR:-/etc/smartdns/domain-set}"
+SMARTDNS_INIT="${SMARTDNS_INIT:-/etc/init.d/smartdns}"
+MIN_LINES="${MIN_LINES:-100000}"
+TMP=$(mktemp)
+trap 'rm -f "$TMP"' EXIT
 
-log() { logger -t cn-domains-update "$*"; }
+curl -sf --max-time 30 "$URL" -o "$TMP" || { logger -t cn-domains "download failed"; exit 1; }
 
-# Download (primary then mirror)
-if ! curl -sf --connect-timeout 15 --max-time 60 "$URL" -o /tmp/raw.conf 2>/dev/null; then
-    log "github failed, trying mirror..."
-    curl -sf --connect-timeout 15 --max-time 60 "$MIRROR" -o /tmp/raw.conf || {
-        log "ERROR: both sources failed"; exit 1; }
-fi
+LINES=$(wc -l < "$TMP")
+[ "$LINES" -gt "$MIN_LINES" ] || { logger -t cn-domains "too few lines: $LINES"; exit 1; }
 
-# Sanity check
-COUNT=$(wc -l < /tmp/raw.conf)
-[ "$COUNT" -lt 50000 ] && { log "ERROR: only $COUNT lines"; exit 1; }
+CONF_TMP=$(mktemp)
+FLAT_TMP=$(mktemp)
+trap 'rm -f "$TMP" "$CONF_TMP" "$FLAT_TMP"' EXIT
 
-# Convert: server=/domain/ip -> nameserver /domain/domestic
-python3 -c "
-import sys
-with open('/tmp/raw.conf') as f:
-    for line in f:
-        line = line.strip()
-        if line.startswith('server=/'):
-            parts = line[8:].rsplit('/', 1)
-            print('nameserver /' + parts[0] + '/domestic')
-" > "$TMP"
+sed "s|^server=/\([^/]*\)/.*|nameserver /\1/domestic|" "$TMP" > "$CONF_TMP"
+sed "s|^server=/\([^/]*\)/.*|\1|" "$TMP" > "$FLAT_TMP"
 
-NEW_COUNT=$(wc -l < "$TMP")
-[ "$NEW_COUNT" -lt 50000 ] && { log "ERROR: only $NEW_COUNT converted"; exit 1; }
+[ -f "$DEST_DIR/local-cn.txt" ] && {
+    while read -r d; do
+        [ -n "$d" ] && {
+            echo "nameserver /$d/domestic" >> "$CONF_TMP"
+            echo "$d" >> "$FLAT_TMP"
+        }
+    done < "$DEST_DIR/local-cn.txt"
+}
 
-mkdir -p "$(dirname "$DEST")"
-mv "$TMP" "$DEST"
-rm -f /tmp/raw.conf
-
-# Generate flat domain list for SmartDNS domain-set (nftset bypass).
-# cn_domain_flat.txt is referenced by custom.conf domain-rules directive
-# to add resolved IPs to nftables cn_domain_ips set.
-FLAT_DEST="/etc/smartdns/domain-set/cn_domain_flat.txt"
-sed 's|nameserver /||;s|/domestic||' "$DEST" > "${FLAT_DEST}.tmp"
-mv "${FLAT_DEST}.tmp" "$FLAT_DEST"
-
-# Reload SmartDNS gracefully
-
-
-log "updated: $NEW_COUNT domains"
-# Reload: restart SmartDNS (this version does not support graceful reload)
-/etc/init.d/smartdns restart
-# Flush dnsmasq cache so stale DNS records don't persist after SmartDNS
-# domain list change (dnsmasq forwards to SmartDNS but caches responses).
-killall -HUP dnsmasq 2>/dev/null || true
+# The destination is not guaranteed to exist: a freshly restored system
+# has the package but not necessarily the directory, and this script is
+# what creates the two files in it.  Both moves are checked -- an
+# unchecked failure here still reached the "updated: N domains" line,
+# so the log claimed an update that had not happened.
+mkdir -p "$DEST_DIR" || { logger -t cn-domains "cannot create $DEST_DIR"; exit 1; }
+mv "$CONF_TMP" "$DEST_DIR/cn_domains.conf" || { logger -t cn-domains "cannot install cn_domains.conf"; exit 1; }
+mv "$FLAT_TMP" "$DEST_DIR/cn_domain_flat.txt" || { logger -t cn-domains "cannot install cn_domain_flat.txt"; exit 1; }
+"$SMARTDNS_INIT" restart
+# Report what was installed, not what was downloaded: local-cn.txt adds
+# rows on top of the source list, so the raw count understates the file.
+INSTALLED=$(wc -l < "$DEST_DIR/cn_domain_flat.txt")
+logger -t cn-domains "updated: $INSTALLED domains installed ($LINES from felixonmars)"

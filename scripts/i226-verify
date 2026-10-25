@@ -15,36 +15,54 @@
 #           the state file from the run before, so the first run after
 #           boot only records a baseline).  A counter lower than the
 #           stored one means the box rebooted: re-baseline, no verdict.
-#      The i226 NVM 2.17 defect flapped eth0 at random, mostly at
-#      night -- after the 2026-10-18 upgrade to 2.32 a flap is the
-#      recurrence signal.  A channel-B delta covers "since the
-#      previous run", not the --window minutes; the channels are
-#      complementary, not duplicate.
+#      A channel-B delta covers "since the previous run", not the
+#      --window minutes; the channels are complementary, not duplicate.
 #   4. error counters are reported for drift comparison.
 #
-# Usage:  i226-verify [--fw VERSION] [--window MIN] [--quiet]
+# A flap means different things depending on the port.  The i226 NVM
+# 2.17 defect flapped the WAN port (eth0) at random, mostly at night, so
+# after the 2026-10-18 upgrade to 2.32 any WAN flap is the recurrence
+# signal and fails the run at once.  A LAN port flaps whenever the thing
+# plugged into it reboots or its cable moves -- an AP reboot three times
+# in a minute looks identical from the driver's side.  Those runs report
+# the event but do not fail, until the same port flaps in three
+# consecutive runs, which no single reboot explains.
+#
+# A failed run logs one line to syslog itself.  The hourly cron runs
+# --quiet with no redirection, so a verdict printed only to stdout left
+# no trace anywhere: a flap was detected and nobody could have seen it.
+#
+# Usage:  i226-verify [--fw VERSION] [--window MIN] [--wan PORT] [--quiet]
 #         --fw       expected firmware-version string (default 2032:88b6)
 #         --window   flap lookback window in minutes (default 30)
+#         --wan      the port whose flap is an NVM signal (default eth0)
 #         --quiet    only print the RESULT line
 #
-# Exit 0 = all hard checks pass (fw + flap).  Link-down ports and
-# error counters are informational and do not fail the run.
+# Exit 0 = fw matches and no WAN flap (a single LAN flap is reported, not
+# failed).  Exit 1 = fw mismatch, unreadable fw, WAN flap, or the same LAN
+# port flapping in 3 consecutive runs.  Link-down ports and error
+# counters are informational and do not fail the run.
 #
-# Cron (hourly flap trace, no alert noise):
+# Cron (hourly flap trace):
 #   5 * * * * /usr/local/sbin/i226-verify --window 65 --quiet
 
 EXPECT_FW="2032:88b6"
 WINDOW_MIN=30
+WAN_PORT=eth0
 QUIET=0
 while [ $# -gt 0 ]; do
     case "$1" in
         # The value guard matters: with `--fw` as the last argument a
         # bare `shift 2` cannot consume anything, $1 never changes and
         # the loop spins forever.
-        --fw|--window)
+        --fw|--window|--wan)
             [ $# -ge 2 ] || { echo "$1 requires a value" >&2; exit 2; }
             _v="$2"
-            case "$1" in --fw) EXPECT_FW="$_v" ;; --window) WINDOW_MIN="$_v" ;; esac
+            case "$1" in
+                --fw) EXPECT_FW="$_v" ;;
+                --window) WINDOW_MIN="$_v" ;;
+                --wan) WAN_PORT="$_v" ;;
+            esac
             shift 2 ;;
         --quiet)  QUIET=1; shift ;;
         *) echo "usage: $1 unknown (see header)" >&2; exit 2 ;;
@@ -59,14 +77,15 @@ esac
 # on a board with fewer populated ports, ethtool on a missing name
 # fails, fw reads empty and the run false-fails forever -- an hourly
 # cron would then raise a permanent alarm.
+NET_DIR="${NET_DIR:-/sys/class/net}"
 PORTS=""
-for _n in /sys/class/net/*; do
+for _n in "$NET_DIR"/*; do
     _drv=""
     [ -L "$_n/device/driver" ] && _drv=$(basename "$(readlink "$_n/device/driver")")
     [ "$_drv" = "igc" ] && PORTS="$PORTS ${_n##*/}"
 done
 PORTS="${PORTS# }"
-STATE=/run/i226-verify.state
+STATE="${STATE:-/run/i226-verify.state}"
 now_s=$(cut -d. -f1 /proc/uptime)
 # An unreadable /proc/uptime (restricted container, very early boot)
 # must not fall through: an empty now_s makes cutoff negative and the
@@ -77,7 +96,20 @@ esac
 cutoff=$(( now_s - WINDOW_MIN * 60 ))
 fail=0
 out=""
+reasons=""
+add_reason() { reasons="${reasons}${reasons:+; }$1"; }
 note() { [ "$QUIET" = "1" ] || printf '%s\n' "$1"; }
+
+# One line per run at most, and only when there is something to say.
+# `logger` may be absent (a minimal image); that must not turn into a
+# crash or an extra failure.
+syslog() {
+    _prio="$1"
+    shift
+    command -v logger >/dev/null 2>&1 || return 0
+    logger -t i226-verify -p "user.$_prio" "$*" 2>/dev/null
+    return 0
+}
 
 if [ -z "$PORTS" ]; then
     note "no igc-driven ports found; nothing to verify on this board"
@@ -85,19 +117,32 @@ if [ -z "$PORTS" ]; then
     exit 0
 fi
 
-note "i226 online verify -- $(date '+%Y-%m-%d %H:%M') (window ${WINDOW_MIN}m)"
+# A --wan name that is not an igc port on this board would silently
+# downgrade every flap to "LAN, not a signal".  Say so and keep eth0's
+# behaviour only if it is genuinely present.
+case " $PORTS " in
+    *" $WAN_PORT "*) ;;
+    *)
+        echo "WAN port '$WAN_PORT' is not one of: $PORTS" >&2
+        exit 2
+        ;;
+esac
 
-# --- read live carrier counters and the previous baseline ---
+note "i226 online verify -- $(date '+%Y-%m-%d %H:%M') (window ${WINDOW_MIN}m, wan ${WAN_PORT})"
+
+# --- per-port inventory ---
 for eth in $PORTS; do
     # --- firmware ---
     fw=$(ethtool -i "$eth" 2>/dev/null | awk -F': ' '/^firmware-version/{print $2}')
     if [ -z "$fw" ]; then
         out="$out fw:$eth=unreadable"
         fail=1
+        add_reason "fw $eth unreadable"
         note "fw $eth UNREADABLE (ethtool -i failed)"
     elif [ "$fw" != "$EXPECT_FW" ]; then
         out="$out fw:$eth=$fw"
         fail=1
+        add_reason "fw $eth $fw != $EXPECT_FW"
         note "fw $eth $fw MISMATCH (want $EXPECT_FW)"
     else
         out="$out fw:$eth=ok"
@@ -116,19 +161,21 @@ for eth in $PORTS; do
     note "errs $eth rx_crc=${crc:-na} tx_errors=${txerr:-na}"
 done
 
+# Which ports flapped in this run, by any channel: "eth2 eth3".
+flapped=""
+
 # --- flap channel A: dmesg events inside the window ---
 # Capture once (the per-port loops below reuse it) and check the exit
 # status: an unreadable dmesg must not masquerade as "zero flaps".
 _dmesg_out=$(dmesg 2>/dev/null); _dmesg_rc=$?
-flap_fail=0
 if [ "$_dmesg_rc" -ne 0 ]; then
     out="$out flapwin:dmesg=unreadable"
     note "dmesg unreadable (rc=$_dmesg_rc); channel A degraded, channel B carries the flap verdict"
 elif [ "$now_s" -lt $(( WINDOW_MIN * 60 )) ]; then
     # Boot-window grace: uptime has not yet spanned the lookback, so a
     # negative cutoff would count every event since boot as in-window.
-    # Boot-time link negotiation is not an NVM regression signal --
-    # mirror channel B's first-run baseline instead of failing.
+    # Boot-time link negotiation is not a regression signal -- mirror
+    # channel B's first-run baseline instead of failing.
     out="$out flapwin:boot-window"
     note "uptime ${now_s}s < window ${WINDOW_MIN}m since boot; channel A holds verdict until the window is covered"
 else
@@ -140,19 +187,22 @@ else
             } END { print c + 0 }')
         out="$out flapwin:$eth=$n"
         if [ "$n" -gt 0 ]; then
-            flap_fail=1
-            note "flap $eth $n down-event(s) in last ${WINDOW_MIN}m -- NVM regression signal"
+            flapped="$flapped $eth"
+            if [ "$eth" = "$WAN_PORT" ]; then
+                fail=1
+                add_reason "WAN flap $eth x$n (NVM regression signal)"
+                note "flap $eth $n down-event(s) in last ${WINDOW_MIN}m -- NVM regression signal"
+            else
+                note "link event $eth $n down-event(s) in last ${WINDOW_MIN}m -- LAN port; peer reboot or cable, not an NVM signal"
+            fi
         fi
     done
 fi
-[ "$flap_fail" = "1" ] && fail=1
 note "flap dmesg summary (window ${WINDOW_MIN}m): $(printf '%s' "$out" | tr ' ' '\n' | grep '^flapwin:' | tr '\n' ' ')"
 
 # --- flap channel B: carrier_changes delta vs previous run ---
-cc_fail=0
-new_state=""
 for eth in $PORTS; do
-    now=$(cat /sys/class/net/$eth/carrier_changes 2>/dev/null)
+    now=$(cat "$NET_DIR/$eth/carrier_changes" 2>/dev/null)
     old=$(awk -v p="$eth" '$1==p {print $2; found=1} END {if (!found) print ""}' "$STATE" 2>/dev/null)
     # An unreadable counter is never persisted: storing a sentinel here
     # would poison the next run's delta.  No stored line means the next
@@ -160,7 +210,6 @@ for eth in $PORTS; do
     # carry a -1 from the previous scheme: treat it as baseline too.
     case "$now" in ''|*[!0-9]*) continue ;; esac
     case "$old" in ''|*[!0-9]*) old="" ;; esac
-    new_state="$new_state$eth $now\n"
     if [ -z "$old" ]; then
         out="$out ccdelta:$eth=baseline"
         continue
@@ -175,11 +224,47 @@ for eth in $PORTS; do
     fi
     out="$out ccdelta:$eth=$delta"
     if [ "$delta" -gt 0 ]; then
-        cc_fail=1
-        note "flap $eth carrier_changes +$delta since previous run (dmesg ring may have churned)"
+        case " $flapped " in
+            *" $eth "*) ;;
+            *) flapped="$flapped $eth" ;;
+        esac
+        if [ "$eth" = "$WAN_PORT" ]; then
+            fail=1
+            add_reason "WAN carrier_changes +$delta on $eth"
+            note "flap $eth carrier_changes +$delta since previous run (dmesg ring may have churned) -- NVM regression signal"
+        else
+            note "link event $eth carrier_changes +$delta since previous run -- LAN port"
+        fi
     fi
 done
-[ "$cc_fail" = "1" ] && fail=1
+
+# --- streak and new baseline ----------------------------------------
+# The counter to persist is read here rather than inside the loop above:
+# a port whose counter was unreadable is skipped there but must still
+# keep its line, and one that is unreadable now must keep the old one.
+new_state=""
+lan_streak_fail=""
+for eth in $PORTS; do
+    now=$(cat "$NET_DIR/$eth/carrier_changes" 2>/dev/null)
+    case "$now" in ''|*[!0-9]*) continue ;; esac
+    prev=$(awk -v p="$eth" '$1==p {print $3; found=1} END {if (!found) print ""}' "$STATE" 2>/dev/null)
+    case "$prev" in ''|*[!0-9]*) prev=0 ;; esac
+    streak=0
+    case " $flapped " in
+        *" $eth "*)
+            # The NVM signal is the WAN port; a LAN port earns a streak
+            # only because its peer keeps coming back.
+            [ "$eth" = "$WAN_PORT" ] || streak=$(( prev + 1 )) ;;
+    esac
+    new_state="$new_state$eth $now $streak\n"
+    if [ "$streak" -ge 3 ]; then
+        fail=1
+        lan_streak_fail="$lan_streak_fail $eth($streak)"
+        add_reason "LAN flap streak on $eth x$streak"
+    fi
+done
+[ -n "$lan_streak_fail" ] && note "repeated LAN flapping:$lan_streak_fail -- no single reboot explains this"
+
 # persist the new baseline (tmpfs: dies with the reboot, same as the
 # counters).  Temp+rename, never truncate-in-place: a manual run
 # overlapping the hourly cron could otherwise read a half-written file,
@@ -191,10 +276,14 @@ if printf '%b' "$new_state" > "$_state_tmp" 2>/dev/null; then
 fi
 unset _state_tmp
 
+# The hourly cron passes --quiet and redirects nothing, so a verdict that
+# stays on stdout is a verdict nobody reads.
 if [ "$fail" = "0" ]; then
+    [ -n "$flapped" ] && syslog notice "link event on:$flapped (LAN port; peer reboot or cable, not an NVM signal)"
     echo "RESULT: PASS $out"
     exit 0
 else
+    syslog warning "FAIL: $reasons"
     echo "RESULT: FAIL $out"
     exit 1
 fi

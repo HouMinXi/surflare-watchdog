@@ -27,3 +27,12 @@ router/services/surflare_rx_watch.sh:/usr/local/sbin/surflare_rx_watch.sh:755
 router/hotplug/30-rps-wan-eth0:/etc/hotplug.d/net/30-rps-wan-eth0:755
 router/sysctl/13-netdev-backlog.conf:/etc/sysctl.d/13-netdev-backlog.conf:644
 etc/logrotate.d/surflare-watchdog:/etc/logrotate.d/surflare-watchdog:644
+scripts/i226-verify:/usr/local/sbin/i226-verify:755
+scripts/tui-supervisor.sh:/usr/local/sbin/tui-supervisor.sh:755
+scripts/learn-cn-domains.sh:/usr/local/sbin/learn-cn-domains.sh:755
+router/update-cn-domains.sh:/usr/local/sbin/update-cn-domains.sh:755
+scripts/surflare-hk-24h-observer.sh:/usr/local/sbin/surflare-hk-24h-observer.sh:755
+router/services/surflare-dedicated/surflare-ded-canary:/usr/local/sbin/surflare-ded-canary:755
+router/services/surflare-dedicated/surflare-ded-reattach:/usr/local/sbin/surflare-ded-reattach:755
+scripts/dedicated-monitor.sh:/usr/local/sbin/dedicated-monitor.sh:755
+scripts/hk24h-public-map.jq:/usr/local/sbin/hk24h-public-map.jq:644
