@@ -77,7 +77,6 @@ run_probe "  🇺🇸 Dallas  Poor
   🇺🇸 Chicago  Good" RATINGS2
 FN_ROTATE="$(extract_fn _rating_for_city)
 $(extract_fn _rotate_node)"
-FN_RATING="$(extract_fn _rating_for_city)"
 OUT=$(bash -c "
 	NODE_CANDIDATES=(Dallas Chicago Miami 'New York')
 	SPEED_PROBE_ENABLED=1

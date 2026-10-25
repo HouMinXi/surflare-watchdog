@@ -96,7 +96,7 @@ EOS
 	else
 		bad "fwmark rules survived the teardown"
 	fi
-	left=$(ls "$TMP/run" 2>/dev/null | grep -c .)
+	left=$(find "$TMP/run" -mindepth 1 -maxdepth 1 2>/dev/null | wc -l)
 	if [ "$left" -eq 0 ]; then
 		ok "the teardown clears the state files the next run would inherit"
 	else

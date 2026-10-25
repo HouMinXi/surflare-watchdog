@@ -93,7 +93,9 @@ chmod +x "$TMP/stage2/run.sh"
 exec -a surflare_route_updater bash "$TMP/stage2/run.sh" "$TMP/stage2" &
 WORKER2=$!; PIDS="$PIDS $WORKER2"
 # Deterministic: wait until /proc/<pid>/stat yields now_age >= 1.
-for i in $(seq 1 20); do
+_tries=0
+while [ "$_tries" -lt 20 ]; do
+    _tries=$((_tries + 1))
     st=$(awk '{print $22}' "/proc/$WORKER2/stat" 2>/dev/null)
     up=$(awk '{print int($1)}' /proc/uptime)
     [ -n "$st" ] && [ $(( up - st / 100 )) -ge 1 ] && break

@@ -17,14 +17,14 @@ TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 
 # A child started the way the runner starts tests must not see descriptor 200.
-exec 200>"$TMP/lock"
-sleep 2 200>&- &
+exec 9>"$TMP/lock"
+sleep 2 9>&- &
 child=$!
 sleep 0.3
-if ls -l "/proc/$child/fd" 2>/dev/null | grep -q ' 200 ->'; then
-	bad "a child started with 200>&- still holds the lock descriptor"
+if [ -e "/proc/$child/fd/9" ]; then
+	bad "a child started with 9>&- still holds the lock descriptor"
 else
-	ok "a child started with 200>&- does not hold the lock descriptor"
+	ok "a child started with 9>&- does not hold the lock descriptor"
 fi
 wait "$child" 2>/dev/null
 
@@ -33,16 +33,16 @@ wait "$child" 2>/dev/null
 sleep 2 &
 child2=$!
 sleep 0.3
-if ls -l "/proc/$child2/fd" 2>/dev/null | grep -q ' 200 ->'; then
+if [ -e "/proc/$child2/fd/9" ]; then
 	ok "without the redirection the same child inherits it, so the check bites"
 else
 	bad "the control case did not inherit fd 200; this check proves nothing"
 fi
 wait "$child2" 2>/dev/null
-exec 200>&-
+exec 9>&-
 
 # And the runner must actually use it where it starts tests.
-if grep -qE '200>&-' scripts/run-tests.sh; then
+if grep -qE '9>&-' scripts/run-tests.sh; then
 	ok "the runner closes the lock descriptor on every test it starts"
 else
 	bad "the runner leaks its lock descriptor to every test"
@@ -50,7 +50,7 @@ fi
 
 # After a run the lock has to be free again.
 LOCK="$TMP/reuse.lock"
-( exec 200>"$LOCK"; flock -n 200 ) || true
+( exec 9>"$LOCK"; flock -n 9 ) || true
 if flock -n "$LOCK" true; then
 	ok "a released lock can be taken again"
 else

@@ -302,10 +302,6 @@ OUT=$(bash -c "
 " 2>/dev/null)
 [ "$OUT" = "WARN_SEEN" ] && ok "persist failure warns" || bad "T20 wrong: $OUT"
 
-echo "T21: production SURFLARE_CLI_LOG declaration present"
-grep -q '^SURFLARE_CLI_LOG="/var/log/surflare/surflare.log"' "$WATCHDOG" \
-	&& ok "CLI log path declared" || bad "T21: declaration missing"
-
 echo "T22: '(1.1)' IS pin-shaped by design (heuristic + membership guard)"
 OUT=$(NODE="(1.1)" CANDS="(1.1)|Los Angeles" \
 	ROT_FILE_CONTENT="$(printf 'Los Angeles\t1')" run_startup)

@@ -42,7 +42,7 @@ _source_functions() {
 	local _src="$1"
 	local _tmp
 	_tmp=$(mktemp /tmp/surflare-funcs-XXXXXX.sh)
-	trap "rm -f '$_tmp'" RETURN
+	trap 'rm -f "$_tmp"' RETURN
 
 	# Extract specific functions needed for diagnosis testing.
 	# Uses sed to grab from function name() { to the closing } at column 0.

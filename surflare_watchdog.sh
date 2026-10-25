@@ -731,10 +731,9 @@ _run_observability_probes() {
 # logger (which writes to kmsg), rate-limited to PROXY_LOG_RATE_SEC.
 _proxy_log_pid=""
 PROXY_LOG="/var/log/surflare/surflare-proxy.log"
-# CLI session log.  Kept for diagnostics; rotation reconcile does NOT
-# read it.  `connect --daemon` does not append a session line, so the
-# file lags the live node (measured N100 2026-09-05 17:56).
-SURFLARE_CLI_LOG="/var/log/surflare/surflare.log"
+# The CLI session log (/var/log/surflare/surflare.log) is not read here:
+# `connect --daemon` does not append a session line, so the file lags the
+# live node (measured N100 2026-09-05 17:56).
 PROXY_LOG_RATE_SEC=60
 PROXY_ERR_STATE="/run/surflare_proxy_err_count"
 DED_NAME_MAP="/run/surflare_ded_name_map"  # base<TAB>exact catalog names for dedicated rows, written by _sync_node_candidates

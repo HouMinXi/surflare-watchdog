@@ -58,6 +58,30 @@ else
 	bad "these tests use scratch space without mktemp:$n_needing"
 fi
 
+# Every tests/*.sh that the suite does not run has to be declared. A manual
+# harness that nothing names reads as coverage while protecting nothing.
+undeclared=""
+for t in tests/*.sh; do
+	base=$(basename "$t")
+	case "$base" in test_*) continue ;; esac
+	[ "$base" = "$(basename "$0")" ] && continue
+	grep -q "$base" tests/MANUAL.md 2>/dev/null || undeclared="$undeclared $base"
+done
+if [ -z "$undeclared" ]; then
+	ok "every harness outside the suite is declared in tests/MANUAL.md"
+else
+	bad "undeclared harnesses:$undeclared"
+fi
+
+# The runner's reported status must survive the echo that follows it. Under a
+# non-POSIX shell, `printf ... "$(basename ...)" "$?"` runs the substitution
+# first and every test records a pass.
+if grep -qE '^\s*rc=\$\?' scripts/run-tests.sh; then
+	ok "the runner captures each test's status before any substitution"
+else
+	bad "the runner reads \$? after a command substitution, which hides failures"
+fi
+
 # The runner is what makes 'must be run serially' a tool constraint instead of a
 # memory: it refuses a second instance and reports a tree the suite dirtied.
 RUNNER=scripts/run-tests.sh
