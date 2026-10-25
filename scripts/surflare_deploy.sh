@@ -147,6 +147,14 @@ DEPLOY
     # Crash check via PID file (not pgrep -- avoids ssh shell self-match)
     if ssh -n "$N100" 'kill -0 "$(cat /run/surflare_watchdog.pid 2>/dev/null)" 2>/dev/null'; then
         echo "Deploy OK -- watchdog running (PID file verified)"
+        # This script deploys one of the nine files the box runs.  Say so out
+        # loud when the rest has drifted: on 2026-10-25 the router was carrying
+        # an updater four months older than the tree, and every deploy until
+        # then had reported success.
+        if ! "$(dirname "$0")/surflare_drift_check.sh" --remote "$N100" >/dev/null 2>&1; then
+            echo "WARN: other installed files differ from this tree; run"
+            echo "      $(dirname "$0")/surflare_drift_check.sh --remote $N100"
+        fi
     else
         echo "WARN: watchdog not running after ${DEPLOY_WAIT}s"
         if ssh -n "$N100" "test -f '${REMOTE_WATCHDOG}.prev'"; then

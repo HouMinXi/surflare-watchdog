@@ -305,12 +305,18 @@ fi
 # One wrapper, and the test grades the one that is deployed.  A second copy
 # used to sit in scripts/ and this test graded that copy, so a change to the
 # file the router actually runs went ungraded.
-n_wrappers=$(find . -name 'surflare-proxy*' -type f -not -path './.git/*' \
+# The fork that caused the trouble was a second file with the *same* basename
+# in another directory, so the name is what matters, not the count of files
+# whose name starts with it -- n100/ carries a patched build under its own name
+# and that is not a second wrapper.
+n_named=$(find . -name 'surflare-proxy' -type f -not -path './.git/*' \
 	-not -path './.worktrees/*' | wc -l)
-if [ "$n_wrappers" -eq 1 ] && [ -f router/surflare-proxy ]; then
-	ok "T10 there is exactly one proxy wrapper and it lives where the router runs it"
+n_forks=$(find . -name 'surflare-proxy-wrapper*' -type f -not -path './.git/*' \
+	-not -path './.worktrees/*' | wc -l)
+if [ "$n_named" -eq 1 ] && [ "$n_forks" -eq 0 ] && [ -f router/surflare-proxy ]; then
+	ok "T10 one wrapper by name, and it lives where the router runs it"
 else
-	bad "T10 the tree has ${n_wrappers} proxy wrappers" \
+	bad "T10 the tree has ${n_named} files named surflare-proxy and ${n_forks} wrapper forks" \
 		"keep only router/surflare-proxy: $(find . -name 'surflare-proxy*' -type f -not -path './.git/*' -not -path './.worktrees/*' | tr '\n' ' ')"
 fi
 # Grading the deployed file is a property of what this test executes, not of
