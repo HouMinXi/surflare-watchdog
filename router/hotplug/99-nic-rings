@@ -1,0 +1,9 @@
+#!/bin/sh
+# Reapply the larger RX/TX rings whenever a port comes up; ethtool -G does not
+# persist across a reboot.
+#
+# This file is not under /usr/local/sbin, and sysupgrade keeps that directory
+# wholesale. Without a line of its own in /etc/sysupgrade.conf an upgrade drops
+# the hook and the next boot comes up on the driver's 256-slot default.
+[ "$ACTION" = "ifup" ] && /usr/local/sbin/set-nic-rings.sh
+exit 0

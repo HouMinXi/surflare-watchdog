@@ -74,10 +74,23 @@ done
 
 hard=0
 skip=0
+broken=0
 while read -r name rc; do
 	case "$rc" in
 	0) ;;
-	2) skip=$((skip + 1)); printf '%-46s SKIP\n' "$name" ;;
+	# Exit 2 is the suite's "could not run" code, and it is only that when
+	# the test said so. mktemp failing exits 2 as well, and that test ran
+	# nothing; counting it as a skip reports a clean suite for a broken one.
+	2)
+		if grep -q '^SKIP:' "$LOGS/$name.log" 2>/dev/null; then
+			skip=$((skip + 1))
+			printf '%-46s SKIP\n' "$name"
+		else
+			broken=$((broken + 1))
+			printf '%-46s rc=%s (no SKIP line)\n' "$name" "$rc"
+			[ -f "$LOGS/$name.log" ] && tail -n 12 "$LOGS/$name.log" | sed 's/^/    /'
+		fi
+		;;
 	3)
 		hard=$((hard + 1))
 		printf '%-46s PARSE-ERROR\n' "$name"
@@ -101,5 +114,5 @@ if [ "$before" != "$after" ]; then
 	exit 1
 fi
 
-echo "RESULT: hard_fails=$hard skipped=$skip"
-[ "$hard" -eq 0 ]
+echo "RESULT: hard_fails=$hard skipped=$skip broken=$broken"
+[ "$hard" -eq 0 ] && [ "$broken" -eq 0 ]

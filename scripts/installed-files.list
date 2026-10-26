@@ -25,6 +25,8 @@ router/@MODE@/surflare-lan-tproxy.nft:/etc/surflare-lan-tproxy.nft:644
 scripts/surflare_rps_assert.sh:/usr/local/sbin/surflare_rps_assert.sh:755
 router/services/surflare_rx_watch.sh:/usr/local/sbin/surflare_rx_watch.sh:755
 router/hotplug/30-rps-wan-eth0:/etc/hotplug.d/net/30-rps-wan-eth0:755
+router/hotplug/99-nic-rings:/etc/hotplug.d/iface/99-nic-rings:755
+router/sbin/set-nic-rings.sh:/usr/local/sbin/set-nic-rings.sh:755
 router/sysctl/13-netdev-backlog.conf:/etc/sysctl.d/13-netdev-backlog.conf:644
 etc/logrotate.d/surflare-watchdog:/etc/logrotate.d/surflare-watchdog:644
 scripts/i226-verify:/usr/local/sbin/i226-verify:755
