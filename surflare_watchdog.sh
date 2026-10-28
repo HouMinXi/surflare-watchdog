@@ -2987,7 +2987,6 @@ _enter_storm_cooldown() {
 # regardless of DHCP reassignment.
 _update_bypass_devices() {
 	nft list table inet sw_lan_tproxy >/dev/null 2>&1 || return 0
-	nft flush set inet sw_lan_tproxy bypass_devices 2>/dev/null || true
 
 	local all_ips="" ip_csv mac ip line
 	# Source 1: explicit IPs
@@ -3024,34 +3023,30 @@ _update_bypass_devices() {
 			[ -n "$_v6" ] && all_v6="${all_v6:+$all_v6,}$(echo "$_v6" | tr '\n' ',' | sed 's/,$//')"
 		done < "$BYPASS_LAN_MACS_FILE"
 	fi
-	# Flush + repopulate bypass_devices6 (atomic: empty is valid when no IPv6 neighbors)
-	nft flush set inet sw_lan_tproxy bypass_devices6 2>/dev/null || true
+	# Repopulate bypass_devices6 only when something resolved.  Flushing it
+	# first, before knowing that, emptied it on every resolve-nothing call.
 	if [ -n "$all_v6" ]; then
+		nft flush set inet sw_lan_tproxy bypass_devices6 2>/dev/null || true
 		nft add element inet sw_lan_tproxy bypass_devices6 "{ $all_v6 }" 2>/dev/null || \
 			log "WARN: bypass_devices6 update failed (${all_v6})"
 	fi
 
+	# Nothing resolved.  Leave the sets alone.  Flushing them here would
+	# empty bypass_devices, and the main-loop guard refills that set
+	# whenever it is empty, so the flush would run again every cycle
+	# until a MAC resolves.  Stale entries are cleared on the next call
+	# that does resolve something: that path flushes before it refills.
 	if [ -z "$all_ips" ] && [ -z "$all_v6" ]; then
-		# No bypass devices: sync auto_bypass only to killswitch bypass_src
-		# and dns_enforce vpn_bypass.  Without this, stale device IPs from
-		# a previous connect cycle remain in bypass_src after DHCP change.
-		if nft list table inet killswitch >/dev/null 2>&1; then
-			local _auto_ips
-			_auto_ips=$(nft list set inet sw_lan_tproxy auto_bypass 2>/dev/null \
-				| grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | paste -sd,)
-			{
-				printf 'flush set inet killswitch bypass_src\n'
-				printf 'flush set inet killswitch bypass_src6\n'
-				[ -n "$_auto_ips" ] && \
-					printf 'add element inet killswitch bypass_src { %s }\n' "$_auto_ips"
-			} | nft -f - 2>/dev/null || true
-		fi
 		_sync_dns_enforce_bypass
 		return 0
 	fi
-	# Deduplicate in case same IP appears in both BYPASS_LAN_DEVICES and MAC file
+	# Deduplicate, then replace the set.  The flush stays on this side of
+	# the resolve-nothing return above: flushing before we know whether
+	# anything resolved emptied the set, and the main-loop guard refilled
+	# it again every cycle.
 	if [ -n "$all_ips" ]; then
 		all_ips=$(echo "$all_ips" | tr ',' '\n' | sort -u | paste -sd,)
+		nft flush set inet sw_lan_tproxy bypass_devices 2>/dev/null || true
 		nft add element inet sw_lan_tproxy bypass_devices "{ $all_ips }" 2>/dev/null || \
 			log "WARN: bypass_devices update failed (${all_ips})"
 	fi
@@ -8128,6 +8123,28 @@ while true; do
 	   ! nft list set inet sw_lan_tproxy bypass_devices 2>/dev/null | grep -qE '[0-9]+\.[0-9]'; then
 		log "bypass_devices empty (hotplug rebuild?), repopulating"
 		_update_bypass_devices
+	fi
+
+	# bypass_src is what the killswitch forward chain actually reads, and it
+	# is not rebuilt with the table the way bypass_devices is.  After a
+	# restart it stays empty until the next VPN reconnect, so a device that
+	# is meant to bypass gets rejected and logged the whole time.
+	#
+	# Try once, then stop.  _update_bypass_devices flushes the set and only
+	# refills it when a bypass MAC resolves, so while none resolve (DHCP
+	# lease not in yet) the set stays empty.  A plain emptiness test would
+	# call it again every cycle, flushing the set forever.  One failed try
+	# suppresses further tries until the set is seen non-empty, which is
+	# what a reconnect or a later lease leaves behind.
+	if [ -s "$BYPASS_LAN_MACS_FILE" ] && \
+	   nft list table inet killswitch >/dev/null 2>&1; then
+		if nft list set inet killswitch bypass_src 2>/dev/null | grep -qE '[0-9]+\.[0-9]'; then
+			_bypass_src_tried=0
+		elif [ "${_bypass_src_tried:-0}" -eq 0 ]; then
+			log "bypass_src empty, repopulating"
+			_update_bypass_devices
+			_bypass_src_tried=1
+		fi
 	fi
 
 	# IPv6 prefixes change without a reconnect.  Compare the addresses
