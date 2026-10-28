@@ -43,9 +43,9 @@ else
 fi
 
 # The exact state found on 2026-10-25: the init script and the two tuning files
-# were on no list at all. The ring hook joined them later; a keep list from
-# before it existed loses that one too, so the assertion names the files
-# instead of counting them.
+# were on no list at all. The ring hook joined them later, and the nftables
+# reload hook after that; a keep list from before either existed loses both, so
+# the assertion names the files instead of counting them.
 grep -v -e '/etc/init.d/surflare-rps-assert' -e 'hotplug' -e 'sysctl.d' \
 	"$TMP/keep-all" > "$TMP/keep-old"
 rc=$(drive "$TMP/keep-old")
@@ -54,11 +54,12 @@ want=$(printf '%s\n' \
 	/etc/init.d/surflare-rps-assert \
 	/etc/hotplug.d/net/30-rps-wan-eth0 \
 	/etc/hotplug.d/iface/99-nic-rings \
+	/etc/hotplug.d/nftables/20-surflare-lan-tproxy \
 	/etc/sysctl.d/13-netdev-backlog.conf | sort)
 if [ "$rc" -eq 1 ] && [ "$lost" = "$want" ]; then
-	ok "the files missing from the old keep list are named, including the ring hook"
+	ok "the files missing from the old keep list are named, including both hooks"
 else
-	bad "expected those four lost, got rc=$rc and: $lost"
+	bad "expected the five lost, got rc=$rc and: $lost"
 fi
 
 # A file kept by an exact directory entry must not be counted twice or missed.

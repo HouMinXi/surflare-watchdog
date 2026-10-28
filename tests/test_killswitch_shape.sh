@@ -23,7 +23,7 @@ if [ ! -s "$TMP/fn.sh" ]; then
 	echo "RESULT: 0 passed, 1 failed"
 	exit 1
 fi
-if [ "$(wc -l < "$TMP/fn.sh")" -gt 40 ]; then
+if [ "$(wc -l < "$TMP/fn.sh")" -gt 60 ]; then
 	echo "FAIL: extraction ran away ($(wc -l < "$TMP/fn.sh") lines)"
 	echo "RESULT: 0 passed, 1 failed"
 	exit 1
@@ -55,6 +55,24 @@ case "$1 $2" in
 			printf '\t\tudp dport 53 reject\n'
 		printf '\t}\n'
 	fi
+	# Static sets.  A table from an older version has the chains and the reject
+	# but not these, so the stub has to be able to leave them out.
+	if [ -f "${NFT_SETS:-$NFT_PRESENT}" ]; then
+		# The elements come from files so a case can hand back a set whose
+		# contents differ from what the script expects.
+		if [ -n "${NFT_SET_DERP:-}" ]; then
+			_el=$(cat "$NFT_SET_DERP")
+		else
+			_el=101.132.101.215
+		fi
+		printf "	set derp_asia { type ipv4_addr; elements = { $_el } }\n"
+		if [ -n "${NFT_SET_CTRL:-}" ]; then
+			_el=$(cat "$NFT_SET_CTRL")
+		else
+			_el=192.200.0.0/24
+		fi
+		printf "	set ts_control { type ipv4_addr; flags interval; elements = { $_el } }\n"
+	fi
 	printf '}\n'
 	exit 0 ;;
 "list chain")
@@ -67,13 +85,13 @@ EOS
 chmod +x "$TMP/bin/nft"
 
 drive() { # $1 = initial armed flag, $2 = present file, prints "<rc> <armed>"
-	PATH="$TMP/bin:$PATH" NFT_CALLS="$TMP/calls" NFT_PRESENT="$2" NFT_BROKEN="${3:-0}" NFT_CHAIN="${4:-$2}" NFT_FORWARD_RULES="${5:-}" NFT_OUTPUT="${6:-}" NFT_OUTPUT_RULES="${7:-}" \
+	PATH="$TMP/bin:$PATH" NFT_CALLS="$TMP/calls" NFT_PRESENT="$2" NFT_BROKEN="${3:-0}" NFT_CHAIN="${4:-$2}" NFT_FORWARD_RULES="${5:-}" NFT_OUTPUT="${6:-}" NFT_OUTPUT_RULES="${7:-}" NFT_SETS="${8:-}" \
 		bash -c '
 		. "$1/fn.sh"
 		_killswitch_armed=$2
 		if _killswitch_needs_install; then rc=0; else rc=1; fi
 		echo "$rc $_killswitch_armed"
-	' _ "$TMP" "$1" 2>/dev/null
+	' "$WD" "$TMP" "$1" 2>/dev/null
 }
 
 # --- case 1: flag says armed, the chain is gone -> install again ---------
@@ -111,6 +129,39 @@ if [ "$(wc -l < "$TMP/calls")" -ge 1 ]; then
 	ok "the check asks nft rather than trusting the flag"
 else
 	bad "nft was never consulted"
+fi
+
+# --- case 2b: chains and reject there, static sets missing -> rebuild ------
+# This is the upgrade path: a table built before ts_control existed looks
+# healthy by every older check, so the new exemption never lands.
+: > "$TMP/calls"
+touch "$TMP/present"
+rm -f "$TMP/nosets"
+out=$(drive 1 "$TMP/present" 0 "" "" "" "" "$TMP/nosets")
+set -- $out
+if [ "${1:-x}" = "0" ]; then
+	ok "a killswitch without the static sets is rebuilt"
+else
+	bad "a killswitch without the static sets was left alone (got ${out:-nothing})"
+fi
+if [ "${2:-x}" = "0" ]; then
+	ok "the armed flag is cleared so the rebuild runs"
+else
+	bad "the flag stayed at ${2:-?}: the rebuild would not run"
+fi
+
+# --- case 2c: the set is there but holds more than it should -> rebuild ----
+# Narrowing an existing set must rebuild too.  A check that only asks whether
+# the set exists leaves the wider contents in place.
+: > "$TMP/calls"
+touch "$TMP/present"
+printf '101.132.101.215, 185.40.234.53' > "$TMP/wide"
+out=$(NFT_SET_DERP="$TMP/wide" drive 1 "$TMP/present")
+set -- $out
+if [ "${1:-x}" = "0" ]; then
+	ok "a killswitch whose set holds extra addresses is rebuilt"
+else
+	bad "a wider set was left in place (got ${out:-nothing})"
 fi
 
 # --- case 3: already unarmed -> no nft call at all -----------------------

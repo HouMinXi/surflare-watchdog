@@ -83,6 +83,8 @@ enrol "enable surflare-watchdog at boot" \
 	'/etc/init.d/surflare-watchdog enable'
 enrol "enable the receive-spread assert at boot" \
 	'/etc/init.d/surflare-rps-assert enable'
+enrol "enable the boot lock at boot" \
+	'/etc/init.d/surflare-bootlock enable'
 enrol "record receive drops every five minutes" \
 	'crontab -l 2>/dev/null | grep -q surflare_rx_watch || (crontab -l 2>/dev/null; echo "*/5 * * * * /usr/local/sbin/surflare_rx_watch.sh >> /dev/null 2>&1") | crontab -'
 enrol "keep the rps assert in cron every five minutes" \

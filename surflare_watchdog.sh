@@ -2224,7 +2224,8 @@ NFTEOF
 # only pay for the install when the cheap answer is "gone".
 _killswitch_needs_install() {
 	[ "$_killswitch_armed" -eq 0 ] && return 0
-	local _tables _table
+	local _tables _table _self
+	_self=$(readlink -f "$0" 2>/dev/null || echo "$0")
 	# Presence first: a missing table and an nft that cannot answer both return
 	# non-zero from every query, and only one of them means "install it".  The
 	# table list is the cheap question that separates them.
@@ -2252,6 +2253,24 @@ _killswitch_needs_install() {
 		_killswitch_armed=0
 		return 0
 	fi
+	# Static sets, and their contents.  Presence alone is not enough: a set that
+	# still holds the addresses an older version exempted looks healthy while
+	# letting through more than this version means to.  The expected elements
+	# are read from this script's own killswitch template, so the check and the
+	# install cannot drift apart.
+	local _set _live _want
+	for _set in derp_asia ts_control; do
+		printf '%s\n' "$_table" | grep -q "^[[:space:]]*set ${_set}[[:space:]]*{" ||
+			{ _killswitch_armed=0; return 0; }
+		# Fixed window, not a brace match: a literal closing brace here would
+		# end this function's own compound command.
+		_live=$(printf '%s\n' "$_table" |
+			awk -v n="set ${_set} " 'index($0, n) { f = 1 } f && index($0, "elements") { print; exit }' |
+			grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}(/[0-9]+)?' | sort -u)
+		_want=$(awk -v n="set ${_set} " 'index($0, n) { f = 1 } f && index($0, "elements") { print; exit }' "$_self" |
+			grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}(/[0-9]+)?' | sort -u)
+		[ "$_live" = "$_want" ] || { _killswitch_armed=0; return 0; }
+	done
 	return 1
 }
 
@@ -2271,17 +2290,24 @@ table inet killswitch {
 	# Their non-CN traffic is forwarded directly; no log noise needed.
 	set bypass_src  { type ipv4_addr; }
 	set bypass_src6 { type ipv6_addr; }
-	# derp_asia: Tailscale DERP nodes (sin/tok/hkg) that z66 reaches
-	# ISP-direct.  Paired with the same-named set in sw_lan_tproxy
-	# (surflare-lan-tproxy.nft), which exempts this traffic from tproxy
-	# so tailscaled's DERP region selection measures the CN path.
+	# derp_asia: the only relay z66 (.12) and W1 (.10) can commit to --
+	# our own DERP (region 900, 101.132.101.215).  The tailnet policy sets
+	# omitDefaultRegions, so no Tailscale region is ever selected.  Paired
+	# with the same-named set in sw_lan_tproxy (surflare-lan-tproxy.nft);
+	# this copy is the one that decides while the proxy is down.
 	# User-adjudicated 2026-09-01 (project memory 56, branch A).
 	set derp_asia {
 		type ipv4_addr
-		elements = { 103.6.84.152, 172.237.28.183, 172.237.66.30,
-			172.237.72.8, 172.237.72.43, 172.237.72.79,
-			172.238.6.34, 172.238.6.179, 172.238.6.180,
-			205.147.105.30, 205.147.105.78 }
+		elements = { 101.132.101.215 }
+	}
+	# Tailscale control plane (controlplane/api/login.tailscale.com).
+	# tailscaled holds a long-lived connection here; rejecting it costs
+	# the netmap, which is what took z66 and W1 off the tailnet with the
+	# proxy down on 2026-10-28.
+	set ts_control {
+		type ipv4_addr
+		flags interval
+		elements = { 192.200.0.0/24 }
 	}
 	# Gmail SMTP submission IPs (smtp.gmail.com / smtp.googlemail.com).
 	# Paired with sw_lan_tproxy gmail_smtp; only tcp/465 and tcp/587
@@ -2372,12 +2398,16 @@ table inet killswitch {
 		iifname "br-lan" ip6 daddr @cn6_domain_ips accept
 		iifname "br-lan" ip saddr @bypass_src accept
 		iifname "br-lan" ip6 saddr @bypass_src6 accept
-		# z66 Tailscale underlay, outbound-only (memory 56 branch A,
-		# adjudicated 2026-09-01): WireGuard peer UDP 41641 + DERP Asia
-		# (relay TCP/443, STUN UDP/3478).  No listener is exposed;
-		# return traffic matches ct state established,related above.
-		iifname "br-lan" ip saddr 192.168.100.12 udp dport 41641 accept
-		iifname "br-lan" ip saddr 192.168.100.12 ip daddr @derp_asia accept
+		# Tailscale underlay, outbound-only (memory 56 branch A, adjudicated
+		# 2026-09-01): DERP (relay TCP/443, STUN UDP/3478) and the control plane
+		# for z66 and W1 -- both reach the tailnet through the Aliyun relay, and
+		# both must stay reachable when the proxy dies.  No listener is exposed;
+		# return traffic matches established,related.
+		# There is deliberately no bare "udp dport 41641" accept.  It would be
+		# destination-unrestricted, and neither host uses that port: both speak
+		# to the relay on 3478, which @derp_asia already covers.
+		iifname "br-lan" ip saddr { 192.168.100.10, 192.168.100.12 } ip daddr @derp_asia accept
+		iifname "br-lan" ip saddr { 192.168.100.10, 192.168.100.12 } ip daddr @ts_control accept
 		# Gmail SMTP submission (465/587 only).  tproxy returns this
 		# traffic to the WAN; without this accept, killswitch forward
 		# would reject it.  Do not widen to 22/25.
@@ -2396,7 +2426,7 @@ table inet killswitch {
 		iifname "br-lan" udp dport 123 accept
 		# Only log TCP.  Non-CN UDP is correctly blocked here (tproxy
 		# is TCP-only); logging it flooded dmesg (1994049).  ICMP echo
-		# from LAN (Tailscale DERP probes on z66) is likewise correctly
+		# from LAN (Tailscale DERP probes on z66 and W1) is likewise correctly
 		# rejected -- tproxy cannot carry ICMP -- but logging it at 5/s
 		# filled the ring buffer the same way.  TCP here still means
 		# tproxy miss.

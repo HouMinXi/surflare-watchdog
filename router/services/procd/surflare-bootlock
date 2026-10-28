@@ -1,4 +1,5 @@
 #!/bin/sh /etc/rc.common
+# shellcheck disable=SC2034  # USE_PROCD/START/STOP consumed by rc.common
 
 # Boot-time lockdown: block LAN overseas traffic before surflare-watchdog
 # starts.  Loads a minimal nft table at S18 (before S19firewall/S20network)
@@ -28,6 +29,13 @@ table inet surflare_boot_lock {
             10.0.0.0/8, 100.64.0.0/10, 169.254.0.0/16,
             172.16.0.0/12, 192.168.0.0/16
         } accept
+        # Tailscale for z66 (.12) and W1 (.10).  This window blocks CN too,
+        # not just overseas, so without these the relay and the control plane
+        # are unreachable for up to 120s after a boot -- and the tailnet is
+        # the only way in when the proxy is down.  Same addresses as
+        # derp_asia / ts_control in surflare-lan-tproxy.nft.
+        iifname "br-lan" ip saddr { 192.168.100.10, 192.168.100.12 } ip daddr 101.132.101.215 accept
+        iifname "br-lan" ip saddr { 192.168.100.10, 192.168.100.12 } ip daddr 192.200.0.0/24 accept
         iifname "br-lan" ip6 daddr { ::1/128, fe80::/10, fc00::/7 } accept
         iifname "br-lan" ip daddr 255.255.255.255 accept
         iifname "br-lan" ip daddr 224.0.0.0/4 accept

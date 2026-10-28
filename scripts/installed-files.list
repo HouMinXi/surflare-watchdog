@@ -18,6 +18,7 @@ setup_auth.sh:/usr/local/sbin/setup_auth.sh:755
 laptop/surflare_early_detector.sh:/usr/local/sbin/surflare_early_detector.sh:755
 laptop/surflare_node_probe.sh:/usr/local/sbin/surflare_node_probe.sh:755
 router/services/procd/surflare-watchdog:/etc/init.d/surflare-watchdog:755
+router/services/procd/surflare-bootlock:/etc/init.d/surflare-bootlock:755
 router/services/procd/surflare-rps-assert:/etc/init.d/surflare-rps-assert:755
 router/surflare_route_updater.sh:/usr/local/sbin/surflare_route_updater.sh:755
 router/ripe_fetch.py:/usr/local/sbin/ripe_fetch.py:755
@@ -25,6 +26,7 @@ router/@MODE@/surflare-lan-tproxy.nft:/etc/surflare-lan-tproxy.nft:644
 scripts/surflare_rps_assert.sh:/usr/local/sbin/surflare_rps_assert.sh:755
 router/services/surflare_rx_watch.sh:/usr/local/sbin/surflare_rx_watch.sh:755
 router/hotplug/30-rps-wan-eth0:/etc/hotplug.d/net/30-rps-wan-eth0:755
+router/rule/hotplug-nftables-20-surflare-lan-tproxy:/etc/hotplug.d/nftables/20-surflare-lan-tproxy:755
 router/hotplug/99-nic-rings:/etc/hotplug.d/iface/99-nic-rings:755
 router/sbin/set-nic-rings.sh:/usr/local/sbin/set-nic-rings.sh:755
 router/sysctl/13-netdev-backlog.conf:/etc/sysctl.d/13-netdev-backlog.conf:644

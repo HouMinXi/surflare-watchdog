@@ -119,8 +119,8 @@ LAN device (TCP/QUIC/DNS)
 |  server_ips? ---------> accept       (no CN split at proxy)
 |  bypass_ipv4 (CN)? ---> accept
 ||  bypass_src? ---------> accept
-||  z66 UDP/41641? ------> accept  (Tailscale WG underlay, memory 56)
-||  z66 -> derp_asia? ---> accept  (DERP relay TCP/443 + STUN UDP/3478)
+||  z66/W1 -> derp_asia? -> accept  (DERP relay TCP/443 + STUN UDP/3478)
+||  z66/W1 -> ts_control? -> accept  (Tailscale control plane)
 ||  gmail_smtp tcp/465,587? -> accept (Gmail submission, ISP)
 ||  lan_ranges? ---------> accept
 |  NTP UDP/123? --------> accept
@@ -209,12 +209,15 @@ bypassed devices have NO VPN protection for non-CN traffic.**
 (N100 live: .11 BT, .17 Mac/AnyConnect, .120 work laptop).  There is
 no rule-mode skip.
 
-`derp_asia` (Tailscale DERP sin/tok/hkg node IPs) is returned to the WAN
-before the tproxy rules for z66 (192.168.100.12) only, so z66's
-tailscaled measures and reaches Asia DERP over the ISP path instead of
-hairpinning through the US VPN exit.  The killswitch forward chain
-carries a same-named set accepting this traffic plus z66's WireGuard
-UDP/41641, outbound-only.  User-adjudicated 2026-09-01 (project memory
+`derp_asia` (our own Tailscale region 900, 101.132.101.215, and nothing
+else -- the tailnet policy omits the default regions) and `ts_control`
+(the 192.200.0.0/24 control plane) are
+returned to the WAN before the tproxy rules, for z66 (.12) and
+W1 (.10) only, so their tailscaled reaches a relay and the control plane over the
+ISP path instead of hairpinning through the US VPN exit.  The killswitch
+carries the same two sets.  If the policy ever stops omitting the default
+regions, the region it falls back to must be added here too, or the
+killswitch drops it.  User-adjudicated 2026-09-01 (project memory
 56 branch A).
 
 `gmail_smtp` / `gmail_smtp6` return only tcp/465 and tcp/587 (ISP

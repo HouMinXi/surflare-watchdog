@@ -198,6 +198,15 @@ procd)
     /etc/init.d/surflare-bootlock enable || true
     test -L /etc/rc.d/S18surflare-bootlock || \
         ln -sf /etc/init.d/surflare-bootlock /etc/rc.d/S18surflare-bootlock
+    # Reload sw_lan_tproxy after an nftables reload.  fw4 tears the table down
+    # on every firewall restart; without this hook the LAN keeps running with
+    # no tproxy until the watchdog notices.  It used to be placed by hand on
+    # N100, which meant a reinstall or an upgrade silently dropped it.
+    if [ -f "$REPO/router/rule/hotplug-nftables-20-surflare-lan-tproxy" ]; then
+        mkdir -p /etc/hotplug.d/nftables
+        install -m 755 "$REPO/router/rule/hotplug-nftables-20-surflare-lan-tproxy" \
+            /etc/hotplug.d/nftables/20-surflare-lan-tproxy
+    fi
     ;;
 
 runit)
