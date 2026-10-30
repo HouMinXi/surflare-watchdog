@@ -249,6 +249,24 @@ if jq --argjson T "$TOLERANCE" --arg I "$INTERVAL" --arg D "$INJECT_DOMAINS" --a
     else $cfg end
   | .route.rules[-1].outbound = $vpn
   | .route.final = $vpn
+  # Loopback diagnostic inbound, independent of the egress layer.
+  # Port 10800 is a tproxy listener: it only accepts flows the nft
+  # rules redirected, so pointing a SOCKS client at it hangs until
+  # timeout.  That made a working tunnel look dead and drove needless
+  # node rotations.  This port speaks SOCKS5 and HTTP CONNECT, so
+  # `curl --socks5-hostname 127.0.0.1:10808 <url>` answers whether the
+  # tunnel really carries traffic.  Loopback only: the LAN keeps using
+  # the tproxy path, and no credentials are exposed beyond the host.
+  # Skip when the provider config already uses the tag or the port:
+  # two inbounds on one port would stop sing-box from starting.
+  | if ([.inbounds[]? | select(.tag == "diag-socks-in" or .listen_port == 10808)] | length) == 0 then
+      .inbounds += [{
+        "type": "mixed",
+        "tag": "diag-socks-in",
+        "listen": "127.0.0.1",
+        "listen_port": 10808
+      }]
+    else . end
   # Dedicated-IP egress layer (EXIT_VIA_DED=1): append a socks outbound
   # to the dedicated exit.  Arrival path is the DED_VIA knob in
   # ded-exit.conf: "direct" dials the socks server over the WAN
