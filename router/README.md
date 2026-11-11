@@ -11,6 +11,7 @@ Scripts and config for N100 mini-PC running iStoreOS or OpenWrt (procd init).
 | `rule/bypass-macs.conf` | Mode-specific bypass config. N100 live still lists .11/.17/.120 even in rule mode (AnyConnect + BT). |
 | `global/bypass-macs.conf` | Mode-specific bypass config: devices needing full CN ISP direct (e.g. Thunder). **WARNING: bypassed devices have NO VPN protection.** |
 | `update-cn-domains.sh` | Weekly cron: downloads dnsmasq-china-list, converts to SmartDNS nameserver format, validates, restarts SmartDNS. |
+| `zoro-exit` | Manual Zoro-primary switch; inserts a rule before Surflare `:10800`, leaves Surflare configured but not automatic. `check` is read-only and reports `mode=unknown` if nft is unreadable, `mode=lost` if the requested state is on but the rule is gone. Requires tproxy 7895, SOCKS 7890, outbound mark 255. |
 | `smartdns/custom.conf.example` | SmartDNS config template: domestic group (CN DoT/DoH), foreign group (1.1.1.1 via VPN), Bing fix, bootstrap isolation. |
 | `smartdns/force-foreign.conf.example` | Per-domain VPN-path overrides for CN-IP duality domains (e.g. bing.com). |
 | `smartdns/gmail-smtp.conf.example` | smtp.gmail.com / smtp.googlemail.com -> gmail_smtp nftset (tcp/465,587 ISP-direct). |

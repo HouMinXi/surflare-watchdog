@@ -94,6 +94,15 @@ if [ "$INIT" = "procd" ]; then
     # nightly run loses that source and still exits 0.
     install -m 755 "$REPO/router/ripe_fetch.py" \
         /usr/local/sbin/ripe_fetch.py
+    install -m 755 "$REPO/router/zoro-exit" /usr/bin/zoro-exit
+    if ! grep -qxF /usr/bin/zoro-exit /etc/sysupgrade.conf 2>/dev/null; then
+        echo /usr/bin/zoro-exit >> /etc/sysupgrade.conf 2>/dev/null || \
+            echo "WARN: could not add /usr/bin/zoro-exit to /etc/sysupgrade.conf" >&2
+    fi
+    if ! grep -qxF /etc/zoro-exit.requested /etc/sysupgrade.conf 2>/dev/null; then
+        echo /etc/zoro-exit.requested >> /etc/sysupgrade.conf 2>/dev/null || \
+            echo "WARN: could not add /etc/zoro-exit.requested to /etc/sysupgrade.conf" >&2
+    fi
     install -m 755 "$REPO/cross_validate_cloud_cdn.py" \
         /usr/local/sbin/cross_validate_cloud_cdn.py
     opkg install \

@@ -40,3 +40,4 @@ router/services/surflare-dedicated/surflare-ded-canary:/usr/local/sbin/surflare-
 router/services/surflare-dedicated/surflare-ded-reattach:/usr/local/sbin/surflare-ded-reattach:755
 scripts/dedicated-monitor.sh:/usr/local/sbin/dedicated-monitor.sh:755
 scripts/hk24h-public-map.jq:/usr/local/sbin/hk24h-public-map.jq:644
+router/zoro-exit:/usr/bin/zoro-exit:755

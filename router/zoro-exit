@@ -1,0 +1,414 @@
+#!/bin/sh
+set -u
+
+# procd runs with a predictable PATH; pin it before resolving helpers.
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+
+# Test seams are honored only for the source-tree copy, never for the installed
+# /usr/bin/zoro-exit. Production tools stay absolute.
+if [ "${ZORO_TEST_MODE:-0}" = 1 ] &&
+	[ "$(basename -- "$(dirname -- "$0")")" = router ] &&
+	[ -f "$(dirname -- "$0")/../tests/test_zoro_exit_check.sh" ]; then
+	NFT=${ZORO_NFT:-nft}
+	IP=${ZORO_IP:-ip}
+	SS=${ZORO_SS:-ss}
+	CURL=${ZORO_CURL:-curl}
+	LOGGER=${ZORO_LOGGER:-logger}
+	SERVICE=${ZORO_SERVICE:-/etc/init.d/zoro-xray}
+	PROBE_URL=${ZORO_PROBE_URL:-https://www.gstatic.com/generate_204}
+	PROBE_TIMEOUT=${ZORO_PROBE_TIMEOUT:-8}
+	SOCKS_PORT=${ZORO_SOCKS_PORT:-7890}
+	STATE_FILE=${ZORO_STATE_FILE:-/etc/zoro-exit.requested}
+	CONFIG=${ZORO_CONFIG:-/etc/zoro-n100-primary.json}
+else
+	NFT=/usr/sbin/nft
+	IP=/sbin/ip
+	SS=/usr/sbin/ss
+	CURL=/usr/bin/curl
+	LOGGER=/usr/bin/logger
+	SERVICE=/etc/init.d/zoro-xray
+	PROBE_URL=https://www.gstatic.com/generate_204
+	PROBE_TIMEOUT=8
+	SOCKS_PORT=7890
+	STATE_FILE=/etc/zoro-exit.requested
+	CONFIG=/etc/zoro-n100-primary.json
+fi
+
+COMMENT="zoro-exit"
+MARK="0x00000002"
+TABLE=101
+PREF=1000
+PORT=7895
+
+log() {
+	"$LOGGER" -t zoro-exit -- "$*" >/dev/null 2>&1 || true
+	printf '%s\n' "$*" >&2
+}
+
+die() {
+	log "ERROR: $*"
+	exit 1
+}
+
+usage() {
+	printf 'usage: %s {on [--force]|off [--force]|status}\n       %s check\n' "$0" "$0" >&2
+	exit 2
+}
+
+rule_lines() {
+	"$NFT" -a list chain inet sw_lan_tproxy prerouting 2>/dev/null \
+		| grep -F "comment \"$COMMENT\""
+}
+
+rule_handles() {
+	rule_lines | sed -n 's/.*# handle \([0-9][0-9]*\).*/\1/p'
+}
+
+surflare_handle() {
+	"$NFT" -a list chain inet sw_lan_tproxy prerouting 2>/dev/null \
+		| grep -F "tproxy ip to :10800" \
+		| sed -n 's/.*# handle \([0-9][0-9]*\).*/\1/p' \
+		| head -1
+}
+
+tombstone_handle() {
+	"$NFT" -a list chain inet sw_lan_tproxy prerouting 2>/dev/null \
+		| grep -E 'iifname "br-lan".*meta l4proto tcp reject' \
+		| sed -n 's/.*# handle \([0-9][0-9]*\).*/\1/p' \
+		| head -1
+}
+
+order_before_tombstone() {
+	# shellcheck disable=SC3043  # OpenWrt ash supports local
+	local _dump _z _t
+	_dump=$("$NFT" -a list chain inet sw_lan_tproxy prerouting 2>/dev/null) || return 1
+	_z=$(printf '%s\n' "$_dump" | grep -n -F "comment \"$COMMENT\"" | head -1 | cut -d: -f1)
+	_t=$(printf '%s\n' "$_dump" | grep -n -E 'iifname "br-lan".*meta l4proto tcp reject' | head -1 | cut -d: -f1)
+	[ -n "$_z" ] && [ -n "$_t" ] && [ "$_z" -lt "$_t" ]
+}
+
+nft_ready() {
+	"$NFT" list table inet sw_lan_tproxy >/dev/null 2>&1
+}
+
+chain_ready() {
+	"$NFT" list chain inet sw_lan_tproxy prerouting >/dev/null 2>&1
+}
+
+route_ok() {
+	"$IP" rule 2>/dev/null | grep -Eq "fwmark 0x0*2 lookup ${TABLE}( |$)" &&
+		"$IP" route show table "$TABLE" 2>/dev/null | grep -Fq 'local default'
+}
+
+order_ok() {
+	# nft handles are a monotonic counter, so insert-before gets a HIGHER
+	# handle. Compare line numbers in one chain dump, which follow eval order.
+	# shellcheck disable=SC3043  # OpenWrt ash supports local
+	local _dump _z _s
+	_dump=$("$NFT" -a list chain inet sw_lan_tproxy prerouting 2>/dev/null) || return 1
+	_z=$(printf '%s\n' "$_dump" | grep -n -F "comment \"$COMMENT\"" | head -1 | cut -d: -f1)
+	_s=$(printf '%s\n' "$_dump" | grep -n -F "tproxy ip to :10800" | head -1 | cut -d: -f1)
+	[ -n "$_z" ] && [ -n "$_s" ] && [ "$_z" -eq "$((_s - 1))" ]
+}
+
+rule_ok() {
+	# shellcheck disable=SC3043  # OpenWrt ash supports local
+	local _line
+	_line=$(rule_lines | head -1)
+	[ -n "$_line" ] || return 1
+	printf '%s\n' "$_line" | grep -F "tproxy ip to :$PORT" >/dev/null || return 1
+	printf '%s\n' "$_line" | grep -F "meta mark set $MARK" >/dev/null || return 1
+	printf '%s\n' "$_line" | grep -F 'ct mark set 0x00000200' >/dev/null || return 1
+	printf '%s\n' "$_line" | grep -F 'iifname "br-lan"' >/dev/null || return 1
+	printf '%s\n' "$_line" | grep -F 'meta nfproto ipv4' >/dev/null || return 1
+	printf '%s\n' "$_line" | grep -F ' accept' >/dev/null || return 1
+	printf '%s\n' "$_line" | grep -F 'l4proto tcp' >/dev/null || return 1
+	return 0
+}
+
+add_route() {
+	"$IP" rule add fwmark "$MARK" lookup "$TABLE" pref "$PREF" 2>/dev/null || true
+	"$IP" route add local 0.0.0.0/0 dev lo table "$TABLE" 2>/dev/null || true
+}
+
+del_route() {
+	"$IP" rule del fwmark "$MARK" lookup "$TABLE" pref "$PREF" 2>/dev/null || true
+	"$IP" route del local 0.0.0.0/0 dev lo table "$TABLE" 2>/dev/null || true
+}
+
+xray_up() {
+	"$SS" -ltn 2>/dev/null | grep -Eq "(\*|0\.0\.0\.0|\[::\]):${PORT}[[:space:]]"
+}
+
+ensure_xray() {
+	xray_up && return 0
+	"$SERVICE" start >/dev/null 2>&1 || true
+	for _ in 1 2 3 4 5; do
+		sleep 1
+		xray_up && return 0
+	done
+	return 1
+}
+
+requested_state() {
+	if [ ! -e "$STATE_FILE" ]; then
+		echo unset
+	elif [ ! -s "$STATE_FILE" ]; then
+		echo unknown
+	else
+		# Normalize CR/spaces, but never guess an unrecognized value.
+		case "$(tr -d ' \r' < "$STATE_FILE")" in
+		on) echo on ;;
+		off) echo off ;;
+		*) echo unknown ;;
+		esac
+	fi
+}
+
+report_unknown() {
+	printf 'mode=unknown\nnft=unreadable\nprobe_scope=socks\n'
+	printf 'route=unknown\nxray_listening=%s\n' "$(xray_up && echo yes || echo no)"
+	printf 'fallback=unknown\norder=unknown\nprobe_http=skipped\nprobe=skipped\n'
+}
+
+probe_once() {
+	# shellcheck disable=SC3043  # OpenWrt ash supports local
+	local _code
+	_code=$("$CURL" -sS --max-time "$PROBE_TIMEOUT" \
+		--socks5-hostname "127.0.0.1:$SOCKS_PORT" \
+		-o /dev/null -w '%{http_code}' -- "$PROBE_URL" 2>/dev/null) || _code=000
+	_probe_code=$_code
+	case "$_code" in
+	200|204) return 0 ;;
+	*) return 1 ;;
+	esac
+}
+
+do_on() {
+	_force=0
+	if [ $# -gt 0 ]; then
+		[ $# -eq 1 ] && [ "$1" = "--force" ] || usage
+		_force=1
+	fi
+	nft_ready && chain_ready || die "sw_lan_tproxy is not readable"
+	sh=$(surflare_handle)
+	_anchor=$sh
+	if [ -z "$sh" ] && [ "$_force" -eq 0 ]; then
+		die "Surflare tproxy :10800 rule missing; use 'on --force' to switch anyway"
+	fi
+	if [ -z "$_anchor" ]; then
+		_anchor=$(tombstone_handle)
+	fi
+	[ -x "$SERVICE" ] || die "xray service missing: $SERVICE"
+	[ -r "$CONFIG" ] || die "xray config missing: $CONFIG"
+	ensure_xray || die "xray tproxy $PORT is not listening"
+	probe_once || die "Zoro uplink probe failed (HTTP $_probe_code); not switching"
+	add_route
+	route_ok || {
+		del_route
+		die "failed to install fwmark $MARK route"
+	}
+
+	# A stale or foreign rule is removed and replaced, not treated as success.
+	_had_rule=0
+	[ -n "$(rule_handles)" ] && _had_rule=1
+	if [ -n "$(rule_handles)" ] && { ! order_ok || ! rule_ok; }; then
+		for h in $(rule_handles); do
+			"$NFT" delete rule inet sw_lan_tproxy prerouting handle "$h" 2>/dev/null || true
+		done
+	fi
+	if [ -z "$(rule_handles)" ]; then
+		if [ -n "$_anchor" ]; then
+			"$NFT" insert rule inet sw_lan_tproxy prerouting position "$_anchor" \
+				iifname "br-lan" meta nfproto ipv4 meta l4proto tcp \
+				tproxy ip to ":$PORT" meta mark set "$MARK" \
+				ct mark set 0x00000200 accept comment "$COMMENT" 2>/dev/null || {
+					del_route
+					die "failed to insert Zoro tproxy rule"
+				}
+		else
+			# No :10800 anchor: append after every bypass return instead of
+			# prepending above them.
+			"$NFT" add rule inet sw_lan_tproxy prerouting \
+				iifname "br-lan" meta nfproto ipv4 meta l4proto tcp \
+				tproxy ip to ":$PORT" meta mark set "$MARK" \
+				ct mark set 0x00000200 accept comment "$COMMENT" 2>/dev/null || {
+					del_route
+					die "failed to add Zoro tproxy rule"
+				}
+		fi
+	fi
+
+	if [ -n "$sh" ]; then
+		order_ok && rule_ok || {
+			for h in $(rule_handles); do
+				"$NFT" delete rule inet sw_lan_tproxy prerouting handle "$h" 2>/dev/null || true
+			done
+			del_route
+			die "Zoro rule is missing, misplaced, or does not match the configured port/mark"
+		}
+	elif [ -n "$_anchor" ]; then
+		order_before_tombstone && rule_ok || {
+			for h in $(rule_handles); do
+				"$NFT" delete rule inet sw_lan_tproxy prerouting handle "$h" 2>/dev/null || true
+			done
+			del_route
+			die "Zoro rule is behind the Surflare tombstone or does not match the port/mark"
+		}
+	else
+		rule_ok || {
+			for h in $(rule_handles); do
+				"$NFT" delete rule inet sw_lan_tproxy prerouting handle "$h" 2>/dev/null || true
+			done
+			del_route
+			die "Zoro rule does not match the configured port/mark"
+		}
+	fi
+
+	if ! printf 'on\n' > "$STATE_FILE"; then
+		if [ "$_had_rule" -eq 0 ]; then
+			for h in $(rule_handles); do
+				"$NFT" delete rule inet sw_lan_tproxy prerouting handle "$h" 2>/dev/null || true
+			done
+			del_route
+		fi
+		die "failed to record requested state"
+	fi
+	log "on: LAN TCP -> $PORT; Surflare :10800 is configured but not automatic"
+}
+
+do_off() {
+	_force=0
+	if [ $# -gt 0 ]; then
+		[ $# -eq 1 ] && [ "$1" = "--force" ] || usage
+		_force=1
+	fi
+	if ! nft_ready || ! chain_ready; then
+		die "sw_lan_tproxy is not readable; refusing to stop the service while the Zoro rule may remain"
+	fi
+	if [ -z "$(surflare_handle)" ] && [ "$_force" -eq 0 ]; then
+		die "Surflare tproxy :10800 rule missing; remove the Zoro rule with 'off --force'"
+	fi
+	for h in $(rule_handles); do
+		"$NFT" delete rule inet sw_lan_tproxy prerouting handle "$h" 2>/dev/null || true
+	done
+	[ -z "$(rule_handles)" ] || die "Zoro rule still present after off"
+	del_route
+	if route_ok; then
+		die "policy route still present after off"
+	fi
+	"$SERVICE" stop >/dev/null 2>&1 || true
+	printf 'off\n' > "$STATE_FILE" || die "failed to record requested state"
+	if [ -n "$(surflare_handle)" ]; then
+		log "off: LAN TCP -> Surflare :10800"
+	else
+		log "off: Zoro rule removed; LAN TCP has no exit (Surflare :10800 is absent)"
+	fi
+}
+
+do_check() {
+	[ $# -eq 0 ] || usage
+	if ! nft_ready || ! chain_ready; then
+		report_unknown
+		return 3
+	fi
+
+	if [ -z "$(rule_handles)" ]; then
+		_req=$(requested_state)
+		if [ "$_req" = unknown ]; then
+			printf 'mode=unknown\nnft=ok\nprobe_scope=socks\nroute=unknown\nxray_listening=%s\n' "$(xray_up && echo yes || echo no)"
+			printf 'fallback=unknown\norder=unknown\nprobe_http=skipped\nprobe=skipped\n'
+			return 3
+		fi
+		if [ "$_req" = on ]; then
+			printf 'mode=lost\nnft=ok\nprobe_scope=socks\n'
+			printf 'route=%s\n' "$(route_ok && echo ok || echo missing)"
+			printf 'xray_listening=%s\n' "$(xray_up && echo yes || echo no)"
+			printf 'fallback=%s\n' "$( [ -n "$(surflare_handle)" ] && echo ok || echo missing)"
+			printf 'order=missing\nprobe_http=skipped\nprobe=skipped\n'
+			return 1
+		fi
+		printf 'mode=off\nnft=ok\nprobe_scope=socks\n'
+		printf 'route=%s\n' "$(route_ok && echo ok || echo missing)"
+		printf 'xray_listening=%s\n' "$(xray_up && echo yes || echo no)"
+		printf 'fallback=%s\n' "$( [ -n "$(surflare_handle)" ] && echo ok || echo missing)"
+		printf 'order=missing\nprobe_http=skipped\nprobe=skipped\n'
+		return 0
+	fi
+
+	_fb=missing
+	[ -n "$(surflare_handle)" ] && _fb=ok
+	_order=missing
+	if [ "$_fb" = ok ]; then
+		order_ok && rule_ok && _order=ok || _order=misplaced
+	elif [ -n "$(tombstone_handle)" ]; then
+		order_before_tombstone && rule_ok && _order=ok || _order=misplaced
+	else
+		_order=unverified
+	fi
+	printf 'mode=on\nnft=ok\nprobe_scope=socks\n'
+	printf 'route=%s\n' "$(route_ok && echo ok || echo missing)"
+	printf 'xray_listening=%s\n' "$(xray_up && echo yes || echo no)"
+	printf 'fallback=%s\n' "$_fb"
+	printf 'order=%s\n' "$_order"
+
+	if ! route_ok; then
+		printf 'probe_http=skipped\nprobe=fail\n'
+		return 1
+	fi
+	if ! xray_up; then
+		printf 'probe_http=skipped\nprobe=fail\n'
+		return 1
+	fi
+	if [ "$_order" != ok ] && [ "$_order" != unverified ]; then
+		printf 'probe_http=skipped\nprobe=fail\n'
+		return 1
+	fi
+	if ! probe_once; then
+		printf 'probe_http=%s\nprobe=fail\n' "$_probe_code"
+		return 1
+	fi
+	printf 'probe_http=%s\nprobe=ok\n' "$_probe_code"
+	return 0
+}
+
+do_status() {
+	[ $# -eq 0 ] || usage
+	if ! nft_ready || ! chain_ready; then
+		printf 'mode=unknown\nnft=unreadable\nroute=unknown\nxray_listening=%s\nsurflare_10800=unknown\n' "$(xray_up && echo yes || echo no)"
+		return 3
+	fi
+	if [ -n "$(rule_handles)" ]; then
+		mode=on
+	else
+		mode=off
+		case "$(requested_state)" in
+		on) mode=lost ;;
+		unknown) mode=unknown ;;
+		esac
+	fi
+	printf 'mode=%s\nnft=ok\n' "$mode"
+	printf 'route=%s\n' "$(route_ok && echo ok || echo missing)"
+	printf 'xray_listening=%s\n' "$(xray_up && echo yes || echo no)"
+	printf 'surflare_10800=%s\n' "$( [ -n "$(surflare_handle)" ] && echo yes || echo no)"
+	case "$mode" in
+	lost) return 1 ;;
+	unknown) return 3 ;;
+	esac
+	return 0
+}
+
+cmd=${1:-status}
+case "$cmd" in
+on|off|check|status)
+	[ $# -gt 0 ] && shift
+	;;
+*) usage ;;
+esac
+case "$cmd" in
+on) do_on "$@" ;;
+off) do_off "$@" ;;
+check) do_check "$@" ;;
+status) do_status "$@" ;;
+esac

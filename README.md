@@ -714,8 +714,8 @@ sudo bash install.sh
 ```
 
 `install.sh` detects the init system (systemd / OpenRC / procd / runit), copies
-scripts to `/usr/local/sbin/`, installs and enables services, and adds the
-log_health cron entry.
+scripts to `/usr/local/sbin/` (plus `/usr/bin/zoro-exit` on procd routers),
+installs and enables services, and adds the log_health cron entry.
 
 ```bash
 # Auth setup (optional — TPM2-backed password storage)
@@ -778,6 +778,60 @@ sudo python3 -m json.tool /run/surflare_node_health.json
 sudo /usr/local/sbin/surflare_node_probe.sh
 sudo python3 -m json.tool /run/surflare_probe_results.json
 ```
+
+### Zoro manual exit (procd router installs only)
+
+`install.sh` installs this switch only when it detects a procd/openwrt router.
+The optional Zoro switch is a manual A/B path, not an automatic failover:
+
+```bash
+ssh root@192.168.100.1 /usr/bin/zoro-exit status
+ssh root@192.168.100.1 /usr/bin/zoro-exit check
+ssh root@192.168.100.1 /usr/bin/zoro-exit on
+# on --force bypasses the missing-Surflare precondition
+ssh root@192.168.100.1 /usr/bin/zoro-exit off
+```
+
+`on` requires an existing `/etc/init.d/zoro-xray` service and the xray config
+`/etc/zoro-n100-primary.json`, and a live Surflare `:10800` rule unless
+`--force` is used. The xray
+config needs a tproxy inbound on `7895`, a loopback SOCKS inbound on `7890`,
+and an outbound `sockopt.mark: 255`; without that mark the Surflare killswitch
+drops the Zoro uplink. `on` probes the
+Zoro uplink through xray SOCKS before changing nft, then inserts a Zoro tproxy
+rule before the existing Surflare `:10800` rule. With `--force` and no
+`:10800` rule, it inserts before the first `br-lan` TCP `reject` (the Surflare
+tombstone or the IPv6 reject, which render alike) when one exists, otherwise
+appends at the end of the chain. Surflare stays configured, but
+it is not an automatic fallback: if xray or the Zoro node dies while the rule
+is present, LAN TCP has no working exit until `off` removes the rule. With a
+Surflare tombstone, `off --force` removes the Zoro rule but does not restore
+connectivity; Surflare must recover first.
+
+`off` removes the Zoro rule, the fwmark `0x2`/table 101 route, and stops
+`/etc/init.d/zoro-xray`. If Surflare `:10800` is missing (tombstone), `off`
+refuses by default; use `off --force` to remove the Zoro-only path. When nft
+itself is unreadable, `off` refuses even with `--force`: stopping the service
+while the rule may remain would blackhole LAN TCP.
+
+`check` is read-only. `probe_scope=socks` means the probe uses xray's SOCKS
+inbound `127.0.0.1:7890`, not the LAN tproxy path; its success proves the xray
+outbound, not that LAN clients are already using it. It prints `mode`, `nft`,
+`probe_scope`, `route`, `xray_listening`, `fallback`, `order`, `probe_http`,
+and `probe`. `fallback=ok` means the Surflare `:10800` rule string is present,
+not that Surflare is passing traffic. `mode=lost` means the requested state in
+`/etc/zoro-exit.requested` is `on` but the rule is gone. It exits 0 for a
+healthy on-state or a deliberate off, 1 for a broken on-state or `mode=lost`,
+2 for usage, or 3 when nft state is unreadable or the requested state is
+unrecognized (`mode=unknown`). A Surflare table rebuild removes
+the inserted rule; run `on` again. `status` prints `mode`, `nft`, `route`,
+`xray_listening`, and `surflare_10800`; it exits 1 for `mode=lost` and 3 for
+unreadable nft or an unrecognized requested state (`mode=unknown`).
+
+The requested state persists in `/etc`; a reboot does not silently drop Zoro mode. Re-run `on` after reboot to restore the dataplane.
+The Zoro rule must carry tproxy port `7895`, `meta mark set 0x00000002`, `ct
+mark set 0x00000200`, `iifname "br-lan"`, and `l4proto tcp`; `on` replaces a
+rule that does not match.
 
 ---
 

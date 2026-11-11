@@ -25,10 +25,16 @@ the upgrade is the worst day to rediscover it.
 
 ## After flashing
 
-1. `scripts/surflare_reinstall_router.sh` -- installs all fourteen files at
-   their destinations with their modes, enables both init scripts, restores the
-   cron entry and the sysupgrade keep entries, applies the backlog and asserts
-   the receive spread.
+1. `scripts/surflare_reinstall_router.sh` -- installs every file listed in
+   `scripts/installed-files.list` at its destination with its mode, enables the
+   router init scripts, restores the cron entries and the sysupgrade keep
+   entries, applies the backlog and asserts the receive spread. The manual Zoro
+   switch `/usr/bin/zoro-exit` is not enabled at boot; its xray service,
+   `/etc/init.d/zoro-xray`, `/etc/zoro-n100-primary.json`, and
+   `/usr/local/bin/xray` are not part of this tree and must be restored
+   separately before `zoro-exit on`. Add all four to `/etc/sysupgrade.conf`
+   or a sysupgrade will remove them. The requested-state file
+   `/etc/zoro-exit.requested` is also kept there.
 2. `scripts/surflare_drift_check.sh` -- every file must read `match`.
 3. `scripts/surflare_upgrade_audit.sh` -- the new box must keep them next time.
 4. Health: `/etc/init.d/surflare-watchdog status`, `nft list tables`,
