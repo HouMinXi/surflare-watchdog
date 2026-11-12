@@ -137,6 +137,7 @@ _BAND_WARNED=0                         # run-scoped: band-inversion warning logg
 _EGRESS_DEGRADED=0                      # run-scoped: 1 while last egress probe was in the slow band
 TPROXY_NFT_STAMP="/run/surflare_tproxy_nft.stamp"  # md5 of /etc/surflare-lan-tproxy.nft at last _restore_tproxy
 ZORO_STATE_FILE="/etc/zoro-exit.requested"  # manual Zoro switch: "on" or "off"
+ZORO_UPLINK_INTERVAL=300              # seconds between Zoro SOCKS probes while requested-on
 NODE_HEALTH_FILE="/var/run/surflare_node_health.json"
 NODE_ERR_ROTATE_THRESHOLD=50    # current-node outbound error count to trigger proactive rotation
 NODE_ERR_HEALTHY_MAX=10         # candidate healthy threshold, aligned with _node_is_log_healthy (>10 = unhealthy). Absent key = 0 = healthy.
@@ -2756,6 +2757,61 @@ _zoro_mode_loss_alert() {
 		_deliver_alert "surflare: Zoro primary mode lost" \
 			"$(printf '%b' 'LAN tproxy was rebuilt and the manual Zoro rule is gone.\nRun: zoro-exit on\nSurflare :10800 rule is present; traffic is not verified.')" \
 			"yes" "fault:zoro-mode-lost"
+	) 9>&- 200>&- &
+}
+# While the operator asked for Zoro and the rule is still in the chain, a
+# dead SOCKS uplink is a different fault from a missing rule. Report it.
+# Do not invoke the manual switch. Returning to Surflare stays an operator action.
+_zoro_uplink_alert() {
+	[ -s "$ZORO_STATE_FILE" ] || return 0
+	[ "$(tr -d ' \r' < "$ZORO_STATE_FILE")" = on ] || return 0
+	nft list chain inet sw_lan_tproxy prerouting >/dev/null 2>&1 || {
+		log "WARN: cannot inspect sw_lan_tproxy; Zoro uplink unknown"
+		return 0
+	}
+	nft list chain inet sw_lan_tproxy prerouting 2>/dev/null \
+		| grep -F 'comment "zoro-exit"' >/dev/null 2>&1 || return 0
+	local _now _last
+	_now=$(date +%s)
+	_last=${_zoro_uplink_last:-0}
+	# A backwards clock leaves the last probe time in the future.
+	# Rebase onto now so the probe is not starved until wall time catches up.
+	if [ "$_last" -gt "$_now" ]; then
+		_last=0
+	fi
+	[ $((_now - _last)) -ge "${ZORO_UPLINK_INTERVAL:-300}" ] || return 0
+	local _code
+	_code=$(curl -sS --max-time "${ZORO_PROBE_TIMEOUT:-8}" \
+		--socks5-hostname "127.0.0.1:${ZORO_SOCKS_PORT:-7890}" \
+		-o /dev/null -w '%{http_code}' \
+		-- "${ZORO_PROBE_URL:-https://www.gstatic.com/generate_204}" \
+		2>/dev/null) || _code=000
+	case "$_code" in
+	''|*[!0-9]*) _code=000 ;;
+	esac
+	_zoro_uplink_last=$_now
+	case "$_code" in
+	200|204) return 0 ;;
+	esac
+	local _stamp_dir="${ZORO_ALERT_STAMP_DIR:-/run/surflare}"
+	local _stamp="${_stamp_dir}/zoro_uplink_down.stamp"
+	local _age=86400
+	mkdir -p "$_stamp_dir" 2>/dev/null || true
+	[ -f "$_stamp" ] && _age=$((_now - $(stat -c %Y "$_stamp" 2>/dev/null || echo 0)))
+	# A stamp mtime in the future is not a recent page.
+	if [ "$_age" -lt 0 ]; then
+		_age=86400
+	fi
+	if [ "$_age" -lt "${ZORO_UPLINK_SUPPRESS:-3600}" ]; then
+		log "Zoro uplink alert suppressed (${_age}s < ${ZORO_UPLINK_SUPPRESS:-3600}s)"
+		return 0
+	fi
+	date +%s > "$_stamp" 2>/dev/null || true
+	log "WARN: Zoro uplink probe HTTP ${_code}; rule left in place"
+	(
+		_deliver_alert "surflare: Zoro uplink down" \
+			"$(printf '%b' "Zoro SOCKS probe returned HTTP ${_code}.\\nThe manual rule is still present.\\nOperator action: return to Surflare by hand\\nWatchdog left the rule in place.")" \
+			"yes" "fault:zoro-uplink-down"
 	) 9>&- 200>&- &
 }
 _restore_tproxy() {
@@ -7904,6 +7960,7 @@ while true; do
 			log "VPN healthy: exit=${health}"
 			last_heartbeat=$now
 		fi
+		_zoro_uplink_alert
 
 	elif [ "$health" = "CN" ]; then
 		# CN exit detected: tunnel broken (exit IP == ISP IP).
