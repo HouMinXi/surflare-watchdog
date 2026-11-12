@@ -136,6 +136,7 @@ EGRESS_DEAD_TIMEOUT=15                 # seconds: no target answered within this
 _BAND_WARNED=0                         # run-scoped: band-inversion warning logged once, not per probe
 _EGRESS_DEGRADED=0                      # run-scoped: 1 while last egress probe was in the slow band
 TPROXY_NFT_STAMP="/run/surflare_tproxy_nft.stamp"  # md5 of /etc/surflare-lan-tproxy.nft at last _restore_tproxy
+ZORO_STATE_FILE="/etc/zoro-exit.requested"  # manual Zoro switch: "on" or "off"
 NODE_HEALTH_FILE="/var/run/surflare_node_health.json"
 NODE_ERR_ROTATE_THRESHOLD=50    # current-node outbound error count to trigger proactive rotation
 NODE_ERR_HEALTHY_MAX=10         # candidate healthy threshold, aligned with _node_is_log_healthy (>10 = unhealthy). Absent key = 0 = healthy.
@@ -576,7 +577,7 @@ _send_alert() {
 			log "ERROR: invalid flap class format: ${_class}"
 			return 1
 		fi
-		local _stamp_dir="/run/surflare"
+		local _stamp_dir="${ZORO_ALERT_STAMP_DIR:-/run/surflare}"
 		mkdir -p "$_stamp_dir" 2>/dev/null || true
 		local _stamp="${_stamp_dir}/alert_${_class}.stamp"
 		if [ -f "$_stamp" ]; then
@@ -2720,6 +2721,43 @@ EOF
 # Case (b): table missing entirely (first boot) -> load.
 # Case (c): table exists with live tproxy -> reload is idempotent
 #           (destroy + recreate with same content).
+# The manual Zoro switch lives in a rule that _restore_tproxy cannot know
+# about: a destroy+reload removes it, while /etc/zoro-exit.requested still
+# says "on". Alert instead of silently reverting to Surflare. The switch is
+# manual, so this only reports; re-applying is the operator's call.
+_zoro_mode_loss_alert() {
+	[ -s "$ZORO_STATE_FILE" ] || return 0
+	[ "$(tr -d ' \r' < "$ZORO_STATE_FILE")" = on ] || return 0
+	# A failed read is not evidence of loss. Only a readable chain that
+	# lacks the manual rule is a reportable state.
+	nft list chain inet sw_lan_tproxy prerouting >/dev/null 2>&1 || {
+		log "WARN: cannot inspect sw_lan_tproxy after restore; Zoro state unknown"
+		return 0
+	}
+	nft list chain inet sw_lan_tproxy prerouting 2>/dev/null \
+		| grep -F 'comment "zoro-exit"' >/dev/null 2>&1 && return 0
+
+	# Bypass the global 600s limiter: the reconnect alert that precedes this
+	# restore would otherwise swallow the one page that matters. Keep a
+	# private one-hour stamp so a rebuild loop cannot spam.
+	local _stamp_dir="${ZORO_ALERT_STAMP_DIR:-/run/surflare}"
+	local _stamp="${_stamp_dir}/zoro_mode_lost.stamp"
+	local _now _age=86400
+	mkdir -p "$_stamp_dir" 2>/dev/null || true
+	_now=$(date +%s)
+	[ -f "$_stamp" ] && _age=$((_now - $(stat -c %Y "$_stamp" 2>/dev/null || echo 0)))
+	if [ "$_age" -lt 3600 ]; then
+		log "Zoro mode-loss alert suppressed (${_age}s < 3600s)"
+		return 0
+	fi
+	date +%s > "$_stamp" 2>/dev/null || true
+	log "WARN: Zoro primary mode lost after tproxy rebuild; re-run zoro-exit on"
+	(
+		_deliver_alert "surflare: Zoro primary mode lost" \
+			"$(printf '%b' 'LAN tproxy was rebuilt and the manual Zoro rule is gone.\nRun: zoro-exit on\nSurflare :10800 rule is present; traffic is not verified.')" \
+			"yes" "fault:zoro-mode-lost"
+	) 9>&- 200>&- &
+}
 _restore_tproxy() {
 	local _lan_tproxy_nft="/etc/surflare-lan-tproxy.nft"
 	if [ ! -f "$_lan_tproxy_nft" ]; then
@@ -2774,6 +2812,9 @@ _restore_tproxy() {
 	# Reload CN CIDRs: destroy+reload above empties cn_direct/cn6_direct.
 	# Without this, all LAN traffic goes through VPN proxy (no CN bypass).
 	_load_tproxy_cn_direct
+	if [ "$_load_ok" -eq 1 ]; then
+		_zoro_mode_loss_alert
+	fi
 	# Stamp the nft file hash so adopt can detect stale rules without
 	# rebuilding the table every restart.  Only stamp on successful
 	# load (_load_ok): a failed nft -f leaves stale rules, and stamping
