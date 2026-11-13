@@ -19,6 +19,7 @@ if [ "${ZORO_TEST_MODE:-0}" = 1 ] &&
 	PROBE_URL=${ZORO_PROBE_URL:-https://www.gstatic.com/generate_204}
 	PROBE_TIMEOUT=${ZORO_PROBE_TIMEOUT:-8}
 	SOCKS_PORT=${ZORO_SOCKS_PORT:-7890}
+	DNSPY=${ZORO_DNSPY:-python3}
 	STATE_FILE=${ZORO_STATE_FILE:-/etc/zoro-exit.requested}
 	CONFIG=${ZORO_CONFIG:-/etc/zoro-n100-primary.json}
 else
@@ -31,6 +32,7 @@ else
 	PROBE_URL=https://www.gstatic.com/generate_204
 	PROBE_TIMEOUT=8
 	SOCKS_PORT=7890
+	DNSPY=/usr/bin/python3
 	STATE_FILE=/etc/zoro-exit.requested
 	CONFIG=/etc/zoro-n100-primary.json
 fi
@@ -63,6 +65,116 @@ rule_lines() {
 
 rule_handles() {
 	rule_lines | sed -n 's/.*# handle \([0-9][0-9]*\).*/\1/p'
+}
+
+chain_rules() {
+	# $1 table, $2 chain -> lines tagged with our comment
+	"$NFT" -a list chain inet "$1" "$2" 2>/dev/null \
+		| grep -F "comment \"$COMMENT\""
+}
+
+chain_handles() {
+	sed -n 's/.*# handle \([0-9][0-9]*\).*/\1/p'
+}
+
+dns_prerouting_lines() {
+	chain_rules surflare prerouting
+}
+
+dns_output_lines() {
+	chain_rules surflare output
+}
+
+ks_output_lines() {
+	chain_rules killswitch output
+}
+
+dns_output_anchor() {
+	# Insert before the first dport-53 mark rule -- the watchdog's
+	# _insert_dns_fallback uses the same anchor -- which lands the zoro
+	# rules after both @server_ports accepts and ahead of every mark-0x1
+	# DNS rule.
+	"$NFT" -a list chain inet surflare output 2>/dev/null \
+		| grep -F 'dport 53 meta mark set' \
+		| head -1 \
+		| sed -n 's/.*# handle \([0-9][0-9]*\).*/\1/p'
+}
+
+ks_output_anchor() {
+	# Insert before the oif lo accept rule so the accept lands right
+	# after ct state invalid drop (which must stay the chain's first
+	# verdict) and ahead of every other rule.
+	"$NFT" -a list chain inet killswitch output 2>/dev/null \
+		| grep -F 'oif "lo" accept' \
+		| head -1 \
+		| sed -n 's/.*# handle \([0-9][0-9]*\).*/\1/p'
+}
+
+dns_rule_ok() {
+	# shellcheck disable=SC3043  # OpenWrt ash supports local
+	# The five DNS-consistency rules: udp+tcp tproxy catch in surflare
+	# prerouting, udp+tcp dport-53 mark rules in surflare output, and
+	# the killswitch mark accept.
+	local _p_udp _p_tcp _o_udp _o_tcp _ks
+	_p_udp=$(dns_prerouting_lines | grep -F 'meta l4proto udp' | head -1)
+	_p_tcp=$(dns_prerouting_lines | grep -F 'meta l4proto tcp' | head -1)
+	_o_udp=$(dns_output_lines | grep -F 'udp dport 53' | head -1)
+	_o_tcp=$(dns_output_lines | grep -F 'tcp dport 53' | head -1)
+	_ks=$(ks_output_lines | head -1)
+	printf '%s\n' "$_p_udp" | grep -Fq "tproxy ip to :$PORT" || return 1
+	printf '%s\n' "$_p_udp" | grep -Fq "meta mark set $MARK" || return 1
+	printf '%s\n' "$_p_tcp" | grep -Fq "tproxy ip to :$PORT" || return 1
+	printf '%s\n' "$_p_tcp" | grep -Fq "meta mark set $MARK" || return 1
+	printf '%s\n' "$_o_udp" | grep -Fq "udp dport 53" || return 1
+	printf '%s\n' "$_o_udp" | grep -Fq "meta mark set $MARK" || return 1
+	printf '%s\n' "$_o_tcp" | grep -Fq "tcp dport 53" || return 1
+	printf '%s\n' "$_o_tcp" | grep -Fq "meta mark set $MARK" || return 1
+	printf '%s\n' "$_ks" | grep -Fq "meta mark $MARK accept" || return 1
+	return 0
+}
+
+ensure_dns_rules() {
+	[ -z "$(dns_prerouting_lines)" ] && {
+		"$NFT" insert rule inet surflare prerouting \
+			meta nfproto ipv4 meta l4proto udp meta mark "$MARK" \
+			tproxy ip to ":$PORT" meta mark set "$MARK" \
+			accept comment "$COMMENT" 2>/dev/null || return 1
+		"$NFT" insert rule inet surflare prerouting \
+			meta nfproto ipv4 meta l4proto tcp meta mark "$MARK" \
+			tproxy ip to ":$PORT" meta mark set "$MARK" \
+			accept comment "$COMMENT" 2>/dev/null || return 1
+	}
+	[ -z "$(dns_output_lines)" ] && {
+		_anchor=$(dns_output_anchor)
+		[ -n "$_anchor" ] || return 1
+		"$NFT" insert rule inet surflare output position "$_anchor" \
+			meta nfproto ipv4 udp dport 53 meta mark set "$MARK" \
+			accept comment "$COMMENT" 2>/dev/null || return 1
+		"$NFT" insert rule inet surflare output position "$_anchor" \
+			meta nfproto ipv4 tcp dport 53 meta mark set "$MARK" \
+			accept comment "$COMMENT" 2>/dev/null || return 1
+	}
+	[ -z "$(ks_output_lines)" ] && {
+		_anchor=$(ks_output_anchor)
+		[ -n "$_anchor" ] || return 1
+		"$NFT" insert rule inet killswitch output position "$_anchor" \
+			meta mark "$MARK" accept comment "$COMMENT" 2>/dev/null || return 1
+	}
+	dns_rule_ok
+}
+
+drop_dns_rules() {
+	# shellcheck disable=SC3043  # OpenWrt ash supports local
+	local _t _c _h _t_c
+	for _t_c in "surflare prerouting" "surflare output" "killswitch output"; do
+		# shellcheck disable=SC2086
+		set -- $_t_c
+		_t=$1; _c=$2
+		# shellcheck disable=SC2086
+		for _h in $(chain_rules "$_t" "$_c" | chain_handles); do
+			"$NFT" delete rule inet "$_t" "$_c" handle "$_h" 2>/dev/null || true
+		done
+	done
 }
 
 surflare_handle() {
@@ -266,16 +378,26 @@ do_on() {
 		}
 	fi
 
+	ensure_dns_rules || {
+		for h in $(rule_handles); do
+			"$NFT" delete rule inet sw_lan_tproxy prerouting handle "$h" 2>/dev/null || true
+		done
+		drop_dns_rules
+		del_route
+		die "failed to install the DNS exit rules"
+	}
+
 	if ! printf 'on\n' > "$STATE_FILE"; then
 		if [ "$_had_rule" -eq 0 ]; then
 			for h in $(rule_handles); do
 				"$NFT" delete rule inet sw_lan_tproxy prerouting handle "$h" 2>/dev/null || true
 			done
+			drop_dns_rules
 			del_route
 		fi
 		die "failed to record requested state"
 	fi
-	log "on: LAN TCP -> $PORT; Surflare :10800 is configured but not automatic"
+	log "on: LAN TCP -> $PORT; router DNS -> $PORT; Surflare :10800 is configured but not automatic"
 }
 
 do_off() {
@@ -293,7 +415,11 @@ do_off() {
 	for h in $(rule_handles); do
 		"$NFT" delete rule inet sw_lan_tproxy prerouting handle "$h" 2>/dev/null || true
 	done
+	drop_dns_rules
 	[ -z "$(rule_handles)" ] || die "Zoro rule still present after off"
+	[ -z "$(dns_prerouting_lines)" ] || die "Zoro DNS tproxy rules still present after off"
+	[ -z "$(dns_output_lines)" ] || die "Zoro DNS mark rules still present after off"
+	[ -z "$(ks_output_lines)" ] || die "Zoro killswitch accept still present after off"
 	del_route
 	if route_ok; then
 		die "policy route still present after off"
@@ -305,6 +431,32 @@ do_off() {
 	else
 		log "off: Zoro rule removed; LAN TCP has no exit (Surflare :10800 is absent)"
 	fi
+}
+
+# The SOCKS probe says nothing about the UDP tproxy :7895 path actually
+# carrying DNS. Resolve a fixed name through a fixed foreign resolver; any
+# well-formed DNS answer (even NXDOMAIN) proves the new exit path works
+# end to end. python3 is already a watchdog dependency on this host.
+probe_dns() {
+	"$DNSPY" - <<'PYEOF' 2>/dev/null
+import socket, struct, sys
+def name(n):
+    out = b""
+    for part in n.split("."):
+        out += bytes([len(part)]) + part.encode()
+    return out + b"\0"
+tid = 0x7A2B
+query = struct.pack(">HHHHHH", tid, 0x0100, 1, 0, 0, 0) + name("cloudflare.com") + struct.pack(">HH", 1, 1)
+try:
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.settimeout(5)
+    s.sendto(query, ("1.1.1.1", 53))
+    data, _ = s.recvfrom(512)
+    rid = struct.unpack(">H", data[:2])[0]
+    sys.exit(0 if rid == tid else 1)
+except Exception:
+    sys.exit(1)
+PYEOF
 }
 
 do_check() {
@@ -352,7 +504,12 @@ do_check() {
 	printf 'xray_listening=%s\n' "$(xray_up && echo yes || echo no)"
 	printf 'fallback=%s\n' "$_fb"
 	printf 'order=%s\n' "$_order"
+	printf 'dns=%s\n' "$(dns_rule_ok && echo ok || echo missing)"
 
+	if ! dns_rule_ok; then
+		printf 'probe_http=skipped\nprobe=fail\n'
+		return 1
+	fi
 	if ! route_ok; then
 		printf 'probe_http=skipped\nprobe=fail\n'
 		return 1
@@ -366,6 +523,10 @@ do_check() {
 		return 1
 	fi
 	if ! probe_once; then
+		printf 'probe_http=%s\nprobe=fail\n' "$_probe_code"
+		return 1
+	fi
+	if ! probe_dns; then
 		printf 'probe_http=%s\nprobe=fail\n' "$_probe_code"
 		return 1
 	fi
@@ -392,6 +553,9 @@ do_status() {
 	printf 'route=%s\n' "$(route_ok && echo ok || echo missing)"
 	printf 'xray_listening=%s\n' "$(xray_up && echo yes || echo no)"
 	printf 'surflare_10800=%s\n' "$( [ -n "$(surflare_handle)" ] && echo yes || echo no)"
+	if [ "$mode" = on ]; then
+		printf 'dns=%s\n' "$(dns_rule_ok && echo ok || echo missing)"
+	fi
 	case "$mode" in
 	lost) return 1 ;;
 	unknown) return 3 ;;

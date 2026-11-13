@@ -33,75 +33,96 @@ EOF
 
 cat > "$BIN/nft" <<'EOF'
 #!/bin/sh
-case " $* " in
-	*" list table inet sw_lan_tproxy "*)
-		exit "${FAKE_NFT_TABLE_RC:-0}"
-		;;
-	*" list chain inet sw_lan_tproxy prerouting "*)
-		rc=${FAKE_NFT_CHAIN_RC:-0}
-		[ "$rc" -eq 0 ] || exit "$rc"
-		while IFS= read -r line; do
-			case " $* " in
-			*" -a "*|*" --handle "*) printf '%s\n' "$line" ;;
-			*) printf '%s\n' "${line%% # handle*}" ;;
-			esac
-		done < "${FAKE_NFT_STATE:?}"
-		exit 0
-		;;
-	*" add rule "*)
-		[ "${FAKE_NFT_INSERT_RC:-0}" = 0 ] || exit 1
-		printf '%s\n' "$*" >> "${FAKE_INSERT_LOG:?}"
-		printf 'nft %s\n' "$*" >> "${FAKE_MUTATION_LOG:?}"
-		line=${*#*prerouting }
-		line=$(printf '%s' "$line" | sed 's/ iifname \([^ ]*\)/ iifname "\1"/; s/ comment \([^ ]*\)$/ comment "\1"/')
-		printf '%s\n' "$(cat "${FAKE_NFT_STATE:?}")" > "${FAKE_NFT_STATE}.new"
-		printf '%s # handle 37\n' "$line" >> "${FAKE_NFT_STATE}.new"
-		mv "${FAKE_NFT_STATE}.new" "$FAKE_NFT_STATE"
-		exit 0
-		;;
-	*" insert rule "*)
-		[ "${FAKE_NFT_INSERT_RC:-0}" = 0 ] || exit 1
-		printf '%s\n' "$*" >> "${FAKE_INSERT_LOG:?}"
-		printf 'nft %s\n' "$*" >> "${FAKE_MUTATION_LOG:?}"
-		line=${*#*prerouting }
-		case "$line" in
-		position\ *) line=${line#position }; line=${line# } ;;
-		esac
-		line=$(printf '%s' "$line" | sed 's/ iifname \([^ ]*\)/ iifname "\1"/; s/ comment \([^ ]*\)$/ comment "\1"/')
-		# shellcheck disable=SC2086  # deliberate positional scan
-		pos=""; prev=""
-		for arg in "$@"; do
-			[ "$prev" = position ] && pos=$arg
-			prev=$arg
-		done
-		ln=""
-		[ -n "$pos" ] && ln=$(grep -n "# handle $pos\$" "${FAKE_NFT_STATE:?}" | head -1 | cut -d: -f1)
-		if [ -n "$ln" ]; then
-			head -n "$((ln - 1))" "${FAKE_NFT_STATE}" > "${FAKE_NFT_STATE}.new"
-			printf '%s # handle 37\n' "$line" >> "${FAKE_NFT_STATE}.new"
-			tail -n "+$ln" "${FAKE_NFT_STATE}" >> "${FAKE_NFT_STATE}.new"
+# Multi-chain fake. Each chain lives in its own state file; the table name
+# selects it. Handles are static (37 for adds) like the old single-chain
+# fake, which is fine because nothing here tests handle arithmetic.
+chain_file() {
+	case "$1 $2" in
+	"sw_lan_tproxy prerouting") printf '%s\n' "${FAKE_NFT_STATE:?}" ;;
+	"surflare prerouting") printf '%s\n' "${FAKE_SF_PRE_STATE:?}" ;;
+	"surflare output") printf '%s\n' "${FAKE_SF_OUT_STATE:?}" ;;
+	"killswitch output") printf '%s\n' "${FAKE_KS_OUT_STATE:?}" ;;
+	*) exit 1 ;;
+	esac
+}
+
+_show_handles=0
+if [ "${1:-}" = "-a" ]; then
+	shift
+	_show_handles=1
+fi
+
+case "$1 $2" in
+"list table")
+	[ "$3 $4" = "inet sw_lan_tproxy" ] || exit 1
+	exit "${FAKE_NFT_TABLE_RC:-0}"
+	;;
+"list chain")
+	# argv: list chain inet TABLE CHAIN
+	_file=$(chain_file "$4" "$5") || exit 1
+	[ -f "$_file" ] || exit 1
+	rc=${FAKE_NFT_CHAIN_RC:-0}
+	[ "$rc" -eq 0 ] || exit "$rc"
+	while IFS= read -r line; do
+		if [ "$_show_handles" -eq 1 ]; then
+			printf '%s\n' "$line"
 		else
-			printf '%s # handle 37\n' "$line" > "${FAKE_NFT_STATE}.new"
-			cat "${FAKE_NFT_STATE:?}" >> "${FAKE_NFT_STATE}.new"
+			printf '%s\n' "${line%% # handle*}"
 		fi
-		mv "${FAKE_NFT_STATE}.new" "$FAKE_NFT_STATE"
-		exit 0
-		;;
-	*" delete rule "*)
-		printf 'nft %s\n' "$*" >> "${FAKE_MUTATION_LOG:?}"
-		handle=""
-		for arg in "$@"; do
-			if [ "$handle" = next ]; then
-				handle=$arg
-				break
-			fi
-			[ "$arg" = handle ] && handle=next
-		done
-		[ -n "$handle" ] && [ "$handle" != next ] || exit 1
-		grep -v "# handle ${handle}$" "${FAKE_NFT_STATE:?}" > "${FAKE_NFT_STATE}.rem"
-		mv "${FAKE_NFT_STATE}.rem" "$FAKE_NFT_STATE"
-		exit 0
-		;;
+	done < "$_file"
+	exit 0
+	;;
+"add rule"|"insert rule")
+	_cmd="$1 $2"
+	_file=$(chain_file "$4" "$5") || exit 1
+	[ "${FAKE_NFT_INSERT_RC:-0}" = 0 ] || exit 1
+	printf '%s\n' "$*" >> "${FAKE_INSERT_LOG:?}"
+	printf 'nft %s\n' "$*" >> "${FAKE_MUTATION_LOG:?}"
+	# drop argv through the chain name; what remains is [position H] RULE
+	shift 5
+	_pos=""
+	if [ "${1:-}" = position ]; then
+		_pos=$2
+		shift 2
+	fi
+	line=$(printf '%s' "$*" | sed 's/\( \|^\)iifname \([^ ]*\)/\1iifname "\2"/; s/ comment \([^ ]*\)$/ comment "\1"/')
+	if [ "$_cmd" = "insert rule" ] && [ -n "$_pos" ]; then
+		ln=$(grep -n "# handle ${_pos}\$" "$_file" | head -1 | cut -d: -f1)
+		if [ -n "$ln" ]; then
+			head -n "$((ln - 1))" "$_file" > "$_file.new"
+			printf '%s # handle 37\n' "$line" >> "$_file.new"
+			tail -n "+$ln" "$_file" >> "$_file.new"
+		else
+			printf '%s # handle 37\n' "$line" > "$_file.new"
+			cat "$_file" >> "$_file.new"
+		fi
+	elif [ "$_cmd" = "insert rule" ]; then
+		printf '%s # handle 37\n' "$line" > "$_file.new"
+		cat "$_file" >> "$_file.new"
+	else
+		cat "$_file" > "$_file.new"
+		printf '%s # handle 37\n' "$line" >> "$_file.new"
+	fi
+	mv "$_file.new" "$_file"
+	exit 0
+	;;
+"delete rule")
+	printf 'nft %s\n' "$*" >> "${FAKE_MUTATION_LOG:?}"
+	_file=$(chain_file "$4" "$5") || exit 1
+	handle=""
+	shift 5
+	while [ $# -gt 0 ]; do
+		if [ "$1" = handle ]; then
+			handle=$2
+			break
+		fi
+		shift
+	done
+	[ -n "$handle" ] || exit 1
+	grep -v "# handle ${handle}$" "$_file" > "$_file.rem"
+	mv "$_file.rem" "$_file"
+	exit 0
+	;;
 esac
 printf '%s\n' "$*" >> "${FAKE_MUTATION_LOG:?}"
 exit 1
@@ -149,6 +170,12 @@ printf '%s' "${FAKE_HTTP:-204}"
 exit "${FAKE_CURL_RC:-0}"
 EOF
 
+cat > "$BIN/dnspy" <<'EOF'
+#!/bin/sh
+cat > /dev/null
+exit "${FAKE_DNS_RC:-0}"
+EOF
+
 cat > "$BIN/service" <<'EOF'
 #!/bin/sh
 printf '%s\n' "$*" >> "${FAKE_SERVICE_LOG:?}"
@@ -162,8 +189,9 @@ chmod 755 "$BIN"/*
 export ZORO_TEST_MODE=1
 export ZORO_NFT="$BIN/nft" ZORO_IP="$BIN/ip" ZORO_SS="$BIN/ss"
 export ZORO_CURL="$BIN/curl" ZORO_LOGGER="$BIN/logger"
-export ZORO_SERVICE="$BIN/service" ZORO_PROBE_URL="https://probe.invalid/generate_204" ZORO_STATE_FILE="$TMP/requested" ZORO_CONFIG="$TMP/xray.json"
+export ZORO_SERVICE="$BIN/service" ZORO_DNSPY="$BIN/dnspy" ZORO_PROBE_URL="https://probe.invalid/generate_204" ZORO_STATE_FILE="$TMP/requested" ZORO_CONFIG="$TMP/xray.json"
 export FAKE_NFT_STATE="$STATE" FAKE_IPDIR="$IPDIR" FAKE_LISTEN_FLAG="$TMP/listening"
+export FAKE_SF_PRE_STATE="$TMP/sf_pre.state" FAKE_SF_OUT_STATE="$TMP/sf_out.state" FAKE_KS_OUT_STATE="$TMP/ks_out.state"
 export FAKE_MUTATION_LOG="$MUT" FAKE_CURL_LOG="$CURL_LOG" FAKE_SERVICE_LOG="$SERVICE_LOG"
 export FAKE_INSERT_LOG="$TMP/insert.log"
 
@@ -175,6 +203,21 @@ has() { printf '%s\n' "$1" | grep -q "^$2$"; }
 
 reset_state() {
 	rm -f "$TMP/requested"
+	: > "$FAKE_SF_PRE_STATE"
+	printf '%s\n' \
+		'oifname "lo" tcp dport 10800 counter drop comment "watchdog-tproxy-self-dial" # handle 2' \
+		'tcp sport @server_ports accept # handle 3' \
+		'udp sport @server_ports accept # handle 4' \
+		'tcp dport 53 meta mark set 0x00000001 accept # handle 6' \
+		'udp dport 53 meta mark set 0x00000001 accept # handle 7' \
+		'meta l4proto { tcp, udp } meta mark set 0x00000001 accept # handle 9' \
+		> "$FAKE_SF_OUT_STATE"
+	printf '%s\n' \
+		'ct state invalid drop # handle 1' \
+		'oif "lo" accept # handle 2' \
+		'meta mark 0x00000001 accept # handle 3' \
+		'meta mark 0x000000ff accept # handle 4' \
+		> "$FAKE_KS_OUT_STATE"
 	printf 'iifname "br-lan" meta nfproto ipv4 meta l4proto tcp tproxy ip to :10800 meta mark set 0x00000001 ct mark set 0x00000100 accept # handle 38\n' > "$STATE"
 	rm -f "$IPDIR/rule" "$IPDIR/route"
 	: > "$MUT"; : > "$CURL_LOG"; : > "$SERVICE_LOG"; : > "$FAKE_INSERT_LOG"
@@ -186,7 +229,22 @@ add_zoro() {
 	mv "$STATE.new" "$STATE"
 }
 
+add_dns() {
+	printf '%s\n' \
+		'meta nfproto ipv4 meta l4proto udp meta mark 0x00000002 tproxy ip to :7895 meta mark set 0x00000002 accept comment "zoro-exit" # handle 31' \
+		'meta nfproto ipv4 meta l4proto tcp meta mark 0x00000002 tproxy ip to :7895 meta mark set 0x00000002 accept comment "zoro-exit" # handle 32' \
+		> "$FAKE_SF_PRE_STATE"
+	printf '%s\n' \
+		'meta nfproto ipv4 udp dport 53 meta mark set 0x00000002 accept comment "zoro-exit" # handle 33' \
+		'meta nfproto ipv4 tcp dport 53 meta mark set 0x00000002 accept comment "zoro-exit" # handle 34' \
+		> "$FAKE_SF_OUT_STATE"
+	printf '%s\n' \
+		'meta mark 0x00000002 accept comment "zoro-exit" # handle 35' \
+		> "$FAKE_KS_OUT_STATE"
+}
+
 run() {
+	FAKE_DNS_RC="${FAKE_DNS_RC:-0}" \
 	FAKE_LISTEN="${FAKE_LISTEN:-public}" FAKE_HTTP="${FAKE_HTTP:-204}" \
 	FAKE_CURL_RC="${FAKE_CURL_RC:-0}" FAKE_NFT_TABLE_RC="${FAKE_NFT_TABLE_RC:-0}" \
 	FAKE_NFT_CHAIN_RC="${FAKE_NFT_CHAIN_RC:-0}" \
@@ -200,7 +258,7 @@ out=$(FAKE_LISTEN=none run check); rc=$?
 	[ ! -s "$MUT" ] && [ ! -s "$SERVICE_LOG" ]
 if [ $? -eq 0 ]; then ok 'off state is measured and read-only'; else bad 'off state is measured and read-only'; fi
 
-reset_state; add_zoro; : > "$IPDIR/rule"; : > "$IPDIR/route"
+reset_state; add_zoro; add_dns; : > "$IPDIR/rule"; : > "$IPDIR/route"
 out=$(run check); rc=$?
 [ "$rc" -eq 0 ] && has "$out" 'mode=on' && has "$out" 'route=ok' &&
 	has "$out" 'xray_listening=yes' && has "$out" 'order=ok' &&
@@ -280,7 +338,7 @@ if [ $? -eq 0 ]; then ok 'status exits 3 for an unreadable requested state'; els
 reset_state
 sed -i '/:10800/d' "$STATE"
 out=$(run on --force 2>&1); rc=$?
-grep -q 'comment "zoro-exit"' "$STATE" && [ "$rc" -eq 0 ] && ! grep -q 'position' "$FAKE_INSERT_LOG"
+grep -q 'comment "zoro-exit"' "$STATE" && [ "$rc" -eq 0 ] && ! head -1 "$FAKE_INSERT_LOG" | grep -q 'position'
 if [ $? -eq 0 ]; then ok 'on --force works without a Surflare fallback'; else bad 'on --force works without a Surflare fallback'; fi
 
 reset_state; add_zoro; sed -i 's/0x00000002/0x00000009/' "$STATE"
@@ -337,7 +395,7 @@ out=$(run off 2>&1); rc=$?
 [ "$rc" -ne 0 ] && grep -q 'comment "zoro-exit"' "$STATE" && [ ! -s "$MUT" ]
 if [ $? -eq 0 ]; then ok 'off refuses without --force when fallback is missing'; else bad 'off refuses without --force when fallback is missing'; fi
 
-reset_state; add_zoro; : > "$IPDIR/rule"; : > "$IPDIR/route"; sed -i '/:10800/d' "$STATE"
+reset_state; add_zoro; add_dns; : > "$IPDIR/rule"; : > "$IPDIR/route"; sed -i '/:10800/d' "$STATE"
 out=$(run check); rc=$?
 [ "$rc" -eq 0 ] && has "$out" 'fallback=missing' && has "$out" 'order=unverified' && has "$out" 'probe=ok' && [ ! -s "$MUT" ]
 if [ $? -eq 0 ]; then ok 'check does not false-fail when fallback is tombstoned'; else bad 'check does not false-fail when fallback is tombstoned'; fi
@@ -359,7 +417,7 @@ if [ $? -eq 0 ]; then ok 'on installs rule and route'; else bad 'on installs rul
 
 out=$(run on 2>&1); rc=$?
 idem=1
-if [ "$(grep -c 'comment "zoro-exit"' "$STATE")" -eq 1 ] && [ "$rc" -eq 0 ] && [ "$(wc -l < "$FAKE_INSERT_LOG")" -eq 1 ]; then
+if [ "$(grep -c 'comment "zoro-exit"' "$STATE")" -eq 1 ] && [ "$rc" -eq 0 ] && [ "$(wc -l < "$FAKE_INSERT_LOG")" -eq 6 ]; then
 	idem=0
 fi
 if [ "$idem" -eq 0 ]; then ok 'on is idempotent'; else bad 'on is idempotent'; fi
@@ -373,7 +431,7 @@ out=$(FAKE_NFT_CHAIN_RC=1 run check); rc=$?
 [ "$rc" -eq 3 ] && has "$out" 'mode=unknown'
 if [ $? -eq 0 ]; then ok 'unreadable chain is unknown'; else bad 'unreadable chain is unknown'; fi
 
-reset_state; add_zoro; : > "$IPDIR/rule"; : > "$IPDIR/route"
+reset_state; add_zoro; add_dns; : > "$IPDIR/rule"; : > "$IPDIR/route"
 out=$(FAKE_HTTP=200 run check); rc=$?
 [ "$rc" -eq 0 ] && has "$out" 'probe=ok'
 if [ $? -eq 0 ]; then ok 'probe accepts HTTP 200'; else bad 'probe accepts HTTP 200'; fi
@@ -414,5 +472,125 @@ out=$(run check); rc=$?
 [ "$rc" -eq 1 ] && has "$out" 'order=misplaced'
 if [ $? -eq 0 ]; then ok 'rule with the wrong port exits 1'; else bad 'rule with the wrong port exits 1'; fi
 
+# --- DNS exit consistency ---
+# When the switch is on, the router's own upstream DNS must leave through
+# Zoro like the data path: tproxy catch in surflare prerouting, dport-53
+# mark rules ahead of the mark-0x1 rules in surflare output, and a
+# killswitch accept for mark 0x2 (which the ks accept set lacked).
+
+reset_state
+run on >/dev/null 2>&1
+[ "$?" -eq 0 ] \
+	&& grep -q 'meta l4proto udp meta mark 0x00000002' "$FAKE_SF_PRE_STATE" \
+	&& grep -q 'tproxy ip to :7895' "$FAKE_SF_PRE_STATE" \
+	&& ok "on installs the udp tproxy catch" \
+	|| bad "on missed the udp tproxy catch"
+
+grep -q 'meta l4proto tcp meta mark 0x00000002' "$FAKE_SF_PRE_STATE" \
+	&& ok "on installs the tcp tproxy catch" \
+	|| bad "on missed the tcp tproxy catch"
+
+grep -q 'meta nfproto ipv4 udp dport 53 meta mark set 0x00000002' "$FAKE_SF_OUT_STATE" \
+	&& ok "the output rules are IPv4-qualified" \
+	|| bad "the output rules lost their family qualifier"
+
+_sport_ln=$(grep -n 'udp sport @server_ports accept' "$FAKE_SF_OUT_STATE" | head -1 | cut -d: -f1)
+_first_zoro_ln=$(grep -n 'zoro-exit' "$FAKE_SF_OUT_STATE" | head -1 | cut -d: -f1)
+[ -n "$_sport_ln" ] && [ "$_sport_ln" -lt "$_first_zoro_ln" ] \
+	&& ok "the output rules stay behind the server-port accepts" \
+	|| bad "the output rules jumped ahead of the server-port accepts"
+
+_dns_ln=$(grep -n 'dport 53 meta mark set 0x00000002' "$FAKE_SF_OUT_STATE" | head -1 | cut -d: -f1)
+_sf_ln=$(grep -n 'dport 53 meta mark set 0x00000001' "$FAKE_SF_OUT_STATE" | head -1 | cut -d: -f1)
+[ -n "$_dns_ln" ] && [ -n "$_sf_ln" ] && [ "$_dns_ln" -lt "$_sf_ln" ] \
+	&& ok "the zoro DNS mark rules precede the surflare ones" \
+	|| bad "the zoro DNS mark rules landed after the surflare ones [$_dns_ln vs $_sf_ln]"
+
+grep -q 'meta mark 0x00000002 accept' "$FAKE_KS_OUT_STATE" \
+	&& ! grep -q 'meta mark set 0x00000002 accept' "$FAKE_KS_OUT_STATE" \
+	&& [ "$(head -1 "$FAKE_KS_OUT_STATE")" = 'ct state invalid drop # handle 1' ] \
+	&& ok "on installs the killswitch mark accept (match form)" \
+	|| bad "on missed the killswitch mark accept or used the set form or displaced the first verdict"
+
+out=$(run status); rc=$?
+[ "$rc" -eq 0 ] && has "$out" 'mode=on' && has "$out" 'dns=ok' \
+	&& ok "status reports the DNS exit healthy" \
+	|| bad "status missed the DNS state"
+
+out=$(run check); rc=$?
+[ "$rc" -eq 0 ] && has "$out" 'dns=ok' \
+	&& ok "check reports the DNS exit healthy" \
+	|| bad "check missed the DNS state"
+
+run off >/dev/null 2>&1
+[ "$?" -eq 0 ] \
+	&& ! grep -q 'zoro-exit' "$FAKE_SF_PRE_STATE" \
+	&& ! grep -q 'zoro-exit' "$FAKE_SF_OUT_STATE" \
+	&& ! grep -q 'zoro-exit' "$FAKE_KS_OUT_STATE" \
+	&& ! grep -q 'zoro-exit' "$STATE" \
+	&& ok "off removes the DNS rules with the rest" \
+	|| bad "off left zoro rules behind"
+
+reset_state
+: > "$FAKE_KS_OUT_STATE"
+out=$(run on 2>&1); rc=$?
+[ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q 'DNS exit rules' \
+	&& ok "a missing killswitch anchor refuses the switch" \
+	|| bad "a missing anchor did not stop the switch rc=$rc"
+
+reset_state
+: > "$FAKE_SF_OUT_STATE"
+out=$(run on 2>&1); rc=$?
+[ "$rc" -eq 1 ] \
+	&& ok "a missing output anchor refuses the switch" \
+	|| bad "a missing output anchor did not stop the switch rc=$rc"
+
+reset_state
+run on >/dev/null 2>&1
+sed -i 's/tproxy ip to :7895/tproxy ip to :9999/' "$FAKE_SF_PRE_STATE"
+out=$(run status 2>&1)
+has "$out" 'dns=missing' \
+	&& ok "status sees a tampered tproxy port" \
+	|| bad "status missed a tampered tproxy port"
+
+reset_state
+
+# --- the check exit code sees a vanished DNS exit ---
+reset_state
+run on >/dev/null 2>&1
+sed -i '/zoro-exit/d' "$FAKE_KS_OUT_STATE"
+out=$(FAKE_DNS_RC=0 run check); rc=$?
+[ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q 'dns=missing' \
+	&& ok "check fails when the DNS exit vanishes" \
+	|| bad "check stayed green without the DNS exit"
+
+# --- the UDP DNS probe gates check ---
+reset_state
+run on >/dev/null 2>&1
+out=$(FAKE_DNS_RC=1 run check); rc=$?
+[ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q 'probe=fail' \
+	&& ok "a dead DNS path fails the check" \
+	|| bad "check ignored the DNS probe"
+
+# --- a refused switch leaves no DNS residue ---
+reset_state
+: > "$FAKE_KS_OUT_STATE"
+run on >/dev/null 2>&1
+! grep -q 'zoro-exit' "$FAKE_SF_PRE_STATE" \
+	&& ! grep -q 'zoro-exit' "$FAKE_SF_OUT_STATE" \
+	&& ! grep -q 'zoro-exit' "$FAKE_KS_OUT_STATE" \
+	&& ok "a refused switch leaves no DNS residue" \
+	|| bad "a refused switch left DNS residue behind"
+
+reset_state
+: > "$FAKE_SF_OUT_STATE"
+run on >/dev/null 2>&1
+! grep -q 'zoro-exit' "$FAKE_SF_PRE_STATE" \
+	&& ! grep -q 'zoro-exit' "$FAKE_SF_OUT_STATE" \
+	&& ok "an output-anchor refusal leaves no prerouting residue" \
+	|| bad "an output-anchor refusal left residue behind"
+
+reset_state
+
 echo "pass=$pass fail=$fail"
-[ "$fail" -eq 0 ] && [ "$pass" -eq 38 ]
+[ "$fail" -eq 0 ] && [ "$pass" -eq 54 ]
