@@ -3291,19 +3291,28 @@ _zoro_mode_loss_alert() {
 	# the surflare table exists -- with the table gone there are no
 	# anchors to install against anyway, and the data-rule branch covers
 	# that state on the next rebuild.
-	if [ -z "$_zoro_missing" ] && nft list table inet surflare >/dev/null 2>&1; then
-		_zoro_dns_ok=1
-		nft list chain inet surflare prerouting 2>/dev/null \
-			| grep -F 'comment "zoro-exit"' >/dev/null 2>&1 || _zoro_dns_ok=0
-		nft list chain inet surflare output 2>/dev/null \
-			| grep -F 'comment "zoro-exit"' >/dev/null 2>&1 || _zoro_dns_ok=0
-		nft list chain inet killswitch output 2>/dev/null \
-			| grep -F 'comment "zoro-exit"' >/dev/null 2>&1 || _zoro_dns_ok=0
-		[ "$_zoro_dns_ok" -eq 1 ] || _zoro_missing="DNS rules"
-	fi
-	[ -n "$_zoro_missing" ] || return 0
-
 	_zoro_bin="${ZORO_EXIT_BIN:-/usr/bin/zoro-exit}"
+	if [ -z "$_zoro_missing" ] && [ -x "$_zoro_bin" ] &&
+		nft list table inet surflare >/dev/null 2>&1; then
+		# Ask the tool that owns these rules instead of keeping a second
+		# definition here.  `status` is read-only and prints the DNS verdict
+		# without probing the uplink, so it is cheap enough for the health tick
+		# and it sees ordering as well as absence.
+		_zoro_dns_state=$(timeout -k 1 10 "$_zoro_bin" status 2>/dev/null 9>&- 200>&- |
+			sed -n 's/^dns=//p' | head -1)
+		# A verdict we could not read is not evidence of a loss: a slow nft, a
+		# killed call or an older helper all print nothing, and paging on that
+		# would cry wolf on a switch that is fine.  Same rule as the data rule
+		# above, where a failed read leaves the flag alone.
+		case "$_zoro_dns_state" in
+		ok | '') : ;;
+		*) _zoro_missing="DNS rules" ;;
+		esac
+	fi
+	if [ -z "$_zoro_missing" ]; then
+		rm -f "${ZORO_ALERT_STAMP_DIR:-/run/surflare}/zoro_busy.count" 2>/dev/null || true
+		return 0
+	fi
 	if [ -x "$_zoro_bin" ]; then
 		_zoro_rstamp="${ZORO_ALERT_STAMP_DIR:-/run/surflare}/zoro_mode_restore.stamp"
 		_zoro_rage=86400
@@ -3330,12 +3339,42 @@ _zoro_mode_loss_alert() {
 		}
 		log "WARN: Zoro switch incomplete (missing: $_zoro_missing); restoring via zoro-exit on"
 		# Bounded: a hung helper must not freeze the health loop. zoro-exit
-		# needs at most ~15s (xray wait + probe); 25 leaves headroom.
-		if timeout 25 "$_zoro_bin" on >/dev/null 2>&1; then
+		# needs at most ~15s (xray wait + probe); 25 leaves headroom, and -k
+		# makes the bound hold even if the helper catches the signal.
+		_zoro_rc=0
+		# -k so the bound holds even if the helper catches the signal; the kill
+		# delay is one second so a TERM-ignoring helper cannot outlive the tick.
+		# --repair keeps this from overriding a switch-off that a person asked
+		# for while the call was queued; the fd closes keep this daemon's own
+		# locks out of a helper that may outlive the tick.
+		timeout -k 1 "${ZORO_RESTORE_TIMEOUT:-25}" "$_zoro_bin" on --repair \
+			>/dev/null 2>&1 9>&- 200>&- || _zoro_rc=$?
+		if [ "$_zoro_rc" -eq 0 ]; then
 			log "Zoro primary restored (was missing: $_zoro_missing)"
+			rm -f "${ZORO_ALERT_STAMP_DIR:-/run/surflare}/zoro_busy.count" 2>/dev/null || true
 			return 0
 		fi
-		log "WARN: zoro-exit on failed or timed out; paging"
+		if [ "$_zoro_rc" -eq 4 ]; then
+			# Somebody else is already repairing this -- usually a person
+			# running the same command.  Not a failure: no page, and drop the
+			# throttle so the next tick picks up whatever they leave behind.
+			# A lock that stays busy for twenty ticks is not a person: count
+			# the deferrals and page once so a stuck lock cannot go silent.
+			_zoro_busy_file="${ZORO_ALERT_STAMP_DIR:-/run/surflare}/zoro_busy.count"
+			_zoro_busy=0
+			[ -f "$_zoro_busy_file" ] && _zoro_busy=$(cat "$_zoro_busy_file" 2>/dev/null)
+			case "$_zoro_busy" in '' | *[!0-9]*) _zoro_busy=0 ;; esac
+			_zoro_busy=$((_zoro_busy + 1))
+			printf '%s\n' "$_zoro_busy" > "$_zoro_busy_file" 2>/dev/null || true
+			if [ "$_zoro_busy" -lt 20 ]; then
+				log "Zoro restore deferred: another zoro-exit is running"
+				rm -f "$_zoro_rstamp" 2>/dev/null || true
+				return 0
+			fi
+			log "WARN: Zoro restore deferred $_zoro_busy times; the lock is not moving"
+			rm -f "$_zoro_busy_file" 2>/dev/null || true
+		fi
+		log "WARN: zoro-exit on failed or timed out (rc=$_zoro_rc); paging"
 		fi
 	else
 		log "WARN: $_zoro_bin not installed; cannot restore the Zoro switch automatically"

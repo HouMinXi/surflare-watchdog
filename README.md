@@ -845,16 +845,44 @@ while the rule may remain would blackhole LAN TCP.
 `check` is read-only. `probe_scope=socks` means the probe uses xray's SOCKS
 inbound `127.0.0.1:7890`, not the LAN tproxy path; its success proves the xray
 outbound, not that LAN clients are already using it. It prints `mode`, `nft`,
-`probe_scope`, `route`, `xray_listening`, `fallback`, `order`, `probe_http`,
-and `probe`. `fallback=ok` means the Surflare `:10800` rule string is present,
-not that Surflare is passing traffic. `mode=lost` means the requested state in
-`/etc/zoro-exit.requested` is `on` but the rule is gone. It exits 0 for a
-healthy on-state or a deliberate off, 1 for a broken on-state or `mode=lost`,
-2 for usage, or 3 when nft state is unreadable or the requested state is
-unrecognized (`mode=unknown`). A Surflare table rebuild removes
-the inserted rule; run `on` again. `status` prints `mode`, `nft`, `route`,
-`xray_listening`, and `surflare_10800`; it exits 1 for `mode=lost` and 3 for
+`probe_scope`, `route`, `xray_listening`, `fallback`, `order`, `dns`,
+`probe_http`, and `probe`. `dns` covers the five rules that keep the router's
+own DNS on the same exit as the data path: `ok`; `missing` when one of them is
+gone; `misplaced` when a rule that can take DNS comes first -- a port-53 rule in
+any spelling, or a rule that sets a mark, which is how the chain ends
+(`meta l4proto { tcp, udp } meta mark set 0x1 accept` matches every DNS packet);
+`residue` when the switch is asked off but our rules are still installed. Those
+three broken states exit 1. `fallback=ok` means the Surflare `:10800` rule
+string is present, not that Surflare is passing traffic. `mode=lost` means the
+requested state in `/etc/zoro-exit.requested` is `on` but the rule is gone. It
+exits 0 for a healthy on-state or a deliberate off, 1 for a broken on-state, for
+`mode=lost`, or for an off that left residue, 2 for usage, or 3 when nft state is
+unreadable or the requested state is unrecognized (`mode=unknown`). A Surflare
+table rebuild removes the inserted rule; the watchdog puts it back on its own.
+`status` prints `mode`, `nft`, `route`, `xray_listening`, `surflare_10800`, and
+`dns` whenever the mode is not `off`; it exits 1 for `mode=lost` and 3 for
 unreadable nft or an unrecognized requested state (`mode=unknown`).
+
+`on` and `off` take a `flock` on `/var/lock/zoro-exit.lock` so two runs of this
+tool cannot interleave their nft edits. The kernel owns the lock, so a killed
+run cannot leave it behind and nothing has to trust a pid or a timestamp; the fd
+is closed for the service we start, so a daemon that backgrounds itself cannot
+inherit it and hold the lock after we exit. The watchdog's own table rebuilds
+(`sw_lan_tproxy`, `killswitch`) are outside this lock: they recreate the chains
+these rules live in, which is why the restore path exists. A second writer waits
+about four seconds and then exits 4 without touching anything. The watchdog
+treats 4 as "someone else is repairing this", defers, and does not page -- but
+after twenty consecutive deferrals it pages once, because a lock that never
+moves is not a person. Traps end a run instead of letting it keep editing: ash
+runs a handler at the next command boundary, so a call already in flight
+finishes first.
+
+The switch is not a one-way door. While `/etc/zoro-exit.requested` reads `on`,
+the watchdog re-installs a switch that a table rebuild wiped, at most once every
+300 s. That repair runs `on --repair`, which is skipped if the request file has
+been turned off in the meantime, so a manual `off` wins over a queued repair.
+`ZORO_RESTORE_TIMEOUT` (default 25, seconds) bounds the call, and it is
+`timeout -k 1`, so a helper that ignores TERM is still killed.
 
 The requested state persists in `/etc`; a reboot does not silently drop Zoro mode. Re-run `on` after reboot to restore the dataplane.
 The Zoro rule must carry tproxy port `7895`, `meta mark set 0x00000002`, `ct

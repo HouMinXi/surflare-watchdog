@@ -74,6 +74,12 @@ case "$1 $2" in
 	;;
 "add rule"|"insert rule")
 	_cmd="$1 $2"
+	[ -n "${FAKE_NFT_SLEEP:-}" ] && sleep "$FAKE_NFT_SLEEP"
+	if [ -n "${FAKE_NFT_INSERT_FAIL_ON:-}" ]; then
+		case "$*" in
+		*"$FAKE_NFT_INSERT_FAIL_ON"*) exit 1 ;;
+		esac
+	fi
 	_file=$(chain_file "$4" "$5") || exit 1
 	[ "${FAKE_NFT_INSERT_RC:-0}" = 0 ] || exit 1
 	printf '%s\n' "$*" >> "${FAKE_INSERT_LOG:?}"
@@ -88,6 +94,10 @@ case "$1 $2" in
 	line=$(printf '%s' "$*" | sed 's/\( \|^\)iifname \([^ ]*\)/\1iifname "\2"/; s/ comment \([^ ]*\)$/ comment "\1"/')
 	if [ "$_cmd" = "insert rule" ] && [ -n "$_pos" ]; then
 		ln=$(grep -n "# handle ${_pos}\$" "$_file" | head -1 | cut -d: -f1)
+		# Real nft refuses an insert at a handle that is not there; the fake
+		# used to prepend instead, which hid a rebuild anchored on a rule it
+		# had just deleted.
+		[ -n "$ln" ] || exit 1
 		if [ -n "$ln" ]; then
 			head -n "$((ln - 1))" "$_file" > "$_file.new"
 			printf '%s # handle 37\n' "$line" >> "$_file.new"
@@ -189,11 +199,25 @@ chmod 755 "$BIN"/*
 export ZORO_TEST_MODE=1
 export ZORO_NFT="$BIN/nft" ZORO_IP="$BIN/ip" ZORO_SS="$BIN/ss"
 export ZORO_CURL="$BIN/curl" ZORO_LOGGER="$BIN/logger"
-export ZORO_SERVICE="$BIN/service" ZORO_DNSPY="$BIN/dnspy" ZORO_PROBE_URL="https://probe.invalid/generate_204" ZORO_STATE_FILE="$TMP/requested" ZORO_CONFIG="$TMP/xray.json"
+export ZORO_SERVICE="$BIN/service" ZORO_DNSPY="$BIN/dnspy" ZORO_PROBE_URL="https://probe.invalid/generate_204" ZORO_STATE_FILE="$TMP/requested" ZORO_CONFIG="$TMP/xray.json" ZORO_LOCK_FILE="$TMP/lock"
 export FAKE_NFT_STATE="$STATE" FAKE_IPDIR="$IPDIR" FAKE_LISTEN_FLAG="$TMP/listening"
 export FAKE_SF_PRE_STATE="$TMP/sf_pre.state" FAKE_SF_OUT_STATE="$TMP/sf_out.state" FAKE_KS_OUT_STATE="$TMP/ks_out.state"
 export FAKE_MUTATION_LOG="$MUT" FAKE_CURL_LOG="$CURL_LOG" FAKE_SERVICE_LOG="$SERVICE_LOG"
 export FAKE_INSERT_LOG="$TMP/insert.log"
+
+hold_lock() { # background: hold the lock until killed
+	( exec 9>>"$TMP/lock"; flock 9; sleep 300 ) &
+	_holder_pid=$!
+	sleep 0.5
+}
+
+run_exec() {
+	FAKE_DNS_RC="${FAKE_DNS_RC:-0}" FAKE_LISTEN="${FAKE_LISTEN:-public}" \
+	FAKE_HTTP="${FAKE_HTTP:-204}" FAKE_CURL_RC="${FAKE_CURL_RC:-0}" \
+	FAKE_NFT_TABLE_RC="${FAKE_NFT_TABLE_RC:-0}" FAKE_NFT_CHAIN_RC="${FAKE_NFT_CHAIN_RC:-0}" \
+	FAKE_NFT_SLEEP="${FAKE_NFT_SLEEP:-}" \
+	exec "$SCRIPT" "$@"
+}
 
 pass=0
 fail=0
@@ -247,6 +271,7 @@ run() {
 	FAKE_DNS_RC="${FAKE_DNS_RC:-0}" \
 	FAKE_LISTEN="${FAKE_LISTEN:-public}" FAKE_HTTP="${FAKE_HTTP:-204}" \
 	FAKE_CURL_RC="${FAKE_CURL_RC:-0}" FAKE_NFT_TABLE_RC="${FAKE_NFT_TABLE_RC:-0}" \
+	FAKE_NFT_SLEEP="${FAKE_NFT_SLEEP:-}" \
 	FAKE_NFT_CHAIN_RC="${FAKE_NFT_CHAIN_RC:-0}" \
 	"$SCRIPT" "$@"
 }
@@ -453,7 +478,7 @@ FAKE_IPDIR="$TMP/nonexistent" run on >/dev/null 2>&1; rc=$?
 if [ $? -eq 0 ]; then ok 'on fails closed when route cannot install'; else bad 'on fails closed when route cannot install'; fi
 
 reset_state
-out=$(FAKE_NFT_INSERT_RC=1 run on 2>&1); rc=$?
+out=$(FAKE_NFT_INSERT_FAIL_ON='dport 53' run on 2>&1); rc=$?
 [ "$rc" -ne 0 ] && ! grep -q 'comment "zoro-exit"' "$STATE" && [ ! -f "$IPDIR/route" ]
 if [ $? -eq 0 ]; then ok 'on rolls back when nft insert fails'; else bad 'on rolls back when nft insert fails'; fi
 
@@ -522,6 +547,20 @@ out=$(run check); rc=$?
 	&& ok "check reports the DNS exit healthy" \
 	|| bad "check missed the DNS state"
 
+# A half-installed DNS group must be repaired, not treated as done: if only
+# the udp catch survived, "on" has to add the tcp catch back instead of
+# failing and leaving the switch unusable until someone runs "off" first.
+reset_state; add_zoro; add_dns
+grep -v 'meta l4proto tcp meta mark 0x00000002' "$FAKE_SF_PRE_STATE" > "$FAKE_SF_PRE_STATE.new"
+mv "$FAKE_SF_PRE_STATE.new" "$FAKE_SF_PRE_STATE"
+printf 'on\n' > "$TMP/requested"
+run on >/dev/null 2>&1
+_rc=$?
+[ "$_rc" -eq 0 ] \
+	&& grep -q 'meta l4proto tcp meta mark 0x00000002' "$FAKE_SF_PRE_STATE" \
+	&& ok "on repairs a half-installed DNS group" \
+	|| bad "on cannot repair a half-installed DNS group, rc=$_rc [$(grep -c zoro-exit "$FAKE_SF_PRE_STATE") rules]"
+
 run off >/dev/null 2>&1
 [ "$?" -eq 0 ] \
 	&& ! grep -q 'zoro-exit' "$FAKE_SF_PRE_STATE" \
@@ -538,12 +577,20 @@ out=$(run on 2>&1); rc=$?
 	&& ok "a missing killswitch anchor refuses the switch" \
 	|| bad "a missing anchor did not stop the switch rc=$rc"
 
+# No competing dport-53 rule means nothing to insert in front of: the pair is
+# appended.  What must still refuse is a chain that cannot be extended at all.
 reset_state
 : > "$FAKE_SF_OUT_STATE"
 out=$(run on 2>&1); rc=$?
-[ "$rc" -eq 1 ] \
-	&& ok "a missing output anchor refuses the switch" \
-	|| bad "a missing output anchor did not stop the switch rc=$rc"
+[ "$rc" -eq 0 ] && grep -q 'udp dport 53' "$FAKE_SF_OUT_STATE" \
+	&& ok "an empty output chain gets the pair appended" \
+	|| bad "an empty output chain was not handled rc=$rc"
+
+reset_state
+out=$(FAKE_NFT_INSERT_FAIL_ON='dport 53' run on 2>&1); rc=$?
+[ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q 'DNS exit rules' \
+	&& ok "a refused insert refuses the switch" \
+	|| bad "a refused insert did not stop the switch rc=$rc"
 
 reset_state
 run on >/dev/null 2>&1
@@ -583,14 +630,251 @@ run on >/dev/null 2>&1
 	|| bad "a refused switch left DNS residue behind"
 
 reset_state
-: > "$FAKE_SF_OUT_STATE"
-run on >/dev/null 2>&1
+FAKE_NFT_INSERT_FAIL_ON='dport 53' run on >/dev/null 2>&1
 ! grep -q 'zoro-exit' "$FAKE_SF_PRE_STATE" \
 	&& ! grep -q 'zoro-exit' "$FAKE_SF_OUT_STATE" \
-	&& ok "an output-anchor refusal leaves no prerouting residue" \
-	|| bad "an output-anchor refusal left residue behind"
+	&& ok "a refused DNS insert leaves no residue anywhere" \
+	|| bad "a refused DNS insert left residue behind"
+
+# A DNS group can be complete and still wrong: if a Surflare mark-0x1 rule
+# sits ahead of the Zoro ones, the router's DNS leaves through Surflare while
+# the data path stays on Zoro.  Existence alone must not read as healthy.
+reset_state; add_zoro; add_dns
+printf '%s\n' \
+	'udp dport 53 meta mark set 0x00000001 accept # handle 41' \
+	'meta nfproto ipv4 udp dport 53 meta mark set 0x00000002 accept comment "zoro-exit" # handle 33' \
+	'meta nfproto ipv4 tcp dport 53 meta mark set 0x00000002 accept comment "zoro-exit" # handle 34' \
+	'tcp dport 53 meta mark set 0x00000001 accept # handle 42' \
+	> "$FAKE_SF_OUT_STATE"
+out=$(run check); rc=$?
+[ "$rc" -eq 1 ] && has "$out" 'dns=misplaced' \
+	&& ok "check calls out a shadowed DNS mark rule" \
+	|| bad "check missed the shadowed DNS mark rule [rc=$rc $(printf '%s' "$out" | tr '\n' ' ')]"
+
+out=$(run status); rc=$?
+[ "$rc" -eq 0 ] && has "$out" 'dns=misplaced' \
+	&& ok "status reports the shadowed DNS mark rule" \
+	|| bad "status missed the shadowed DNS mark rule [rc=$rc]"
+
+# "on" must repair what "check" calls broken, otherwise the tool reports success
+# in the very state its own check fails on.
+reset_state; add_zoro; add_dns
+printf '%s\n' \
+	'udp dport 53 meta mark set 0x00000001 accept # handle 41' \
+	'meta nfproto ipv4 udp dport 53 meta mark set 0x00000002 accept comment "zoro-exit" # handle 33' \
+	'meta nfproto ipv4 tcp dport 53 meta mark set 0x00000002 accept comment "zoro-exit" # handle 34' \
+	> "$FAKE_SF_OUT_STATE"
+run on >/dev/null 2>&1
+out=$(run check); rc=$?
+[ "$rc" -eq 0 ] && has "$out" 'dns=ok' \
+	&& ok "on repairs a shadowed DNS pair" \
+	|| bad "on left a shadowed DNS pair behind [rc=$rc]"
+
+# A rule for dport 5353 is not a rule for dport 53.
+reset_state; add_zoro; add_dns
+printf '%s\n' \
+	'meta nfproto ipv4 udp dport 5353 meta mark set 0x00000002 accept comment "zoro-exit" # handle 51' \
+	'meta nfproto ipv4 tcp dport 53 meta mark set 0x00000002 accept comment "zoro-exit" # handle 34' \
+	> "$FAKE_SF_OUT_STATE"
+out=$(run check); rc=$?
+[ "$rc" -eq 1 ] && has "$out" 'dns=missing' \
+	&& ok "a dport-5353 decoy does not satisfy the udp rule" \
+	|| bad "a dport-5353 decoy passed as the udp rule [rc=$rc]"
+
+# Competing rules carry counters; matching by literal adjacency missed them.
+reset_state; add_zoro; add_dns
+printf '%s\n' \
+	'udp dport 53 counter packets 91 bytes 8190 meta mark set 0x00000001 accept # handle 41' \
+	'meta nfproto ipv4 udp dport 53 meta mark set 0x00000002 accept comment "zoro-exit" # handle 33' \
+	'meta nfproto ipv4 tcp dport 53 meta mark set 0x00000002 accept comment "zoro-exit" # handle 34' \
+	> "$FAKE_SF_OUT_STATE"
+out=$(run check); rc=$?
+[ "$rc" -eq 1 ] && has "$out" 'dns=misplaced' \
+	&& ok "a counter-bearing shadow is reported" \
+	|| bad "a counter-bearing shadow read as healthy [rc=$rc]"
+
+# Only one protocol of the pair shadowed: the first-match comparison missed it.
+reset_state; add_zoro; add_dns
+printf '%s\n' \
+	'meta nfproto ipv4 udp dport 53 meta mark set 0x00000002 accept comment "zoro-exit" # handle 33' \
+	'tcp dport 53 meta mark set 0x00000001 accept # handle 42' \
+	'meta nfproto ipv4 tcp dport 53 meta mark set 0x00000002 accept comment "zoro-exit" # handle 34' \
+	> "$FAKE_SF_OUT_STATE"
+out=$(run check); rc=$?
+[ "$rc" -eq 1 ] && has "$out" 'dns=misplaced' \
+	&& ok "a half-shadowed pair is reported" \
+	|| bad "a half-shadowed pair read as healthy [rc=$rc]"
+
+# Contention has its own exit code so the daemon can defer instead of paging.
+reset_state
+hold_lock
+run on >/dev/null 2>&1; rc=$?
+kill "$_holder_pid" 2>/dev/null; wait "$_holder_pid" 2>/dev/null
+[ "$rc" -eq 4 ] && ok "contention exits with the busy code" \
+	|| bad "contention reused a failure exit code [$rc]"
+
+# The same refusal has to cover "off": that is the command an operator runs to
+# get LAN traffic back on Surflare.
+reset_state; add_zoro; add_dns; printf 'on\n' > "$TMP/requested"
+hold_lock
+run off >/dev/null 2>&1; rc=$?
+kill "$_holder_pid" 2>/dev/null; wait "$_holder_pid" 2>/dev/null
+if [ "$rc" -eq 4 ] && grep -q 'zoro-exit' "$STATE"; then
+	ok "off refuses while another writer holds the lock"
+else
+	bad "off ran despite a held lock [rc=$rc]"
+fi
+
+# The kernel drops the lock with the process, so a killed holder cannot wedge
+# the next run -- no pid to recycle and no timestamp we grew old.
+reset_state
+( exec 9>>"$TMP/lock"; flock 9; sleep 300 ) & _holder_pid=$!
+sleep 0.5
+kill -9 "$_holder_pid" 2>/dev/null; wait "$_holder_pid" 2>/dev/null
+run on >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 0 ] && ok "a killed holder does not wedge the next run" \
+	|| bad "a killed holder wedged the next run [rc=$rc]"
+
+# A lock path that cannot be opened is an environment failure, not contention.
+reset_state
+# Call the script directly: the point is what it reports before it touches nft.
+ZORO_LOCK_FILE="$TMP/no-such/lock" "$SCRIPT" on >/dev/null 2>"$TMP/lockerr.txt"; rc=$?
+out=$(cat "$TMP/lockerr.txt")
+echo "DEBUG rc=$rc bytes=$(wc -c < "$TMP/lockerr.txt") parent=$([ -d "$TMP/no-such" ] && echo yes || echo no)"
+case "$out" in
+*"cannot open the lock file"*) [ "$rc" -eq 1 ] \
+	&& ok "an unopenable lock file is reported honestly" \
+	|| bad "an unopenable lock file was treated as contention [$rc]" ;;
+*) bad "an unopenable lock file produced the wrong diagnosis [rc=$rc out=$out]" ;;
+esac
+
+# A dport-5353 rule next to the pair is neither a competitor nor a substitute.
+reset_state; add_zoro; add_dns
+printf '%s\n' \
+	'udp dport 5353 meta mark set 0x00000001 accept # handle 61' \
+	'meta nfproto ipv4 udp dport 53 meta mark set 0x00000002 accept comment "zoro-exit" # handle 33' \
+	'meta nfproto ipv4 tcp dport 53 meta mark set 0x00000002 accept comment "zoro-exit" # handle 34' \
+	> "$FAKE_SF_OUT_STATE"
+out=$(run check); rc=$?
+# The route fixture is not seeded here, so the exit code is not the signal --
+# the DNS verdict is.
+has "$out" 'dns=ok' \
+	&& ok "a dport-5353 neighbour is not a competitor" \
+	|| bad "a dport-5353 neighbour was read as a competitor [rc=$rc]"
+
+# ... and it must not be chosen as the insert anchor either: with no competing
+# dport-53 rule the pair is appended, leaving the 5353 rule in front.
+reset_state; add_zoro
+printf '%s\n' \
+	'udp dport 5353 meta mark set 0x00000001 accept # handle 61' \
+	> "$FAKE_SF_OUT_STATE"
+run on >/dev/null 2>&1
+_first=$(head -1 "$FAKE_SF_OUT_STATE")
+case "$_first" in
+*5353*) ok "the anchor ignores dport-5353 rules" ;;
+*) bad "the pair was inserted in front of a dport-5353 rule [$_first]" ;;
+esac
+# The pair is incomplete and our surviving rule is the earliest dport-53 rule:
+# the rebuild deletes it and must not anchor on it.  Anchoring first leaves nft
+# with a dead handle and the rollback takes the whole switch down.
+reset_state; add_zoro
+printf '%s\n' \
+	'meta nfproto ipv4 udp dport 53 meta mark set 0x00000002 accept comment "zoro-exit" # handle 33' \
+	'udp dport 53 meta mark set 0x00000001 accept # handle 41' \
+	> "$FAKE_SF_OUT_STATE"
+out=$(run on 2>&1); rc=$?
+out2=$(run check)
+_ours=$(grep -c 'comment "zoro-exit"' "$FAKE_SF_OUT_STATE")
+[ "$rc" -eq 0 ] && has "$out2" 'dns=ok' && [ "$_ours" -eq 2 ] \
+	&& ok "a half pair ahead of its competitor is rebuilt in place" \
+	|| bad "rebuilding the half pair failed [rc=$rc ours=$_ours]"
+# A mark on the rule itself is required: a bare port rule is not our rule.
+reset_state; add_zoro
+printf '%s\n' \
+	'meta nfproto ipv4 udp dport 53 accept comment "zoro-exit" # handle 71' \
+	'meta nfproto ipv4 tcp dport 53 meta mark set 0x00000002 accept comment "zoro-exit" # handle 34' \
+	'meta nfproto ipv4 meta l4proto udp meta mark 0x00000002 tproxy ip to :7895 meta mark set 0x00000002 accept comment "zoro-exit" # handle 24' \
+	> "$FAKE_SF_PRE_STATE"
+out=$(run check); rc=$?
+[ "$rc" -eq 1 ] && has "$out" 'dns=missing' \
+	&& ok "a comment without the mark is not the rule" \
+	|| bad "a markless rule satisfied the check [rc=$rc]"
+
+# A lost data rule still reports the DNS dimension, and a deliberate off that
+# left our rules behind is not healthy.
+reset_state; add_dns; printf 'on\n' > "$TMP/requested"
+out=$(run check); rc=$?
+[ "$rc" -eq 1 ] && has "$out" 'mode=lost' && has "$out" 'dns=ok' \
+	&& ok "check reports the DNS state when the data rule is lost" \
+	|| bad "check hid the DNS state in mode=lost [rc=$rc]"
+
+reset_state; add_dns; printf 'off\n' > "$TMP/requested"
+out=$(run check); rc=$?
+[ "$rc" -eq 1 ] && has "$out" 'dns=residue' \
+	&& ok "check calls outoff residue dns rules" \
+	|| bad "check called leftover dns rules healthy [rc=$rc]"
 
 reset_state
 
+
+# The chain the router really has: mark-0x1 dport-53 rules plus a catch-all at
+# the tail.  The pair has to land in front of the first rule that can take the
+# traffic, not merely somewhere in the chain.
+reset_state; : > "$IPDIR/rule"
+out=$(run on 2>&1); rc=$?
+_ours=$(grep -c 'udp dport 53 meta mark set 0x00000002 accept comment "zoro-exit"' "$FAKE_SF_OUT_STATE")
+_udp=$(grep -n 'udp dport 53 meta mark set 0x00000002 accept comment "zoro-exit"' "$FAKE_SF_OUT_STATE" | cut -d: -f1)
+_first=$(grep -n 'dport 53 meta mark set 0x00000001' "$FAKE_SF_OUT_STATE" | head -1 | cut -d: -f1)
+[ "$rc" -eq 0 ] && [ "$_ours" -eq 1 ] && [ -n "$_udp" ] && [ "$_udp" -lt "$_first" ] \
+	&& ok "the pair lands in front of the mark-0x1 DNS rules" \
+	|| bad "the pair did not reach the front [rc=$rc ours=$_ours udp=${_udp:-none} first=${_first:-none}]"
+out=$(run check); rc=$?
+[ "$rc" -eq 0 ] && has "$out" 'dns=ok' \
+	&& ok "check agrees with that placement" \
+	|| bad "check disagreed right after on [rc=$rc]"
+
+# Nothing matches port 53 but the tail accepts every tcp/udp packet: appending
+# behind it would leave the pair dead while every presence check still passes.
+reset_state
+printf '%s\n' \
+	'tcp sport @server_ports accept # handle 3' \
+	'udp sport @server_ports accept # handle 4' \
+	'meta l4proto { tcp, udp } meta mark set 0x00000001 accept # handle 9' \
+	> "$FAKE_SF_OUT_STATE"
+: > "$IPDIR/rule"
+out=$(run on 2>&1); rc=$?
+_catch=$(grep -n 'meta l4proto { tcp, udp }' "$FAKE_SF_OUT_STATE" | cut -d: -f1)
+_udp=$(grep -n 'udp dport 53 meta mark set 0x00000002 accept comment "zoro-exit"' "$FAKE_SF_OUT_STATE" | cut -d: -f1)
+[ "$rc" -eq 0 ] && [ -n "$_udp" ] && [ -n "$_catch" ] && [ "$_udp" -lt "$_catch" ] \
+	&& ok "the pair goes in front of a catch-all instead of behind it" \
+	|| bad "the pair landed behind the catch-all [rc=$rc udp=${_udp:-none} catch=${_catch:-none}]"
+out=$(run check); rc=$?
+[ "$rc" -eq 0 ] && has "$out" 'dns=ok' \
+	&& ok "check confirms the pair is reachable" \
+	|| bad "check rejected the placement [rc=$rc]"
+
+# A pair that sits behind the catch-all is dead traffic, not a healthy switch.
+reset_state; add_zoro; add_dns; printf 'on\n' > "$TMP/requested"
+printf '%s\n' 'meta l4proto { tcp, udp } meta mark set 0x00000001 accept # handle 9' > "$FAKE_SF_OUT_STATE.new"
+cat "$FAKE_SF_OUT_STATE" >> "$FAKE_SF_OUT_STATE.new"; mv "$FAKE_SF_OUT_STATE.new" "$FAKE_SF_OUT_STATE"
+out=$(run check); rc=$?
+[ "$rc" -eq 1 ] && has "$out" 'dns=misplaced' \
+	&& ok "a pair behind the catch-all is reported as misplaced" \
+	|| bad "a shadowed pair read as healthy [rc=$rc]"
+
+# A DNS-side failure says nothing about the rules that were already working.
+reset_state; add_zoro; : > "$IPDIR/rule"; : > "$IPDIR/route"; printf 'on\n' > "$TMP/requested"
+out=$(FAKE_NFT_INSERT_FAIL_ON='tproxy ip to :7895' run on 2>&1); rc=$?
+[ "$rc" -eq 1 ] && grep -q 'comment "zoro-exit"' "$STATE" && [ -f "$IPDIR/route" ] \
+	&& ok "a DNS repair failure leaves the installed switch alone" \
+	|| bad "a DNS failure tore the switch down [rc=$rc state=$(grep -c 'zoro-exit' "$STATE")]" \; rm -f "$IPDIR/route"
+
+# Repair restores what was asked for; it never overrules the person who asked.
+reset_state; add_zoro; add_dns; : > "$IPDIR/rule"; : > "$IPDIR/route"; printf 'off\n' > "$TMP/requested"
+out=$(run on --repair 2>&1); rc=$?
+[ "$rc" -eq 0 ] && [ ! -s "$MUT" ] && [ ! -s "$SERVICE_LOG" ] \
+	&& ok "on --repair honours a switch-off" \
+	|| bad "on --repair overrode a switch-off [rc=$rc mut=$(wc -l < "$MUT")]"
+
 echo "pass=$pass fail=$fail"
-[ "$fail" -eq 0 ] && [ "$pass" -eq 54 ]
+[ "$fail" -eq 0 ] && [ "$pass" -eq 79 ]

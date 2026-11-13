@@ -19,7 +19,9 @@ bad() { echo "FAIL: $*"; fail=$((fail + 1)); }
 awk '/^_zoro_mode_loss_alert\(\) \{/ { i = 1 }
 	i { print }
 	i && /^}$/ { exit }' "$WD" > "$TMP/func.sh"
-if [ ! -s "$TMP/func.sh" ] || [ "$(wc -l < "$TMP/func.sh")" -gt 90 ]; then
+# A runaway guard, not a size contract: the body grows as the restore path
+# gains steps, and a number that tracks the real length only ever gets raised.
+if [ ! -s "$TMP/func.sh" ] || [ "$(wc -l < "$TMP/func.sh")" -gt 200 ]; then
 	bad "could not extract _zoro_mode_loss_alert"
 	echo "RESULT: $pass passed, $fail failed"
 	exit 1
@@ -28,9 +30,25 @@ fi
 cat > "$TMP/zoro-exit" <<'EOF'
 #!/bin/bash
 printf 'zoro-exit %s\n' "$*" >> "$TMP_DIR/zoro_calls"
+# The daemon asks `status` for the DNS verdict instead of counting rules
+# itself, so the stub has to answer that shape.
+if [ "${1:-}" = status ]; then
+	if [ "${FAKE_ZORO_SILENT:-0}" = 1 ]; then
+		printf 'mode=on\nnft=ok\n'
+		exit 0
+	fi
+	printf 'mode=on\nnft=ok\ndns=%s\n' "${FAKE_ZORO_DNS:-ok}"
+	exit 0
+fi
 exit "${ZORO_EXIT_RC:-0}"
 EOF
 chmod +x "$TMP/zoro-exit"
+
+_complete_pre='meta nfproto ipv4 meta l4proto udp meta mark 0x00000002 tproxy ip to :7895 meta mark set 0x00000002 accept comment "zoro-exit" # handle 24
+meta nfproto ipv4 meta l4proto tcp meta mark 0x00000002 tproxy ip to :7895 meta mark set 0x00000002 accept comment "zoro-exit" # handle 25'
+_complete_out='meta nfproto ipv4 udp dport 53 meta mark set 0x00000002 accept comment "zoro-exit" # handle 26
+meta nfproto ipv4 tcp dport 53 meta mark set 0x00000002 accept comment "zoro-exit" # handle 27'
+_complete_ks='meta mark 0x00000002 accept comment "zoro-exit" # handle 87'
 
 run_case() {
 	: > "$TMP/alerts"
@@ -40,13 +58,30 @@ run_case() {
 	ZORO_EXIT_RC="${3:-0}"
 	ZORO_STATE_FILE="$TMP/state"
 	ZORO_ALERT_STAMP_DIR="$TMP/surflare"
-	ZORO_EXIT_BIN="$TMP/zoro-exit"
+	ZORO_EXIT_BIN="${ZORO_EXIT_BIN_OVERRIDE:-$TMP/zoro-exit}"
 	TMP_DIR="$TMP"
-	if [ -n "${4:-}" ]; then Nft_sf_pre="$4"; else unset Nft_sf_pre; fi
-	if [ -n "${5:-}" ]; then Nft_sf_out="$5"; else unset Nft_sf_out; fi
-	if [ -n "${6:-}" ]; then Nft_ks_out="$6"; else unset Nft_ks_out; fi
+	# A switch that is fully installed carries two catches, two dport-53 mark
+	# rules and one killswitch accept; the daemon counts them, so the fixture
+	# has to model the real set rather than one line per chain.  Pass `none`
+	# to wipe a chain.
+	case "${4:-}" in
+	"") Nft_sf_pre="$_complete_pre" ;;
+	none) Nft_sf_pre="" ;;
+	*) Nft_sf_pre="$4" ;;
+	esac
+	case "${5:-}" in
+	"") Nft_sf_out="$_complete_out" ;;
+	none) Nft_sf_out="" ;;
+	*) Nft_sf_out="$5" ;;
+	esac
+	case "${6:-}" in
+	"") Nft_ks_out="$_complete_ks" ;;
+	none) Nft_ks_out="" ;;
+	*) Nft_ks_out="$6" ;;
+	esac
 	Nft_table_rc="${7:-0}"
 	export Nft_rc Nft_output ZORO_EXIT_RC ZORO_STATE_FILE ZORO_ALERT_STAMP_DIR ZORO_EXIT_BIN TMP TMP_DIR Nft_sf_pre Nft_sf_out Nft_ks_out Nft_table_rc
+	export Nft_complete_pre="$_complete_pre" Nft_complete_out="$_complete_out" Nft_complete_ks="$_complete_ks"
 	bash -c '
 			. "$1"
 			nft() {
@@ -57,11 +92,11 @@ run_case() {
 					sw_lan_tproxy) printf "%s\n" "$Nft_output" ;;
 					surflare)
 						if [ "$5" = prerouting ]; then
-							printf "%s\n" "${Nft_sf_pre-$Nft_output}"
+							printf "%s\n" "${Nft_sf_pre-$Nft_complete_pre}"
 						else
-							printf "%s\n" "${Nft_sf_out-$Nft_output}"
+							printf "%s\n" "${Nft_sf_out-$Nft_complete_out}"
 						fi ;;
-					killswitch) printf "%s\n" "${Nft_ks_out-$Nft_output}" ;;
+					killswitch) printf "%s\n" "${Nft_ks_out-$Nft_complete_ks}" ;;
 					esac
 					return "$Nft_rc" ;;
 				*) return 1 ;;
@@ -192,7 +227,7 @@ fi
 printf 'on\n' > "$TMP/state"
 rm -rf "$TMP/surflare"; : > "$TMP/zoro_calls"
 run_case 0 'iifname "br-lan" tproxy ip to :7895 comment "zoro-exit"' 0
-if [ ! -s "$TMP/zoro_calls" ] && [ ! -s "$TMP/alerts" ] && [ ! -s "$TMP/log" ]; then
+if ! grep -q "zoro-exit on" "$TMP/zoro_calls" && [ ! -s "$TMP/alerts" ] && [ ! -s "$TMP/log" ]; then
 	ok "a complete switch is never touched"
 else
 	bad "a complete switch was disturbed [calls=$(cat "$TMP/zoro_calls" 2>/dev/null)]"
@@ -201,8 +236,8 @@ fi
 # 5e: a killswitch-only wipe (data rule survives, DNS rules gone) restores
 printf 'on\n' > "$TMP/state"
 rm -rf "$TMP/surflare"
-run_case 0 'iifname "br-lan" tproxy ip to :7895 comment "zoro-exit"' 0 \
-	'x comment "zoro-exit"' 'x comment "zoro-exit"' 'oif "lo" accept'
+FAKE_ZORO_DNS=missing run_case 0 'iifname "br-lan" tproxy ip to :7895 comment "zoro-exit"' 0 \
+	'' '' 'oif "lo" accept'
 if [ "$(grep -c 'zoro-exit on' "$TMP/zoro_calls")" -eq 1 ] \
 	&& grep -q 'missing: DNS rules' "$TMP/log"; then
 	ok "a killswitch-only wipe restores with the DNS piece named"
@@ -215,7 +250,7 @@ printf 'on\n' > "$TMP/state"
 rm -rf "$TMP/surflare"; : > "$TMP/zoro_calls"
 run_case 0 'iifname "br-lan" tproxy ip to :7895 comment "zoro-exit"' 0 \
 	'oif "lo" accept' 'oif "lo" accept' 'oif "lo" accept' 1
-if [ ! -s "$TMP/zoro_calls" ] && [ ! -s "$TMP/alerts" ]; then
+if ! grep -q "zoro-exit on" "$TMP/zoro_calls" && [ ! -s "$TMP/alerts" ]; then
 	ok "a missing surflare table neither restores nor pages"
 else
 	bad "a missing surflare table misbehaved"
@@ -236,6 +271,31 @@ else
 	bad "private stamp did not suppress the repeat loss"
 fi
 
+# 5h: half of a DNS pair is still a loss -- presence per chain read it healthy
+# and the repair never ran.
+printf 'on\n' > "$TMP/state"
+rm -rf "$TMP/surflare"; : > "$TMP/zoro_calls"
+FAKE_ZORO_DNS=missing run_case 0 'iifname "br-lan" tproxy ip to :7895 comment "zoro-exit"' 0 \
+	'meta nfproto ipv4 meta l4proto udp meta mark 0x00000002 tproxy ip to :7895 meta mark set 0x00000002 accept comment "zoro-exit" # handle 24'
+if [ "$(grep -c 'zoro-exit on' "$TMP/zoro_calls")" -eq 1 ] \
+	&& grep -q 'missing: DNS rules' "$TMP/log"; then
+	ok "a half-installed DNS pair is restored"
+else
+	bad "a half-installed DNS pair read as healthy [calls=$(cat "$TMP/zoro_calls" 2>/dev/null)]"
+fi
+
+# 6b: a busy helper is a deferral, not a failure -- no page, and the throttle
+# is dropped so the next tick sees whatever the other writer left behind.
+printf 'on\n' > "$TMP/state"
+rm -rf "$TMP/surflare"; : > "$TMP/zoro_calls"
+run_case 0 'iifname "br-lan" tproxy ip to :10800' 4
+if [ ! -s "$TMP/alerts" ] && grep -q 'restore deferred' "$TMP/log" \
+	&& [ ! -f "$TMP/surflare/zoro_mode_restore.stamp" ]; then
+	ok "a busy helper defers without paging"
+else
+	bad "a busy helper was treated as a failure [alerts=$(wc -l < "$TMP/alerts") stamp=$([ -f "$TMP/surflare/zoro_mode_restore.stamp" ] && echo kept || echo gone)]"
+fi
+
 # 7: the production state path is pinned to the persistent file
 if grep -qF 'ZORO_STATE_FILE="/etc/zoro-exit.requested"' "$WD"; then
 	ok "production state path stays on /etc"
@@ -254,6 +314,51 @@ if [ -n "$_call" ] && [ -n "$_load" ] && [ -n "$_guard" ] \
 	ok "_restore_tproxy and the healthy tick both call the check"
 else
 	bad "_restore_tproxy or the healthy tick lost the check call"
+fi
+
+# 8: a helper that ignores TERM must not hold the health loop: the -k bound
+# has to end it.
+printf 'on\n' > "$TMP/state"
+rm -rf "$TMP/surflare"; : > "$TMP/zoro_calls"
+cat > "$TMP/zoro-hang" <<'EOF'
+#!/bin/bash
+trap '' TERM
+sleep 30
+EOF
+chmod +x "$TMP/zoro-hang"
+_start=$(date +%s)
+FAKE_ZORO_DNS=missing ZORO_RESTORE_TIMEOUT=2 ZORO_EXIT_BIN_OVERRIDE="$TMP/zoro-hang" \
+	run_case 0 'iifname "br-lan" tproxy ip to :10800'
+_elapsed=$(( $(date +%s) - _start ))
+[ "$_elapsed" -le 8 ] && ok "a TERM-ignoring helper is killed at the bound [${_elapsed}s]" \
+	|| bad "a TERM-ignoring helper held the loop for ${_elapsed}s"
+
+# A verdict that could not be read is not evidence of a loss.  The helper prints
+# no dns= line here, which is what a slow nft or a killed call looks like, and a
+# healthy switch must not be paged about.
+: > "$TMP/alerts"
+rm -f "$TMP/surflare/zoro_mode_restore.stamp"
+FAKE_ZORO_SILENT=1 run_case 0 'iifname "br-lan" tproxy ip to :7895 comment "zoro-exit"' 
+[ ! -s "$TMP/alerts" ] && ! grep -q "zoro-exit on" "$TMP/zoro_calls" 2>/dev/null \
+	&& ok "an unreadable DNS verdict triggers no restore and no page" \
+	|| bad "an unreadable verdict was read as a lost switch [alerts=$(wc -l < "$TMP/alerts" 2>/dev/null)]"
+
+# A misplaced pair is a real fault: the daemon has to repair it, not accept any
+# non-empty verdict as fine.
+: > "$TMP/alerts"
+# Earlier cases may have written the restore stamp; a 300 s throttle would hide
+# the repair this case is about.
+rm -f "$TMP/surflare/zoro_mode_restore.stamp"
+FAKE_ZORO_DNS=misplaced run_case 0 'iifname "br-lan" tproxy ip to :7895 comment "zoro-exit"'
+grep -q "zoro-exit on --repair" "$TMP/zoro_calls" 2>/dev/null \
+	&& ok "a misplaced DNS pair is repaired through on --repair" \
+	|| bad "a misplaced pair was left alone [calls=$(tr '\n' ' ' < "$TMP/zoro_calls" 2>/dev/null)]"
+
+# 9: the count is pinned, so a silently skipped case cannot pass as green
+if [ "$pass" -eq 21 ]; then
+	ok "the daemon case count is pinned"
+else
+	bad "the daemon case count moved to $pass"
 fi
 
 echo "RESULT: $pass passed, $fail failed"

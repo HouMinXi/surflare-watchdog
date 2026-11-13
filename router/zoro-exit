@@ -21,6 +21,7 @@ if [ "${ZORO_TEST_MODE:-0}" = 1 ] &&
 	SOCKS_PORT=${ZORO_SOCKS_PORT:-7890}
 	DNSPY=${ZORO_DNSPY:-python3}
 	STATE_FILE=${ZORO_STATE_FILE:-/etc/zoro-exit.requested}
+	LOCK_FILE=${ZORO_LOCK_FILE:-/var/lock/zoro-exit.lock}
 	CONFIG=${ZORO_CONFIG:-/etc/zoro-n100-primary.json}
 else
 	NFT=/usr/sbin/nft
@@ -34,6 +35,7 @@ else
 	SOCKS_PORT=7890
 	DNSPY=/usr/bin/python3
 	STATE_FILE=/etc/zoro-exit.requested
+	LOCK_FILE=/var/lock/zoro-exit.lock
 	CONFIG=/etc/zoro-n100-primary.json
 fi
 
@@ -54,7 +56,7 @@ die() {
 }
 
 usage() {
-	printf 'usage: %s {on [--force]|off [--force]|status}\n       %s check\n' "$0" "$0" >&2
+	printf 'usage: %s {on [--force] [--repair]|off [--force]|status}\n       %s check\n' "$0" "$0" >&2
 	exit 2
 }
 
@@ -89,13 +91,35 @@ ks_output_lines() {
 	chain_rules killswitch output
 }
 
+dns_preempt_lines() {
+	# Read a chain dump on stdin and print the rules that can take DNS traffic
+	# before ours sees it.  Two shapes matter: anything matching port 53 in any
+	# spelling, and any rule that sets a mark -- the chain ends with
+	# `meta l4proto { tcp, udp } meta mark set 0x1 accept`, which matches every
+	# DNS packet, so appending behind it leaves our rules dead while every
+	# presence check still passes.  A rule scoped to a destination or an
+	# interface cannot preempt traffic to anywhere else: those are the
+	# watchdog's deliberate exemptions, and stepping in front of one cancels it.
+	# A mark rule only matters when it constrains nothing else: the tail of the
+	# chain marks every tcp/udp packet and accepts it.  A rule that marks one
+	# other port cannot take DNS traffic, so it is neither a competitor nor an
+	# anchor.
+	awk -v c="comment \"$COMMENT\"" '
+		index($0, c) { next }
+		/ip6? daddr |oifname |oif "/ { next }
+		/dport 53([^0-9]|$)|dport \{ 53[,}]/ { print; next }
+		/meta mark set/ && !/dport/ { print; next }
+	'
+}
+
 dns_output_anchor() {
-	# Insert before the first dport-53 mark rule -- the watchdog's
-	# _insert_dns_fallback uses the same anchor -- which lands the zoro
-	# rules after both @server_ports accepts and ahead of every mark-0x1
-	# DNS rule.
+	# Insert in front of the first rule that could preempt us.  Reader and
+	# writer share one predicate on purpose: a reader that counts a rule the
+	# writer cannot anchor on asks for an order the writer can never produce.
+	# Our own rules are excluded -- the rebuild deletes them first, and an
+	# insert at the handle of a rule that no longer exists fails outright.
 	"$NFT" -a list chain inet surflare output 2>/dev/null \
-		| grep -F 'dport 53 meta mark set' \
+		| dns_preempt_lines \
 		| head -1 \
 		| sed -n 's/.*# handle \([0-9][0-9]*\).*/\1/p'
 }
@@ -111,56 +135,122 @@ ks_output_anchor() {
 }
 
 dns_rule_ok() {
-	# shellcheck disable=SC3043  # OpenWrt ash supports local
-	# The five DNS-consistency rules: udp+tcp tproxy catch in surflare
-	# prerouting, udp+tcp dport-53 mark rules in surflare output, and
-	# the killswitch mark accept.
-	local _p_udp _p_tcp _o_udp _o_tcp _ks
-	_p_udp=$(dns_prerouting_lines | grep -F 'meta l4proto udp' | head -1)
-	_p_tcp=$(dns_prerouting_lines | grep -F 'meta l4proto tcp' | head -1)
-	_o_udp=$(dns_output_lines | grep -F 'udp dport 53' | head -1)
-	_o_tcp=$(dns_output_lines | grep -F 'tcp dport 53' | head -1)
-	_ks=$(ks_output_lines | head -1)
-	printf '%s\n' "$_p_udp" | grep -Fq "tproxy ip to :$PORT" || return 1
-	printf '%s\n' "$_p_udp" | grep -Fq "meta mark set $MARK" || return 1
-	printf '%s\n' "$_p_tcp" | grep -Fq "tproxy ip to :$PORT" || return 1
-	printf '%s\n' "$_p_tcp" | grep -Fq "meta mark set $MARK" || return 1
-	printf '%s\n' "$_o_udp" | grep -Fq "udp dport 53" || return 1
-	printf '%s\n' "$_o_udp" | grep -Fq "meta mark set $MARK" || return 1
-	printf '%s\n' "$_o_tcp" | grep -Fq "tcp dport 53" || return 1
-	printf '%s\n' "$_o_tcp" | grep -Fq "meta mark set $MARK" || return 1
-	printf '%s\n' "$_ks" | grep -Fq "meta mark $MARK accept" || return 1
+	# Verify with the same five predicates the installer repairs with.  Reading
+	# the chains a second way (first match per family) made the two disagree: a
+	# stale copy ahead of a good one satisfied the repair test but failed the
+	# old verification, and "on" then rolled back a switch that was working.
+	dns_prerouting_ok udp || return 1
+	dns_prerouting_ok tcp || return 1
+	dns_output_ok udp || return 1
+	dns_output_ok tcp || return 1
+	ks_output_ok || return 1
 	return 0
 }
 
+dns_order_ok() {
+	# Existence is not enough: a rule that sits behind a competing mark-0x1
+	# rule never sees the traffic it was installed for.  Both halves used to be
+	# read with head -1, which passed a pair where only one protocol was
+	# shadowed, and the foreign rule was matched by literal adjacency, which
+	# missed any rule carrying a counter or another qualifier.  Compare the last
+	# Zoro line against the first foreign one, matched loosely.
+	# shellcheck disable=SC3043  # OpenWrt ash supports local
+	local _dump _last _first
+	_dump=$("$NFT" -a list chain inet surflare output 2>/dev/null) || return 1
+	# Our side counts only the rules that actually catch DNS: a comment on some
+	# other rule says nothing about ordering.
+	_last=$(printf '%s\n' "$_dump" \
+		| grep -n -E 'dport 53([^0-9]|$)|dport \{ 53[,}]' \
+		| grep -F "comment \"$COMMENT\"" | tail -1 | cut -d: -f1)
+	# The competing side is exactly what the installer has to step in front of,
+	# so both read the same list and cannot disagree.
+	_first=$(printf '%s\n' "$_dump" | grep -n '' | dns_preempt_lines | head -1 | cut -d: -f1)
+	[ -n "$_last" ] || return 1
+	# No foreign dport-53 mark rule at all means nothing can shadow us.
+	[ -z "$_first" ] || [ "$_last" -lt "$_first" ]
+}
+
+dns_state() {
+	# ok | missing | misplaced
+	dns_rule_ok || { printf 'missing'; return 0; }
+	dns_order_ok || { printf 'misplaced'; return 0; }
+	printf 'ok'
+}
+
+dns_prerouting_ok() {
+	# $1 = l4proto; the catch is only useful together with the mark set on the
+	# same rule, so both halves are required.
+	chain_rules surflare prerouting \
+		| grep -F "meta l4proto $1 meta mark $MARK" \
+		| grep -Fq "tproxy ip to :$PORT meta mark set $MARK"
+}
+
+dns_output_ok() {
+	# $1 = udp|tcp.  The trailing space keeps udp dport 5353 from satisfying a
+	# check that asks for dport 53, and the mark is required on the same rule.
+	chain_rules surflare output \
+		| grep -F "$1 dport 53 " \
+		| grep -Fq "meta mark set $MARK"
+}
+
+ks_output_ok() {
+	ks_output_lines | grep -Fq "meta mark $MARK accept"
+}
+
 ensure_dns_rules() {
-	[ -z "$(dns_prerouting_lines)" ] && {
+	# shellcheck disable=SC3043  # OpenWrt ash supports local
+	# Each of the five DNS-consistency rules is repaired on its own.  A group
+	# that is half present -- one of a udp/tcp pair lost, or an interrupted
+	# install -- used to be skipped as done, which left "on" failing until
+	# someone ran "off" first.
+	local _anchor _h
+	dns_prerouting_ok udp || {
 		"$NFT" insert rule inet surflare prerouting \
 			meta nfproto ipv4 meta l4proto udp meta mark "$MARK" \
 			tproxy ip to ":$PORT" meta mark set "$MARK" \
 			accept comment "$COMMENT" 2>/dev/null || return 1
+	}
+	dns_prerouting_ok tcp || {
 		"$NFT" insert rule inet surflare prerouting \
 			meta nfproto ipv4 meta l4proto tcp meta mark "$MARK" \
 			tproxy ip to ":$PORT" meta mark set "$MARK" \
 			accept comment "$COMMENT" 2>/dev/null || return 1
 	}
-	[ -z "$(dns_output_lines)" ] && {
+	if ! dns_output_ok udp || ! dns_output_ok tcp || ! dns_order_ok; then
+		# Rebuild the pair in front of whatever competes.  The deletes come
+		# first and the anchor is read afterwards: an anchor read before the
+		# deletes can name one of our own rules, and nft rejects an insert at a
+		# handle that no longer exists.
+		for _h in $(dns_output_lines | chain_handles); do
+			"$NFT" delete rule inet surflare output handle "$_h" 2>/dev/null || true
+		done
 		_anchor=$(dns_output_anchor)
-		[ -n "$_anchor" ] || return 1
-		"$NFT" insert rule inet surflare output position "$_anchor" \
-			meta nfproto ipv4 udp dport 53 meta mark set "$MARK" \
-			accept comment "$COMMENT" 2>/dev/null || return 1
-		"$NFT" insert rule inet surflare output position "$_anchor" \
-			meta nfproto ipv4 tcp dport 53 meta mark set "$MARK" \
-			accept comment "$COMMENT" 2>/dev/null || return 1
-	}
-	[ -z "$(ks_output_lines)" ] && {
+		if [ -n "$_anchor" ]; then
+			"$NFT" insert rule inet surflare output position "$_anchor" \
+				meta nfproto ipv4 udp dport 53 meta mark set "$MARK" \
+				accept comment "$COMMENT" 2>/dev/null || return 1
+			"$NFT" insert rule inet surflare output position "$_anchor" \
+				meta nfproto ipv4 tcp dport 53 meta mark set "$MARK" \
+				accept comment "$COMMENT" 2>/dev/null || return 1
+		else
+			"$NFT" add rule inet surflare output \
+				meta nfproto ipv4 udp dport 53 meta mark set "$MARK" \
+				accept comment "$COMMENT" 2>/dev/null || return 1
+			"$NFT" add rule inet surflare output \
+				meta nfproto ipv4 tcp dport 53 meta mark set "$MARK" \
+				accept comment "$COMMENT" 2>/dev/null || return 1
+		fi
+	fi
+	if ! ks_output_ok; then
 		_anchor=$(ks_output_anchor)
 		[ -n "$_anchor" ] || return 1
 		"$NFT" insert rule inet killswitch output position "$_anchor" \
 			meta mark "$MARK" accept comment "$COMMENT" 2>/dev/null || return 1
-	}
-	dns_rule_ok
+	fi
+	# Success means the same thing "check" means: all five rules present and
+	# in front of the rules they have to preempt.
+	dns_rule_ok || return 1
+	dns_order_ok
 }
 
 drop_dns_rules() {
@@ -255,7 +345,9 @@ xray_up() {
 
 ensure_xray() {
 	xray_up && return 0
-	"$SERVICE" start >/dev/null 2>&1 || true
+	# The lock fd stays open for this whole run, and a service that backgrounds
+	# its daemon would inherit it and hold the lock after we exit.
+	"$SERVICE" start >/dev/null 2>&1 9>&- || true
 	for _ in 1 2 3 4 5; do
 		sleep 1
 		xray_up && return 0
@@ -297,11 +389,65 @@ probe_once() {
 	esac
 }
 
+# The watchdog restores the switch on its own while a person may be running the
+# same command from a shell.  Without a lock the two interleave: one deletes the
+# rules the other just added, and the recorded state no longer describes nft.
+# flock rather than a lock directory: the kernel owns the lock, so a killed run
+# cannot leave it behind, nothing has to trust a pid or a timestamp, and a
+# recycled pid cannot wedge the switch.  The watchdog already depends on flock.
+LOCK_BUSY=4
+LOCK_FD=9
+
+acquire_lock() {
+	# shellcheck disable=SC3043  # OpenWrt ash supports local
+	local _tries=0
+	# A failed redirection on exec is fatal in bash and ash alike, so the path is
+	# probed with a plain append first and the failure reported in our own words.
+	# Redirections are processed left to right, so the suppressor comes first:
+	# with the append first, the shell prints its own error before the stderr
+	# redirect takes effect.  `true` rather than `:`: a redirection failure on a
+	# special builtin ends the shell outright, before the message is printed.
+	command -v flock >/dev/null 2>&1 ||
+		die "flock is required to serialise the switch; it is missing from PATH"
+	if ! true 2>/dev/null >>"$LOCK_FILE"; then
+		die "cannot open the lock file $LOCK_FILE"
+	fi
+	exec 9>>"$LOCK_FILE"
+	while ! flock -n "$LOCK_FD"; do
+		_tries=$((_tries + 1))
+		if [ "$_tries" -ge 5 ]; then
+			log "ERROR: another zoro-exit is running; try again shortly"
+			exit "$LOCK_BUSY"
+		fi
+		# Whole seconds: busybox without fancy sleep rejects 0.25.
+		sleep 1
+	done
+	# The lock is released when this process exits, however it exits.  These
+	# handlers exist so a signal actually ends the run instead of letting the
+	# handler return and the work continue.
+	trap 'exit 130' INT
+	trap 'exit 143' TERM
+	trap 'exit 129' HUP
+}
+
 do_on() {
 	_force=0
-	if [ $# -gt 0 ]; then
-		[ $# -eq 1 ] && [ "$1" = "--force" ] || usage
-		_force=1
+	_repair=0
+	while [ $# -gt 0 ]; do
+		case "$1" in
+		--force) _force=1 ;;
+		--repair) _repair=1 ;;
+		*) usage ;;
+		esac
+		shift
+	done
+	acquire_lock
+	# Repair mode restores a switch that is still asked for; it never overrides
+	# an intent.  The request file is read under the lock so a person's "off"
+	# that finished while this run was queued wins instead of being reverted.
+	if [ "$_repair" -eq 1 ] && [ "$(requested_state)" = off ]; then
+		log "on: repair skipped, a switch-off was requested"
+		return 0
 	fi
 	nft_ready && chain_ready || die "sw_lan_tproxy is not readable"
 	sh=$(surflare_handle)
@@ -379,11 +525,16 @@ do_on() {
 	fi
 
 	ensure_dns_rules || {
-		for h in $(rule_handles); do
-			"$NFT" delete rule inet sw_lan_tproxy prerouting handle "$h" 2>/dev/null || true
-		done
-		drop_dns_rules
-		del_route
+		# These rules were already in place before this run, so a DNS-side
+		# failure says nothing about them: removing them would turn a repair
+		# attempt into an outage.  Leave the switch and report the failure.
+		if [ "$_had_rule" -eq 0 ]; then
+			for h in $(rule_handles); do
+				"$NFT" delete rule inet sw_lan_tproxy prerouting handle "$h" 2>/dev/null || true
+			done
+			drop_dns_rules
+			del_route
+		fi
 		die "failed to install the DNS exit rules"
 	}
 
@@ -406,6 +557,7 @@ do_off() {
 		[ $# -eq 1 ] && [ "$1" = "--force" ] || usage
 		_force=1
 	fi
+	acquire_lock
 	if ! nft_ready || ! chain_ready; then
 		die "sw_lan_tproxy is not readable; refusing to stop the service while the Zoro rule may remain"
 	fi
@@ -478,14 +630,25 @@ do_check() {
 			printf 'route=%s\n' "$(route_ok && echo ok || echo missing)"
 			printf 'xray_listening=%s\n' "$(xray_up && echo yes || echo no)"
 			printf 'fallback=%s\n' "$( [ -n "$(surflare_handle)" ] && echo ok || echo missing)"
-			printf 'order=missing\nprobe_http=skipped\nprobe=skipped\n'
+			printf 'order=missing\n'
+			# The data rule is gone: the DNS rules are what an operator needs to
+			# know about next, and they can survive on their own.
+			printf 'dns=%s\n' "$(dns_state)"
+			printf 'probe_http=skipped\nprobe=skipped\n'
 			return 1
 		fi
 		printf 'mode=off\nnft=ok\nprobe_scope=socks\n'
 		printf 'route=%s\n' "$(route_ok && echo ok || echo missing)"
 		printf 'xray_listening=%s\n' "$(xray_up && echo yes || echo no)"
 		printf 'fallback=%s\n' "$( [ -n "$(surflare_handle)" ] && echo ok || echo missing)"
-		printf 'order=missing\nprobe_http=skipped\nprobe=skipped\n'
+		printf 'order=missing\n'
+		# A deliberate off that left our DNS rules behind is not healthy:
+		# "off" verifies the same thing and refuses to call it done.
+		if [ -n "$(dns_prerouting_lines)$(dns_output_lines)$(ks_output_lines)" ]; then
+			printf 'dns=residue\nprobe_http=skipped\nprobe=fail\n'
+			return 1
+		fi
+		printf 'probe_http=skipped\nprobe=skipped\n'
 		return 0
 	fi
 
@@ -504,9 +667,10 @@ do_check() {
 	printf 'xray_listening=%s\n' "$(xray_up && echo yes || echo no)"
 	printf 'fallback=%s\n' "$_fb"
 	printf 'order=%s\n' "$_order"
-	printf 'dns=%s\n' "$(dns_rule_ok && echo ok || echo missing)"
+	_dns=$(dns_state)
+	printf 'dns=%s\n' "$_dns"
 
-	if ! dns_rule_ok; then
+	if [ "$_dns" != ok ]; then
 		printf 'probe_http=skipped\nprobe=fail\n'
 		return 1
 	fi
@@ -553,8 +717,11 @@ do_status() {
 	printf 'route=%s\n' "$(route_ok && echo ok || echo missing)"
 	printf 'xray_listening=%s\n' "$(xray_up && echo yes || echo no)"
 	printf 'surflare_10800=%s\n' "$( [ -n "$(surflare_handle)" ] && echo yes || echo no)"
-	if [ "$mode" = on ]; then
-		printf 'dns=%s\n' "$(dns_rule_ok && echo ok || echo missing)"
+	# Report the DNS dimension whenever the switch is meant to be up: with the
+	# data rule lost is exactly when an operator wants to know whether the DNS
+	# rules survived.  A deliberate off has none to report on.
+	if [ "$mode" != off ]; then
+		printf 'dns=%s\n' "$(dns_state)"
 	fi
 	case "$mode" in
 	lost) return 1 ;;
