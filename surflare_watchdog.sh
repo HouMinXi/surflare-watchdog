@@ -3265,23 +3265,43 @@ EOF
 # Case (b): table missing entirely (first boot) -> load.
 # Case (c): table exists with live tproxy -> reload is idempotent
 #           (destroy + recreate with same content).
-# The manual Zoro switch lives in a rule that _restore_tproxy cannot know
-# about: a destroy+reload removes it, while /etc/zoro-exit.requested still
-# says "on". Zoro is the household's fixed primary now, so the watchdog
-# puts the switch back itself; zoro-exit re-probes the uplink and refuses
-# to install anything half-broken. A failed -- or impossible -- restore
-# raises a page.
+# The manual Zoro switch lives in rules that _restore_tproxy cannot know
+# about: a destroy+reload removes them, while /etc/zoro-exit.requested
+# still says "on". A killswitch-only rebuild is a sneakier variant: the
+# data rule survives but the DNS rules are wiped. Both are "mode loss".
+# Zoro is the household's fixed primary now, so the watchdog puts the
+# switch back itself; zoro-exit re-probes the uplink and refuses to
+# install anything half-broken. A failed -- or impossible -- restore
+# raises a page. Runs both after a rebuild and on the healthy tick.
 _zoro_mode_loss_alert() {
 	[ -s "$ZORO_STATE_FILE" ] || return 0
 	[ "$(tr -d ' \r' < "$ZORO_STATE_FILE")" = on ] || return 0
 	# A failed read is not evidence of loss. Only a readable chain that
 	# lacks the manual rule is a reportable state.
 	nft list chain inet sw_lan_tproxy prerouting >/dev/null 2>&1 || {
-		log "WARN: cannot inspect sw_lan_tproxy after restore; Zoro state unknown"
+		log "WARN: cannot inspect sw_lan_tproxy; Zoro state unknown"
 		return 0
 	}
+	_zoro_missing=""
 	nft list chain inet sw_lan_tproxy prerouting 2>/dev/null \
-		| grep -F 'comment "zoro-exit"' >/dev/null 2>&1 && return 0
+		| grep -F 'comment "zoro-exit"' >/dev/null 2>&1 \
+		|| _zoro_missing="data rule"
+	# The DNS rules live in three other chains; a killswitch-only rebuild
+	# wipes them while the data rule above survives. Only check them when
+	# the surflare table exists -- with the table gone there are no
+	# anchors to install against anyway, and the data-rule branch covers
+	# that state on the next rebuild.
+	if [ -z "$_zoro_missing" ] && nft list table inet surflare >/dev/null 2>&1; then
+		_zoro_dns_ok=1
+		nft list chain inet surflare prerouting 2>/dev/null \
+			| grep -F 'comment "zoro-exit"' >/dev/null 2>&1 || _zoro_dns_ok=0
+		nft list chain inet surflare output 2>/dev/null \
+			| grep -F 'comment "zoro-exit"' >/dev/null 2>&1 || _zoro_dns_ok=0
+		nft list chain inet killswitch output 2>/dev/null \
+			| grep -F 'comment "zoro-exit"' >/dev/null 2>&1 || _zoro_dns_ok=0
+		[ "$_zoro_dns_ok" -eq 1 ] || _zoro_missing="DNS rules"
+	fi
+	[ -n "$_zoro_missing" ] || return 0
 
 	_zoro_bin="${ZORO_EXIT_BIN:-/usr/bin/zoro-exit}"
 	if [ -x "$_zoro_bin" ]; then
@@ -3308,11 +3328,11 @@ _zoro_mode_loss_alert() {
 			log "Zoro switch turned off while restoring; honoring it"
 			return 0
 		}
-		log "WARN: Zoro rule missing after tproxy rebuild; restoring via zoro-exit on"
+		log "WARN: Zoro switch incomplete (missing: $_zoro_missing); restoring via zoro-exit on"
 		# Bounded: a hung helper must not freeze the health loop. zoro-exit
 		# needs at most ~15s (xray wait + probe); 25 leaves headroom.
 		if timeout 25 "$_zoro_bin" on >/dev/null 2>&1; then
-			log "Zoro primary restored after tproxy rebuild"
+			log "Zoro primary restored (was missing: $_zoro_missing)"
 			return 0
 		fi
 		log "WARN: zoro-exit on failed or timed out; paging"
@@ -8556,6 +8576,7 @@ while true; do
 			last_heartbeat=$now
 		fi
 		_zoro_uplink_alert
+		_zoro_mode_loss_alert
 
 	elif [ "$health" = "CN" ]; then
 		# CN exit detected: tunnel broken (exit IP == ISP IP).

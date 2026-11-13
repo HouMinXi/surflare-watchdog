@@ -42,12 +42,28 @@ run_case() {
 	ZORO_ALERT_STAMP_DIR="$TMP/surflare"
 	ZORO_EXIT_BIN="$TMP/zoro-exit"
 	TMP_DIR="$TMP"
-	export Nft_rc Nft_output ZORO_EXIT_RC ZORO_STATE_FILE ZORO_ALERT_STAMP_DIR ZORO_EXIT_BIN TMP TMP_DIR
+	if [ -n "${4:-}" ]; then Nft_sf_pre="$4"; else unset Nft_sf_pre; fi
+	if [ -n "${5:-}" ]; then Nft_sf_out="$5"; else unset Nft_sf_out; fi
+	if [ -n "${6:-}" ]; then Nft_ks_out="$6"; else unset Nft_ks_out; fi
+	Nft_table_rc="${7:-0}"
+	export Nft_rc Nft_output ZORO_EXIT_RC ZORO_STATE_FILE ZORO_ALERT_STAMP_DIR ZORO_EXIT_BIN TMP TMP_DIR Nft_sf_pre Nft_sf_out Nft_ks_out Nft_table_rc
 	bash -c '
 			. "$1"
 			nft() {
 				case "$1" in
-				list) printf "%s\n" "$Nft_output"; return "$Nft_rc" ;;
+				list)
+					if [ "$2" = table ]; then return "${Nft_table_rc:-0}"; fi
+					case "$4" in
+					sw_lan_tproxy) printf "%s\n" "$Nft_output" ;;
+					surflare)
+						if [ "$5" = prerouting ]; then
+							printf "%s\n" "${Nft_sf_pre-$Nft_output}"
+						else
+							printf "%s\n" "${Nft_sf_out-$Nft_output}"
+						fi ;;
+					killswitch) printf "%s\n" "${Nft_ks_out-$Nft_output}" ;;
+					esac
+					return "$Nft_rc" ;;
 				*) return 1 ;;
 				esac
 			}
@@ -82,7 +98,7 @@ printf 'on\n' > "$TMP/state"
 run_case 0 'iifname "br-lan" tproxy ip to :10800' 0
 if [ ! -s "$TMP/alerts" ] \
 	&& [ "$(grep -c 'zoro-exit on' "$TMP/zoro_calls")" -eq 1 ] \
-	&& grep -q 'restored after tproxy rebuild' "$TMP/log"; then
+	&& grep -q 'restored (was missing: data rule)' "$TMP/log"; then
 	ok "mode loss is restored without a page"
 else
 	bad "mode loss did not restore cleanly [alerts=$(wc -l < "$TMP/alerts") calls=$(cat "$TMP/zoro_calls" 2>/dev/null)]"
@@ -150,7 +166,7 @@ mkdir -p "$TMP/surflare"
 touch -d '1 hour' "$TMP/surflare/zoro_mode_restore.stamp"
 run_case 0 'iifname "br-lan" tproxy ip to :10800' 0
 if [ "$(grep -c 'zoro-exit on' "$TMP/zoro_calls")" -eq 1 ] \
-	&& grep -q 'restored after tproxy rebuild' "$TMP/log"; then
+	&& grep -q 'restored (was missing: data rule)' "$TMP/log"; then
 	ok "a future-dated stamp restores instead of stalling"
 else
 	bad "a future-dated stamp stalled the restore"
@@ -170,6 +186,39 @@ if [ ! -s "$TMP/zoro_calls" ] \
 	ok "an unwritable stamp dir skips restore and still pages"
 else
 	bad "an unwritable stamp dir misbehaved [calls=$(wc -l < "$TMP/zoro_calls")]"
+fi
+
+# 5g: everything present means total silence -- no restore, no page
+printf 'on\n' > "$TMP/state"
+rm -rf "$TMP/surflare"; : > "$TMP/zoro_calls"
+run_case 0 'iifname "br-lan" tproxy ip to :7895 comment "zoro-exit"' 0
+if [ ! -s "$TMP/zoro_calls" ] && [ ! -s "$TMP/alerts" ] && [ ! -s "$TMP/log" ]; then
+	ok "a complete switch is never touched"
+else
+	bad "a complete switch was disturbed [calls=$(cat "$TMP/zoro_calls" 2>/dev/null)]"
+fi
+
+# 5e: a killswitch-only wipe (data rule survives, DNS rules gone) restores
+printf 'on\n' > "$TMP/state"
+rm -rf "$TMP/surflare"
+run_case 0 'iifname "br-lan" tproxy ip to :7895 comment "zoro-exit"' 0 \
+	'x comment "zoro-exit"' 'x comment "zoro-exit"' 'oif "lo" accept'
+if [ "$(grep -c 'zoro-exit on' "$TMP/zoro_calls")" -eq 1 ] \
+	&& grep -q 'missing: DNS rules' "$TMP/log"; then
+	ok "a killswitch-only wipe restores with the DNS piece named"
+else
+	bad "a killswitch-only wipe did not restore [calls=$(cat "$TMP/zoro_calls" 2>/dev/null)]"
+fi
+
+# 5f: with the surflare table gone there are no anchors; stay silent
+printf 'on\n' > "$TMP/state"
+rm -rf "$TMP/surflare"; : > "$TMP/zoro_calls"
+run_case 0 'iifname "br-lan" tproxy ip to :7895 comment "zoro-exit"' 0 \
+	'oif "lo" accept' 'oif "lo" accept' 'oif "lo" accept' 1
+if [ ! -s "$TMP/zoro_calls" ] && [ ! -s "$TMP/alerts" ]; then
+	ok "a missing surflare table neither restores nor pages"
+else
+	bad "a missing surflare table misbehaved"
 fi
 
 # 6: the one-hour alert stamp suppresses a repeat page even when the
@@ -195,14 +244,16 @@ else
 fi
 
 # 8: the call sits after the reload and inside the successful-load guard
-_call=$(grep -n '^[[:space:]]*_zoro_mode_loss_alert$' "$WD" | cut -d: -f1)
+_call=$(grep -n '^[[:space:]]*_zoro_mode_loss_alert$' "$WD" | cut -d: -f1 | head -1)
+_tick=$(grep -A1 '^[[:space:]]*_zoro_uplink_alert$' "$WD" | grep -c '_zoro_mode_loss_alert')
 _load=$(grep -n '_load_tproxy_cn_direct$' "$WD" | cut -d: -f1)
 _guard=$(grep -n 'if \[ "\$_load_ok" -eq 1 \]; then' "$WD" | cut -d: -f1)
 if [ -n "$_call" ] && [ -n "$_load" ] && [ -n "$_guard" ] \
-	&& [ "$_load" -lt "$_guard" ] && [ "$_guard" -lt "$_call" ]; then
-	ok "_restore_tproxy calls the check after a successful reload"
+	&& [ "$_load" -lt "$_guard" ] && [ "$_guard" -lt "$_call" ] \
+	&& [ "$_tick" -ge 1 ]; then
+	ok "_restore_tproxy and the healthy tick both call the check"
 else
-	bad "_restore_tproxy does not call the check after a successful reload"
+	bad "_restore_tproxy or the healthy tick lost the check call"
 fi
 
 echo "RESULT: $pass passed, $fail failed"
