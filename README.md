@@ -6,6 +6,34 @@ internal urltest results for real-time node health — zero VPN disruption requi
 
 ---
 
+## DNS cache guard
+
+SmartDNS writes one resolved address per lookup into the guarded nftables
+caches (`cn_domain_ips`, `cn6_domain_ips`, `surflare_control`, `gmail_smtp`,
+`gmail_smtp6`). A wider element there makes the tproxy table treat a whole
+address block as domestic while the killswitch table does not accept it, which
+blackholed GitHub and Google on 2026-11-11.
+
+The watchdog inspects those caches once per `CN_DOMAIN_GUARD_INTERVAL` seconds
+whenever the loop reaches its normal path; diagnostic mode and probe deferral
+skip the whole cycle. It repairs a defect by rebuilding the affected set: one
+transaction flushes every configured copy and adds back the union of the
+healthy entries. Deleting
+only the offending element was rejected on the router at the time the guard was
+written; rebuilding is kept because it repairs both copies in a single
+transaction either way. A set whose peer copy is missing, or whose listing cannot be
+parsed, is skipped and paged instead of narrowed, because rebuilding from a
+partial view is what creates the one-sided state the guard exists to remove.
+
+Pages are throttled per outcome and cause. The repaired page stays off the
+fallback channel. A missing peer copy, a missing table, or a listing that
+cannot be understood also goes to the fallback channel, on an eight-times
+longer window, which holds each cause to three pages a day. The fallback
+channel itself allows three pages a day in total and logs the refusal when it
+is reached, so two persistent causes still exhaust it in about eight hours. A
+repair that was attempted and failed stays on the base window and counts
+against that budget. The `inspect` and `tables` causes behave the same way.
+
 ## System Architecture
 
 ```mermaid

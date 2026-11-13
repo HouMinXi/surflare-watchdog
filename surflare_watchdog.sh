@@ -144,6 +144,21 @@ NODE_ERR_HEALTHY_MAX=10         # candidate healthy threshold, aligned with _nod
 NODE_ERR_COOLDOWN=660           # seconds between proactive node-error rotation attempts (600s health window + 60s margin)
 NODE_ERR_STORM_CONSECUTIVE=7    # consecutive all-candidates-unhealthy hits before relay-wide storm cooldown
 NODE_HEALTH_WINDOW=600          # seconds; node_health.json freshness window (cron writes every 3 min)
+# The cache sets are DNS caches: SmartDNS writes one resolved address per
+# lookup.  A single address stays cached; any span of two or more addresses
+# is not a DNS answer.  When tproxy has one and the
+# killswitch set does not, the difference turns the whole span into a
+# blackhole (GitHub/Google incident, 2026-11-11).
+CN_DOMAIN_MIN_SPAN="${CN_DOMAIN_MIN_SPAN:-2}"   # IPv4 addresses; IPv6 flags any prefix below /128
+CN_DOMAIN_GUARD_INTERVAL="${CN_DOMAIN_GUARD_INTERVAL:-60}"   # seconds between inspections
+CN_DOMAIN_GUARD_TABLES="${CN_DOMAIN_GUARD_TABLES:-sw_lan_tproxy killswitch}"
+CN_DOMAIN_GUARD_SETS="${CN_DOMAIN_GUARD_SETS:-cn_domain_ips cn6_domain_ips surflare_control gmail_smtp gmail_smtp6}"
+# Only single-address SmartDNS caches may be guarded.  Sets that hold
+# deliberate prefixes by design (ts_control, derp_asia, cn_direct) must
+# never enter the list, even through the environment.
+CN_DOMAIN_GUARD_ALLOWED_SETS="cn_domain_ips cn6_domain_ips surflare_control gmail_smtp gmail_smtp6"
+CN_DOMAIN_GUARD_SUPPRESS="${CN_DOMAIN_GUARD_SUPPRESS:-3600}"   # seconds between pages for one outcome and cause
+CN_DOMAIN_GUARD_LOG_SUPPRESS="${CN_DOMAIN_GUARD_LOG_SUPPRESS:-3600}"  # seconds between log records of one class
 OBS_HEARTBEAT_EVERY=20                # log heartbeat every N observability probe runs (~10 min)
 TRANSIENT_THRESHOLD=6                 # consecutive external timeouts (local state OK) before escalating to fail_count
 AUTH_FAIL_THRESHOLD=3                 # consecutive auth refresh failures before forcing reconnect
@@ -1631,6 +1646,534 @@ _load_tproxy_cn_direct() {
 		fi
 	fi
 	rm -f "$_batch"
+}
+
+# _cn_domain_wide_intervals: print every entry in one cache set that is
+# wider than a DNS answer.  IPv4 intervals count inclusively and a prefix
+# counts as 2^(32-len).  IPv6 has no size arithmetic: any interval or any
+# prefix other than /128 is already wider than a DNS reply.
+# _cn_domain_strip_comments: drop element comments, including a comment
+# whose closing quote sits on a later line.  Detection and every later read
+# of the same listing must use the stripped text, because comment words can
+# otherwise be mistaken for elements and empty out a rebuilt cache.
+_cn_domain_strip_comments() {
+	awk '
+		BEGIN { in_comment = 0 }
+		{
+			line = $0
+			out = ""
+			while (length(line) > 0) {
+				if (in_comment) {
+					i = index(line, "\"")
+					if (i == 0) { line = ""; break }
+					line = substr(line, i + 1)
+					in_comment = 0
+					continue
+				}
+				i = index(line, "comment \"")
+				if (i == 0) { out = out line; break }
+				out = out substr(line, 1, i - 1)
+				line = substr(line, i + 9)
+				in_comment = 1
+			}
+			print out
+		}'
+}
+
+_cn_domain_wide_intervals() {
+	local _set="$1" _min
+	_min="${CN_DOMAIN_MIN_SPAN:-2}"
+	case "$_min" in
+		''|*[!0-9]*)
+			_cn_domain_guard_log_once "knob-span" "WARN: invalid CN_DOMAIN_MIN_SPAN=${CN_DOMAIN_MIN_SPAN:-}, using 2"
+			_min=2
+			;;
+	esac
+	local _max="${CN_DOMAIN_MIN_SPAN_MAX:-65536}"
+	case "$_max" in
+		''|*[!0-9]*)
+			_cn_domain_guard_log_once "knob-span-max-invalid" "WARN: invalid CN_DOMAIN_MIN_SPAN_MAX=${CN_DOMAIN_MIN_SPAN_MAX:-}, using 65536"
+			_max=65536
+			;;
+	esac
+	[ "${#_max}" -gt 6 ] && _max=65536
+	[ "${#_min}" -gt 6 ] && _min=2
+	if [ "$_min" -gt "$_max" ]; then
+		_cn_domain_guard_log_once "knob-span-max" "WARN: CN_DOMAIN_MIN_SPAN=${_min} above the supported maximum, clamped"
+		_min="$_max"
+	fi
+	case "$_set" in
+		cn6_domain_ips|gmail_smtp6)
+			awk '{
+				for (i = 1; i <= NF; i++) {
+					t = $i
+					gsub(/[{},]/, "", t)
+					if (t !~ /:/) continue
+					if (t ~ /-/) print t
+					else if (t ~ /\//) {
+						split(t, p, "/")
+						if (p[2] != 128) print t
+					}
+				}
+			}'
+			;;
+		*)
+			grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(-[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+|/[0-9]+)?' |
+			awk -v min="$_min" '
+				function ip2int(s, a) {
+					split(s, a, ".")
+					return ((a[1] * 256 + a[2]) * 256 + a[3]) * 256 + a[4]
+				}
+				{
+					if (index($0, "-") > 0) {
+						split($0, p, "-")
+						if (p[1] ~ /^[0-9.]+$/ && p[2] ~ /^[0-9.]+$/) {
+							span = ip2int(p[2]) - ip2int(p[1]) + 1
+							if (span >= min) print $0
+						}
+					} else if (index($0, "/") > 0) {
+						split($0, p, "/")
+						if (p[2] ~ /^[0-9]+$/ && p[2] < 32) {
+							span = 2 ^ (32 - p[2])
+							if (span >= min) print $0
+						}
+					}
+				}'
+			;;
+	esac
+}
+
+# _cn_domain_guard_log_once: at most one record per message class and
+# window.  The guard runs every minute and its lines go to /dev/kmsg;
+# repeating them would wrap the ring buffer.  A single shared window would
+# also let a routine message hide the error that explains a failed repair,
+# so each class carries its own stamp.  The window is consumed only when a
+# record is written, so a quiet run does not silence the first finding.
+_cn_domain_guard_log_once() {
+	local _key="$1" _msg="$2" _suppress
+	_suppress="${CN_DOMAIN_GUARD_LOG_SUPPRESS:-3600}"
+	case "$_suppress" in
+		''|*[!0-9]*)
+			_suppress=3600
+			;;
+	esac
+	local _stamp_dir="${ZORO_ALERT_STAMP_DIR:-/run/surflare}"
+	local _vkey_file
+	_vkey_file="${_key//[^A-Za-z0-9_]/_}"
+	local _stamp="${_stamp_dir}/cn_domain_guard.log.${_vkey_file}.stamp"
+	mkdir -p "$_stamp_dir" 2>/dev/null || true
+	if [ -f "$_stamp" ]; then
+		local _age
+		_age=$(($(date +%s) - $(stat -c %Y "$_stamp" 2>/dev/null || echo 0)))
+		if [ "$_age" -ge 0 ] && [ "$_age" -lt "$_suppress" ]; then
+			return 1
+		fi
+	fi
+	if ! date +%s 2>/dev/null > "$_stamp"; then
+		# An unwritable stamp directory must not turn into a per-cycle flood.
+		# Keys carry hyphens, which are not valid in a variable name and would
+		# turn ${name:-0} into a default-value expansion, so sanitise first.
+		local _now _last _vkey _var
+		_vkey="${_key//[^A-Za-z0-9_]/_}"
+		_var="_cn_domain_guard_log_last_${_vkey}"
+		_now=$(date +%s)
+		_last=${!_var:-0}
+		case "$_last" in
+			''|*[!0-9]*) _last=0 ;;
+		esac
+		if [ "$_last" -le "$_now" ] && [ $((_now - _last)) -lt "$_suppress" ]; then
+			return 1
+		fi
+		printf -v "$_var" '%s' "$_now"
+	fi
+	log "$_msg"
+	return 0
+}
+
+_cn_domain_guard_due() {
+	local _now="$1" _last _interval
+	_interval="${CN_DOMAIN_GUARD_INTERVAL:-60}"
+	case "$_interval" in
+		''|*[!0-9]*)
+			_cn_domain_guard_log_once "knob-interval" "WARN: invalid CN_DOMAIN_GUARD_INTERVAL=${CN_DOMAIN_GUARD_INTERVAL:-}, using 60"
+			_interval=60
+			;;
+	esac
+	[ "$_interval" -ge 1 ] || _interval=60
+	_last="${_cn_domain_guard_last:-0}"
+	case "$_last" in
+		''|*[!0-9]*) _last=0 ;;
+	esac
+	# A backwards clock must not suppress inspection until wall time catches up.
+	if [ "$_last" -gt "$_now" ]; then
+		_last=0
+	fi
+	[ $((_now - _last)) -ge "$_interval" ] || return 1
+	_cn_domain_guard_last=$_now
+	return 0
+}
+
+# _cn_domain_guard_alert: page without consuming the global alert slot.
+# Repaired and un-repaired outcomes carry separate stamps and classes, so a
+# benign page for a defect that was fixed cannot hide a later page saying
+# the cache could not be repaired.
+_cn_domain_guard_alert() {
+	local _body="$1" _key="${2:-unrepaired}" _cause="${3:-general}"
+	local _vkey _stamp_key
+	_vkey="${_key//[^A-Za-z0-9_]/_}"
+	_stamp_key="${_vkey}_${_cause//[^A-Za-z0-9_]/_}"
+	local _class="fault:cn-domain-${_stamp_key}"
+	local _title="surflare: DNS cache unrepaired"
+	local _sc="yes"
+	local _deferred=0
+	case "$_cause" in
+		absent_copy|absent_table|parse)
+			# A wide entry was seen and stays cached, or the listing was read
+			# and could not be understood so the span may still be there.  Both
+			# are the incident state and must reach the fallback channel, on a
+			# longer window so an outage cannot spend the daily budget on
+			# hourly repeats.
+			_deferred=1
+			;;
+		config|set_name)
+			# Nothing was read, or a name is simply wrong: there is no cache
+			# state to report, so these stay off the emergency channel and the
+			# operator works from the log.
+			_sc="no"
+			;;
+	esac
+	if [ "$_key" = "repaired" ]; then
+		_class="fault:cn-domain-range"
+		_title="surflare: DNS cache rebuilt"
+		# A repaired cache is not an outage; keep the emergency fallback
+		# budget for the pages that report something still broken.
+		_sc="no"
+	fi
+	local _suppress="${CN_DOMAIN_GUARD_SUPPRESS:-3600}"
+	case "$_suppress" in
+		''|*[!0-9]*) _suppress=3600 ;;
+	esac
+	if [ "$_deferred" -eq 1 ]; then
+		# At most three pages a day, which is what the fallback channel
+		# accepts; a fourth would be dropped without a trace.
+		_suppress=$((_suppress * 8))
+	fi
+	local _stamp_dir="${ZORO_ALERT_STAMP_DIR:-/run/surflare}"
+	local _stamp="${_stamp_dir}/cn_domain_guard.${_stamp_key}.stamp"
+	local _now
+	mkdir -p "$_stamp_dir" 2>/dev/null || true
+	_now=$(date +%s)
+	# Test for the stamp's presence, not against a seed age: a suppression
+	# window longer than the seed would otherwise silence every page forever.
+	if [ -f "$_stamp" ]; then
+		local _age
+		_age=$((_now - $(stat -c %Y "$_stamp" 2>/dev/null || echo 0)))
+		if [ "$_age" -ge 0 ] && [ "$_age" -lt "$_suppress" ]; then
+			_cn_domain_guard_log_once "alert-suppressed-${_key}" "DNS cache guard ${_key} alert suppressed (${_age}s < ${_suppress}s)"
+			return 0
+		fi
+	fi
+	if ! date +%s 2>/dev/null > "$_stamp"; then
+		# The fallback must keep the same per-outcome separation as the
+		# file stamps, or a benign repair page hides the outage page.
+		local _last _vkey _var
+		_vkey="${_stamp_key}"
+		_var="_cn_domain_guard_alert_last_${_vkey}"
+		_last=${!_var:-0}
+		if [ "$_last" -le "$_now" ] && [ $((_now - _last)) -lt "$_suppress" ]; then
+			_cn_domain_guard_log_once "alert-suppressed-${_key}" 				"DNS cache guard ${_key} alert suppressed (fallback timer)"
+			return 0
+		fi
+		printf -v "$_var" '%s' "$_now"
+	fi
+	_cn_domain_guard_log_once "guard-${_key}" "WARN: DNS cache guard ${_key}: ${_body}"
+	(
+		_deliver_alert "$_title" "$_body" "$_sc" "$_class"
+	) 9>&- 200>&- &
+}
+
+# _guard_cn_domain_ranges: repair a DNS cache that holds an answer wider
+# than a DNS answer.  Removing a single interval element from a set that is
+# both interval and timeout was rejected on the router when this was written,
+# and a rebuild repairs both copies in one transaction either way, so the
+# repair rebuilds the
+# cache: one transaction flushes every configured copy of the affected set
+# and adds back the union of its healthy entries.  With every copy readable
+# they then hold the same elements, so a tproxy return is not left without
+# its killswitch accept.  Entries outside the span keep working; their expiry is refreshed
+# to the set default.  Nothing is written when a copy cannot be read, since
+# rebuilding from a partial view is what would create the one-sided state.
+# The caller owns the interval gate; this function only checks the platform.
+# _cn_domain_elements: list element tokens of one address family from a
+# stripped "nft list set" body.
+# _cn_domain_nft: bound every nft call; a stalled netlink would otherwise
+# block the watchdog loop above the health gate.
+_cn_domain_nft() {
+	# Tests replace nft with a shell function, which timeout cannot reach.
+	# That shortcut is gated so an injected function cannot disarm the bound.
+	if [ "${CN_DOMAIN_TEST_MODE:-0}" = "1" ] && declare -F nft >/dev/null 2>&1; then
+		nft "$@"
+		return $?
+	fi
+	if command -v timeout >/dev/null 2>&1; then
+		timeout 10 nft "$@"
+		return $?
+	fi
+	nft "$@"
+}
+
+_cn_domain_elements() {
+	case "$1" in
+		v6)
+			grep -oE '[0-9a-fA-F:]*:[0-9a-fA-F:.]*(-[0-9a-fA-F:.]+|/[0-9]+)?' || true
+			;;
+		*)
+			grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(-[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+|/[0-9]+)?' || true
+			;;
+	esac
+}
+
+_guard_cn_domain_ranges() {
+	[ "${PLATFORM:-}" = "router" ] || return 0
+	command -v nft >/dev/null 2>&1 || return 0
+
+	# Sets that hold deliberate prefixes by design must never be rebuilt,
+	# even when the environment asks for them.
+	local -a _sets=()
+	local _refused=0
+	read -r -a _sets <<< "$CN_DOMAIN_GUARD_SETS"
+	local _set
+	for _set in "${_sets[@]}"; do
+		case " ${CN_DOMAIN_GUARD_ALLOWED_SETS} " in
+			*" ${_set} "*) ;;
+			*)
+				_cn_domain_guard_log_once "set-name" "ERROR: refusing unknown cache set ${_set}"
+				_cn_domain_guard_alert "cache set name ${_set} is not a guarded cache, nothing inspected" "unrepaired" "set_name"
+				return 0
+				;;
+		esac
+	done
+
+	local _tables_out _table _set _out _clean _hit _wkey _table_set _family
+	_tables_out=$(_cn_domain_nft list tables 2>/dev/null)
+	if [ $? -ne 0 ]; then
+		_cn_domain_guard_alert "nft table list inspection failed, cache not inspected" "unrepaired" "tables"
+		return 0
+	fi
+
+	local -a _tables=()
+	local -a _bad_tables=()
+	local -a _cfg_tables=()
+	read -r -a _cfg_tables <<< "$CN_DOMAIN_GUARD_TABLES"
+	for _table in "${_cfg_tables[@]}"; do
+		case "$_table" in
+			''|*[!a-z0-9_]*)
+				_cn_domain_guard_log_once "table-name" "ERROR: refusing unknown table name ${_table}"
+				_bad_tables+=("$_table")
+				continue
+				;;
+		esac
+		case "$_tables_out" in
+			*"table inet ${_table}"*) _tables+=("$_table") ;;
+		esac
+	done
+	if [ "${#_bad_tables[@]}" -gt 0 ]; then
+		_cn_domain_guard_log_once "table-name-config" "ERROR: ${_bad_tables[*]} is not a usable table name, cache not rebuilt"
+		_cn_domain_guard_alert "${_bad_tables[*]} is not a usable table name, cache not rebuilt" "unrepaired" "config"
+		return 0
+	fi
+	if [ "${#_tables[@]}" -eq 0 ]; then
+		_cn_domain_guard_log_once "no-table" "INFO: no configured table present, cache not inspected"
+		return 0
+	fi
+
+	# One read pass.  A set or a whole table that a configured peer does not
+	# carry is recorded as absent: rebuilding the surviving copy alone is
+	# what goes one-sided the moment the peer comes back, so such a set is
+	# skipped below and paged instead.  Any other read error aborts the cycle,
+	# because a cache state that cannot be read cannot be rebuilt from.
+	local -A _listings=() _absent=() _unparsed=()
+	local _err _tokens
+	for _table in "${_tables[@]}"; do
+		for _set in "${_sets[@]}"; do
+			# Parse stdout only: stderr must never become element text.
+			if ! _out=$(_cn_domain_nft list set inet "$_table" "$_set" 2>/dev/null); then
+				_err=$(_cn_domain_nft list set inet "$_table" "$_set" 2>&1 >/dev/null)
+				case "$_err" in
+					*"No such file"*) _absent["${_table}|${_set}"]=1 ; continue ;;
+				esac
+				_err=$(printf '%s' "$_err" | tr '\n' ' ')
+				_cn_domain_guard_log_once "inspect" "ERROR: cannot read ${_table} ${_set}: ${_err}"
+				_cn_domain_guard_alert "cache set ${_table} ${_set} inspection failed, wide entry was not removed" "unrepaired" "inspect"
+				return 0
+			fi
+			if printf '%s\n' "$_out" | grep -qE 'comment "[^"]*"[^ ,}]|\\"'; then
+				_cn_domain_guard_log_once "comment-quote-${_table}-${_set}" "ERROR: ${_table} ${_set} carries a comment this reader cannot follow, skipped"
+				_cn_domain_guard_alert "cache set ${_table} ${_set} carries an unparsable comment, nothing rebuilt" "unrepaired" "parse"
+				_unparsed["${_set}"]=1
+				_refused=1
+				continue
+			fi
+			_clean=$(printf '%s\n' "$_out" | _cn_domain_strip_comments)
+			# A listing that names elements but parses to none means the
+			# filter broke; rebuilding from that view would empty a cache.
+			if printf '%s\n' "$_clean" | grep -q 'elements = {' &&
+				[ -z "$(printf '%s\n' "$_clean" | _cn_domain_elements v4; printf '%s\n' "$_clean" | _cn_domain_elements v6)" ]; then
+				_cn_domain_guard_log_once "parse" "ERROR: ${_table} ${_set} listed elements that could not be parsed, skipped"
+				_cn_domain_guard_alert "cache set ${_table} ${_set} could not be parsed, nothing rebuilt" "unrepaired" "parse"
+				_refused=1
+				_unparsed["${_set}"]=1
+				continue
+			fi
+			_listings["${_table}|${_set}"]="$_clean"
+		done
+	done
+	# Nothing readable at all: say so once, unless a set was there and was
+	# refused, in which case its own record already explains the cycle.
+	if [ "${#_listings[@]}" -eq 0 ] && [ "$_refused" -eq 0 ]; then
+		_cn_domain_guard_log_once "no-set" "INFO: no guarded cache set exists in ${_tables[*]}"
+	fi
+	[ "${#_listings[@]}" -gt 0 ] || return 0
+
+	# Removing a single interval element from a set that is both interval and
+	# timeout was rejected on the router when this was written, and a rebuild
+	# repairs both copies in one transaction either way, so a defect is
+	# repaired by rebuilding the
+	# cache: one transaction flushes every configured copy of the set and adds
+	# back the union of its healthy entries.  When every copy is readable they
+	# then hold the same elements, which is what keeps the tproxy return and
+	# the killswitch accept in step.
+	local -A _offending=() _keep=()
+	local -a _cmds=() _dirty=() _copies=() _healthy=() _rebuilt=() _emptied_sets=()
+	local _emptied=0
+	for _family in v4 v6; do
+		_offending=()
+		for _wkey in "${!_listings[@]}"; do
+			_table_set="${_wkey%%|*}"
+			_set="${_wkey#*|}"
+			case "$_set" in
+				cn6_domain_ips|gmail_smtp6) [ "$_family" = "v6" ] || continue ;;
+				*) [ "$_family" = "v4" ] || continue ;;
+			esac
+			_out=$(printf '%s\n' "${_listings[$_wkey]}" | _cn_domain_wide_intervals "$_set")
+			[ -n "$_out" ] || continue
+			while IFS= read -r _hit; do
+				[ -n "$_hit" ] || continue
+				_cn_domain_guard_log_once "holds-${_table_set}-${_set}-${_hit//[.:\/]/-}" "WARN: ${_table_set} ${_set} holds ${_hit}"
+				_offending["${_set}|${_hit}"]=1
+			done <<< "$_out"
+		done
+		[ "${#_offending[@]}" -gt 0 ] || continue
+
+		_dirty=()
+		for _wkey in "${!_offending[@]}"; do
+			_set="${_wkey%%|*}"
+			case " ${_dirty[*]-} " in
+				*" ${_set} "*) ;;
+				*) _dirty+=("$_set") ;;
+			esac
+		done
+
+		for _set in "${_dirty[@]}"; do
+			_keep=()
+			_copies=()
+			local _copy_missing=""
+			local _cfg_table
+			if [ -n "${_unparsed["$_set"]:-}" ]; then
+				continue
+			fi
+			for _cfg_table in "${_cfg_tables[@]}"; do
+				case " ${_tables[*]} " in
+					*" ${_cfg_table} "*)
+						if [ -n "${_absent["${_cfg_table}|${_set}"]:-}" ]; then
+							_copy_missing="$_cfg_table"
+							break
+						fi
+						;;
+					*)
+						_copy_missing="$_cfg_table"
+						break
+						;;
+				esac
+			done
+			if [ -n "$_copy_missing" ]; then
+				case " ${_tables[*]-} " in
+					*" ${_copy_missing} "*)
+						_cn_domain_guard_log_once "absent-copy" "WARN: ${_copy_missing} has no ${_set}; not rebuilding the other copy"
+						_cn_domain_guard_alert "cache set ${_set} is missing from ${_copy_missing}, left as it is this cycle" "unrepaired" "absent_copy"
+						;;
+					*)
+						_cn_domain_guard_log_once "absent-table" "WARN: table ${_copy_missing} is absent; not rebuilding ${_set}"
+						_cn_domain_guard_alert "table ${_copy_missing} is absent, ${_set} left as it is until it returns" "unrepaired" "absent_table"
+						;;
+				esac
+				continue
+			fi
+			for _wkey in "${!_listings[@]}"; do
+				[ "${_wkey#*|}" = "$_set" ] || continue
+				_copies+=("${_wkey%%|*}")
+			done
+			# Union of healthy entries across every readable copy, so a
+			# per-table cache drift cannot leave a return without an accept.
+			for _wkey in "${!_listings[@]}"; do
+				[ "${_wkey#*|}" = "$_set" ] || continue
+				while IFS= read -r _hit; do
+					[ -n "$_hit" ] || continue
+					[ -n "${_offending["${_set}|${_hit}"]:-}" ] && continue
+					_keep["$_hit"]=1
+				done < <(printf '%s\n' "${_listings[$_wkey]}" | _cn_domain_elements "$_family")
+			done
+
+			_healthy=("${!_keep[@]}")
+			if [ "${#_healthy[@]}" -eq 0 ]; then
+				_emptied=1
+				_emptied_sets+=("$_set")
+			else
+				_rebuilt+=("$_set")
+			fi
+			local _copy
+			for _copy in "${_copies[@]}"; do
+				_cmds+=("flush set inet ${_copy} ${_set}")
+				for _hit in "${_healthy[@]}"; do
+					[ -n "$_hit" ] || continue
+					_cmds+=("add element inet ${_copy} ${_set} { ${_hit} timeout 1h }")
+				done
+			done
+		done
+	done
+
+	if [ "${#_cmds[@]}" -eq 0 ]; then
+		return 0
+	fi
+
+	local _out_nft _rc_nft
+	# The batch is built in full before nft reads it: printf writes every line
+	# into the pipe before nft's stdin closes in the normal case, and nft
+	# applies the file as one transaction.
+	_out_nft=$(printf '%s\n' "${_cmds[@]}" | _cn_domain_nft -f - 2>&1)
+	_rc_nft=$?
+	if [ "$_rc_nft" -ne 0 ]; then
+		_out_nft=$(printf '%s' "$_out_nft" | tr '\n' ' ')
+		_cn_domain_guard_log_once "rebuild-fail" "ERROR: removal failed rc=${_rc_nft}: ${_out_nft}"
+		if [ "$_rc_nft" -eq 124 ]; then
+			_cn_domain_guard_alert "the cache rebuild timed out and its result is unverified" "unrepaired" "rebuild_timeout"
+		else
+			_cn_domain_guard_alert "could not remove the wide DNS entry, cache left as it was" "unrepaired" "rebuild"
+		fi
+		return 1
+	fi
+	_cn_domain_guard_log_once "repaired" "INFO: DNS cache rebuilt, offending ranges dropped"
+	local _body="dropped a wide DNS answer range and rebuilt the cache"
+	if [ "$_emptied" -eq 1 ]; then
+		if [ "${#_rebuilt[@]}" -eq 0 ]; then
+			_body="dropped the only answers cached in $(printf '%s, ' "${_emptied_sets[@]}" | sed 's/, $//'), which held nothing but a wide range"
+		else
+			_body="dropped a wide DNS answer range and rebuilt the cache; $(printf '%s, ' "${_emptied_sets[@]}" | sed 's/, $//') held nothing else and is now empty"
+		fi
+	fi
+	[ -n "${_rebuilt[*]-}" ] && _body="${_body} ($(printf '%s, ' "${_rebuilt[@]}" | sed 's/, $//'))"
+	_cn_domain_guard_alert "$_body" "repaired" "rebuilt"
+	return 0
 }
 
 # _ensure_smartdns_loader_fix: the nightly SmartDNS package bundles a
@@ -7542,6 +8085,18 @@ while true; do
 		wait "$storm_sleep_pid" || true
 		storm_sleep_pid=""
 		continue
+	fi
+	# Repair a poisoned DNS cache before LAN clients hit its symptom.
+	# A wide interval makes tproxy treat whole address blocks as domestic
+	# while the killswitch rejects them.  The only rules that read these sets
+	# are br-lan qualified, so router-originated probes cannot see the fault
+	# and this guard is the sole detector.  The affected sets are rebuilt
+	# in one transaction (flush plus the union of healthy entries), and no
+	# rule is touched.  This gate is the only interval check: the guard
+	# itself must not re-test it, or the window is consumed twice.
+	_now_cn_guard=$(date +%s)
+	if _cn_domain_guard_due "$_now_cn_guard"; then
+		_guard_cn_domain_ranges
 	fi
 	# Wrapper integrity: surflare auto-update can overwrite the wrapper
 	# script at /usr/bin/surflare-proxy with an ELF binary, bypassing
