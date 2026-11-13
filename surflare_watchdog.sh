@@ -3267,8 +3267,10 @@ EOF
 #           (destroy + recreate with same content).
 # The manual Zoro switch lives in a rule that _restore_tproxy cannot know
 # about: a destroy+reload removes it, while /etc/zoro-exit.requested still
-# says "on". Alert instead of silently reverting to Surflare. The switch is
-# manual, so this only reports; re-applying is the operator's call.
+# says "on". Zoro is the household's fixed primary now, so the watchdog
+# puts the switch back itself; zoro-exit re-probes the uplink and refuses
+# to install anything half-broken. A failed -- or impossible -- restore
+# raises a page.
 _zoro_mode_loss_alert() {
 	[ -s "$ZORO_STATE_FILE" ] || return 0
 	[ "$(tr -d ' \r' < "$ZORO_STATE_FILE")" = on ] || return 0
@@ -3280,6 +3282,44 @@ _zoro_mode_loss_alert() {
 	}
 	nft list chain inet sw_lan_tproxy prerouting 2>/dev/null \
 		| grep -F 'comment "zoro-exit"' >/dev/null 2>&1 && return 0
+
+	_zoro_bin="${ZORO_EXIT_BIN:-/usr/bin/zoro-exit}"
+	if [ -x "$_zoro_bin" ]; then
+		_zoro_rstamp="${ZORO_ALERT_STAMP_DIR:-/run/surflare}/zoro_mode_restore.stamp"
+		_zoro_rage=86400
+		mkdir -p "${ZORO_ALERT_STAMP_DIR:-/run/surflare}" 2>/dev/null || true
+		_zoro_rnow=$(date +%s)
+		[ -f "$_zoro_rstamp" ] \
+			&& _zoro_rage=$((_zoro_rnow - $(stat -c %Y "$_zoro_rstamp" 2>/dev/null || echo 0)))
+		# A backwards clock step leaves the stamp in the future; treat a
+		# negative age as stale and restore now instead of stalling
+		# restore and page for the whole skew (same rebase idiom as
+		# _zoro_uplink_alert below).
+		[ "$_zoro_rage" -lt 0 ] && _zoro_rage=86400
+		if [ "$_zoro_rage" -lt 300 ]; then
+			log "Zoro restore suppressed (${_zoro_rage}s < 300s)"
+			return 0
+		fi
+		if ! date +%s > "$_zoro_rstamp" 2>/dev/null; then
+			log "WARN: cannot write $_zoro_rstamp; skipping auto-restore this cycle"
+		else
+		# A manual off in this window wins: re-read before invoking.
+		[ "$(tr -d ' \r' < "$ZORO_STATE_FILE" 2>/dev/null)" = on ] || {
+			log "Zoro switch turned off while restoring; honoring it"
+			return 0
+		}
+		log "WARN: Zoro rule missing after tproxy rebuild; restoring via zoro-exit on"
+		# Bounded: a hung helper must not freeze the health loop. zoro-exit
+		# needs at most ~15s (xray wait + probe); 25 leaves headroom.
+		if timeout 25 "$_zoro_bin" on >/dev/null 2>&1; then
+			log "Zoro primary restored after tproxy rebuild"
+			return 0
+		fi
+		log "WARN: zoro-exit on failed or timed out; paging"
+		fi
+	else
+		log "WARN: $_zoro_bin not installed; cannot restore the Zoro switch automatically"
+	fi
 
 	# Bypass the global 600s limiter: the reconnect alert that precedes this
 	# restore would otherwise swallow the one page that matters. Keep a
@@ -3298,7 +3338,7 @@ _zoro_mode_loss_alert() {
 	log "WARN: Zoro primary mode lost after tproxy rebuild; re-run zoro-exit on"
 	(
 		_deliver_alert "surflare: Zoro primary mode lost" \
-			"$(printf '%b' 'LAN tproxy was rebuilt and the manual Zoro rule is gone.\nRun: zoro-exit on\nSurflare :10800 rule is present; traffic is not verified.')" \
+			"$(printf '%b' 'LAN tproxy was rebuilt and the watchdog could not restore the Zoro switch (zoro-exit missing, failed, or timed out).\nData has fallen back to Surflare :10800. Investigate with zoro-exit check, then re-apply: zoro-exit on')" \
 			"yes" "fault:zoro-mode-lost"
 	) 9>&- 200>&- &
 }
