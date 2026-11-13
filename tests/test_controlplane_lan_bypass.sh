@@ -338,7 +338,7 @@ fi
 # pin only the mechanism, not the spelling: the helper must consult the
 # live chain before deciding, and the accept payload must be both the
 # thing it greps for and the thing it inserts.
-if grep -Eq "grep -q (-F )?'ip daddr @surflare_control accept'" "$TMP/ensure.sh"; then
+if grep -Eq "grep( -q)?( -F)? 'ip daddr @surflare_control accept'" "$TMP/ensure.sh"; then
     ok "helper: idempotency grep checks the surflare_control accept"
 else
     bad "helper: idempotency grep does not check the accept payload"

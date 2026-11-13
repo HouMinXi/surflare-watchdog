@@ -1223,7 +1223,10 @@ _patch_surflare_self_dial_guard() {
 		# An nft that dies without a word must not be filed under "the chain
 		# is not there yet", which is the one cause that resolves itself.
 		[ -z "$err" ] && err="(nft failed with no output)"
-		if printf '%s' "$err" | grep -qi 'no such file\|does not exist'; then
+		# No -q: when SIGPIPE reaches this process ignored, a reader that exits on
+		# the first match leaves the writer's tail failing with "write error:
+		# Broken pipe".  Reading to EOF costs nothing here.
+		if printf '%s' "$err" | grep -i 'no such file\|does not exist' >/dev/null; then
 			_self_dial_report "no-chain" "output chain missing, not applied"
 		else
 			_self_dial_report "chain unreadable: $err" "chain unreadable: $err"
@@ -2007,7 +2010,7 @@ _guard_cn_domain_ranges() {
 				_cn_domain_guard_alert "cache set ${_table} ${_set} inspection failed, wide entry was not removed" "unrepaired" "inspect"
 				return 0
 			fi
-			if printf '%s\n' "$_out" | grep -qE 'comment "[^"]*"[^ ,}]|\\"'; then
+			if printf '%s\n' "$_out" | grep -E 'comment "[^"]*"[^ ,}]|\\"' >/dev/null; then
 				_cn_domain_guard_log_once "comment-quote-${_table}-${_set}" "ERROR: ${_table} ${_set} carries a comment this reader cannot follow, skipped"
 				_cn_domain_guard_alert "cache set ${_table} ${_set} carries an unparsable comment, nothing rebuilt" "unrepaired" "parse"
 				_unparsed["${_set}"]=1
@@ -2017,7 +2020,7 @@ _guard_cn_domain_ranges() {
 			_clean=$(printf '%s\n' "$_out" | _cn_domain_strip_comments)
 			# A listing that names elements but parses to none means the
 			# filter broke; rebuilding from that view would empty a cache.
-			if printf '%s\n' "$_clean" | grep -q 'elements = {' &&
+			if printf '%s\n' "$_clean" | grep 'elements = {' >/dev/null &&
 				[ -z "$(printf '%s\n' "$_clean" | _cn_domain_elements v4; printf '%s\n' "$_clean" | _cn_domain_elements v6)" ]; then
 				_cn_domain_guard_log_once "parse" "ERROR: ${_table} ${_set} listed elements that could not be parsed, skipped"
 				_cn_domain_guard_alert "cache set ${_table} ${_set} could not be parsed, nothing rebuilt" "unrepaired" "parse"
@@ -2506,8 +2509,8 @@ _ensure_gmail_smtp_ks() {
 	nft list table inet killswitch >/dev/null 2>&1 || return 0
 	local _ks_fwd _need_v4=1 _need_v6=1 _h _added=0
 	_ks_fwd=$(nft list chain inet killswitch forward 2>/dev/null)
-	echo "$_ks_fwd" | grep -q 'ip daddr @gmail_smtp tcp dport' && _need_v4=0
-	echo "$_ks_fwd" | grep -q 'ip6 daddr @gmail_smtp6 tcp dport' && _need_v6=0
+	echo "$_ks_fwd" | grep 'ip daddr @gmail_smtp tcp dport' >/dev/null && _need_v4=0
+	echo "$_ks_fwd" | grep 'ip6 daddr @gmail_smtp6 tcp dport' >/dev/null && _need_v6=0
 	[ "$_need_v4" -eq 0 ] && [ "$_need_v6" -eq 0 ] && return 0
 	nft add set inet killswitch gmail_smtp \
 		'{ type ipv4_addr; flags interval, timeout; timeout 1h; }' \
@@ -2544,8 +2547,8 @@ _ensure_gmail_smtp_ks() {
 		fi
 	fi
 	_ks_fwd=$(nft list chain inet killswitch forward 2>/dev/null)
-	if echo "$_ks_fwd" | grep -q 'ip daddr @gmail_smtp tcp dport' && \
-	   echo "$_ks_fwd" | grep -q 'ip6 daddr @gmail_smtp6 tcp dport'; then
+	if echo "$_ks_fwd" | grep 'ip daddr @gmail_smtp tcp dport' >/dev/null && \
+	   echo "$_ks_fwd" | grep 'ip6 daddr @gmail_smtp6 tcp dport' >/dev/null; then
 		[ "$_added" -eq 1 ] && log "Kill switch: gmail_smtp 465/587 accept armed"
 	else
 		log "WARN: gmail_smtp hot-add incomplete (v4/v6 accept missing)"
@@ -2562,7 +2565,7 @@ _ensure_surflare_control_ks() {
 	nft list table inet killswitch >/dev/null 2>&1 || return 0
 	local _ks_fwd _need=1 _h _added=0
 	_ks_fwd=$(nft list chain inet killswitch forward 2>/dev/null)
-	echo "$_ks_fwd" | grep -q 'ip daddr @surflare_control accept' && _need=0
+	echo "$_ks_fwd" | grep 'ip daddr @surflare_control accept' >/dev/null && _need=0
 	[ "$_need" -eq 0 ] && return 0
 	nft add set inet killswitch surflare_control \
 		'{ type ipv4_addr; flags interval, timeout; timeout 1h; }' \
@@ -2580,7 +2583,7 @@ _ensure_surflare_control_ks() {
 			2>/dev/null && _added=1
 	fi
 	_ks_fwd=$(nft list chain inet killswitch forward 2>/dev/null)
-	if echo "$_ks_fwd" | grep -q 'ip daddr @surflare_control accept'; then
+	if echo "$_ks_fwd" | grep 'ip daddr @surflare_control accept' >/dev/null; then
 		[ "$_added" -eq 1 ] && log "Kill switch: surflare_control accept armed"
 	else
 		log "WARN: surflare_control hot-add incomplete"
@@ -2767,6 +2770,9 @@ NFTEOF
 # says armed -- and every repair site is gated on the flag, so the LAN stays
 # outside the tunnel until the next reconnect.  Ask the ruleset instead, and
 # only pay for the install when the cheap answer is "gone".
+# This reads a ~175 KB dump, so no reader over that dump may quit before EOF: an
+# early exit leaves the writer mid-write on a closed pipe, and bash reports it
+# whenever SIGPIPE reaches us ignored (see the PIPE trap in the main preamble).
 _killswitch_needs_install() {
 	[ "$_killswitch_armed" -eq 0 ] && return 0
 	local _tables _table _self
@@ -2778,7 +2784,7 @@ _killswitch_needs_install() {
 		log "WARN: could not read the nftables table list; leaving the flag alone"
 		return 1
 	fi
-	if ! printf '%s\n' "$_tables" | grep -qx 'table inet killswitch'; then
+	if ! printf '%s\n' "$_tables" | grep -x 'table inet killswitch' >/dev/null; then
 		_killswitch_armed=0
 		return 0
 	fi
@@ -2805,13 +2811,16 @@ _killswitch_needs_install() {
 	# install cannot drift apart.
 	local _set _live _want
 	for _set in derp_asia ts_control; do
-		printf '%s\n' "$_table" | grep -q "^[[:space:]]*set ${_set}[[:space:]]*{" ||
+		printf '%s\n' "$_table" | grep "^[[:space:]]*set ${_set}[[:space:]]*{" >/dev/null ||
 			{ _killswitch_armed=0; return 0; }
 		# Fixed window, not a brace match: a literal closing brace here would
 		# end this function's own compound command.
+		# No exit in this awk: the matching line sits ~90% into the dump, so
+		# quitting there leaves printf still writing into a closed pipe.
 		_live=$(printf '%s\n' "$_table" |
-			awk -v n="set ${_set} " 'index($0, n) { f = 1 } f && index($0, "elements") { print; exit }' |
+			awk -v n="set ${_set} " 'index($0, n) { f = 1 } f && !done && index($0, "elements") { print; done = 1 }' |
 			grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}(/[0-9]+)?' | sort -u)
+		# File input, not a pipe: an early exit here breaks nothing.
 		_want=$(awk -v n="set ${_set} " 'index($0, n) { f = 1 } f && index($0, "elements") { print; exit }' "$_self" |
 			grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}(/[0-9]+)?' | sort -u)
 		[ "$_live" = "$_want" ] || { _killswitch_armed=0; return 0; }
@@ -7247,6 +7256,11 @@ fi
 trap 'log "watchdog stopped"; cleanup; exit 0' INT TERM
 trap 'cleanup' EXIT
 trap 'log "received SIGHUP (terminal hangup), ignoring"' HUP
+# A signal that was ignored before this process started cannot be trapped, so
+# when the launcher hands us SIGPIPE ignored this line changes nothing: a write
+# into a closed pipe returns EPIPE and bash reports "write error: Broken pipe".
+# Pipelines over a full nft listing therefore read to EOF instead of quitting on
+# the first match (see _killswitch_needs_install).
 trap ':' PIPE  # no-op handler for SIGPIPE (prevents bash exit on broken pipe)
 
 # Single-instance guard (root fix for duplicate-watchdog storms).

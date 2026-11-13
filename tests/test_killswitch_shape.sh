@@ -55,6 +55,13 @@ case "$1 $2" in
 			printf '\t\tudp dport 53 reject\n'
 		printf '\t}\n'
 	fi
+	if [ -n "${NFT_PAD_BEFORE:-}" ]; then
+		i=0
+		while [ "$i" -lt "$NFT_PAD_BEFORE" ]; do
+			printf '\t# padding line %d ahead of the sets\n' "$i"
+			i=$((i + 1))
+		done
+	fi
 	# Static sets.  A table from an older version has the chains and the reject
 	# but not these, so the stub has to be able to leave them out.
 	if [ -f "${NFT_SETS:-$NFT_PRESENT}" ]; then
@@ -72,6 +79,15 @@ case "$1 $2" in
 			_el=192.200.0.0/24
 		fi
 		printf "	set ts_control { type ipv4_addr; flags interval; elements = { $_el } }\n"
+	fi
+	# A real killswitch dump is ~175 KB; padding lets a case hand back a dump
+	# whose tail is still unsent when an early-exiting reader closes the pipe.
+	if [ -n "${NFT_PAD:-}" ]; then
+		i=0
+		while [ "$i" -lt "$NFT_PAD" ]; do
+			printf '\t# padding line %d for the pipe-size case\n' "$i"
+			i=$((i + 1))
+		done
 	fi
 	printf '}\n'
 	exit 0 ;;
@@ -216,6 +232,92 @@ got=$(drive 1 "$TMP/present" 0 "" "" "$TMP/none")
 case "$got" in
 "0 0") ok "a missing output chain triggers a reinstall" ;;
 *) bad "a missing output chain read as installed (got $got)" ;;
+esac
+
+# When SIGPIPE reaches the daemon ignored, a reader that quits before EOF leaves
+# the writer's tail failing on stderr: "printf: write error: Broken pipe".  The
+# live box logs exactly two of those per tick and its dump is ~175 KB, which is
+# past what a pipe holds, so the checks over it have to read to EOF.
+drive_pipe() { # $1 = padding after the sets, $2 = padding before them
+	: > "$TMP/err"
+	NFT_PAD="$1" NFT_PAD_BEFORE="$2" PATH="$TMP/bin:$PATH" NFT_CALLS="$TMP/calls" \
+		NFT_PRESENT="$TMP/present" bash -c '
+		trap "" PIPE
+		log() { :; }
+		. "$1/fn.sh"
+		_killswitch_armed=1
+		if _killswitch_needs_install; then rc=0; else rc=1; fi
+		echo "$rc $_killswitch_armed"
+	' "$WD" "$TMP" 2>"$TMP/err"
+}
+
+# Precondition: a dump that fits in a pipe cannot exercise the defect, so a case
+# that shrank the padding would otherwise pass with the bug still in the code.
+touch "$TMP/present"
+dump_size() { # $1 = padding after the sets, $2 = padding before them
+	NFT_PAD="$1" NFT_PAD_BEFORE="$2" PATH="$TMP/bin:$PATH" NFT_CALLS="$TMP/calls" \
+		NFT_PRESENT="$TMP/present" nft list table inet killswitch | wc -c
+}
+for _pair in "6000:" ":6000" "409:3676"; do
+	_after=${_pair%%:*}
+	_before=${_pair##*:}
+	_bytes=$(dump_size "$_after" "$_before")
+	if [ "$_bytes" -gt 131072 ]; then
+		ok "padded dump ${_after:-0}/${_before:-0} is $_bytes bytes, past a pipe"
+	else
+		bad "padded dump ${_after:-0}/${_before:-0} is only $_bytes bytes; no pipe overrun"
+	fi
+done
+
+# Not every listing reader has a driving case, so pin the rule statically: the
+# variables below hold whole nft listings, and none of them may be piped into a
+# reader that quits before EOF.  Continuations are joined first -- the site that
+# broke in the field spans two lines -- and comments are skipped so documenting
+# the old form does not trip the check.
+static_bad=$(awk '
+	/^[ \t]*#/ { buf = ""; next }
+	{
+		line = $0
+		sub(/^[ \t]+/, "", line)
+		buf = (buf == "" ? line : buf " " line)
+		if (buf ~ /[|\\]$/) { sub(/[\\]$/, "", buf); next }
+		if (buf ~ /(echo|printf)[^|]*\$[{]?_(table|tables|ks_fwd)[}]?/ &&
+		    buf ~ /\|[ \t]*(grep[ \t]+-[a-zA-Z]*q|head|awk[^|]*exit|sed[^|]*[{;]q)/) {
+			printf "%d: %s\n", NR, buf
+		}
+		buf = ""
+	}
+' "$WD" | head -5)
+if [ -z "$static_bad" ]; then
+	ok "no listing variable is piped into an early-exiting reader"
+else
+	bad "a listing variable feeds an early-exiting reader: $(echo "$static_bad" | head -1)"
+fi
+
+# Shape one: the match is at the head, so both readers still have input to send.
+out=$(drive_pipe 6000 "")
+if [ -s "$TMP/err" ]; then
+	bad "the set check writes into a closed pipe: $(head -1 "$TMP/err")"
+else
+	ok "a dump matched at the head leaves no broken-pipe noise"
+fi
+case "$out" in
+"1 1") ok "the head-match shape still reaches the same verdict" ;;
+*) bad "the verdict changed on a head-match dump (got ${out:-nothing})" ;;
+esac
+
+# Shape two: what the router has -- the matching line sits ~89% in with a tail
+# smaller than a pipe, so only the awk is still writing when its reader quits.
+# This is the shape that produced the two errors per tick in the field.
+out=$(drive_pipe 409 3676)
+if [ -s "$TMP/err" ]; then
+	bad "the set-contents read writes into a closed pipe: $(head -1 "$TMP/err")"
+else
+	ok "a dump matched near the end leaves no broken-pipe noise"
+fi
+case "$out" in
+"1 1") ok "the live shape still reaches the same verdict" ;;
+*) bad "the verdict changed on a live-shape dump (got ${out:-nothing})" ;;
 esac
 
 echo "RESULT: $pass passed, $fail failed"
