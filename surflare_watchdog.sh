@@ -2995,11 +2995,21 @@ NFTEOF
 	_ntp_user=$(id -u chrony >/dev/null 2>&1 && echo chrony || echo root)
 	sed -i "s/skuid chrony/skuid $_ntp_user/" "$_ks_tmp"
 
-	if nft_apply_locked "killswitch install" nft -f "$_ks_tmp"; then
+	# The error text is captured inside the locked call: re-running the load to
+	# see it again would write the same table outside the lock, which is the one
+	# thing this lock exists to prevent.
+	local _ks_err _ks_rc=0
+	_ks_err=$(nft_apply_locked "killswitch install" nft -f "$_ks_tmp" 2>&1) || _ks_rc=$?
+	if [ "$_ks_rc" -eq 0 ]; then
 		log "Kill switch installed (inet killswitch, policy drop, ntp-user=$_ntp_user)"
+	elif [ "$_ks_rc" -eq 2 ]; then
+		# Another writer owns the tables; the flag stays 0 so the next tick
+		# installs again.
+		log "Kill switch install skipped this tick (nft lock busy)"
+		rm -f "$_ks_tmp"
+		return 1
 	else
-		nft -f "$_ks_tmp" >&2  # log actual nft error to stderr/dmesg
-		log "ERROR: kill switch install failed"
+		log "ERROR: kill switch install failed: ${_ks_err:-no output}"
 		rm -f "$_ks_tmp"
 		return 1
 	fi
@@ -3488,7 +3498,10 @@ nft_lock_acquire() { # $1 = label, used in the log line
 		log "WARN: cannot open $NFT_LOCK_FILE; skipping the $1 write"
 		return 1
 	fi
-	exec 8>>"$NFT_LOCK_FILE" 2>/dev/null || return 1
+	# Not `exec 8>>file 2>/dev/null`: a redirection on exec with no command
+	# applies to this shell for good, and its failure ends the shell outright.
+	# The path was just probed, so a plain open is enough here.
+	exec 8>>"$NFT_LOCK_FILE" || return 1
 	while ! flock -n 8; do
 		_t=$((_t + 1))
 		if [ "$_t" -ge 5 ]; then
@@ -3507,9 +3520,12 @@ nft_lock_release() {
 }
 
 nft_apply_locked() { # $1 = label, rest = the command
+	# Return 2 when the write was skipped because the lock was busy, and the
+	# command's own status when it ran.  Callers must not treat 2 as "the command
+	# failed and try again": the whole point is that it did not run.
 	local _l=$1 _rc=0
 	shift
-	nft_lock_acquire "$_l" || return 1
+	nft_lock_acquire "$_l" || return 2
 	"$@" || _rc=$?
 	nft_lock_release
 	return "$_rc"
@@ -3538,12 +3554,15 @@ _restore_tproxy() {
 		printf 'destroy table inet sw_lan_tproxy\n'
 		cat "$_lan_tproxy_nft"
 	} > "$_restore_tmp"
-	local _nft_err _load_ok=0
-	if _nft_err=$(nft_apply_locked "LAN tproxy restore" nft -f "$_restore_tmp" 2>&1); then
+	local _nft_err _load_ok=0 _load_rc=0
+	_nft_err=$(nft_apply_locked "LAN tproxy restore" nft -f "$_restore_tmp" 2>&1) || _load_rc=$?
+	if [ "$_load_rc" -eq 0 ]; then
 		log "LAN tproxy restored (fresh load from ${_lan_tproxy_nft})"
 		_load_ok=1
+	elif [ "$_load_rc" -eq 2 ]; then
+		log "LAN tproxy restore skipped this tick (nft lock busy)"
 	else
-		log "WARN: LAN tproxy restore failed: ${_nft_err}"
+		log "WARN: LAN tproxy restore failed: ${_nft_err:-no output}"
 	fi
 	rm -f "$_restore_tmp"
 	# Sentinel: verify tproxy table exists after load
