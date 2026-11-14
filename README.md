@@ -877,6 +877,18 @@ moves is not a person. Traps end a run instead of letting it keep editing: ash
 runs a handler at the next command boundary, so a call already in flight
 finishes first.
 
+`ensure` is the repair verb: it puts back whatever `/etc/zoro-exit.requested`
+still asks for and answers in one line per key.  `health=ok` means nothing was
+wrong; `health=repaired` carries `reason=data`, `route`, `missing` or
+`misplaced`; `health=off` means nobody asked for the switch and `health=cleaned`
+means the leftovers of an interrupted run were removed.  It defers -- exit 4 --
+when the Surflare table is being rebuilt (`reason=no-table`), when xray is not
+listening yet (`reason=xray`, because rules pointing at a dead port break router
+DNS), or when another writer holds the lock (`health=busy`).  Unreadable state is
+exit 3, a failed repair is exit 1 with `reason=rules|route|anchor`.  It never
+writes the request file, never starts the service and never probes the uplink:
+arming stays `on`'s decision, which is why `ensure` is safe to run every tick.
+
 The switch is not a one-way door. While `/etc/zoro-exit.requested` reads `on`,
 the watchdog re-installs a switch that a table rebuild wiped, at most once every
 300 s. That repair runs `on --repair`, which is skipped if the request file has

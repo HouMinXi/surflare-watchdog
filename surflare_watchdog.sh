@@ -3356,10 +3356,18 @@ _zoro_mode_loss_alert() {
 		# --repair keeps this from overriding a switch-off that a person asked
 		# for while the call was queued; the fd closes keep this daemon's own
 		# locks out of a helper that may outlive the tick.
-		timeout -k 1 "${ZORO_RESTORE_TIMEOUT:-25}" "$_zoro_bin" on --repair \
-			>/dev/null 2>&1 9>&- 200>&- || _zoro_rc=$?
+		# ensure repairs and reports; it reads the request file under its own lock
+		# so a person's off still wins, and it never starts the service or probes
+		# the uplink -- this daemon owns those decisions.
+		_zoro_out=$(timeout -k 1 "${ZORO_RESTORE_TIMEOUT:-25}" "$_zoro_bin" ensure \
+			2>/dev/null 9>&- 200>&-) || _zoro_rc=$?
+		_zoro_why=$(printf '%s\n' "$_zoro_out" | sed -n 's/^reason=//p' | head -1)
 		if [ "$_zoro_rc" -eq 0 ]; then
 			log "Zoro primary restored (was missing: $_zoro_missing)"
+			case "$_zoro_why" in
+			'' | none) : ;;
+			*) log "ensure reported: $_zoro_why" ;;
+			esac
 			rm -f "${ZORO_ALERT_STAMP_DIR:-/run/surflare}/zoro_busy.count" 2>/dev/null || true
 			return 0
 		fi

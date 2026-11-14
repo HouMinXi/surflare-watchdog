@@ -56,7 +56,7 @@ die() {
 }
 
 usage() {
-	printf 'usage: %s {on [--force] [--repair]|off [--force]|status}\n       %s check\n' "$0" "$0" >&2
+	printf 'usage: %s {on [--force]|off [--force]|ensure|status}\n       %s check\n' "$0" "$0" >&2
 	exit 2
 }
 
@@ -298,6 +298,12 @@ chain_ready() {
 	"$NFT" list chain inet sw_lan_tproxy prerouting >/dev/null 2>&1
 }
 
+surflare_ready() {
+	# The table our DNS rules live in.  A rebuilt table is briefly absent, and
+	# there is nothing to anchor a repair against until it is back.
+	"$NFT" list chain inet surflare output >/dev/null 2>&1
+}
+
 route_ok() {
 	"$IP" rule 2>/dev/null | grep -Eq "fwmark 0x0*2 lookup ${TABLE}( |$)" &&
 		"$IP" route show table "$TABLE" 2>/dev/null | grep -Fq 'local default'
@@ -417,6 +423,9 @@ acquire_lock() {
 		_tries=$((_tries + 1))
 		if [ "$_tries" -ge 5 ]; then
 			log "ERROR: another zoro-exit is running; try again shortly"
+			# ensure answers in the same shape as its other verdicts, so the
+			# caller can tell "someone else is on it" from "the repair failed".
+			[ "${_MODE:-}" = ensure ] && printf 'health=busy\n'
 			exit "$LOCK_BUSY"
 		fi
 		# Whole seconds: busybox without fancy sleep rejects 0.25.
@@ -430,25 +439,31 @@ acquire_lock() {
 	trap 'exit 129' HUP
 }
 
+insert_zoro_data_rule() {
+	# $1 = anchor handle, empty to append.  The caller decides what a failure
+	# means: "on" rolls back, "ensure" leaves a working switch alone.
+	if [ -n "$1" ]; then
+		"$NFT" insert rule inet sw_lan_tproxy prerouting position "$1" \
+			iifname "br-lan" meta nfproto ipv4 meta l4proto tcp \
+			tproxy ip to ":$PORT" meta mark set "$MARK" \
+			ct mark set 0x00000200 accept comment "$COMMENT" 2>/dev/null
+	else
+		# No :10800 anchor: append after every bypass return instead of
+		# prepending above them.
+		"$NFT" add rule inet sw_lan_tproxy prerouting \
+			iifname "br-lan" meta nfproto ipv4 meta l4proto tcp \
+			tproxy ip to ":$PORT" meta mark set "$MARK" \
+			ct mark set 0x00000200 accept comment "$COMMENT" 2>/dev/null
+	fi
+}
+
 do_on() {
 	_force=0
-	_repair=0
-	while [ $# -gt 0 ]; do
-		case "$1" in
-		--force) _force=1 ;;
-		--repair) _repair=1 ;;
-		*) usage ;;
-		esac
-		shift
-	done
-	acquire_lock
-	# Repair mode restores a switch that is still asked for; it never overrides
-	# an intent.  The request file is read under the lock so a person's "off"
-	# that finished while this run was queued wins instead of being reverted.
-	if [ "$_repair" -eq 1 ] && [ "$(requested_state)" = off ]; then
-		log "on: repair skipped, a switch-off was requested"
-		return 0
+	if [ $# -gt 0 ]; then
+		[ $# -eq 1 ] && [ "$1" = "--force" ] || usage
+		_force=1
 	fi
+	acquire_lock
 	nft_ready && chain_ready || die "sw_lan_tproxy is not readable"
 	sh=$(surflare_handle)
 	_anchor=$sh
@@ -476,26 +491,9 @@ do_on() {
 			"$NFT" delete rule inet sw_lan_tproxy prerouting handle "$h" 2>/dev/null || true
 		done
 	fi
-	if [ -z "$(rule_handles)" ]; then
-		if [ -n "$_anchor" ]; then
-			"$NFT" insert rule inet sw_lan_tproxy prerouting position "$_anchor" \
-				iifname "br-lan" meta nfproto ipv4 meta l4proto tcp \
-				tproxy ip to ":$PORT" meta mark set "$MARK" \
-				ct mark set 0x00000200 accept comment "$COMMENT" 2>/dev/null || {
-					del_route
-					die "failed to insert Zoro tproxy rule"
-				}
-		else
-			# No :10800 anchor: append after every bypass return instead of
-			# prepending above them.
-			"$NFT" add rule inet sw_lan_tproxy prerouting \
-				iifname "br-lan" meta nfproto ipv4 meta l4proto tcp \
-				tproxy ip to ":$PORT" meta mark set "$MARK" \
-				ct mark set 0x00000200 accept comment "$COMMENT" 2>/dev/null || {
-					del_route
-					die "failed to add Zoro tproxy rule"
-				}
-		fi
+	if [ -z "$(rule_handles)" ] && ! insert_zoro_data_rule "$_anchor"; then
+		del_route
+		die "failed to install the Zoro tproxy rule"
 	fi
 
 	if [ -n "$sh" ]; then
@@ -549,6 +547,99 @@ do_on() {
 		die "failed to record requested state"
 	fi
 	log "on: LAN TCP -> $PORT; router DNS -> $PORT; Surflare :10800 is configured but not automatic"
+}
+
+do_ensure() {
+	# Repair what is still asked for, and report what was wrong.  Reads the
+	# request file under the lock, never writes it, never starts the service and
+	# never runs the uplink probe: "on" owns those decisions.  Nothing that
+	# already works is removed.
+	[ $# -eq 0 ] || usage
+	_MODE=ensure
+	acquire_lock
+	if ! nft_ready; then
+		printf 'health=unknown\nreason=nft\n'
+		return 3
+	fi
+	case "$(requested_state)" in
+	unknown)
+		printf 'health=unknown\nreason=request\n'
+		return 3
+		;;
+	unset | off)
+		# Nobody is asking for the switch.  Leftovers of an interrupted run are
+		# still ours to remove; arming is not.
+		if [ -n "$(rule_handles)" ] || [ -n "$(dns_output_lines)" ] ||
+			[ -n "$(ks_output_lines)" ] || [ -n "$(chain_rules surflare prerouting)" ]; then
+			for h in $(rule_handles); do
+				"$NFT" delete rule inet sw_lan_tproxy prerouting handle "$h" 2>/dev/null || true
+			done
+			drop_dns_rules
+			del_route
+			printf 'health=cleaned\n'
+			return 0
+		fi
+		printf 'health=off\n'
+		return 0
+		;;
+	esac
+	if ! chain_ready || ! surflare_ready; then
+		# A Surflare table rebuild is in flight; the anchors are not there yet.
+		printf 'health=deferred\nreason=no-table\n'
+		return 4
+	fi
+	if ! xray_up; then
+		# Rules that point at a port nobody listens on break router DNS, so a
+		# dead listener defers instead of arming them.
+		printf 'health=deferred\nreason=xray\n'
+		return 4
+	fi
+	_reason=none
+	if ! route_ok; then
+		add_route
+		if ! route_ok; then
+			printf 'health=failed\nreason=route\n'
+			return 1
+		fi
+		_reason=route
+	fi
+	_anchor=$(surflare_handle)
+	[ -n "$_anchor" ] || _anchor=$(tombstone_handle)
+	if [ -z "$(rule_handles)" ]; then
+		if ! insert_zoro_data_rule "$_anchor"; then
+			printf 'health=failed\nreason=data\n'
+			return 1
+		fi
+		_reason=data
+	elif ! rule_ok || { [ -n "$(surflare_handle)" ] && ! order_ok; }; then
+		# A rule that exists but sits wrong is replaced; a good one is left alone.
+		for h in $(rule_handles); do
+			"$NFT" delete rule inet sw_lan_tproxy prerouting handle "$h" 2>/dev/null || true
+		done
+		if ! insert_zoro_data_rule "$_anchor"; then
+			printf 'health=failed\nreason=data\n'
+			return 1
+		fi
+		_reason=data
+	fi
+	case "$(dns_state)" in
+	missing) [ "$_reason" = none ] && _reason=missing ;;
+	misplaced) [ "$_reason" = none ] && _reason=misplaced ;;
+	esac
+	if ! ensure_dns_rules; then
+		printf 'health=failed\nreason=rules\n'
+		return 1
+	fi
+	if [ "$(dns_state)" != ok ]; then
+		printf 'health=failed\nreason=anchor\n'
+		return 1
+	fi
+	if [ "$_reason" = none ]; then
+		printf 'health=ok\nreason=none\n'
+	else
+		printf 'health=repaired\nreason=%s\n' "$_reason"
+	fi
+	return 0
 }
 
 do_off() {
@@ -732,7 +823,7 @@ do_status() {
 
 cmd=${1:-status}
 case "$cmd" in
-on|off|check|status)
+on|off|ensure|check|status)
 	[ $# -gt 0 ] && shift
 	;;
 *) usage ;;
@@ -740,6 +831,7 @@ esac
 case "$cmd" in
 on) do_on "$@" ;;
 off) do_off "$@" ;;
+ensure) do_ensure "$@" ;;
 check) do_check "$@" ;;
 status) do_status "$@" ;;
 esac

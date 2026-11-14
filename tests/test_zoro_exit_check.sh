@@ -869,12 +869,90 @@ out=$(FAKE_NFT_INSERT_FAIL_ON='tproxy ip to :7895' run on 2>&1); rc=$?
 	&& ok "a DNS repair failure leaves the installed switch alone" \
 	|| bad "a DNS failure tore the switch down [rc=$rc state=$(grep -c 'zoro-exit' "$STATE")]" \; rm -f "$IPDIR/route"
 
-# Repair restores what was asked for; it never overrules the person who asked.
-reset_state; add_zoro; add_dns; : > "$IPDIR/rule"; : > "$IPDIR/route"; printf 'off\n' > "$TMP/requested"
-out=$(run on --repair 2>&1); rc=$?
-[ "$rc" -eq 0 ] && [ ! -s "$MUT" ] && [ ! -s "$SERVICE_LOG" ] \
-	&& ok "on --repair honours a switch-off" \
-	|| bad "on --repair overrode a switch-off [rc=$rc mut=$(wc -l < "$MUT")]"
+# ensure answers for the state it finds and changes nothing that already works.
+reset_state; add_zoro; add_dns; : > "$IPDIR/rule"; : > "$IPDIR/route"; printf 'on\n' > "$TMP/requested"
+out=$(run ensure); rc=$?
+[ "$rc" -eq 0 ] && has "$out" 'health=ok' && has "$out" 'reason=none' &&
+	[ ! -s "$MUT" ] && [ ! -s "$SERVICE_LOG" ] && [ "$(cat "$TMP/requested")" = on ]
+if [ $? -eq 0 ]; then ok "ensure leaves a healthy switch untouched"; else bad "ensure moved a healthy switch [rc=$rc mut=$(wc -l < "$MUT")]"; fi
+
+# Nothing is being asked for, so the leftovers of an interrupted run go away.
+reset_state; add_zoro; add_dns; printf 'off\n' > "$TMP/requested"
+out=$(run ensure); rc=$?
+[ "$rc" -eq 0 ] && has "$out" 'health=cleaned' && ! grep -q 'comment "zoro-exit"' "$STATE" &&
+	! grep -q 'comment "zoro-exit"' "$FAKE_SF_OUT_STATE" && [ "$(cat "$TMP/requested")" = off ]
+if [ $? -eq 0 ]; then ok "ensure removes leftovers when the switch is asked off"; else bad "ensure left leftovers on a switch-off [rc=$rc out=$out]"; fi
+
+reset_state; printf 'off\n' > "$TMP/requested"
+out=$(run ensure); rc=$?
+[ "$rc" -eq 0 ] && has "$out" 'health=off' && [ ! -s "$MUT" ] \
+	&& ok "ensure reports a deliberate off without acting" \
+	|| bad "ensure acted on a switch that is off [rc=$rc]"
+
+reset_state
+out=$(run ensure); rc=$?
+[ "$rc" -eq 0 ] && has "$out" 'health=off' && [ ! -e "$TMP/requested" ] \
+	&& ok "ensure treats an unset request as off and writes nothing" \
+	|| bad "ensure rewrote an unset request [rc=$rc]"
+
+reset_state; printf 'yes please\n' > "$TMP/requested"
+out=$(run ensure); rc=$?
+[ "$rc" -eq 3 ] && has "$out" 'health=unknown' && has "$out" 'reason=request' \
+	&& ok "ensure refuses to guess an unrecognized request" \
+	|| bad "ensure guessed at an unrecognized request [rc=$rc]"
+
+reset_state; printf 'on\n' > "$TMP/requested"
+out=$(FAKE_NFT_TABLE_RC=1 run ensure); rc=$?
+[ "$rc" -eq 3 ] && has "$out" 'health=unknown' && has "$out" 'reason=nft' \
+	&& ok "ensure does not read an unreadable nft as a lost switch" \
+	|| bad "ensure confused unreadable nft with a loss [rc=$rc]"
+
+reset_state; printf 'on\n' > "$TMP/requested"
+out=$(FAKE_NFT_CHAIN_RC=1 run ensure); rc=$?
+[ "$rc" -eq 4 ] && has "$out" 'health=deferred' && has "$out" 'reason=no-table' \
+	&& ok "ensure defers while the table it needs is gone" \
+	|| bad "ensure tried to repair against a missing table [rc=$rc]"
+
+reset_state; printf 'on\n' > "$TMP/requested"
+out=$(FAKE_LISTEN=none run ensure); rc=$?
+[ "$rc" -eq 4 ] && has "$out" 'health=deferred' && has "$out" 'reason=xray' &&
+	[ ! -s "$MUT" ] && [ ! -s "$SERVICE_LOG" ]
+if [ $? -eq 0 ]; then ok "ensure defers instead of arming rules at a dead port"; else bad "ensure armed rules with no listener [rc=$rc]"; fi
+
+# The three repair dimensions, each named in its own verdict.
+reset_state; add_zoro; : > "$IPDIR/rule"; : > "$IPDIR/route"; printf 'on\n' > "$TMP/requested"
+out=$(run ensure); rc=$?
+[ "$rc" -eq 0 ] && has "$out" 'health=repaired' && has "$out" 'reason=missing' &&
+	run check | grep -q 'dns=ok'
+if [ $? -eq 0 ]; then ok "ensure repairs a missing DNS pair and says so"; else bad "ensure did not repair the DNS pair [rc=$rc out=$out]"; fi
+
+reset_state; add_zoro; add_dns; : > "$IPDIR/rule"; : > "$IPDIR/route"; printf 'on\n' > "$TMP/requested"
+printf '%s\n' 'meta nfproto ipv4 udp dport 53 meta mark set 0x00000001 accept # handle 6' > "$FAKE_SF_OUT_STATE.new"
+cat "$FAKE_SF_OUT_STATE" >> "$FAKE_SF_OUT_STATE.new"; mv "$FAKE_SF_OUT_STATE.new" "$FAKE_SF_OUT_STATE"
+out=$(run ensure); rc=$?
+[ "$rc" -eq 0 ] && has "$out" 'health=repaired' && has "$out" 'reason=misplaced' &&
+	run check | grep -q 'dns=ok'
+if [ $? -eq 0 ]; then ok "ensure re-orders a shadowed DNS pair"; else bad "ensure left the pair shadowed [rc=$rc out=$out]"; fi
+
+reset_state; add_dns; : > "$IPDIR/rule"; : > "$IPDIR/route"; printf 'on\n' > "$TMP/requested"
+out=$(run ensure); rc=$?
+[ "$rc" -eq 0 ] && has "$out" 'health=repaired' && has "$out" 'reason=data' &&
+	grep -q 'comment "zoro-exit"' "$STATE"
+if [ $? -eq 0 ]; then ok "ensure restores a lost data rule"; else bad "ensure did not restore the data rule [rc=$rc out=$out]"; fi
+
+reset_state; add_zoro; add_dns; : > "$IPDIR/rule"; rm -f "$IPDIR/route"; printf 'on\n' > "$TMP/requested"
+out=$(run ensure); rc=$?
+[ "$rc" -eq 0 ] && has "$out" 'health=repaired' && has "$out" 'reason=route' && [ -f "$IPDIR/route" ]
+if [ $? -eq 0 ]; then ok "ensure reinstalls a missing route"; else bad "ensure did not reinstall the route [rc=$rc out=$out]"; fi
+
+# A held lock is not a failure: the caller has to be able to tell the two apart.
+reset_state; add_zoro; add_dns; printf 'on\n' > "$TMP/requested"
+hold_lock
+out=$(run ensure 2>/dev/null); rc=$?
+kill "$_holder_pid" 2>/dev/null; wait "$_holder_pid" 2>/dev/null
+[ "$rc" -eq 4 ] && has "$out" 'health=busy' \
+	&& ok "ensure reports a held lock as busy" \
+	|| bad "ensure hid a held lock [rc=$rc out=$out]"
 
 echo "pass=$pass fail=$fail"
-[ "$fail" -eq 0 ] && [ "$pass" -eq 79 ]
+[ "$fail" -eq 0 ] && [ "$pass" -eq 91 ]

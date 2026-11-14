@@ -40,6 +40,10 @@ if [ "${1:-}" = status ]; then
 	printf 'mode=on\nnft=ok\ndns=%s\n' "${FAKE_ZORO_DNS:-ok}"
 	exit 0
 fi
+if [ "${1:-}" = ensure ]; then
+	printf 'health=%s\nreason=%s\n' "${FAKE_ZORO_HEALTH:-ok}" "${FAKE_ZORO_WHY:-none}"
+	exit "${FAKE_ZORO_ENSURE_RC:-${ZORO_EXIT_RC:-0}}"
+fi
 exit "${ZORO_EXIT_RC:-0}"
 EOF
 chmod +x "$TMP/zoro-exit"
@@ -132,7 +136,7 @@ printf 'on\n' > "$TMP/state"
 : > "$TMP/zoro_calls"
 run_case 0 'iifname "br-lan" tproxy ip to :10800' 0
 if [ ! -s "$TMP/alerts" ] \
-	&& [ "$(grep -c 'zoro-exit on' "$TMP/zoro_calls")" -eq 1 ] \
+	&& [ "$(grep -c 'zoro-exit ensure' "$TMP/zoro_calls")" -eq 1 ] \
 	&& grep -q 'restored (was missing: data rule)' "$TMP/log"; then
 	ok "mode loss is restored without a page"
 else
@@ -158,13 +162,13 @@ fi
 printf 'on\n' > "$TMP/state"
 rm -rf "$TMP/surflare"; : > "$TMP/zoro_calls"
 run_case 0 'iifname "br-lan" tproxy ip to :10800' 1
-calls_after_first=$(grep -c 'zoro-exit on' "$TMP/zoro_calls")
+calls_after_first=$(grep -c 'zoro-exit ensure' "$TMP/zoro_calls")
 run_case 0 'iifname "br-lan" tproxy ip to :10800' 1
-calls_after_second=$(grep -c 'zoro-exit on' "$TMP/zoro_calls")
+calls_after_second=$(grep -c 'zoro-exit ensure' "$TMP/zoro_calls")
 grep -q 'restore suppressed' "$TMP/log" && _saw_suppress=1 || _saw_suppress=0
 touch -d '6 minutes ago' "$TMP/surflare/zoro_mode_restore.stamp"
 run_case 0 'iifname "br-lan" tproxy ip to :10800' 1
-calls_after_third=$(grep -c 'zoro-exit on' "$TMP/zoro_calls")
+calls_after_third=$(grep -c 'zoro-exit ensure' "$TMP/zoro_calls")
 if [ "$calls_after_first" -eq 1 ] && [ "$calls_after_second" -eq 1 ] \
 	&& [ "$calls_after_third" -eq 2 ] && [ "$_saw_suppress" -eq 1 ]; then
 	ok "the restore stamp throttles for five minutes and an aged stamp retries"
@@ -200,7 +204,7 @@ rm -rf "$TMP/surflare"; : > "$TMP/zoro_calls"
 mkdir -p "$TMP/surflare"
 touch -d '1 hour' "$TMP/surflare/zoro_mode_restore.stamp"
 run_case 0 'iifname "br-lan" tproxy ip to :10800' 0
-if [ "$(grep -c 'zoro-exit on' "$TMP/zoro_calls")" -eq 1 ] \
+if [ "$(grep -c 'zoro-exit ensure' "$TMP/zoro_calls")" -eq 1 ] \
 	&& grep -q 'restored (was missing: data rule)' "$TMP/log"; then
 	ok "a future-dated stamp restores instead of stalling"
 else
@@ -227,7 +231,7 @@ fi
 printf 'on\n' > "$TMP/state"
 rm -rf "$TMP/surflare"; : > "$TMP/zoro_calls"
 run_case 0 'iifname "br-lan" tproxy ip to :7895 comment "zoro-exit"' 0
-if ! grep -q "zoro-exit on" "$TMP/zoro_calls" && [ ! -s "$TMP/alerts" ] && [ ! -s "$TMP/log" ]; then
+if ! grep -q "zoro-exit ensure" "$TMP/zoro_calls" && [ ! -s "$TMP/alerts" ] && [ ! -s "$TMP/log" ]; then
 	ok "a complete switch is never touched"
 else
 	bad "a complete switch was disturbed [calls=$(cat "$TMP/zoro_calls" 2>/dev/null)]"
@@ -238,7 +242,7 @@ printf 'on\n' > "$TMP/state"
 rm -rf "$TMP/surflare"
 FAKE_ZORO_DNS=missing run_case 0 'iifname "br-lan" tproxy ip to :7895 comment "zoro-exit"' 0 \
 	'' '' 'oif "lo" accept'
-if [ "$(grep -c 'zoro-exit on' "$TMP/zoro_calls")" -eq 1 ] \
+if [ "$(grep -c 'zoro-exit ensure' "$TMP/zoro_calls")" -eq 1 ] \
 	&& grep -q 'missing: DNS rules' "$TMP/log"; then
 	ok "a killswitch-only wipe restores with the DNS piece named"
 else
@@ -250,7 +254,7 @@ printf 'on\n' > "$TMP/state"
 rm -rf "$TMP/surflare"; : > "$TMP/zoro_calls"
 run_case 0 'iifname "br-lan" tproxy ip to :7895 comment "zoro-exit"' 0 \
 	'oif "lo" accept' 'oif "lo" accept' 'oif "lo" accept' 1
-if ! grep -q "zoro-exit on" "$TMP/zoro_calls" && [ ! -s "$TMP/alerts" ]; then
+if ! grep -q "zoro-exit ensure" "$TMP/zoro_calls" && [ ! -s "$TMP/alerts" ]; then
 	ok "a missing surflare table neither restores nor pages"
 else
 	bad "a missing surflare table misbehaved"
@@ -277,7 +281,7 @@ printf 'on\n' > "$TMP/state"
 rm -rf "$TMP/surflare"; : > "$TMP/zoro_calls"
 FAKE_ZORO_DNS=missing run_case 0 'iifname "br-lan" tproxy ip to :7895 comment "zoro-exit"' 0 \
 	'meta nfproto ipv4 meta l4proto udp meta mark 0x00000002 tproxy ip to :7895 meta mark set 0x00000002 accept comment "zoro-exit" # handle 24'
-if [ "$(grep -c 'zoro-exit on' "$TMP/zoro_calls")" -eq 1 ] \
+if [ "$(grep -c 'zoro-exit ensure' "$TMP/zoro_calls")" -eq 1 ] \
 	&& grep -q 'missing: DNS rules' "$TMP/log"; then
 	ok "a half-installed DNS pair is restored"
 else
@@ -339,7 +343,7 @@ _elapsed=$(( $(date +%s) - _start ))
 : > "$TMP/alerts"
 rm -f "$TMP/surflare/zoro_mode_restore.stamp"
 FAKE_ZORO_SILENT=1 run_case 0 'iifname "br-lan" tproxy ip to :7895 comment "zoro-exit"' 
-[ ! -s "$TMP/alerts" ] && ! grep -q "zoro-exit on" "$TMP/zoro_calls" 2>/dev/null \
+[ ! -s "$TMP/alerts" ] && ! grep -q "zoro-exit ensure" "$TMP/zoro_calls" 2>/dev/null \
 	&& ok "an unreadable DNS verdict triggers no restore and no page" \
 	|| bad "an unreadable verdict was read as a lost switch [alerts=$(wc -l < "$TMP/alerts" 2>/dev/null)]"
 
@@ -350,7 +354,7 @@ FAKE_ZORO_SILENT=1 run_case 0 'iifname "br-lan" tproxy ip to :7895 comment "zoro
 # the repair this case is about.
 rm -f "$TMP/surflare/zoro_mode_restore.stamp"
 FAKE_ZORO_DNS=misplaced run_case 0 'iifname "br-lan" tproxy ip to :7895 comment "zoro-exit"'
-grep -q "zoro-exit on --repair" "$TMP/zoro_calls" 2>/dev/null \
+grep -q "zoro-exit ensure" "$TMP/zoro_calls" 2>/dev/null \
 	&& ok "a misplaced DNS pair is repaired through on --repair" \
 	|| bad "a misplaced pair was left alone [calls=$(tr '\n' ' ' < "$TMP/zoro_calls" 2>/dev/null)]"
 
