@@ -2995,7 +2995,7 @@ NFTEOF
 	_ntp_user=$(id -u chrony >/dev/null 2>&1 && echo chrony || echo root)
 	sed -i "s/skuid chrony/skuid $_ntp_user/" "$_ks_tmp"
 
-	if nft -f "$_ks_tmp"; then
+	if nft_apply_locked "killswitch install" nft -f "$_ks_tmp"; then
 		log "Kill switch installed (inet killswitch, policy drop, ntp-user=$_ntp_user)"
 	else
 		nft -f "$_ks_tmp" >&2  # log actual nft error to stderr/dmesg
@@ -3473,6 +3473,48 @@ _zoro_uplink_alert() {
 			"yes" "fault:zoro-uplink-down"
 	) 9>&- 200>&- &
 }
+# Whole-table replacement is not atomic against another writer: two nft -f
+# loads that each destroy and recreate a table interleave into a state neither
+# of them intended.  zoro-exit takes this same lock, so a repair and a rebuild
+# cannot cross.  The fd is closed after every block so a child cannot inherit it
+# and keep the lock past our exit, and locked blocks never nest: nothing inside
+# one may call zoro-exit or another locked block.  A busy lock is not an error:
+# the write is skipped, the caller sees a failure, and the next tick retries.
+NFT_LOCK_FILE=${SURFLARE_NFT_LOCK:-/var/lock/zoro-exit.lock}
+
+nft_lock_acquire() { # $1 = label, used in the log line
+	local _t=0
+	if ! true 2>/dev/null >>"$NFT_LOCK_FILE"; then
+		log "WARN: cannot open $NFT_LOCK_FILE; skipping the $1 write"
+		return 1
+	fi
+	exec 8>>"$NFT_LOCK_FILE" 2>/dev/null || return 1
+	while ! flock -n 8; do
+		_t=$((_t + 1))
+		if [ "$_t" -ge 5 ]; then
+			log "WARN: nft lock busy; skipping the $1 write this tick"
+			exec 8>&-
+			return 1
+		fi
+		sleep 1
+	done
+	return 0
+}
+
+nft_lock_release() {
+	flock -u 8 2>/dev/null || true
+	exec 8>&- 2>/dev/null || true
+}
+
+nft_apply_locked() { # $1 = label, rest = the command
+	local _l=$1 _rc=0
+	shift
+	nft_lock_acquire "$_l" || return 1
+	"$@" || _rc=$?
+	nft_lock_release
+	return "$_rc"
+}
+
 _restore_tproxy() {
 	local _lan_tproxy_nft="/etc/surflare-lan-tproxy.nft"
 	if [ ! -f "$_lan_tproxy_nft" ]; then
@@ -3497,7 +3539,7 @@ _restore_tproxy() {
 		cat "$_lan_tproxy_nft"
 	} > "$_restore_tmp"
 	local _nft_err _load_ok=0
-	if _nft_err=$(nft -f "$_restore_tmp" 2>&1); then
+	if _nft_err=$(nft_apply_locked "LAN tproxy restore" nft -f "$_restore_tmp" 2>&1); then
 		log "LAN tproxy restored (fresh load from ${_lan_tproxy_nft})"
 		_load_ok=1
 	else
@@ -6182,8 +6224,11 @@ cleanup_probe_state() {
 	_stop_proxy_log_monitor
 	wait_for_exit surflare-proxy
 	if nft list table inet surflare >/dev/null 2>&1; then
-		nft flush table inet surflare 2>/dev/null || true
-		nft delete table inet surflare 2>/dev/null || true
+		if nft_lock_acquire "probe state cleanup"; then
+			nft flush table inet surflare 2>/dev/null || true
+			nft delete table inet surflare 2>/dev/null || true
+			nft_lock_release
+		fi
 	fi
 	while ip rule del fwmark 0x1 lookup 100 2>/dev/null; do :; done
 	while ip -6 rule del fwmark 0x1 lookup 100 2>/dev/null; do :; done
