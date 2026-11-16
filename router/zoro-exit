@@ -52,6 +52,9 @@ log() {
 
 die() {
 	log "ERROR: $*"
+	if [ "${_MODE:-}" = ensure ]; then
+		printf 'health=failed\nreason=lock\n'
+	fi
 	exit 1
 }
 
@@ -217,29 +220,54 @@ ensure_dns_rules() {
 			accept comment "$COMMENT" 2>/dev/null || return 1
 	}
 	if ! dns_output_ok udp || ! dns_output_ok tcp || ! dns_order_ok; then
-		# Rebuild the pair in front of whatever competes.  The deletes come
-		# first and the anchor is read afterwards: an anchor read before the
-		# deletes can name one of our own rules, and nft rejects an insert at a
-		# handle that no longer exists.
-		for _h in $(dns_output_lines | chain_handles); do
-			"$NFT" delete rule inet surflare output handle "$_h" 2>/dev/null || true
-		done
+		# Rebuild the pair in front of whatever competes, inserting before
+		# deleting so a failed insert never leaves the router without its DNS
+		# exit.  The old handles are captured first and removed only once both
+		# new rules are in; on a partial failure the rules added here are
+		# removed again and the previous pair is left in place.
+		# shellcheck disable=SC3043  # OpenWrt ash supports local
+		local _old_h _added_h _ok=1
+		_old_h=$(dns_output_lines | chain_handles)
+		_old_set=$(printf ' %s ' $_old_h)
 		_anchor=$(dns_output_anchor)
 		if [ -n "$_anchor" ]; then
 			"$NFT" insert rule inet surflare output position "$_anchor" \
 				meta nfproto ipv4 udp dport 53 meta mark set "$MARK" \
-				accept comment "$COMMENT" 2>/dev/null || return 1
-			"$NFT" insert rule inet surflare output position "$_anchor" \
-				meta nfproto ipv4 tcp dport 53 meta mark set "$MARK" \
-				accept comment "$COMMENT" 2>/dev/null || return 1
+				accept comment "$COMMENT" 2>/dev/null || _ok=0
+			if [ "$_ok" -eq 1 ]; then
+				"$NFT" insert rule inet surflare output position "$_anchor" \
+					meta nfproto ipv4 tcp dport 53 meta mark set "$MARK" \
+					accept comment "$COMMENT" 2>/dev/null || _ok=0
+			fi
 		else
 			"$NFT" add rule inet surflare output \
 				meta nfproto ipv4 udp dport 53 meta mark set "$MARK" \
-				accept comment "$COMMENT" 2>/dev/null || return 1
-			"$NFT" add rule inet surflare output \
-				meta nfproto ipv4 tcp dport 53 meta mark set "$MARK" \
-				accept comment "$COMMENT" 2>/dev/null || return 1
+				accept comment "$COMMENT" 2>/dev/null || _ok=0
+			if [ "$_ok" -eq 1 ]; then
+				"$NFT" add rule inet surflare output \
+					meta nfproto ipv4 tcp dport 53 meta mark set "$MARK" \
+					accept comment "$COMMENT" 2>/dev/null || _ok=0
+			fi
 		fi
+		if [ "$_ok" -eq 0 ]; then
+			# Deleting here cannot tell our own half-installed rule from one a
+			# concurrent writer added with the same shape, and the shape is what
+			# the chain actually carries. Leave it: it marks DNS exactly like the
+			# rule it replaced, and the next successful rebuild removes the
+			# duplicate because only handles captured before the write are kept.
+			log "DNS rules: WARN: partial install left in place; next run converges"
+			return 1
+		fi
+		# Remove only what was there before this attempt and still carries the
+		# shape we replace: a handle recycled into another writer's rule between
+		# the capture and here fails both tests and stays.
+		for _h in $(dns_output_lines | grep -E "(udp|tcp) dport 53 meta mark set $MARK accept comment \"$COMMENT\"" |
+			chain_handles); do
+			case "$_old_set" in
+			*" $_h "*) "$NFT" delete rule inet surflare output handle "$_h" \
+				2>/dev/null || true ;;
+			esac
+		done
 	fi
 	if ! ks_output_ok; then
 		_anchor=$(ks_output_anchor)
@@ -270,8 +298,18 @@ drop_dns_rules() {
 surflare_handle() {
 	"$NFT" -a list chain inet sw_lan_tproxy prerouting 2>/dev/null \
 		| grep -F "tproxy ip to :10800" \
+		| grep -F "meta l4proto tcp" \
 		| sed -n 's/.*# handle \([0-9][0-9]*\).*/\1/p' \
 		| head -1
+}
+
+data_anchor() {
+	# Earliest TCP obstruction wins; a live UDP rule is not a TCP anchor.
+	"$NFT" -a list chain inet sw_lan_tproxy prerouting 2>/dev/null |
+		awk '/iifname "br-lan"/ && /meta l4proto tcp/ &&
+		    (/tproxy ip to :10800/ || /reject/) {
+			if (!seen) { sub(/.*# handle /, ""); print; seen=1 }
+		}'
 }
 
 tombstone_handle() {
@@ -298,41 +336,38 @@ chain_ready() {
 	"$NFT" list chain inet sw_lan_tproxy prerouting >/dev/null 2>&1
 }
 
-surflare_ready() {
-	# The table our DNS rules live in.  A rebuilt table is briefly absent, and
-	# there is nothing to anchor a repair against until it is back.
-	"$NFT" list chain inet surflare output >/dev/null 2>&1
-}
-
 route_ok() {
 	"$IP" rule 2>/dev/null | grep -Eq "fwmark 0x0*2 lookup ${TABLE}( |$)" &&
 		"$IP" route show table "$TABLE" 2>/dev/null | grep -Fq 'local default'
 }
 
 order_ok() {
-	# nft handles are a monotonic counter, so insert-before gets a HIGHER
-	# handle. Compare line numbers in one chain dump, which follow eval order.
-	# shellcheck disable=SC3043  # OpenWrt ash supports local
+	# Handles identify rules, not evaluation order. Compare one chain dump.
+	# shellcheck disable=SC3043
 	local _dump _z _s
 	_dump=$("$NFT" -a list chain inet sw_lan_tproxy prerouting 2>/dev/null) || return 1
 	_z=$(printf '%s\n' "$_dump" | grep -n -F "comment \"$COMMENT\"" | head -1 | cut -d: -f1)
-	_s=$(printf '%s\n' "$_dump" | grep -n -F "tproxy ip to :10800" | head -1 | cut -d: -f1)
+	_s=$(printf '%s\n' "$_dump" | awk '
+		/iifname "br-lan"/ && /meta l4proto tcp/ &&
+		(/tproxy ip to :10800/ || /reject/) {if (!n) n=NR}
+		END {if (n) print n}')
 	[ -n "$_z" ] && [ -n "$_s" ] && [ "$_z" -eq "$((_s - 1))" ]
 }
 
 rule_ok() {
-	# shellcheck disable=SC3043  # OpenWrt ash supports local
-	local _line
-	_line=$(rule_lines | head -1)
-	[ -n "$_line" ] || return 1
-	printf '%s\n' "$_line" | grep -F "tproxy ip to :$PORT" >/dev/null || return 1
-	printf '%s\n' "$_line" | grep -F "meta mark set $MARK" >/dev/null || return 1
-	printf '%s\n' "$_line" | grep -F 'ct mark set 0x00000200' >/dev/null || return 1
-	printf '%s\n' "$_line" | grep -F 'iifname "br-lan"' >/dev/null || return 1
-	printf '%s\n' "$_line" | grep -F 'meta nfproto ipv4' >/dev/null || return 1
-	printf '%s\n' "$_line" | grep -F ' accept' >/dev/null || return 1
-	printf '%s\n' "$_line" | grep -F 'l4proto tcp' >/dev/null || return 1
-	return 0
+	# A positive substring list also accepts restricted catches such as
+	# ct state established. Only the complete installed form is total.
+	# shellcheck disable=SC3043
+	local _lines _line _expected
+	_lines=$(rule_lines)
+	[ "$(printf '%s\n' "$_lines" | wc -l)" -eq 1 ] || return 1
+	_line=$(printf '%s\n' "$_lines" |
+		sed 's/[[:space:]]*# handle [0-9][0-9]*[[:space:]]*$//' |
+		awk '{$1=$1; print}')
+	_expected="iifname \"br-lan\" meta nfproto ipv4 meta l4proto tcp"
+	_expected="$_expected tproxy ip to :$PORT meta mark set $MARK"
+	_expected="$_expected ct mark set 0x00000200 accept comment \"$COMMENT\""
+	[ "$_line" = "$_expected" ]
 }
 
 add_route() {
@@ -402,24 +437,28 @@ probe_once() {
 # cannot leave it behind, nothing has to trust a pid or a timestamp, and a
 # recycled pid cannot wedge the switch.  The watchdog already depends on flock.
 LOCK_BUSY=4
-LOCK_FD=9
 
 acquire_lock() {
 	# shellcheck disable=SC3043  # OpenWrt ash supports local
-	local _tries=0
-	# A failed redirection on exec is fatal in bash and ash alike, so the path is
-	# probed with a plain append first and the failure reported in our own words.
-	# Redirections are processed left to right, so the suppressor comes first:
-	# with the append first, the shell prints its own error before the stderr
-	# redirect takes effect.  `true` rather than `:`: a redirection failure on a
-	# special builtin ends the shell outright, before the message is printed.
+	local _tries=0 _lock_rc=0
+	# Probe with a regular builtin: a redirection failure on exec can end ash.
+	# Suppress the probe's own diagnostic, not the calling shell's stderr.
 	command -v flock >/dev/null 2>&1 ||
 		die "flock is required to serialise the switch; it is missing from PATH"
 	if ! true 2>/dev/null >>"$LOCK_FILE"; then
 		die "cannot open the lock file $LOCK_FILE"
 	fi
+	# exec redirection errors may terminate the shell before a following ||.
+	# Keep a last-resort verdict armed only during this open.
+	[ "${_MODE:-}" != ensure ] ||
+		trap 'printf "health=failed\nreason=lock\n"' EXIT
 	exec 9>>"$LOCK_FILE"
-	while ! flock -n "$LOCK_FD"; do
+	[ "${_MODE:-}" != ensure ] || trap - EXIT
+	while :; do
+		_lock_rc=0
+		flock -n 9 || _lock_rc=$?
+		[ "$_lock_rc" -eq 0 ] && break
+		[ "$_lock_rc" -eq 1 ] || die "flock failed (rc=$_lock_rc)"
 		_tries=$((_tries + 1))
 		if [ "$_tries" -ge 5 ]; then
 			log "ERROR: another zoro-exit is running; try again shortly"
@@ -459,14 +498,37 @@ insert_zoro_data_rule() {
 
 do_on() {
 	_force=0
+	_repair=0
+	if [ "${1:-}" = --repair ]; then
+		_repair=1
+		shift
+	fi
 	if [ $# -gt 0 ]; then
 		[ $# -eq 1 ] && [ "$1" = "--force" ] || usage
 		_force=1
 	fi
 	acquire_lock
+	# Recovery may start a dead listener, but must not override a queued off.
+	if [ "$_repair" -eq 1 ]; then
+		_req=$(requested_state)
+		if [ "$_req" = unknown ]; then
+			# "ensure" treats an unreadable request as unknown and so must
+			# a repair: guessing "off" here would silently skip recovery.
+			log "on --repair: requested state is unreadable"
+			printf 'health=unknown\nreason=request-unreadable\n'
+			return 3
+		fi
+		if [ "$_req" != on ]; then
+			printf 'health=off\n'
+			return 0
+		fi
+		# Intent was already on: a tombstoned cold standby must not prevent
+		# restarting the primary listener and restoring its existing switch.
+		_force=1
+	fi
 	nft_ready && chain_ready || die "sw_lan_tproxy is not readable"
 	sh=$(surflare_handle)
-	_anchor=$sh
+	_anchor=$(data_anchor)
 	if [ -z "$sh" ] && [ "$_force" -eq 0 ]; then
 		die "Surflare tproxy :10800 rule missing; use 'on --force' to switch anyway"
 	fi
@@ -497,7 +559,7 @@ do_on() {
 	fi
 
 	if [ -n "$sh" ]; then
-		order_ok && rule_ok || {
+		data_rule_ready || {
 			for h in $(rule_handles); do
 				"$NFT" delete rule inet sw_lan_tproxy prerouting handle "$h" 2>/dev/null || true
 			done
@@ -547,6 +609,69 @@ do_on() {
 		die "failed to record requested state"
 	fi
 	log "on: LAN TCP -> $PORT; router DNS -> $PORT; Surflare :10800 is configured but not automatic"
+	if [ "$_repair" -eq 1 ]; then
+		printf 'health=repaired\nreason=xray\n'
+	fi
+}
+
+inspect_zoro_state() {
+	# Absence is certified only by successful reads. A missing table/chain is
+	# valid absence when its parent listing succeeded; a failed read is unknown.
+	# shellcheck disable=SC3043
+	local _tables _table _dump _pair _t _c _handles _rules _routes
+	_snapshot_handles=""
+	_snapshot_residue=0
+	_snapshot_chains=0
+	_tables=$("$NFT" list tables 2>/dev/null) || return 3
+	for _pair in "sw_lan_tproxy prerouting" "surflare prerouting" \
+		"surflare output" "killswitch output"; do
+		# shellcheck disable=SC2086
+		set -- $_pair
+		_t=$1; _c=$2
+		printf '%s\n' "$_tables" | grep -Fx "table inet $_t" >/dev/null || continue
+		_table=$("$NFT" list table inet "$_t" 2>/dev/null) || return 3
+		printf '%s\n' "$_table" |
+			grep -E "^[[:space:]]*chain $_c \{" >/dev/null || continue
+		_dump=$("$NFT" -a list chain inet "$_t" "$_c" 2>/dev/null) || return 3
+		_snapshot_chains=$((_snapshot_chains + 1))
+		_handles=$(printf '%s\n' "$_dump" | awk -v t="$_t" -v c="$_c" '
+			/comment "zoro-exit"/ {
+				if ($0 !~ /# handle [0-9]+[[:space:]]*$/) {bad=1; next}
+				print t, c, $NF
+			}
+			END {if (bad) exit 3}') || return 3
+		[ -z "$_handles" ] || _snapshot_handles="$_snapshot_handles
+$_handles"
+	done
+	_rules=$("$IP" rule 2>/dev/null) || return 3
+	# Query all tables: a named but empty FIB table returns an error on iproute2.
+	_routes=$("$IP" route show table all 2>/dev/null) || return 3
+	[ -z "$_snapshot_handles" ] || _snapshot_residue=1
+	if printf '%s\n' "$_rules" |
+		grep -E "fwmark 0x0*2 lookup ${TABLE}( |$)" >/dev/null ||
+		printf '%s\n' "$_routes" |
+		grep -E "^local default .*table ${TABLE}( |$)" >/dev/null; then
+		_snapshot_residue=1
+	fi
+	return 0
+}
+
+remove_snapshot() {
+	# Delete only the handles discovered by the successful preflight snapshot.
+	# shellcheck disable=SC3043
+	local _t _c _h
+	while read -r _t _c _h; do
+		[ -n "$_h" ] || continue
+		"$NFT" delete rule inet "$_t" "$_c" handle "$_h" 2>/dev/null || true
+	done <<EOF_HANDLES
+$_snapshot_handles
+EOF_HANDLES
+	del_route
+}
+
+data_rule_ready() {
+	rule_ok || return 1
+	[ -z "$(data_anchor)" ] || order_ok
 }
 
 do_ensure() {
@@ -557,10 +682,6 @@ do_ensure() {
 	[ $# -eq 0 ] || usage
 	_MODE=ensure
 	acquire_lock
-	if ! nft_ready; then
-		printf 'health=unknown\nreason=nft\n'
-		return 3
-	fi
 	case "$(requested_state)" in
 	unknown)
 		printf 'health=unknown\nreason=request\n'
@@ -569,13 +690,20 @@ do_ensure() {
 	unset | off)
 		# Nobody is asking for the switch.  Leftovers of an interrupted run are
 		# still ours to remove; arming is not.
-		if [ -n "$(rule_handles)" ] || [ -n "$(dns_output_lines)" ] ||
-			[ -n "$(ks_output_lines)" ] || [ -n "$(chain_rules surflare prerouting)" ]; then
-			for h in $(rule_handles); do
-				"$NFT" delete rule inet sw_lan_tproxy prerouting handle "$h" 2>/dev/null || true
-			done
-			drop_dns_rules
-			del_route
+		if ! inspect_zoro_state; then
+			printf 'health=unknown\nreason=nft-or-route\n'
+			return 3
+		fi
+		if [ "$_snapshot_residue" -eq 1 ]; then
+			remove_snapshot
+			if ! inspect_zoro_state; then
+				printf 'health=unknown\nreason=nft-or-route\n'
+				return 3
+			fi
+			if [ "$_snapshot_residue" -eq 1 ]; then
+				printf 'health=failed\nreason=cleanup\n'
+				return 1
+			fi
 			printf 'health=cleaned\n'
 			return 0
 		fi
@@ -583,7 +711,11 @@ do_ensure() {
 		return 0
 		;;
 	esac
-	if ! chain_ready || ! surflare_ready; then
+	if ! inspect_zoro_state; then
+		printf 'health=unknown\nreason=nft-or-route\n'
+		return 3
+	fi
+	if [ "$_snapshot_chains" -ne 4 ]; then
 		# A Surflare table rebuild is in flight; the anchors are not there yet.
 		printf 'health=deferred\nreason=no-table\n'
 		return 4
@@ -603,24 +735,29 @@ do_ensure() {
 		fi
 		_reason=route
 	fi
-	_anchor=$(surflare_handle)
-	[ -n "$_anchor" ] || _anchor=$(tombstone_handle)
+	_anchor=$(data_anchor)
 	if [ -z "$(rule_handles)" ]; then
 		if ! insert_zoro_data_rule "$_anchor"; then
 			printf 'health=failed\nreason=data\n'
 			return 1
 		fi
 		_reason=data
-	elif ! rule_ok || { [ -n "$(surflare_handle)" ] && ! order_ok; }; then
-		# A rule that exists but sits wrong is replaced; a good one is left alone.
-		for h in $(rule_handles); do
-			"$NFT" delete rule inet sw_lan_tproxy prerouting handle "$h" 2>/dev/null || true
-		done
+	elif ! data_rule_ready; then
+		# Place a new rule before deleting the old one: a failed insert must
+		# not remove the only working path. Re-read handles after insertion.
+		_old_handles=$(rule_handles)
 		if ! insert_zoro_data_rule "$_anchor"; then
 			printf 'health=failed\nreason=data\n'
 			return 1
 		fi
+		for h in $_old_handles; do
+			"$NFT" delete rule inet sw_lan_tproxy prerouting handle "$h" 2>/dev/null || true
+		done
 		_reason=data
+	fi
+	if ! data_rule_ready; then
+		printf 'health=failed\nreason=data\n'
+		return 1
 	fi
 	case "$(dns_state)" in
 	missing) [ "$_reason" = none ] && _reason=missing ;;
@@ -649,30 +786,27 @@ do_off() {
 		_force=1
 	fi
 	acquire_lock
-	if ! nft_ready || ! chain_ready; then
-		die "sw_lan_tproxy is not readable; refusing to stop the service while the Zoro rule may remain"
-	fi
+	inspect_zoro_state || die "nft or route state is not readable; refusing to stop the service while rules may remain"
 	if [ -z "$(surflare_handle)" ] && [ "$_force" -eq 0 ]; then
 		die "Surflare tproxy :10800 rule missing; remove the Zoro rule with 'off --force'"
 	fi
-	for h in $(rule_handles); do
-		"$NFT" delete rule inet sw_lan_tproxy prerouting handle "$h" 2>/dev/null || true
-	done
-	drop_dns_rules
-	[ -z "$(rule_handles)" ] || die "Zoro rule still present after off"
-	[ -z "$(dns_prerouting_lines)" ] || die "Zoro DNS tproxy rules still present after off"
-	[ -z "$(dns_output_lines)" ] || die "Zoro DNS mark rules still present after off"
-	[ -z "$(ks_output_lines)" ] || die "Zoro killswitch accept still present after off"
-	del_route
-	if route_ok; then
-		die "policy route still present after off"
-	fi
-	"$SERVICE" stop >/dev/null 2>&1 || true
+	remove_snapshot
+	inspect_zoro_state || die "cleanup verification is unreadable; refusing to stop the service"
+	[ "$_snapshot_residue" -eq 0 ] || die "Zoro rules or policy route still present after off"
+	_stop_rc=0
+	"$SERVICE" stop >/dev/null 2>&1 || _stop_rc=$?
 	printf 'off\n' > "$STATE_FILE" || die "failed to record requested state"
 	if [ -n "$(surflare_handle)" ]; then
 		log "off: LAN TCP -> Surflare :10800"
 	else
 		log "off: Zoro rule removed; LAN TCP has no exit (Surflare :10800 is absent)"
+	fi
+	if [ "$_stop_rc" -ne 0 ]; then
+		# The switch really is off, so the request is recorded, but a service
+		# that would not stop is a failure the caller must see.
+		log "off: WARN: the service did not stop (rc=${_stop_rc})"
+		printf 'health=off\nreason=service-stop-failed\n'
+		return 5
 	fi
 }
 
@@ -704,7 +838,7 @@ PYEOF
 
 do_check() {
 	[ $# -eq 0 ] || usage
-	if ! nft_ready || ! chain_ready; then
+	if ! inspect_zoro_state; then
 		report_unknown
 		return 3
 	fi
@@ -735,7 +869,7 @@ do_check() {
 		printf 'order=missing\n'
 		# A deliberate off that left our DNS rules behind is not healthy:
 		# "off" verifies the same thing and refuses to call it done.
-		if [ -n "$(dns_prerouting_lines)$(dns_output_lines)$(ks_output_lines)" ]; then
+		if [ "$_snapshot_residue" -eq 1 ]; then
 			printf 'dns=residue\nprobe_http=skipped\nprobe=fail\n'
 			return 1
 		fi
@@ -745,13 +879,11 @@ do_check() {
 
 	_fb=missing
 	[ -n "$(surflare_handle)" ] && _fb=ok
-	_order=missing
-	if [ "$_fb" = ok ]; then
-		order_ok && rule_ok && _order=ok || _order=misplaced
-	elif [ -n "$(tombstone_handle)" ]; then
-		order_before_tombstone && rule_ok && _order=ok || _order=misplaced
-	else
-		_order=unverified
+	_order=unverified
+	if ! data_rule_ready; then
+		_order=misplaced
+	elif [ -n "$(data_anchor)" ]; then
+		_order=ok
 	fi
 	printf 'mode=on\nnft=ok\nprobe_scope=socks\n'
 	printf 'route=%s\n' "$(route_ok && echo ok || echo missing)"
@@ -791,9 +923,13 @@ do_check() {
 
 do_status() {
 	[ $# -eq 0 ] || usage
-	if ! nft_ready || ! chain_ready; then
-		printf 'mode=unknown\nnft=unreadable\nroute=unknown\nxray_listening=%s\nsurflare_10800=unknown\n' "$(xray_up && echo yes || echo no)"
+	if ! inspect_zoro_state; then
+		printf 'mode=unknown\nnft=unreadable\nroute=unknown\nxray_listening=unknown\n'
 		return 3
+	fi
+	if [ "$_snapshot_chains" -ne 4 ] && [ "$(requested_state)" = on ]; then
+		printf 'mode=lost\nnft=missing\nreason=no-table\n'
+		return 4
 	fi
 	if [ -n "$(rule_handles)" ]; then
 		mode=on
@@ -808,6 +944,11 @@ do_status() {
 	printf 'route=%s\n' "$(route_ok && echo ok || echo missing)"
 	printf 'xray_listening=%s\n' "$(xray_up && echo yes || echo no)"
 	printf 'surflare_10800=%s\n' "$( [ -n "$(surflare_handle)" ] && echo yes || echo no)"
+	_order=missing
+	if [ -n "$(rule_handles)" ]; then
+		data_rule_ready && _order=ok || _order=misplaced
+	fi
+	printf 'order=%s\n' "$_order"
 	# Report the DNS dimension whenever the switch is meant to be up: with the
 	# data rule lost is exactly when an operator wants to know whether the DNS
 	# rules survived.  A deliberate off has none to report on.

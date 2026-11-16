@@ -859,42 +859,133 @@ exits 0 for a healthy on-state or a deliberate off, 1 for a broken on-state, for
 `mode=lost`, or for an off that left residue, 2 for usage, or 3 when nft state is
 unreadable or the requested state is unrecognized (`mode=unknown`). A Surflare
 table rebuild removes the inserted rule; the watchdog puts it back on its own.
-`status` prints `mode`, `nft`, `route`, `xray_listening`, `surflare_10800`, and
-`dns` whenever the mode is not `off`; it exits 1 for `mode=lost` and 3 for
-unreadable nft or an unrecognized requested state (`mode=unknown`).
+`status` prints `mode`, `nft`, `route`, `xray_listening`, `surflare_10800`,
+`order`, and `dns` whenever the mode is not `off`. It exits 1 for a missing
+requested data rule, 4 with `reason=no-table` when a required parent is absent,
+and 3 for an unreadable snapshot or unknown request (`mode=unknown`).
 
-`on` and `off` take a `flock` on `/var/lock/zoro-exit.lock` so two runs of this
-tool cannot interleave their nft edits. The kernel owns the lock, so a killed
-run cannot leave it behind and nothing has to trust a pid or a timestamp; the fd
-is closed for the service we start, so a daemon that backgrounds itself cannot
-inherit it and hold the lock after we exit. The watchdog's own table rebuilds
-(`sw_lan_tproxy`, `killswitch`) are outside this lock: they recreate the chains
-these rules live in, which is why the restore path exists. A second writer waits
-about four seconds and then exits 4 without touching anything. The watchdog
-treats 4 as "someone else is repairing this", defers, and does not page -- but
-after twenty consecutive deferrals it pages once, because a lock that never
-moves is not a person. Traps end a run instead of letting it keep editing: ash
-runs a handler at the next command boundary, so a call already in flight
-finishes first.
+`off` exits 5 with `reason=service-stop-failed` when the service will not stop
+(4 stays the contention code), and `on --repair` exits 3 with `health=unknown`
+when the request file cannot be read, matching `ensure` instead of guessing
+`off`.
 
-`ensure` is the repair verb: it puts back whatever `/etc/zoro-exit.requested`
-still asks for and answers in one line per key.  `health=ok` means nothing was
-wrong; `health=repaired` carries `reason=data`, `route`, `missing` or
-`misplaced`; `health=off` means nobody asked for the switch and `health=cleaned`
-means the leftovers of an interrupted run were removed.  It defers -- exit 4 --
-when the Surflare table is being rebuilt (`reason=no-table`), when xray is not
-listening yet (`reason=xray`, because rules pointing at a dead port break router
-DNS), or when another writer holds the lock (`health=busy`).  Unreadable state is
-exit 3, a failed repair is exit 1 with `reason=rules|route|anchor`.  It never
-writes the request file, never starts the service and never probes the uplink:
-arming stays `on`'s decision, which is why `ensure` is safe to run every tick.
+`on`, `off` and `ensure` share `/var/lock/zoro-exit.lock`. CLI contention
+waits about four seconds, then exits 4 with `health=busy`. The CLI holds that lock
+for the whole of each mutation. The watchdog takes it at five enrolled destructive
+sites written as `nft_apply_locked` arguments, and the DNS fallback cleanup takes
+it around its own listing and deletes. Its other enrolled writes run without it,
+serialized by the daemon being single-instance rather than by the lock. The
+manifest's `wrapped` flag records only the syntactic property -- the call is
+written as an `nft_apply_locked` argument -- so it reads five while the daemon has
+six lock-protected behaviours. Of the 112 enrolled sites, those five are wrapped
+and the other 107 break down as 38 table/chain/set writes, 31 rule writes, 17
+element updates, 18 `nft -f` batch loads and 3 wrapper calls. Read-only `list`
+calls are enrolled too and fall inside those buckets, so the totals count call
+sites, not writes. What the lock protects is the CLI-versus-daemon race, not every
+daemon write.
 
-The switch is not a one-way door. While `/etc/zoro-exit.requested` reads `on`,
-the watchdog re-installs a switch that a table rebuild wiped, at most once every
-300 s. That repair runs `on --repair`, which is skipped if the request file has
-been turned off in the meantime, so a manual `off` wins over a queued repair.
-`ZORO_RESTORE_TIMEOUT` (default 25, seconds) bounds the call, and it is
-`timeout -k 1`, so a helper that ignores TERM is still killed.
+Three ways the cleanup can fail to take the lock are counted as deferred ticks:
+the lock file cannot be opened (70), another writer holds it (75), or `flock` is
+missing or not executable (126/127). The count lives in
+`/run/surflare_dns_cleanup_defer` rather than in a shell variable, because
+`connect_vpn` runs in a subshell whose state is discarded. When the count reaches
+`_DNS_CLEANUP_MAX_DEFERRALS` (default 3) **and** the first deferral is at least
+`_DNS_CLEANUP_MIN_DEFER_SECS` (default 60) old, the next attempt cleans without
+the lock and says so in the log; a success clears the file. The age gate is what
+stops a burst of unrelated attempts inside one tick from escalating. Codes 126
+and 127 are defensive on a normally started daemon -- `flock` is in the
+required-command list and a miss exits before the main loop -- so a source-only
+run is the one path where they can be reached.
+
+The cleanup must not be called while the caller already holds the lock, because a
+second descriptor on the same file reads as contention. No caller does that
+today, and the function cannot tell: a caller that holds it sees two deferrals and
+then a body run under the held lock. Both are pinned in
+`tests/test_nft_locked_callers.sh`, the second by a lock held from another
+process.
+
+Five kinds of daemon write are documented as running unlocked: the whole-teardown
+paths taken by a normal stop and by explicit teardown; the boot-lock table removal
+(`destroy table inet surflare_boot_lock`); element updates such as the
+`bypass_src` pre-population; rule-level inserts/deletes such as the DNS fallback
+exemption and the `surflare_moat` rules; and table-level work that builds or
+removes a table of its own, namely `_setup_kernel_moat` and the
+`delete table inet killswitch_swap` in `_update_killswitch_server_ips`. Nothing
+else at table or chain level runs unlocked. Element and rule writes written as literal call sites are enrolled, so the drift
+check sees them even though they do not hold the lock; those generated inside a
+batch file are not. The inventory is a write-site drift detector, not
+proof that a given write held the lock. Its wrapper
+holds descriptor 8 only in a child, waits at most four seconds for contention,
+and bounds the nft process to 15 seconds plus a one-second kill grace. Wrapper
+exit 75 means contention; exit 70 means lock setup failed. Normal stop and
+explicit teardown remain outside this lock. Fine-grained rule and set updates are not a promise
+of global serialization.
+
+`ensure` re-reads `/etc/zoro-exit.requested` under the lock. It reports
+`health=ok`, `repaired`, `off`, `cleaned`, `deferred`, `busy`, `unknown` or
+`failed`. A repair reason names the first detected repaired dimension: `data`, `route`,
+`missing` or `misplaced`. Exit 4 with `health=deferred` distinguishes
+`reason=no-table` from `reason=xray`; unreadable nft or route state exits 3
+with `reason=nft-or-route`. Failed repair exits 1 and names `rules`, `route`, `anchor`, `data`, `cleanup` or `lock`.
+Cleanup requires a successful hierarchy snapshot of the four owned chain
+locations plus both policy-route components, with no owned residue remaining. A
+successful parent listing distinguishes missing chains from failed reads; a
+missing data table does not prevent cleaning DNS rules in the other tables.
+`ensure` does not write intent, start a service, or probe the uplink.
+
+The watchdog checks rule shape/order, routes, DNS and the listener. Repairs use
+`ensure`, bounded by `ZORO_RESTORE_TIMEOUT` (default 25 seconds) and a one-second
+kill grace. Only a dead-listener deferral takes the explicit `on --repair` path,
+which may start xray and probe before arming; it rechecks intent under its lock
+so a queued manual `off` wins. A normal repair is throttled for 300 seconds;
+contention, table-rebuild deferral and timeout drop that throttle. Twenty
+consecutive deferrals for the same cause page with that cause, including
+missing parent tables reported by the CLI status entry. Off/cleaned
+verdicts are not logged as restoration.
+
+The host-only `scripts/check-nft-locked-writes.sh` uses Python and `shfmt`
+(`SHFMT` may name an existing binary). It inventories exact shell command sites
+in both programs that write nft under the shared lock -- the daemon
+(`scripts/nft-write-sites.json`) and the CLI (`scripts/nft-write-sites-zoro-exit.json`)
+-- including heredoc bodies and duplicate sites. Changed/new/unaccounted sites fail; missing tools or a parse failure are
+errors. Literal `command`, `exec`, `env` and `timeout` prefixes are parsed
+without executing them; unsupported options on those known launchers are errors,
+not an empty inventory. For example, `env -S` requires separate inspection rather
+than guessing the embedded command. Literal quote removal is applied before a
+word is recognised, so `\nft`, `n\ft`, `e\nv` and `$'\x6e\x66\x74'` are the same
+command the shell runs and are enrolled too. Brace expansion is refused with a
+non-zero status instead: one written word can become several executed words, and
+guessing them is worse than stopping. A spelling the gate cannot follow is
+refused the same way rather than dropped: an indirection whose command argument
+names nft (`eval`, `sudo`, `sh -c`, `busybox`, `xargs`) and a command
+substitution that names the program are errors. An indirection whose command is
+computed at run time (`sh -c "$CMD"`) cannot be enumerated by a source scan and
+is not covered; the daemon uses that form for interactive expect sessions, so
+rejecting it wholesale would make the check unusable. Enrollment identity hashes the arguments as
+written, so respelling an enrolled site is reported as drift; for a pure
+respelling the new-site and stale-site lines print identical text, and the source
+line is what tells them apart. The gate does not execute shell input or prove
+lock ownership, discover arbitrary aliases, or inspect the generated contents of
+a batch-file variable.
+Runtime caller tests and independent source review cover those limits.
+
+## Formatting gate
+
+`scripts/check-shfmt.sh` runs `shfmt` over every tracked script whose first line
+names a shell (including `#!/usr/bin/env bash`) and compares the result with
+`scripts/shfmt-baseline.txt`, which records how many lines each pre-existing file
+still needs. A new script must be clean, a listed file may not get worse, a listed
+file that becomes clean must lose its line, a record whose count is not a number or
+which names a file that is gone fails the gate, and a missing formatter or a failed
+`git ls-files` fails it too instead of passing nothing. Formats are tab separated
+because a path may contain spaces. `--report` prints the current counts without
+judging them.
+
+The repository is not shfmt-formatted today: 124 files carry 14 005 changed
+lines between them. The gate therefore ratchets — it stops the tree getting worse
+and leaves a whole-tree reformat as its own change, since that rewrites every line
+of those files and every branch open at the time.
+
 
 The requested state persists in `/etc`; a reboot does not silently drop Zoro mode. Re-run `on` after reboot to restore the dataplane.
 The Zoro rule must carry tproxy port `7895`, `meta mark set 0x00000002`, `ct

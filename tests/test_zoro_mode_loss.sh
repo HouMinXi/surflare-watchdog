@@ -1,8 +1,8 @@
 #!/bin/bash
 # The Zoro primary switch lives in a manual nft rule that the Surflare
 # watchdog's destroy+reload removes. The watchdog puts the switch back
-# itself now (Zoro is the fixed primary): it re-runs zoro-exit on, which
-# re-probes the uplink, and only pages when the restore fails.
+# itself now (Zoro is the fixed primary): it runs zoro-exit ensure, which
+# does not probe the uplink; listener recovery is a separate explicit call.
 #
 # The function is extracted from the production script and driven against nft
 # and alert stubs; a pass proves the production body, not a copy.
@@ -33,18 +33,32 @@ printf 'zoro-exit %s\n' "$*" >> "$TMP_DIR/zoro_calls"
 # The daemon asks `status` for the DNS verdict instead of counting rules
 # itself, so the stub has to answer that shape.
 if [ "${1:-}" = status ]; then
-	if [ "${FAKE_ZORO_SILENT:-0}" = 1 ]; then
-		printf 'mode=on\nnft=ok\n'
-		exit 0
+	if [ "${FAKE_NFT_ABSENT:-0}" = 1 ]; then
+		printf 'mode=lost\nnft=missing\nreason=no-table\n'; exit 4
 	fi
-	printf 'mode=on\nnft=ok\ndns=%s\n' "${FAKE_ZORO_DNS:-ok}"
+	if [ "${Nft_rc:-0}" -ne 0 ]; then
+		printf 'mode=unknown\nnft=unreadable\n'; exit 3
+	fi
+	if [ "${Nft_table_rc:-0}" -ne 0 ]; then
+		printf 'mode=lost\nnft=missing\nreason=no-table\n'; exit 4
+	fi
+	if [ "${FAKE_ZORO_SILENT:-0}" = 1 ]; then
+		printf 'mode=on\nnft=ok\n'; exit 0
+	fi
+	mode=on; order=${FAKE_ZORO_ORDER:-ok}
+	case "$Nft_output" in *'comment "zoro-exit"'*) : ;;
+	*) mode=lost; order=missing ;; esac
+	printf 'mode=%s\nnft=ok\ndns=%s\nroute=%s\norder=%s\nxray_listening=%s\n' \
+		"$mode" "${FAKE_ZORO_DNS:-ok}" "${FAKE_ZORO_ROUTE:-ok}" \
+		"$order" "${FAKE_ZORO_LISTENER:-yes}"
 	exit 0
 fi
 if [ "${1:-}" = ensure ]; then
-	printf 'health=%s\nreason=%s\n' "${FAKE_ZORO_HEALTH:-ok}" "${FAKE_ZORO_WHY:-none}"
+	printf 'health=%s\nreason=%s\n' "${FAKE_ZORO_HEALTH:-repaired}" "${FAKE_ZORO_WHY:-none}"
 	exit "${FAKE_ZORO_ENSURE_RC:-${ZORO_EXIT_RC:-0}}"
 fi
-exit "${ZORO_EXIT_RC:-0}"
+printf 'health=%s\nreason=xray\n' "${FAKE_RECOVERY_HEALTH:-repaired}"
+exit "${FAKE_RECOVERY_RC:-0}"
 EOF
 chmod +x "$TMP/zoro-exit"
 
@@ -219,7 +233,7 @@ chmod 555 "$TMP/surflare"
 : > "$TMP/zoro_calls"
 run_case 0 'iifname "br-lan" tproxy ip to :10800' 0
 chmod 755 "$TMP/surflare"
-if [ ! -s "$TMP/zoro_calls" ] \
+if ! grep -q 'zoro-exit ensure' "$TMP/zoro_calls" \
 	&& grep -q 'cannot write' "$TMP/log" \
 	&& [ "$(grep -c "^surflare: Zoro primary mode lost|" "$TMP/alerts")" -eq 1 ]; then
 	ok "an unwritable stamp dir skips restore and still pages"
@@ -249,15 +263,17 @@ else
 	bad "a killswitch-only wipe did not restore [calls=$(cat "$TMP/zoro_calls" 2>/dev/null)]"
 fi
 
-# 5f: with the surflare table gone there are no anchors; stay silent
+# 5f: missing parent state reaches the same counted defer path as a repair
 printf 'on\n' > "$TMP/state"
 rm -rf "$TMP/surflare"; : > "$TMP/zoro_calls"
-run_case 0 'iifname "br-lan" tproxy ip to :7895 comment "zoro-exit"' 0 \
+FAKE_ZORO_HEALTH=deferred FAKE_ZORO_WHY=no-table \
+	run_case 0 'iifname "br-lan" tproxy ip to :7895 comment "zoro-exit"' 4 \
 	'oif "lo" accept' 'oif "lo" accept' 'oif "lo" accept' 1
-if ! grep -q "zoro-exit ensure" "$TMP/zoro_calls" && [ ! -s "$TMP/alerts" ]; then
-	ok "a missing surflare table neither restores nor pages"
+if grep -q "zoro-exit ensure" "$TMP/zoro_calls" && [ ! -s "$TMP/alerts" ] &&
+	[ "$(cat "$TMP/surflare/zoro_busy.count")" = 'no-table 1' ]; then
+	ok "a missing surflare table is counted as a deferred repair"
 else
-	bad "a missing surflare table misbehaved"
+	bad "a missing surflare table bypassed the owner verdict"
 fi
 
 # 6: the one-hour alert stamp suppresses a repeat page even when the
@@ -326,6 +342,9 @@ printf 'on\n' > "$TMP/state"
 rm -rf "$TMP/surflare"; : > "$TMP/zoro_calls"
 cat > "$TMP/zoro-hang" <<'EOF'
 #!/bin/bash
+[ "${1:-}" != status ] || {
+	printf 'mode=lost\nnft=missing\nreason=no-table\n'; exit 4
+}
 trap '' TERM
 sleep 30
 EOF
@@ -355,11 +374,91 @@ FAKE_ZORO_SILENT=1 run_case 0 'iifname "br-lan" tproxy ip to :7895 comment "zoro
 rm -f "$TMP/surflare/zoro_mode_restore.stamp"
 FAKE_ZORO_DNS=misplaced run_case 0 'iifname "br-lan" tproxy ip to :7895 comment "zoro-exit"'
 grep -q "zoro-exit ensure" "$TMP/zoro_calls" 2>/dev/null \
-	&& ok "a misplaced DNS pair is repaired through on --repair" \
+	&& ok "a misplaced DNS pair is repaired through ensure" \
 	|| bad "a misplaced pair was left alone [calls=$(tr '\n' ' ' < "$TMP/zoro_calls" 2>/dev/null)]"
 
+
+# Distinct zero-exit verdicts must never turn an off/cleanup into a restore.
+for health in off cleaned; do
+	rm -rf "$TMP/surflare"; : > "$TMP/zoro_calls"
+	FAKE_ZORO_HEALTH="$health" run_case 0 'tproxy ip to :10800'
+	if ! grep -q 'primary restored' "$TMP/log" &&
+		grep -q 'switch is off' "$TMP/log" && [ ! -s "$TMP/alerts" ]; then
+		ok "daemon honors the $health verdict"
+	else bad "daemon called $health a restore"; fi
+done
+
+# The twentieth consecutive same-cause defer pages; the nineteenth does not.
+for cause in lock no-table; do
+	rm -rf "$TMP/surflare"; mkdir "$TMP/surflare"
+	printf '%s 18\n' "$cause" > "$TMP/surflare/zoro_busy.count"
+	if [ "$cause" = lock ]; then health=busy; why=none
+	else health=deferred; why=no-table; fi
+	FAKE_ZORO_HEALTH="$health" FAKE_ZORO_WHY="$why" \
+		run_case 0 'tproxy ip to :10800' 4
+	first=$(wc -l < "$TMP/alerts")
+	FAKE_ZORO_HEALTH="$health" FAKE_ZORO_WHY="$why" \
+		run_case 0 'tproxy ip to :10800' 4
+	if [ "$first" -eq 0 ] && [ -s "$TMP/alerts" ] &&
+		grep -q "cause=$cause attempts=20" "$TMP/log"; then
+		ok "repeated $cause defer pages with the actual cause at 20"
+	else bad "wrong threshold or cause for $cause"; fi
+done
+
+rm -rf "$TMP/surflare"; mkdir "$TMP/surflare"
+printf 'lock 19\n' > "$TMP/surflare/zoro_busy.count"
+FAKE_ZORO_HEALTH=deferred FAKE_ZORO_WHY=no-table \
+	run_case 0 'tproxy ip to :10800' 4
+if [ ! -s "$TMP/alerts" ] &&
+	[ "$(cat "$TMP/surflare/zoro_busy.count")" = 'no-table 1' ]; then
+	ok 'a new defer cause starts its own consecutive count'
+else bad 'unrelated defer causes were counted together'; fi
+
+rm -rf "$TMP/surflare"; : > "$TMP/zoro_calls"
+FAKE_ZORO_HEALTH=deferred FAKE_ZORO_WHY=xray \
+	run_case 0 'tproxy ip to :10800' 4
+if grep -q '^zoro-exit on --repair$' "$TMP/zoro_calls" &&
+	grep -q 'listener recovered' "$TMP/log" && [ ! -s "$TMP/alerts" ]; then
+	ok 'xray deferral invokes the explicit listener recovery path'
+else bad 'dead listener was mistaken for a busy lock'; fi
+
+rm -rf "$TMP/surflare"; : > "$TMP/zoro_calls"
+FAKE_ZORO_LISTENER=no FAKE_ZORO_HEALTH=deferred FAKE_ZORO_WHY=xray \
+	run_case 0 'tproxy ip to :7895 comment "zoro-exit"' 4
+if grep -q '^zoro-exit on --repair$' "$TMP/zoro_calls"; then
+	ok 'a dead listener is detected even with all rules present'
+else bad 'presence checks hid the dead listener'; fi
+
+rm -rf "$TMP/surflare"; : > "$TMP/zoro_calls"
+FAKE_ZORO_ORDER=misplaced run_case 0 'tproxy ip to :7895 comment "zoro-exit"'
+if grep -q '^zoro-exit ensure$' "$TMP/zoro_calls"; then
+	ok 'misordered data triggers ensure even when its tag is present'
+else bad 'tag-only presence hid incorrect ordering'; fi
+
+# Missing state is valid absence, unlike failed reads; neither missing
+# parent table may bypass the same-cause defer threshold.
+for missing in data dns; do
+	rm -rf "$TMP/surflare"; : > "$TMP/zoro_calls"
+	pages=0
+	for _attempt in $(seq 1 21); do
+		if [ "$missing" = data ]; then
+			FAKE_NFT_ABSENT=1 FAKE_ZORO_HEALTH=deferred FAKE_ZORO_WHY=no-table \
+				run_case 1 '' 4
+		else
+			FAKE_ZORO_HEALTH=deferred FAKE_ZORO_WHY=no-table \
+				run_case 0 'tproxy ip to :7895 comment "zoro-exit"' 4 '' '' '' 1
+		fi
+		[ "$_attempt" -ge 20 ] || [ ! -s "$TMP/alerts" ] || pages=99
+		[ ! -s "$TMP/alerts" ] || pages=$((pages+1))
+	done
+	if [ "$pages" -eq 1 ] &&
+		[ "$(cat "$TMP/surflare/zoro_busy.count")" = 'no-table 20' ]; then
+		ok "actual missing $missing parent reaches the counted threshold"
+	else bad "missing $missing parent bypassed defer handling [pages=$pages]"; fi
+done
+
 # 9: the count is pinned, so a silently skipped case cannot pass as green
-if [ "$pass" -eq 21 ]; then
+if [ "$pass" -eq 31 ]; then
 	ok "the daemon case count is pinned"
 else
 	bad "the daemon case count moved to $pass"

@@ -1007,7 +1007,21 @@ _stop_proxy_log_monitor() {
 		wait "$_proxy_log_pid" 2>/dev/null
 		_proxy_log_pid=""
 	fi
-	pkill -f "tail -n 0 -F ${PROXY_LOG//./\\.}" 2>/dev/null || true
+	# The path is data, so it is never put in a pattern. Find every tail
+	# with the fixed arguments, then keep only the one whose command line is
+	# byte for byte this daemon's own. A `[` in the path would defeat a regex.
+	for _p in $(pgrep -f "tail -n 0 -F " 2>/dev/null); do
+		python3 - "$_p" "$PROXY_LOG" <<'PY' && kill "$_p" 2>/dev/null
+import sys
+pid, path = sys.argv[1], sys.argv[2]
+try:
+    got = open('/proc/%s/cmdline' % pid, 'rb').read()
+except FileNotFoundError:
+    sys.exit(1)
+want = b'tail\0-n\0' + b'0\0-F\0' + path.encode() + b'\0'
+sys.exit(0 if got == want else 1)
+PY
+	done
 	rm -f "$STORM_503_STATE" "${STORM_503_STATE}.tmp"
 	rm -f "$PROXY_ERR_STATE" "${PROXY_ERR_STATE}.tmp"
 }
@@ -1017,24 +1031,234 @@ DESKTOP_CPU_SET=""
 
 _dns_fallback_active=0
 _dns_fallback_gw=""
+DNS_CLEANUP_DEFER_FILE=/run/surflare_dns_cleanup_defer
 DNS_STUCK_FILE="/run/surflare_dns_stuck"
 
+_dns_fallback_body() {
+	# Listing and handle deletes against one snapshot of the chain. The caller
+	# holds the shared lock, so no other writer can recycle a handle here.
+	local gw="$1" h _fb_dump failed=0
+	if ! _fb_dump=$(nft -a list chain inet surflare output 2>/dev/null); then
+		log "DNS fallback: WARN: cannot read the output chain to clean up"
+		return 1
+	fi
+	# Every rule for this address and port is the daemon's own construct, whatever
+	# it says now, so all of them go: a rule that stopped saying accept would
+	# otherwise sit in the chain while the repair kept installing its pair beside
+	# it. Matching on the verdict would also miss a rule whose counters are
+	# rendered in the middle of the line.
+	# A rule that only sets a mark is not an exemption and is not ours to delete:
+	# the insert positions itself relative to such a rule, so removing it here would
+	# leave the pair with nothing to anchor to.
+	for h in $(_dns_gw_port_lines "$_fb_dump" "$gw" | awk '/handle /{print $NF}'); do
+		if ! nft delete rule inet surflare output handle "$h" 2>/dev/null; then
+			log "DNS fallback: WARN: failed to delete handle ${h}"
+			failed=$((failed + 1))
+		fi
+	done
+	[ "$failed" -eq 0 ]
+}
+
+_dns_defer_read() {
+	# Format: "<epoch> <count> <gateway>". A record from another gateway, or
+	# one whose stamp is not a plausible epoch, starts a new episode instead of
+	# escalating on its first collision.
+	_dd_ts=''
+	_dd_n=0
+	if [ -r "$DNS_CLEANUP_DEFER_FILE" ]; then
+		read -r _dd_ts _dd_n _dd_gw <"$DNS_CLEANUP_DEFER_FILE" 2>/dev/null || true
+	fi
+	case "${_dd_ts:-}" in
+	'' | *[!0-9]*) _dd_ts='' ;;
+	esac
+	case "${_dd_n:-0}" in
+	'' | *[!0-9]*) _dd_n=0 ;;
+	esac
+	if [ -n "${_dd_gw:-}" ] && [ "$_dd_gw" != "${1:-}" ]; then
+		_dd_ts=''
+		_dd_n=0
+	fi
+}
+
+_dns_defer_clear() {
+	rm -f "$DNS_CLEANUP_DEFER_FILE" 2>/dev/null || true
+}
+
+_dns_defer_record() {
+	printf '%s %s %s\n' "$1" "$2" "$3" >"$DNS_CLEANUP_DEFER_FILE" 2>/dev/null
+}
+
 _cleanup_dns_fallback_rules() {
-	local gw="${1:-}"
+	local gw="${1:-}" verdict=0 now n ts max min
 	[ -z "$gw" ] && return 0
 	# Validate IP format (defense-in-depth: callers already validate)
 	if ! [[ "$gw" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
 		return 0
 	fi
-	local h removed=0
-	for h in $(nft -a list chain inet surflare output 2>/dev/null \
-		| grep -E "ip daddr ${gw//./\\.} (tcp|udp) dport 53 accept" | awk '/handle /{print $NF}'); do
-		if ! nft delete rule inet surflare output handle "$h" 2>/dev/null; then
-			log "DNS fallback: WARN: failed to delete handle ${h}"
+	# Only unlock-protected write in this file, so it must never be called from a
+	# context that already holds the lock: flock on a second descriptor of the
+	# same file looks like contention. No current caller does, and no test can
+	# observe a re-entrant one, so the invariant lives here and in README.
+	# `command -v` also reports a file that is present but not executable; that
+	# case reaches the same deferral as a missing one (flock then fails with 126).
+	if command -v flock >/dev/null 2>&1; then
+		(
+			# A failed `exec` redirect exits the shell with its own status
+			# (dash 2, ash 1), so writability is probed first to make 70
+			# deterministic.
+			# `:` is a POSIX special builtin: a redirect error there kills the
+			# shell before `||` runs, so the probe uses a regular command.
+			true >>"$NFT_LOCK_FILE" 2>/dev/null || exit 70
+			exec 7>>"$NFT_LOCK_FILE" || exit 70
+			flock -n 7 || exit 75
+			_dns_fallback_body "$gw"
+		)
+		verdict=$?
+	else
+		# Found but not executable, or absent: the same dead end as no flock.
+		verdict=127
+	fi
+	case "$verdict" in
+	0)
+		_dns_defer_clear
+		_dns_cleanup_deferrals=0
+		return 0
+		;;
+	70 | 75 | 126 | 127)
+		# A lock that never becomes available must not disable the DNS
+		# fallback for good. Deferrals accumulate in a state file, because a
+		# caller may run inside a subshell (connect_vpn does), and the budget
+		# also needs a minimum age so that three unrelated attempts in one tick
+		# cannot escalate.
+		now=$(date +%s 2>/dev/null || echo 0)
+		_dns_defer_read "$gw"
+		if [ "$_dd_n" -gt 0 ] && [ -n "$_dd_ts" ]; then
+			n=$((_dd_n + 1))
+			ts=$_dd_ts
+		else
+			n=1
+			ts=$now
 		fi
-		removed=$((removed + 1))
-	done
-	return 0
+		# A clock that jumped backwards must not freeze the age gate at a
+		# negative age; the file's other windows rebase the same way.
+		[ "$ts" -le "$now" ] || ts=$now
+		# Without a writable file the count still has to advance, or a read-only
+		# /run would disable the escalation entirely.
+		if ! _dns_defer_record "$ts" "$n" "$gw"; then
+			n=${_dns_cleanup_deferrals:-0}
+			n=$((n + 1))
+		fi
+		_dns_cleanup_deferrals=$n
+		max=${_DNS_CLEANUP_MAX_DEFERRALS:-3}
+		min=${_DNS_CLEANUP_MIN_DEFER_SECS:-60}
+		if [ "$n" -ge "$max" ] && [ "$((now - ts))" -ge "$min" ]; then
+			log "DNS fallback: WARN: nft lock unavailable ${n} times over $((now - ts))s; cleaning without it"
+			_dns_defer_clear
+			_dns_cleanup_deferrals=0
+			_dns_fallback_body "$gw"
+			return $?
+		fi
+		case "$verdict" in
+		126 | 127)
+			log "DNS fallback: WARN: flock unavailable or not executable (verdict $verdict); cleanup deferred"
+			;;
+		70)
+			# A lock that cannot be opened is a setup fault; calling it busy would
+			# point the next reader at the wrong cause.
+			log "DNS fallback: WARN: cannot open the nft lock (verdict $verdict); cleanup deferred"
+			;;
+		*)
+			log "DNS fallback: WARN: cleanup deferred, nft lock busy (verdict $verdict)"
+			;;
+		esac
+		return 1
+		;;
+	esac
+	return 1
+}
+
+_dns_gw_port_lines() {
+	# Every rule that can change what happens to this gateway's DNS, in the shapes
+	# nft actually prints: a scalar port, a port set, a port range that contains 53,
+	# a verdict with no port at all (which covers 53 as well), and any of those with
+	# a range or a prefix on the address. Two properties matter:
+	#  - the gateway is a whole token: 192.0.2.1 must not match 192.0.2.10, which
+	#    belongs to somebody else and would make the chain look wrong forever.
+	#  - both the predicate and the cleanup read this, so what one can see the other
+	#    can remove. A rule one sees and the other cannot is a repair that never
+	#    converges; a rule neither sees is a blind spot that reads as "exempt".
+	local dump="$1" gw="$2" named scalar setform ranges portless all
+	# Only a destination address decides where the query goes. A source
+	# address equal to the gateway matches traffic the gateway sent, which
+	# is not a query to it.
+	named=$(printf '%s\n' "$dump" | grep -E "(^|[[:space:]])daddr[[:space:]]+(\{[[:space:]]*)?(${gw//./\\.})([^0-9.]|$)")
+	[ -n "$named" ] || return 0
+	# The port token has to be exactly 53: a range that starts at 53 (`53-55`)
+	# covers the same port but is a range, and counting it here as well would
+	# delete its handle twice.
+	scalar='(^|[^s])dport[[:space:]]+53([^0-9-]|$)'
+	setform='dport[[:space:]]+\{[^}]*[[:space:]{,]53([[:space:],}]|$)'
+	ranges=$(printf '%s\n' "$named" | awk '
+		{
+			for (i = 1; i <= NF; i++) {
+				if ($(i - 1) !~ /^(udp|tcp|sctp|dccp)$/ && $(i - 1) != "th") { continue }
+				if ($i == "sport") { continue }
+				if ($i != "dport") { continue }
+				t = $(i + 1)
+				if (t ~ /^[0-9]+-[0-9]+$/) {
+					split(t, b, "-")
+					if (b[1] + 0 <= 53 && 53 <= b[2] + 0) { print; next }
+				}
+				if (t == "{") {
+					for (j = i + 2; j <= NF && $j != "}"; j++) {
+						gsub(/,/, "", $j)
+						if ($j !~ /^[0-9]+-[0-9]+$/) { continue }
+						split($j, b, "-")
+						if (b[1] + 0 <= 53 && 53 <= b[2] + 0) { print; next }
+					}
+				}
+			}
+		}')
+	# A protocol-scoped rule covers one transport. Only a rule with no
+	# protocol, or one that names both tcp and udp, covers the query.
+	portless=$(printf '%s\n' "$named" | grep -vE '(dport|sport)' \
+		| awk '((/l4proto/ || /protocol/) && !(/tcp/ && /udp/)) { next } { print }' \
+		| grep -E '(^|[[:space:]])(drop|reject|redirect|queue|tproxy)([[:space:]]|$)')
+	# A scalar port, a set, a range and a line without a port are distinct
+	# renderings, so no sorting pass is needed here and the path stays on grep
+	# and awk alone.
+	all=$(printf '%s\n%s\n%s\n' \
+		"$(printf '%s\n' "$named" | grep -E "$scalar|$setform")" \
+		"$ranges" "$portless" | grep -v '^$')
+	# A rule that only sets a mark does not decide what happens to the query, it is
+	# not ours to delete, and the insert anchors on it -- the repository's own anchor
+	# is exactly that shape. A rule that sets a mark AND negates is interference.
+	printf '%s\n' "$all" | grep -v 'meta mark set'
+	printf '%s\n' "$all" | grep 'meta mark set' | grep -E '(^|[[:space:]])(drop|reject|redirect|queue|tproxy|accept)([[:space:]]|$)'
+}
+
+
+_exemption_present() {
+	# True only when the chain holds exactly the two rules this daemon installs for
+	# this gateway: one per transport, undecorated, ending in accept.
+	# Two separate questions, because either alone is blind:
+	#  - every rule that mentions this gateway and port 53, however it is written:
+	#    a third rule -- a drop, a redirect, a set-form match, `meta l4proto` -- does
+	#    something to these queries even when the two accepts are still there.
+	#  - what those two rules say, matched as a whole line: a substring match is
+	#    satisfied by a rule scoped to one interface, or by a comment carrying the
+	#    word accept on a rule that drops.
+	local gw="$1" dump mentions pattern strict
+	dump=$(nft -a list chain inet surflare output 2>/dev/null) || return 1
+	mentions=$(_dns_gw_port_lines "$dump" "$gw")
+	[ -n "$mentions" ] || return 1
+	[ "$(printf '%s\n' "$mentions" | grep -c .)" -eq 2 ] || return 1
+	pattern="^[[:space:]]*ip daddr ${gw//./\\.} (tcp|udp) dport 53 "
+	pattern="${pattern}(counter packets [0-9]+ bytes [0-9]+ )?accept( # handle [0-9]+)?\$"
+	strict=$(printf '%s\n' "$mentions" | grep -E "$pattern")
+	[ "$(printf '%s\n' "$strict" | grep -c .)" -eq 2 ] || return 1
+	printf '%s\n' "$strict" | grep -qE "udp dport 53 " || return 1
+	printf '%s\n' "$strict" | grep -qE "tcp dport 53 "
 }
 
 _insert_dns_fallback() {
@@ -1047,11 +1271,22 @@ _insert_dns_fallback() {
 		return 0
 	fi
 	if [ "$_dns_fallback_active" -eq 1 ]; then
-		if nft -a list chain inet surflare output 2>/dev/null \
-			| grep -qE "ip daddr ${gw//./\\.} (tcp|udp) dport 53 accept"; then
+		# Both transports have to be there. One line means a half exemption, which
+		# still sends the other transport through tproxy, so it is repaired below
+		# rather than trusted.
+		if _exemption_present "$gw"; then
+			return 0
+		fi
+		# The gateway changed. Remove the old exemption first; if that cannot be
+		# done now, keep the recorded gateway so a later tick retries instead of
+		# orphaning the old rules behind a "restored" claim.
+		if [ -n "${_dns_fallback_gw:-}" ] &&
+			! _cleanup_dns_fallback_rules "$_dns_fallback_gw"; then
+			log "DNS fallback: WARN: old gateway exemption not removable yet"
 			return 0
 		fi
 		_dns_fallback_active=0
+		_dns_fallback_gw=""
 	fi
 	_cleanup_dns_fallback_rules "$gw"
 	handle=$(nft -a list chain inet surflare output 2>/dev/null \
@@ -1066,8 +1301,15 @@ _insert_dns_fallback() {
 		_dns_fallback_gw="$gw"
 		log "DNS fallback: exempted gateway ${gw}:53 from tproxy"
 	else
-		_cleanup_dns_fallback_rules "$gw"
-		log "DNS fallback: WARN: nft insert failed, cleaned partial rules"
+		if _cleanup_dns_fallback_rules "$gw"; then
+			log "DNS fallback: WARN: nft insert failed, cleaned partial rules"
+		else
+			# Keep it tracked: an unreachable rule that nothing retries would
+			# stay in the chain until the next reboot.
+			_dns_fallback_active=1
+			_dns_fallback_gw="$gw"
+			log "DNS fallback: WARN: nft insert failed and cleanup is incomplete"
+		fi
 	fi
 }
 
@@ -1076,19 +1318,28 @@ _remove_dns_fallback() {
 	local gw="${_dns_fallback_gw:-}"
 	[ -z "$gw" ] && gw=$(ip route show default | awk '/default/{print $3; exit}')
 	[ -z "$gw" ] && return 0
-	_cleanup_dns_fallback_rules "$gw"
-	_dns_fallback_active=0
-	_dns_fallback_gw=""
-	log "DNS fallback: restored tunnel DNS"
+	if _cleanup_dns_fallback_rules "$gw"; then
+		log "DNS fallback: restored tunnel DNS"
+		_dns_fallback_active=0
+		_dns_fallback_gw=""
+	else
+		# Keep the flag: a later removal path must retry the same cleanup
+		# instead of leaving rules behind with the state already cleared.
+		log "DNS fallback: WARN: cleanup incomplete, tunnel DNS may be partly active"
+	fi
 }
 
 _startup_cleanup_dns_fallback() {
 	local gw
 	gw=$(ip route show default | awk '/default/{print $3; exit}')
 	[ -z "$gw" ] && return 0
-	_cleanup_dns_fallback_rules "$gw"
-	_dns_fallback_active=0
-	_dns_fallback_gw=""
+	if _cleanup_dns_fallback_rules "$gw"; then
+		_dns_fallback_active=0
+		_dns_fallback_gw=""
+	else
+		log "DNS fallback: WARN: startup cleanup incomplete"
+	fi
+	rm -f "$DNS_CLEANUP_DEFER_FILE"
 	rm -f "$DNS_STUCK_FILE"
 	rm -f /run/surflare_self_dial_guard.*.note 2>/dev/null || true
 }
@@ -2452,7 +2703,7 @@ _cleanup_on_startup() {
 	fi
 
 	log "Startup cleanup: surflare-proxy not running, flushing stale watchdog state"
-	nft delete table inet surflare 2>/dev/null || true
+	_remove_surflare_table || return $?
 	# Keep sw_lan_tproxy if it exists (tombstoned or live from a prior
 	# instance): bypass_devices/auto_bypass sets persist, and the connect
 	# flow will restore the tproxy rule via nft replace.
@@ -2671,8 +2922,11 @@ _unarm_killswitch_output() {
 	# Guard: output chain must exist (handles double-call)
 	nft list chain inet killswitch output >/dev/null 2>&1 || return 0
 
-	nft flush chain inet killswitch output 2>/dev/null || true
-	nft delete chain inet killswitch output 2>/dev/null || true
+	nft_apply_locked "unarm killswitch output" nft -f - <<'NFT_UNARM'
+destroy chain inet killswitch output
+NFT_UNARM
+	local _unarm_rc=$?
+	[ "$_unarm_rc" -eq 0 ] || return "$_unarm_rc"
 
 	# Flush stale conntrack entries that used the old output chain rules.
 	# Scoped flush only (ct mark 0x100 = tproxy-marked flows, set by the
@@ -2704,14 +2958,10 @@ _reinstall_killswitch_output() {
 		return
 	fi
 
-	# Safety: if output chain exists (double-call), flush+delete first
-	if nft list chain inet killswitch output >/dev/null 2>&1; then
-		nft flush chain inet killswitch output 2>/dev/null || true
-		nft delete chain inet killswitch output 2>/dev/null || true
-	fi
-
+	# Destroy and recreate in one kernel transaction under the shared lock.
 	local _ks_tmp="/tmp/ks_output_$$.nft"
 	cat > "$_ks_tmp" << 'NFTEOF'
+destroy chain inet killswitch output
 add chain inet killswitch output { type filter hook output priority filter + 20 ; policy drop ; }
 add rule inet killswitch output ct state invalid drop
 add rule inet killswitch output oif "lo" accept
@@ -2740,7 +2990,13 @@ NFTEOF
 	_ntp_user=$(id -u chrony >/dev/null 2>&1 && echo chrony || echo root)
 	sed -i "s/meta skuid \"root\"/meta skuid \"$_ntp_user\"/" "$_ks_tmp"
 
-	if ! nft -f "$_ks_tmp"; then
+	local _ks_rc=0
+	nft_apply_locked "killswitch output" nft -f "$_ks_tmp" || _ks_rc=$?
+	if [ "$_ks_rc" -eq 75 ]; then
+		rm -f "$_ks_tmp"
+		return 75
+	fi
+	if [ "$_ks_rc" -ne 0 ]; then
 		log "ERROR: output chain reinstall failed, falling back to full install"
 		rm -f "$_ks_tmp"
 		_install_killswitch
@@ -2759,8 +3015,11 @@ NFTEOF
 
 	# Remove boot-time lockdown if still present
 	if nft list table inet surflare_boot_lock >/dev/null 2>&1; then
-		nft destroy table inet surflare_boot_lock 2>/dev/null || true
-		log "Boot lock removed: killswitch output reinstalled"
+		if nft destroy table inet surflare_boot_lock 2>/dev/null; then
+			log "Boot lock removed: killswitch output reinstalled"
+		else
+			log "WARN: boot lock still present after destroy attempt"
+		fi
 	fi
 }
 
@@ -3001,8 +3260,10 @@ NFTEOF
 	local _ks_err _ks_rc=0
 	_ks_err=$(nft_apply_locked "killswitch install" nft -f "$_ks_tmp" 2>&1) || _ks_rc=$?
 	if [ "$_ks_rc" -eq 0 ]; then
-		log "Kill switch installed (inet killswitch, policy drop, ntp-user=$_ntp_user)"
-	elif [ "$_ks_rc" -eq 2 ]; then
+		# Success is reported only after the read-back below proves the table
+		# is really in the kernel.
+		:
+	elif [ "$_ks_rc" -eq 75 ]; then
 		# Another writer owns the tables; the flag stays 0 so the next tick
 		# installs again.
 		log "Kill switch install skipped this tick (nft lock busy)"
@@ -3044,6 +3305,7 @@ NFTEOF
 		rm -f "$_ks_tmp"
 		return 1
 	fi
+	log "Kill switch installed (inet killswitch, policy drop, ntp-user=$_ntp_user)"
 	rm -f "$_ks_tmp"
 
 	# Remove boot-time lockdown now that killswitch is armed.
@@ -3051,8 +3313,11 @@ NFTEOF
 	# window before this watchdog starts; no longer needed once the real
 	# killswitch is in place.
 	if nft list table inet surflare_boot_lock >/dev/null 2>&1; then
-		nft destroy table inet surflare_boot_lock 2>/dev/null || true
-		log "Boot lock removed: killswitch now armed"
+		if nft destroy table inet surflare_boot_lock 2>/dev/null; then
+			log "Boot lock removed: killswitch now armed"
+		else
+			log "WARN: boot lock still present after destroy attempt"
+		fi
 	fi
 
 	# Enforce LAN DNS through the router's dnsmasq/SmartDNS.
@@ -3075,9 +3340,11 @@ NFTEOF
 		if [ -n "$_diag_server_ips" ]; then
 			local _persist_csv
 			_persist_csv=$(echo "$_diag_server_ips" | tr ' ' ',')
-			nft add element inet killswitch server_ips "{ ${_persist_csv} }" 2>/dev/null || \
+			if nft add element inet killswitch server_ips "{ ${_persist_csv} }" 2>/dev/null; then
+				log "Kill switch: server_ips restored from disk (${_diag_server_ips})"
+			else
 				log "WARN: failed to repopulate server_ips from $_persist_v4"
-			log "Kill switch: server_ips restored from disk (${_diag_server_ips})"
+			fi
 		fi
 	fi
 
@@ -3220,6 +3487,8 @@ _remove_killswitch() {
 # `conntrack -D` returning "0 flow entries deleted" is success; there
 # is deliberately NO full-table fallback (an empty class is not an
 # error, and stale unmarked entries expire on their own timers).
+# Best effort by design: every delete is allowed to fail without aborting the
+# reconnect. Callers must not report the outcome as verified.
 _scoped_conntrack_flush() {
 	local _ip
 	conntrack -D -s 127.0.0.1 >/dev/null 2>&1 || true
@@ -3289,44 +3558,43 @@ EOF
 # still says "on". A killswitch-only rebuild is a sneakier variant: the
 # data rule survives but the DNS rules are wiped. Both are "mode loss".
 # Zoro is the household's fixed primary now, so the watchdog puts the
-# switch back itself; zoro-exit re-probes the uplink and refuses to
-# install anything half-broken. A failed -- or impossible -- restore
+# switch back itself; ensure reports rule repair and delegates a dead
+# listener to the explicit on --repair path. A failed -- or impossible -- restore
 # raises a page. Runs both after a rebuild and on the healthy tick.
 _zoro_mode_loss_alert() {
 	[ -s "$ZORO_STATE_FILE" ] || return 0
 	[ "$(tr -d ' \r' < "$ZORO_STATE_FILE")" = on ] || return 0
-	# A failed read is not evidence of loss. Only a readable chain that
-	# lacks the manual rule is a reportable state.
-	nft list chain inet sw_lan_tproxy prerouting >/dev/null 2>&1 || {
-		log "WARN: cannot inspect sw_lan_tproxy; Zoro state unknown"
-		return 0
-	}
-	_zoro_missing=""
-	nft list chain inet sw_lan_tproxy prerouting 2>/dev/null \
-		| grep -F 'comment "zoro-exit"' >/dev/null 2>&1 \
-		|| _zoro_missing="data rule"
-	# The DNS rules live in three other chains; a killswitch-only rebuild
-	# wipes them while the data rule above survives. Only check them when
-	# the surflare table exists -- with the table gone there are no
-	# anchors to install against anyway, and the data-rule branch covers
-	# that state on the next rebuild.
 	_zoro_bin="${ZORO_EXIT_BIN:-/usr/bin/zoro-exit}"
-	if [ -z "$_zoro_missing" ] && [ -x "$_zoro_bin" ] &&
-		nft list table inet surflare >/dev/null 2>&1; then
-		# Ask the tool that owns these rules instead of keeping a second
-		# definition here.  `status` is read-only and prints the DNS verdict
-		# without probing the uplink, so it is cheap enough for the health tick
-		# and it sees ordering as well as absence.
-		_zoro_dns_state=$(timeout -k 1 10 "$_zoro_bin" status 2>/dev/null 9>&- 200>&- |
-			sed -n 's/^dns=//p' | head -1)
-		# A verdict we could not read is not evidence of a loss: a slow nft, a
-		# killed call or an older helper all print nothing, and paging on that
-		# would cry wolf on a switch that is fine.  Same rule as the data rule
-		# above, where a failed read leaves the flag alone.
-		case "$_zoro_dns_state" in
-		ok | '') : ;;
-		*) _zoro_missing="DNS rules" ;;
+	_zoro_missing="data rule"
+	if [ -x "$_zoro_bin" ]; then
+		# The CLI owns table absence versus read failure. Do not bypass its
+		# deferred verdict with presence-only checks in this consumer.
+		_zoro_status_rc=0
+		_zoro_status=$(timeout -k 1 "${ZORO_RESTORE_TIMEOUT:-25}" "$_zoro_bin" status \
+			2>/dev/null 9>&- 200>&-) || _zoro_status_rc=$?
+		case "$_zoro_status_rc" in
+		0 | 1) : ;;
+		4) _zoro_missing="table rebuild" ;;
+		*) log "WARN: cannot read Zoro status; leaving it unknown"; return 0 ;;
 		esac
+		if [ "$_zoro_status_rc" -ne 4 ]; then
+			_zoro_dns_state=$(printf '%s\n' "$_zoro_status" | sed -n 's/^dns=//p' | head -1)
+			_zoro_order=$(printf '%s\n' "$_zoro_status" | sed -n 's/^order=//p' | head -1)
+			_zoro_route=$(printf '%s\n' "$_zoro_status" | sed -n 's/^route=//p' | head -1)
+			_zoro_listener=$(printf '%s\n' "$_zoro_status" | sed -n 's/^xray_listening=//p' | head -1)
+			_zoro_mode=$(printf '%s\n' "$_zoro_status" | sed -n 's/^mode=//p' | head -1)
+			case "$_zoro_dns_state:$_zoro_order:$_zoro_route:$_zoro_listener:$_zoro_mode" in
+			ok:ok:ok:yes:on) _zoro_missing="" ;;
+			*unknown* | *::* | :* | *:) log "WARN: incomplete Zoro status; leaving it unknown"; return 0 ;;
+			*)
+				[ "$_zoro_mode" = on ] || _zoro_missing="data rule"
+				[ "$_zoro_dns_state" = ok ] || _zoro_missing="DNS rules"
+				[ "$_zoro_order" != misplaced ] || _zoro_missing="data ordering"
+				[ "$_zoro_route" = ok ] || _zoro_missing="policy route"
+				[ "$_zoro_listener" = yes ] || _zoro_missing="xray listener"
+				;;
+			esac
+		fi
 	fi
 	if [ -z "$_zoro_missing" ]; then
 		rm -f "${ZORO_ALERT_STAMP_DIR:-/run/surflare}/zoro_busy.count" 2>/dev/null || true
@@ -3356,24 +3624,25 @@ _zoro_mode_loss_alert() {
 			log "Zoro switch turned off while restoring; honoring it"
 			return 0
 		}
-		log "WARN: Zoro switch incomplete (missing: $_zoro_missing); restoring via zoro-exit on"
-		# Bounded: a hung helper must not freeze the health loop. zoro-exit
-		# needs at most ~15s (xray wait + probe); 25 leaves headroom, and -k
-		# makes the bound hold even if the helper catches the signal.
+		log "WARN: Zoro switch incomplete (missing: $_zoro_missing); restoring via zoro-exit ensure"
 		_zoro_rc=0
-		# -k so the bound holds even if the helper catches the signal; the kill
-		# delay is one second so a TERM-ignoring helper cannot outlive the tick.
-		# --repair keeps this from overriding a switch-off that a person asked
-		# for while the call was queued; the fd closes keep this daemon's own
-		# locks out of a helper that may outlive the tick.
+		# Bound the helper and close the daemon's singleton descriptors. ensure
+		# rechecks intent under its own lock; service recovery is separate.
 		# ensure repairs and reports; it reads the request file under its own lock
 		# so a person's off still wins, and it never starts the service or probes
 		# the uplink -- this daemon owns those decisions.
 		_zoro_out=$(timeout -k 1 "${ZORO_RESTORE_TIMEOUT:-25}" "$_zoro_bin" ensure \
 			2>/dev/null 9>&- 200>&-) || _zoro_rc=$?
+		_zoro_health=$(printf '%s\n' "$_zoro_out" | sed -n 's/^health=//p' | head -1)
 		_zoro_why=$(printf '%s\n' "$_zoro_out" | sed -n 's/^reason=//p' | head -1)
 		if [ "$_zoro_rc" -eq 0 ]; then
-			log "Zoro primary restored (was missing: $_zoro_missing)"
+			case "$_zoro_health" in
+			repaired) log "Zoro primary restored (was missing: $_zoro_missing)" ;;
+			ok) log "Zoro ensure confirmed the switch is healthy" ;;
+			off) log "Zoro restore skipped: the switch is off" ;;
+			cleaned) log "Zoro leftovers removed: the switch is off" ;;
+			*) log "WARN: invalid ensure verdict; leaving state unknown"; return 0 ;;
+			esac
 			case "$_zoro_why" in
 			'' | none) : ;;
 			*) log "ensure reported: $_zoro_why" ;;
@@ -3382,26 +3651,58 @@ _zoro_mode_loss_alert() {
 			return 0
 		fi
 		if [ "$_zoro_rc" -eq 4 ]; then
-			# Somebody else is already repairing this -- usually a person
-			# running the same command.  Not a failure: no page, and drop the
-			# throttle so the next tick picks up whatever they leave behind.
-			# A lock that stays busy for twenty ticks is not a person: count
-			# the deferrals and page once so a stuck lock cannot go silent.
+			case "$_zoro_health:$_zoro_why" in
+			deferred:xray)
+				# ensure remains side-effect-free for services; recovery is an
+				# explicit on --repair call that rechecks intent under its lock.
+				_zoro_rc=0
+				_zoro_recovery=$(timeout -k 1 25 "$_zoro_bin" on --repair \
+					2>/dev/null 9>&- 200>&-) || _zoro_rc=$?
+				if [ "$_zoro_rc" -eq 0 ]; then
+					case "$_zoro_recovery" in
+					*health=off*) log "Zoro listener recovery skipped: switch off" ;;
+					*health=repaired*) log "Zoro listener recovered through on --repair" ;;
+					*) _zoro_rc=1; log "WARN: invalid listener recovery verdict" ;;
+					esac
+					if [ "$_zoro_rc" -eq 0 ]; then
+						rm -f "${ZORO_ALERT_STAMP_DIR:-/run/surflare}/zoro_busy.count"
+						return 0
+					fi
+				fi
+				_zoro_why=xray
+				;;
+			deferred:no-table)
+				log "Zoro restore deferred: table rebuild in progress"
+				;;
+			busy:*) _zoro_why=lock ;;
+			*) _zoro_why=invalid-verdict ;;
+			esac
 			_zoro_busy_file="${ZORO_ALERT_STAMP_DIR:-/run/surflare}/zoro_busy.count"
 			_zoro_busy=0
-			[ -f "$_zoro_busy_file" ] && _zoro_busy=$(cat "$_zoro_busy_file" 2>/dev/null)
+			_zoro_cause=""
+			if [ -f "$_zoro_busy_file" ]; then
+				read -r _zoro_cause _zoro_busy < "$_zoro_busy_file" || true
+			fi
 			case "$_zoro_busy" in '' | *[!0-9]*) _zoro_busy=0 ;; esac
+			[ "$_zoro_cause" = "$_zoro_why" ] || _zoro_busy=0
 			_zoro_busy=$((_zoro_busy + 1))
-			printf '%s\n' "$_zoro_busy" > "$_zoro_busy_file" 2>/dev/null || true
-			if [ "$_zoro_busy" -lt 20 ]; then
-				log "Zoro restore deferred: another zoro-exit is running"
+			printf '%s %s\n' "$_zoro_why" "$_zoro_busy" > "$_zoro_busy_file" 2>/dev/null || true
+			if [ "$_zoro_busy" -lt 20 ] && [ "$_zoro_rc" -eq 4 ]; then
+				log "Zoro restore deferred: $_zoro_why"
 				rm -f "$_zoro_rstamp" 2>/dev/null || true
 				return 0
 			fi
-			log "WARN: Zoro restore deferred $_zoro_busy times; the lock is not moving"
-			rm -f "$_zoro_busy_file" 2>/dev/null || true
+			log "WARN: Zoro restore stuck: cause=$_zoro_why attempts=$_zoro_busy"
 		fi
-		log "WARN: zoro-exit on failed or timed out (rc=$_zoro_rc); paging"
+		if [ "$_zoro_rc" -eq 3 ]; then
+			log "Zoro ensure state unknown; leaving it alone"
+			rm -f "$_zoro_rstamp"
+			return 0
+		fi
+		case "$_zoro_rc" in
+		124 | 137 | 143) rm -f "$_zoro_rstamp" ;;
+		esac
+		log "WARN: zoro-exit ensure failed (rc=$_zoro_rc reason=${_zoro_why:-unknown}); paging"
 		fi
 	else
 		log "WARN: $_zoro_bin not installed; cannot restore the Zoro switch automatically"
@@ -3483,52 +3784,53 @@ _zoro_uplink_alert() {
 			"yes" "fault:zoro-uplink-down"
 	) 9>&- 200>&- &
 }
-# Whole-table replacement is not atomic against another writer: two nft -f
-# loads that each destroy and recreate a table interleave into a state neither
-# of them intended.  zoro-exit takes this same lock, so a repair and a rebuild
-# cannot cross.  The fd is closed after every block so a child cannot inherit it
-# and keep the lock past our exit, and locked blocks never nest: nothing inside
-# one may call zoro-exit or another locked block.  A busy lock is not an error:
-# the write is skipped, the caller sees a failure, and the next tick retries.
+# Serialise the enrolled nft writes with zoro-exit. Each call owns a subshell:
+# descriptors and redirections cannot escape into the daemon. Only the bounded
+# command runs while the lock is held; never invoke this helper recursively.
 NFT_LOCK_FILE=${SURFLARE_NFT_LOCK:-/var/lock/zoro-exit.lock}
 
-nft_lock_acquire() { # $1 = label, used in the log line
-	local _t=0
-	if ! true 2>/dev/null >>"$NFT_LOCK_FILE"; then
-		log "WARN: cannot open $NFT_LOCK_FILE; skipping the $1 write"
-		return 1
+nft_apply_locked() (
+	# 75 means contention; 70 is a lock/setup error. Command exits (including
+	# timeout) remain unchanged. A raw command must not itself return 75.
+	[ "$#" -ge 2 ] || return 70
+	_label=$1
+	shift
+	command -v flock >/dev/null 2>&1 || return 70
+	if [ -e /proc/self/fd/8 ]; then
+		log "ERROR: nested nft lock refused ($_label)"
+		return 70
 	fi
-	# Not `exec 8>>file 2>/dev/null`: a redirection on exec with no command
-	# applies to this shell for good, and its failure ends the shell outright.
-	# The path was just probed, so a plain open is enough here.
-	exec 8>>"$NFT_LOCK_FILE" || return 1
-	while ! flock -n 8; do
-		_t=$((_t + 1))
-		if [ "$_t" -ge 5 ]; then
-			log "WARN: nft lock busy; skipping the $1 write this tick"
-			exec 8>&-
-			return 1
+	if ! true 2>/dev/null >>"$NFT_LOCK_FILE"; then
+		log "ERROR: cannot open nft lock ($_label)"
+		return 70
+	fi
+	# On the narrow probe/open race, normalise fatal exec failure in this
+	# child to the same setup-error code as the probe failure.
+	trap 'exit 70' EXIT
+	exec 8>>"$NFT_LOCK_FILE"
+	trap - EXIT
+	_tries=0
+	while :; do
+		_rc=0
+		flock -n 8 || _rc=$?
+		[ "$_rc" -eq 0 ] && break
+		[ "$_rc" -eq 1 ] || return 70
+		_tries=$((_tries + 1))
+		if [ "$_tries" -ge 5 ]; then
+			log "WARN: nft lock busy; skipping $_label"
+			return 75
 		fi
 		sleep 1
 	done
-	return 0
-}
+	# exec the timeout so no shell can exit early and release its fd while nft
+	# still runs. timeout signals its process group on expiry, then escalates.
+	exec timeout -k 1 15 "$@"
+)
 
-nft_lock_release() {
-	flock -u 8 2>/dev/null || true
-	exec 8>&- 2>/dev/null || true
-}
-
-nft_apply_locked() { # $1 = label, rest = the command
-	# Return 2 when the write was skipped because the lock was busy, and the
-	# command's own status when it ran.  Callers must not treat 2 as "the command
-	# failed and try again": the whole point is that it did not run.
-	local _l=$1 _rc=0
-	shift
-	nft_lock_acquire "$_l" || return 2
-	"$@" || _rc=$?
-	nft_lock_release
-	return "$_rc"
+_remove_surflare_table() {
+	nft_apply_locked "remove surflare table" nft -f - <<'NFT_REMOVE'
+destroy table inet surflare
+NFT_REMOVE
 }
 
 _restore_tproxy() {
@@ -3557,19 +3859,22 @@ _restore_tproxy() {
 	local _nft_err _load_ok=0 _load_rc=0
 	_nft_err=$(nft_apply_locked "LAN tproxy restore" nft -f "$_restore_tmp" 2>&1) || _load_rc=$?
 	if [ "$_load_rc" -eq 0 ]; then
-		log "LAN tproxy restored (fresh load from ${_lan_tproxy_nft})"
 		_load_ok=1
-	elif [ "$_load_rc" -eq 2 ]; then
+	elif [ "$_load_rc" -eq 75 ]; then
 		log "LAN tproxy restore skipped this tick (nft lock busy)"
 	else
 		log "WARN: LAN tproxy restore failed: ${_nft_err:-no output}"
 	fi
 	rm -f "$_restore_tmp"
+	[ "$_load_rc" -eq 0 ] || return "$_load_rc"
 	# Sentinel: verify tproxy table exists after load
 	if ! nft list table inet sw_lan_tproxy >/dev/null 2>&1; then
 		log "CRITICAL: tproxy restore failed -- table missing after nft -f"
 		return 1
 	fi
+	# Only a verified load is reported as restored; the log used to appear
+	# before this check, so a missing table printed success and failure.
+	log "LAN tproxy restored (fresh load from ${_lan_tproxy_nft})"
 	# Restore saved bypass IPs immediately to close the rebuild gap.
 	# _update_bypass_devices will overwrite these on the next connect,
 	# but until then bypass devices keep their exemption.
@@ -6242,13 +6547,7 @@ cleanup_probe_state() {
 	killall surflare-proxy 2>/dev/null
 	_stop_proxy_log_monitor
 	wait_for_exit surflare-proxy
-	if nft list table inet surflare >/dev/null 2>&1; then
-		if nft_lock_acquire "probe state cleanup"; then
-			nft flush table inet surflare 2>/dev/null || true
-			nft delete table inet surflare 2>/dev/null || true
-			nft_lock_release
-		fi
-	fi
+	_remove_surflare_table || return $?
 	while ip rule del fwmark 0x1 lookup 100 2>/dev/null; do :; done
 	while ip -6 rule del fwmark 0x1 lookup 100 2>/dev/null; do :; done
 	ip route flush table 100 2>/dev/null || true
@@ -6762,17 +7061,13 @@ connect_vpn() {
 		# every reconnect, which is how ark/deepseek/cloudflared died
 		# alongside the VPN they never used.
 		_scoped_conntrack_flush
-		log "conntrack flushed (scoped: loopback + tproxy-marked + server endpoints)"
+		log "conntrack scoped flush attempted (best effort: loopback + tproxy-marked + server endpoints)"
 
 		# Flush residual nftables/routing rules that surflare disconnect may have missed.
 		# Without this, all TCP/UDP traffic stays fwmark'd -> routed to table 100 -> loopback
 		# -> ECONNREFUSED, causing "Account check failed" on the next connect attempt.
 		log "Flushing residual nftables rules and policy routing..."
-		if nft list table inet surflare >/dev/null 2>&1; then
-			nft flush table inet surflare 2>/dev/null || true
-			nft delete table inet surflare 2>/dev/null &&
-				log "Removed residual nftables table inet surflare" || true
-		fi
+		_remove_surflare_table || exit $?
 		# Loop: ip rule del only removes one entry at a time; drain all matching rules
 		local rule_count=0
 		while ip rule del fwmark 0x1 lookup 100 2>/dev/null; do
@@ -6863,6 +7158,8 @@ connect_vpn() {
 		local _ks_was_armed=0
 		if nft list table inet killswitch >/dev/null 2>&1; then
 			_unarm_killswitch_output
+			local _unarm_rc=$?
+			[ "$_unarm_rc" -eq 0 ] || exit "$_unarm_rc"
 			_ks_was_armed=1
 			log "connect_vpn: killswitch output unarmed for API access"
 		fi
@@ -6897,7 +7194,12 @@ connect_vpn() {
 			return 1
 		fi
 		if [ "$_ks_was_armed" -eq 1 ]; then
-			_reinstall_killswitch_output
+			local _rearm_rc=0
+			_reinstall_killswitch_output || _rearm_rc=$?
+			if [ "$_rearm_rc" -ne 0 ]; then
+				log "WARN: connect aborted: killswitch output rearm failed (rc=$_rearm_rc)"
+				exit "$_rearm_rc"
+			fi
 			log "connect_vpn: killswitch output reinstalled after connect"
 		fi
 		# Immediately, before the settle poll and before either settle
@@ -7007,11 +7309,21 @@ connect_vpn() {
 		# Previously these were only loaded on the first healthy health check
 		# cycle, leaving LAN devices without tproxy rules for 30+ seconds.
 		if ! nft list table inet sw_lan_tproxy >/dev/null 2>&1; then
-			_restore_tproxy
+			local _tproxy_rc=0
+			_restore_tproxy || _tproxy_rc=$?
+			if [ "$_tproxy_rc" -ne 0 ]; then
+				log "WARN: connect aborted: LAN tproxy install failed (rc=$_tproxy_rc)"
+				exit "$_tproxy_rc"
+			fi
 			_update_bypass_devices
 		fi
 		if ! nft list table inet killswitch >/dev/null 2>&1; then
-			_install_killswitch
+			local _install_rc=0
+			_install_killswitch || _install_rc=$?
+			if [ "$_install_rc" -ne 0 ]; then
+				log "WARN: connect aborted: killswitch install failed (rc=$_install_rc)"
+				exit "$_install_rc"
+			fi
 		fi
 		_ensure_gmail_smtp_ks
 		_ensure_surflare_control_ks
@@ -8430,9 +8742,8 @@ while true; do
 			log "Local VPN state lost during dedicated pin, holding exit ${_active_node}"
 		else
 			log "Local VPN state lost (process/nftables/routing), triggering immediate reconnect"
-			if nft list table inet surflare >/dev/null 2>&1; then
-				nft flush table inet surflare 2>/dev/null || true
-				nft delete table inet surflare 2>/dev/null || true
+			if nft list table inet surflare >/dev/null 2>&1 &&
+				_remove_surflare_table; then
 				_stale=0
 				while ip rule del fwmark 0x1 lookup 100 2>/dev/null; do _stale=$((_stale+1)); done
 				while ip -6 rule del fwmark 0x1 lookup 100 2>/dev/null; do _stale=$((_stale+1)); done

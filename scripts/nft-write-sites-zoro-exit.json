@@ -1,0 +1,156 @@
+[
+  {
+    "id": "ebe379c88412f18f24c6d7f170be6c861c69b57f7f60031e6d5eefd4b94e7863:1",
+    "owner": "chain_rules",
+    "command": "${NFT} -a list chain inet ${1} ${2}",
+    "wrapped": false,
+    "reason": "read-only listing; enrolled because an expanded table name is not a literal"
+  },
+  {
+    "id": "df101aca737aef1ac5c74bcf285d8276df747d0d3d0df098289d6c21334008f0:1",
+    "owner": "ensure_dns_rules",
+    "command": "${NFT} insert rule inet surflare prerouting meta nfproto ipv4 meta l4proto udp meta mark ${MARK} tproxy ip to :${PORT} meta mark set ${MARK} accept comment ${COMMENT}",
+    "wrapped": false,
+    "reason": "rule insert inside the CLI locked mutation path (acquire_lock, fd 9)"
+  },
+  {
+    "id": "1b3253737bbd84f5332444c94fb0fa6e05490e8c1f1f0e5959f3a2666289725e:1",
+    "owner": "ensure_dns_rules",
+    "command": "${NFT} insert rule inet surflare prerouting meta nfproto ipv4 meta l4proto tcp meta mark ${MARK} tproxy ip to :${PORT} meta mark set ${MARK} accept comment ${COMMENT}",
+    "wrapped": false,
+    "reason": "rule insert inside the CLI locked mutation path (acquire_lock, fd 9)"
+  },
+  {
+    "id": "a2ce8dd77732c43fa4004e30eeec165e687f8fc9ac03b2a0c6cc0eb23ad18f6c:1",
+    "owner": "ensure_dns_rules",
+    "command": "${NFT} insert rule inet surflare output position ${_anchor} meta nfproto ipv4 udp dport 53 meta mark set ${MARK} accept comment ${COMMENT}",
+    "wrapped": false,
+    "reason": "rule insert inside the CLI locked mutation path (acquire_lock, fd 9)"
+  },
+  {
+    "id": "e047111bfe18a91663463ffb486565d2a66575b7600b8fd60ad027aee8420f95:1",
+    "owner": "ensure_dns_rules",
+    "command": "${NFT} insert rule inet surflare output position ${_anchor} meta nfproto ipv4 tcp dport 53 meta mark set ${MARK} accept comment ${COMMENT}",
+    "wrapped": false,
+    "reason": "rule insert inside the CLI locked mutation path (acquire_lock, fd 9)"
+  },
+  {
+    "id": "8c94d743f525a0a2956e54471cf68598e68ce5ae82597050df51214821803b07:1",
+    "owner": "ensure_dns_rules",
+    "command": "${NFT} add rule inet surflare output meta nfproto ipv4 udp dport 53 meta mark set ${MARK} accept comment ${COMMENT}",
+    "wrapped": false,
+    "reason": "rule insert inside the CLI locked mutation path (acquire_lock, fd 9)"
+  },
+  {
+    "id": "32b85c066e02d32ad4cd4cc736e1ead85baf341a7d891fcc2162a214cbb2c4d6:1",
+    "owner": "ensure_dns_rules",
+    "command": "${NFT} add rule inet surflare output meta nfproto ipv4 tcp dport 53 meta mark set ${MARK} accept comment ${COMMENT}",
+    "wrapped": false,
+    "reason": "rule insert inside the CLI locked mutation path (acquire_lock, fd 9)"
+  },
+  {
+    "id": "dc4c409f7c19fe2b85a3000730e17e313b40acc3568e12a58e3f211bf837c7c1:1",
+    "owner": "ensure_dns_rules",
+    "command": "${NFT} delete rule inet surflare output handle ${_h}",
+    "wrapped": false,
+    "reason": "handle-level delete inside the CLI locked mutation path (acquire_lock, fd 9)"
+  },
+  {
+    "id": "7172a05fb25b81536f595dfb2298051d35c8a38a8cb817388cc226c40d5d2431:1",
+    "owner": "ensure_dns_rules",
+    "command": "${NFT} insert rule inet killswitch output position ${_anchor} meta mark ${MARK} accept comment ${COMMENT}",
+    "wrapped": false,
+    "reason": "rule insert inside the CLI locked mutation path (acquire_lock, fd 9)"
+  },
+  {
+    "id": "8a191f5a115146e06eb30c7fa97e988363dd01cc4ee44e15ab0d374e80e56df0:1",
+    "owner": "drop_dns_rules",
+    "command": "${NFT} delete rule inet ${_t} ${_c} handle ${_h}",
+    "wrapped": false,
+    "reason": "handle-level delete inside the CLI locked mutation path (acquire_lock, fd 9)"
+  },
+  {
+    "id": "e07ef2fb96a82b5763395e771c471c25775abcdb4338eca281f87de583c10a8c:1",
+    "owner": "insert_zoro_data_rule",
+    "command": "${NFT} insert rule inet sw_lan_tproxy prerouting position ${1} iifname br-lan meta nfproto ipv4 meta l4proto tcp tproxy ip to :${PORT} meta mark set ${MARK} ct mark set 0x00000200 accept comment ${COMMENT}",
+    "wrapped": false,
+    "reason": "rule insert inside the CLI locked mutation path (acquire_lock, fd 9)"
+  },
+  {
+    "id": "8c1d948a9a0ebe09a609bde13e94a2483d0c850ae75d1eff917a1eb08bce14dd:1",
+    "owner": "insert_zoro_data_rule",
+    "command": "${NFT} add rule inet sw_lan_tproxy prerouting iifname br-lan meta nfproto ipv4 meta l4proto tcp tproxy ip to :${PORT} meta mark set ${MARK} ct mark set 0x00000200 accept comment ${COMMENT}",
+    "wrapped": false,
+    "reason": "rule insert inside the CLI locked mutation path (acquire_lock, fd 9)"
+  },
+  {
+    "id": "da3d3365d21c581d6a4e28f848223048fbfa6cf13846bdd8807026bbc0f8dbb8:1",
+    "owner": "do_on",
+    "command": "${NFT} delete rule inet sw_lan_tproxy prerouting handle ${h}",
+    "wrapped": false,
+    "reason": "handle-level delete inside the CLI locked mutation path (acquire_lock, fd 9)"
+  },
+  {
+    "id": "da3d3365d21c581d6a4e28f848223048fbfa6cf13846bdd8807026bbc0f8dbb8:2",
+    "owner": "do_on",
+    "command": "${NFT} delete rule inet sw_lan_tproxy prerouting handle ${h}",
+    "wrapped": false,
+    "reason": "handle-level delete inside the CLI locked mutation path (acquire_lock, fd 9)"
+  },
+  {
+    "id": "da3d3365d21c581d6a4e28f848223048fbfa6cf13846bdd8807026bbc0f8dbb8:3",
+    "owner": "do_on",
+    "command": "${NFT} delete rule inet sw_lan_tproxy prerouting handle ${h}",
+    "wrapped": false,
+    "reason": "handle-level delete inside the CLI locked mutation path (acquire_lock, fd 9)"
+  },
+  {
+    "id": "da3d3365d21c581d6a4e28f848223048fbfa6cf13846bdd8807026bbc0f8dbb8:4",
+    "owner": "do_on",
+    "command": "${NFT} delete rule inet sw_lan_tproxy prerouting handle ${h}",
+    "wrapped": false,
+    "reason": "handle-level delete inside the CLI locked mutation path (acquire_lock, fd 9)"
+  },
+  {
+    "id": "da3d3365d21c581d6a4e28f848223048fbfa6cf13846bdd8807026bbc0f8dbb8:5",
+    "owner": "do_on",
+    "command": "${NFT} delete rule inet sw_lan_tproxy prerouting handle ${h}",
+    "wrapped": false,
+    "reason": "handle-level delete inside the CLI locked mutation path (acquire_lock, fd 9)"
+  },
+  {
+    "id": "da3d3365d21c581d6a4e28f848223048fbfa6cf13846bdd8807026bbc0f8dbb8:6",
+    "owner": "do_on",
+    "command": "${NFT} delete rule inet sw_lan_tproxy prerouting handle ${h}",
+    "wrapped": false,
+    "reason": "handle-level delete inside the CLI locked mutation path (acquire_lock, fd 9)"
+  },
+  {
+    "id": "dc9261f4824ce7cec32e63ea54a032dc5cee79052e67e04bfd83655f3936812a:1",
+    "owner": "inspect_zoro_state",
+    "command": "${NFT} list table inet ${_t}",
+    "wrapped": false,
+    "reason": "table or chain write inside the CLI locked mutation path (acquire_lock, fd 9)"
+  },
+  {
+    "id": "b6aefa9358d7098de0fe9623973d20e2cac555d5f6282d90064d3db311fc01d5:1",
+    "owner": "inspect_zoro_state",
+    "command": "${NFT} -a list chain inet ${_t} ${_c}",
+    "wrapped": false,
+    "reason": "read-only listing; enrolled because an expanded table name is not a literal"
+  },
+  {
+    "id": "093814928f7f5e4a9aa995629043136c15eae9c9bb6d45ef69d1a9b26cc02741:1",
+    "owner": "remove_snapshot",
+    "command": "${NFT} delete rule inet ${_t} ${_c} handle ${_h}",
+    "wrapped": false,
+    "reason": "handle-level delete inside the CLI locked mutation path (acquire_lock, fd 9)"
+  },
+  {
+    "id": "2aa08c7a6484ec5a229f190af3f3a50e002044b21b7b0781a5ba7fd5eac8b944:1",
+    "owner": "do_ensure",
+    "command": "${NFT} delete rule inet sw_lan_tproxy prerouting handle ${h}",
+    "wrapped": false,
+    "reason": "handle-level delete inside the CLI locked mutation path (acquire_lock, fd 9)"
+  }
+]

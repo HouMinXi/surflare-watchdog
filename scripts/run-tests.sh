@@ -61,7 +61,10 @@ for t in tests/test_*.sh; do
 	# 9>&- is not decoration: a test that leaves a background child (a curl
 	# against a blackhole address, a sleep) hands it the lock descriptor, and
 	# that child outlives the run and blocks every later one.
-	timeout -k 5 240 "$interp" "$t" > "$LOGS/$(basename "$t").log" 2>&1 9>&- &
+	# 360 rather than 240: the proxy-log suite finishes in about 45 s idle and
+	# about 250 s with the machine busy, so 240 turned a passing tree into a
+	# hard failure whenever the host was loaded.
+	timeout -k 5 360 "$interp" "$t" > "$LOGS/$(basename "$t").log" 2>&1 9>&- &
 	CURRENT=$!
 	wait "$CURRENT"
 	# Capture before any substitution: `printf ... "$(basename ...)" "$?"`

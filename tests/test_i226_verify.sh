@@ -39,6 +39,8 @@ esac
 EOS
 cat > "$TMP/bin/dmesg" <<'EOS'
 #!/bin/sh
+# dmesg fails on a locked-down kernel; the fixture has to be able to say so.
+[ "${DMESG_RC:-0}" = 0 ] || exit "$DMESG_RC"
 [ -f "$DMESG_FILE" ] && cat "$DMESG_FILE"
 exit 0
 EOS
@@ -55,11 +57,24 @@ run() {
 	NET_DIR="$TMP/net" \
 	STATE="$TMP/state" \
 	DMESG_FILE="$TMP/dmesg" \
+	DMESG_RC="${DMESG_RC:-0}" \
 	LOGGER_FILE="$TMP/logger" \
+	UPTIME_FILE="$TMP/uptime" \
 	sh "$SUT" --window 30 "$@" > "$TMP/out" 2>&1
 	echo $?
 }
+run_uptime() {
+	: > "$TMP/logger"
+	PATH="$TMP/bin:$PATH" NET_DIR="$TMP/net" STATE="$TMP/state" DMESG_FILE="$TMP/dmesg" \
+		LOGGER_FILE="$TMP/logger" UPTIME_FILE="$1" \
+		sh "$SUT" --window 30 > "$TMP/out" 2>&1
+	echo $?
+}
 logged() { grep -c "$1" "$TMP/logger" 2>/dev/null || true; }
+# Pin the uptime so the verdict does not depend on when this host last booted:
+# with a real fresh boot the lookback window is not yet covered and the dmesg
+# channel deliberately holds its verdict.
+printf '999999.00 0.00\n' > "$TMP/uptime"
 set_dmesg() { : > "$TMP/dmesg"; for l in "$@"; do printf '[999999999.000000] igc 0000:0%s:00.0 %s: NIC Link is Down\n' "$l" "$l" >> "$TMP/dmesg"; done; }
 
 # --- T1: quiet board --------------------------------------------------
@@ -91,6 +106,46 @@ if [ "$rc" -eq 0 ] && grep -q 'not an NVM signal' "$TMP/out" && [ "$(logged eth2
 else
 	bad "a LAN flap gave rc=$rc, out=$(tail -1 "$TMP/out")"
 fi
+
+# --- T3b: a freshly booted host cannot judge the lookback window yet ----
+# The dmesg channel deliberately holds its verdict when uptime is shorter than
+# the window, so a flap seen minutes after boot must not be called a regression.
+rm -f "$TMP/state"
+printf '60.00 0.00\n' > "$TMP/uptime"
+set_dmesg eth0 eth0
+rc=$(run)
+if [ "$rc" -eq 0 ] && grep -q 'flapwin:boot-window' "$TMP/out" && [ "$(logged 'holds verdict')" -ge 1 ] &&
+	grep -q 'user.warning' "$TMP/logger"; then
+	ok "a host inside its first window holds the dmesg verdict instead of guessing"
+else
+	bad "a short uptime still produced a verdict: rc=$rc, out=$(tail -1 "$TMP/out")"
+fi
+printf '999999.00 0.00\n' > "$TMP/uptime"
+
+# --- T3c: dmesg is unreadable ---------------------------------------
+# A restricted kernel cannot read the ring. That must not be reported as "no
+# flaps", and it must reach syslog because cron runs this with --quiet.
+rm -f "$TMP/state"
+set_dmesg eth0 eth0
+rc=$(DMESG_RC=1 run)
+if [ "$rc" -eq 0 ] && grep -q 'flapwin:dmesg=unreadable' "$TMP/out" &&
+	[ "$(logged 'dmesg unreadable')" -ge 1 ]; then
+	ok "an unreadable dmesg is reported and logged instead of read as no flaps"
+else
+	bad "an unreadable dmesg produced rc=$rc, syslog=[$(cat "$TMP/logger" 2>/dev/null)]"
+fi
+
+# --- T3d: uptime itself cannot be read -------------------------------
+# Without an uptime there is no window, so the tool must refuse rather than
+# judge every event since boot.
+rm -f "$TMP/state"
+rc=$(run_uptime /nonexistent/uptime)
+if [ "$rc" -eq 2 ] && grep -q '/nonexistent/uptime' "$TMP/out"; then
+	ok "an unreadable uptime refuses to judge and names the source"
+else
+	bad "an unreadable uptime gave rc=$rc, out=$(tail -1 "$TMP/out")"
+fi
+printf '999999.00 0.00\n' > "$TMP/uptime"
 
 # --- T4: the same LAN port flaps in three consecutive runs ------------
 # The first run has no previous sample, so it can only record a baseline;

@@ -1,0 +1,786 @@
+[
+  {
+    "id": "1575b96bd27902adae61f288a48082e5f0350b035f6f9ecdf34cbb0f5940037f:1",
+    "owner": "_dns_fallback_body",
+    "command": "nft delete rule inet surflare output handle ${h}",
+    "wrapped": false,
+    "reason": "Deletes only gateway DNS exemption handles, under the shared lock (the function takes it around its own listing and deletes). The wrapped flag stays false because the call is not written as an nft_apply_locked argument."
+  },
+  {
+    "id": "4b2b81d81983ebe7c53adea41995118488556b5f1036ed0d549bba81094a1c90:1",
+    "owner": "_insert_dns_fallback",
+    "command": "nft insert rule inet surflare output position ${handle} ip daddr ${gw} udp dport 53 accept",
+    "wrapped": false,
+    "reason": "Adds gateway DNS exemption rules; does not replace a table or chain. Ordering with the Zoro DNS pair is tested separately."
+  },
+  {
+    "id": "7ba882a27be62a817e84e6a78ca3eb106a347e370d97e19102aed26f7303386a:1",
+    "owner": "_insert_dns_fallback",
+    "command": "nft insert rule inet surflare output position ${handle} ip daddr ${gw} tcp dport 53 accept",
+    "wrapped": false,
+    "reason": "Adds gateway DNS exemption rules; does not replace a table or chain. Ordering with the Zoro DNS pair is tested separately."
+  },
+  {
+    "id": "ef727f6f1956edf8916de78dea6b200ae9bca85c3296775e784669d47a0efb1a:1",
+    "owner": "_patch_surflare_icmp_lan",
+    "command": "nft insert rule inet surflare output position ${handle} ip6 daddr fe80::/10 accept",
+    "wrapped": false,
+    "reason": "Adds IPv6/link-local and ICMP bypass rules, not the Zoro-tagged rules. No table replacement."
+  },
+  {
+    "id": "a12a392311130dc30f1b8e08a71fb83f5cb8ca712cb0d368ade9d0e1e41d6444:1",
+    "owner": "_patch_surflare_icmp_lan",
+    "command": "nft insert rule inet surflare output position ${handle} ip6 daddr ff00::/8 accept",
+    "wrapped": false,
+    "reason": "Adds IPv6/link-local and ICMP bypass rules, not the Zoro-tagged rules. No table replacement."
+  },
+  {
+    "id": "aeb3b7003aacb2b33427f2b497ebd0ee9a5e54b4f44012bdba8c29aa05e4d652:1",
+    "owner": "_patch_surflare_icmp_lan",
+    "command": "nft insert rule inet surflare output position ${handle} oifname br-lan ip protocol icmp accept",
+    "wrapped": false,
+    "reason": "Adds IPv6/link-local and ICMP bypass rules, not the Zoro-tagged rules. No table replacement."
+  },
+  {
+    "id": "47ccdca1832a1ed9c683570097396922408b8ca71afc9a9c0235517d73f96a72:1",
+    "owner": "_patch_surflare_icmp_lan",
+    "command": "nft insert rule inet surflare output position ${handle} oifname br-lan ip6 nexthdr ipv6-icmp accept",
+    "wrapped": false,
+    "reason": "Adds IPv6/link-local and ICMP bypass rules, not the Zoro-tagged rules. No table replacement."
+  },
+  {
+    "id": "a7ea9cfd4d05053ce3d90e11c4552bd81dbf0c38b973b80627c2306410f7d277:1",
+    "owner": "_cleanup_surflare_icmp_lan",
+    "command": "nft delete rule inet surflare output handle ${h}",
+    "wrapped": false,
+    "reason": "Deletes matching ICMP bypass handles, not Zoro-tagged rules. No table replacement."
+  },
+  {
+    "id": "b3355f8fee0c7fb98b5a2dba140d8aa0137fc5e5b997883e84801c8d4b3d54ec:1",
+    "owner": "_self_dial_delete_tagged",
+    "command": "nft delete rule inet surflare output handle ${h}",
+    "wrapped": false,
+    "reason": "Deletes only self-dial-guard handles; not Zoro rules. No table replacement."
+  },
+  {
+    "id": "2f72ca9b29b062655fee494cf3d3b0ff2ded3e0142387310ef15f95d47ef7c77:1",
+    "owner": "_patch_surflare_self_dial_guard",
+    "command": "nft insert rule inet surflare output oifname lo tcp dport 10800 counter drop comment ${_SELF_DIAL_TAG}",
+    "wrapped": false,
+    "reason": "Inserts a loopback port-10800 guard; not a table replacement."
+  },
+  {
+    "id": "a29e15bfcf32dad0e983935a1b487560b17dd4d32ec8156335bd81fb9b7abf87:1",
+    "owner": "_setup_kernel_moat",
+    "command": "nft add table inet surflare_moat",
+    "wrapped": false,
+    "reason": "Owns the separate surflare_moat table; ensure does not write that table."
+  },
+  {
+    "id": "52776e2f9125b7048de4d84e902007f12b339f5089c314cdfa44d4aea4d9b567:1",
+    "owner": "_setup_kernel_moat",
+    "command": "nft flush table inet surflare_moat",
+    "wrapped": false,
+    "reason": "Owns the separate surflare_moat table; ensure does not write that table."
+  },
+  {
+    "id": "c826117baa284fa2a2140848614d30aaa427891baf248377fe64fd63e4cf9e0e:1",
+    "owner": "_setup_kernel_moat",
+    "command": "nft delete chain inet surflare_moat output",
+    "wrapped": false,
+    "reason": "Owns the separate surflare_moat table; ensure does not write that table."
+  },
+  {
+    "id": "4e7a79e84820c911047558d53f534b13632ba5a71ae055c8893faf60aafc47c5:1",
+    "owner": "_setup_kernel_moat",
+    "command": "nft add chain inet surflare_moat prerouting { type filter hook prerouting priority -300; policy accept; }",
+    "wrapped": false,
+    "reason": "Owns the separate surflare_moat table; ensure does not write that table."
+  },
+  {
+    "id": "5163b38d91fb18d3f773cf6d8ebf2c3300b5e396976de328aec68d77cb8ecb7b:1",
+    "owner": "_setup_kernel_moat",
+    "command": "nft add set inet surflare_moat win_sizes { type inet_service; flags interval; elements = { 32, 64, 78, 128 } }",
+    "wrapped": false,
+    "reason": "Owns the separate surflare_moat table; ensure does not write that table."
+  },
+  {
+    "id": "c5a916227dba4c077cf31de432711a2260c8544d95c0c9893b2d9e18167de250:1",
+    "owner": "_setup_kernel_moat",
+    "command": "nft add rule inet surflare_moat prerouting iifname != br-lan tcp flags \\& fin == fin tcp window @win_sizes ${_moat_action}",
+    "wrapped": false,
+    "reason": "Owns the separate surflare_moat table; ensure does not write that table."
+  },
+  {
+    "id": "2ce7a8d05ef197be57ed8b0c146eb6991fc4ac2a2b7f4ed2b0b46acfcd30aee3:1",
+    "owner": "_setup_kernel_moat",
+    "command": "nft add rule inet surflare_moat prerouting iifname != br-lan tcp flags \\& fin == fin tcp window 78 ${_moat_action}",
+    "wrapped": false,
+    "reason": "Owns the separate surflare_moat table; ensure does not write that table."
+  },
+  {
+    "id": "f58763ac3ed61d500c1861982382f0e359512517b216be1c138bbcb5a7033763:1",
+    "owner": "_setup_kernel_moat",
+    "command": "nft add rule inet surflare_moat prerouting iifname != br-lan tcp flags \\& fin == fin ${_moat_action}",
+    "wrapped": false,
+    "reason": "Owns the separate surflare_moat table; ensure does not write that table."
+  },
+  {
+    "id": "4adb0226f7c0e5b013a86c6ec8401a197d03f725c71c355e7739480a29e424a8:1",
+    "owner": "_setup_kernel_moat",
+    "command": "nft add rule inet surflare_moat prerouting iifname != br-lan tcp flags \\& rst == rst tcp window @win_sizes ${_moat_action}",
+    "wrapped": false,
+    "reason": "Owns the separate surflare_moat table; ensure does not write that table."
+  },
+  {
+    "id": "96bffe176f21aa4e1931a70f74876415a9451ce09299fd8032bea81392cf7185:1",
+    "owner": "_setup_kernel_moat",
+    "command": "nft add rule inet surflare_moat prerouting iifname != br-lan tcp flags \\& rst == rst tcp window 78 ${_moat_action}",
+    "wrapped": false,
+    "reason": "Owns the separate surflare_moat table; ensure does not write that table."
+  },
+  {
+    "id": "1bce4a0f1019fcbbafa9a2302339d06646ff1b57001888c8d55b7072266b3956:1",
+    "owner": "_setup_kernel_moat",
+    "command": "nft add rule inet surflare_moat prerouting iifname != br-lan tcp flags \\& rst == rst ${_moat_action}",
+    "wrapped": false,
+    "reason": "Owns the separate surflare_moat table; ensure does not write that table."
+  },
+  {
+    "id": "ac2becb9062fd5ee7286a146b759bd0ae9dc1864d68ef4b65167e2a44d5adc07:1",
+    "owner": "_setup_kernel_moat",
+    "command": "nft add rule inet surflare_moat prerouting ip6 nexthdr icmpv6 icmpv6 type packet-too-big accept",
+    "wrapped": false,
+    "reason": "Owns the separate surflare_moat table; ensure does not write that table."
+  },
+  {
+    "id": "26796df95ec1c361420892725576bd7ee2b2c7688ea980530b2f8f8c063a9a97:1",
+    "owner": "_setup_kernel_moat",
+    "command": "nft add rule inet surflare_moat prerouting iifname != br-lan tcp flags \\& rst == rst drop",
+    "wrapped": false,
+    "reason": "Owns the separate surflare_moat table; ensure does not write that table."
+  },
+  {
+    "id": "c4dde718e9374792d26944180411aca8c1a962704e8eb7dcc7638d18f9246772:1",
+    "owner": "_setup_chnroute",
+    "command": "nft add set inet surflare cn_ipv4 { type ipv4_addr; flags interval; }",
+    "wrapped": false,
+    "reason": "Replaces CN set contents and adds CN return rules; not the DNS/data chains themselves. Set-level serialization is outside this change."
+  },
+  {
+    "id": "2efb868493e4e88dc952e2ffb70d5a7c89604eb168fda389b6028cfe1ebfdeab:1",
+    "owner": "_setup_chnroute",
+    "command": "nft flush set inet surflare cn_ipv4",
+    "wrapped": false,
+    "reason": "Replaces CN set contents and adds CN return rules; not the DNS/data chains themselves. Set-level serialization is outside this change."
+  },
+  {
+    "id": "a8c6101d9fe889024448a6da6dd7770359ad32bfc50c716d2079bc61d006944c:1",
+    "owner": "_setup_chnroute",
+    "command": "nft -f ${tmp_nft}",
+    "wrapped": false,
+    "reason": "Replaces CN set contents and adds CN return rules; not the DNS/data chains themselves. Set-level serialization is outside this change."
+  },
+  {
+    "id": "40bbf04226a08e20e9f6a1adf24d500f0df602978b5c583372d35dd15821663e:1",
+    "owner": "_setup_chnroute",
+    "command": "nft insert rule inet surflare output ip daddr @cn_ipv4 accept",
+    "wrapped": false,
+    "reason": "Replaces CN set contents and adds CN return rules; not the DNS/data chains themselves. Set-level serialization is outside this change."
+  },
+  {
+    "id": "b1f9c09e0c3b1c825e728d6603b98135280c598748116f83e3365c0b8ca8c5f6:1",
+    "owner": "_setup_chnroute",
+    "command": "nft add set inet surflare cn_ipv6 { type ipv6_addr; flags interval; }",
+    "wrapped": false,
+    "reason": "Replaces CN set contents and adds CN return rules; not the DNS/data chains themselves. Set-level serialization is outside this change."
+  },
+  {
+    "id": "6d972e9290a0caf45ffec968cf68d25ac54e0d86fa53216c05a9866fa7ff2562:1",
+    "owner": "_setup_chnroute",
+    "command": "nft flush set inet surflare cn_ipv6",
+    "wrapped": false,
+    "reason": "Replaces CN set contents and adds CN return rules; not the DNS/data chains themselves. Set-level serialization is outside this change."
+  },
+  {
+    "id": "2d1cc41223bbe60c35f830862859eab9417a1c4dcb07f6e4fea64e6d153d398a:1",
+    "owner": "_setup_chnroute",
+    "command": "nft -f ${tmp_nft_v6}",
+    "wrapped": false,
+    "reason": "Replaces CN set contents and adds CN return rules; not the DNS/data chains themselves. Set-level serialization is outside this change."
+  },
+  {
+    "id": "536132b2a7dbb31d8acf1ee5c40bd61bcb2f07df2e7793868494b2d5269a76e9:1",
+    "owner": "_setup_chnroute",
+    "command": "nft insert rule inet surflare output ip6 daddr @cn_ipv6 accept",
+    "wrapped": false,
+    "reason": "Replaces CN set contents and adds CN return rules; not the DNS/data chains themselves. Set-level serialization is outside this change."
+  },
+  {
+    "id": "3c45fc8c60340264504f316ecc8a39d04970d6ee1cc50c5dd870f4de1bc8cba6:1",
+    "owner": "_setup_chnroute",
+    "command": "nft -f ${tmp_extra}",
+    "wrapped": false,
+    "reason": "Replaces CN set contents and adds CN return rules; not the DNS/data chains themselves. Set-level serialization is outside this change."
+  },
+  {
+    "id": "bf257d7882fbea861b98eaebe5d9cb4feeb8ee0638298969719cf0fc33cca395:1",
+    "owner": "_setup_chnroute",
+    "command": "nft -f ${_ks_batch}",
+    "wrapped": false,
+    "reason": "Replaces CN set contents and adds CN return rules; not the DNS/data chains themselves. Set-level serialization is outside this change."
+  },
+  {
+    "id": "6b8cc6f6739f185e86f229ceb4173d5d0f4bce3ebe5a599d9141213d67a2806c:1",
+    "owner": "_load_tproxy_cn_direct",
+    "command": "nft -f ${_batch}",
+    "wrapped": false,
+    "reason": "Flushes/refills cn_direct and cn6_direct sets in a batch. It does not replace a chain or add rules."
+  },
+  {
+    "id": "c8a4bb4e36af6deb4b8a4386b1efdabbb0118c63bb31d9913034ca2a102bbdbb:1",
+    "owner": "_cn_domain_nft",
+    "command": "nft ${@}",
+    "wrapped": false,
+    "reason": "Bounded forwarding adapter; actual write arguments are inventoried at _guard_cn_domain_ranges. Dynamic dispatch is recorded, not certified as read-only."
+  },
+  {
+    "id": "01602664b9cf16eed087b1c8d8251faa71d6a2908f16b30ad954b998260bb614:1",
+    "owner": "_cn_domain_nft",
+    "command": "timeout 10 nft ${@}",
+    "wrapped": false,
+    "reason": "Bounded forwarding adapter, now including the timeout launcher; actual arguments are recorded at each caller. This is not a lock ownership proof."
+  },
+  {
+    "id": "c8a4bb4e36af6deb4b8a4386b1efdabbb0118c63bb31d9913034ca2a102bbdbb:2",
+    "owner": "_cn_domain_nft",
+    "command": "nft ${@}",
+    "wrapped": false,
+    "reason": "Bounded forwarding adapter; actual write arguments are inventoried at _guard_cn_domain_ranges. Dynamic dispatch is recorded, not certified as read-only."
+  },
+  {
+    "id": "063114ea068aef6de9e6df459bcfe6f34900d739e21b437becf7cf7d9c425a9f:1",
+    "owner": "_guard_cn_domain_ranges",
+    "command": "_cn_domain_nft list set inet ${_table} ${_set}",
+    "wrapped": false,
+    "reason": "Dynamic-name list-set reads are conservatively enrolled because their expanded tokens are not proven literal; mutation writes rebuild DNS cache sets, not chains."
+  },
+  {
+    "id": "d13470f89bec3bb23f20867ed299884873529cd424657f041170263cff1b52a5:1",
+    "owner": "_guard_cn_domain_ranges",
+    "command": "_cn_domain_nft list set inet ${_table} ${_set}",
+    "wrapped": false,
+    "reason": "Dynamic-name list-set reads are conservatively enrolled because their expanded tokens are not proven literal; mutation writes rebuild DNS cache sets, not chains."
+  },
+  {
+    "id": "a223c49bf731656a7a1238964b4c19e7a74aa3eb01fdcb5630f2fc582e83ba8a:1",
+    "owner": "_guard_cn_domain_ranges",
+    "command": "_cn_domain_nft -f -",
+    "wrapped": false,
+    "reason": "Flushes and refills copies of a DNS cache set in a batch. Set-level serialization is outside this change."
+  },
+  {
+    "id": "4ae31a7694c661a91c6a342d5bac479f2a80558ae5fff215072ef4a7dea33a27:1",
+    "owner": "_cleanup_on_startup",
+    "command": "nft delete table inet watchdog_trace",
+    "wrapped": false,
+    "reason": "Trace table cleanup is independent; surflare table cleanup now calls the shared-lock helper before routing cleanup."
+  },
+  {
+    "id": "3101ec81430dfa1f4e13f0b0a791b1289adb758134579a103c61197adbe46ce9:1",
+    "owner": "_ensure_gmail_smtp_ks",
+    "command": "nft add set inet killswitch gmail_smtp { type ipv4_addr; flags interval, timeout; timeout 1h; }",
+    "wrapped": false,
+    "reason": "Hot-adds SMTP sets and forward-chain accepts; ensure writes killswitch output, not forward."
+  },
+  {
+    "id": "1580772215ced290cd41066cc6c49e67a2b1fc04f2fccebab212b49115df346e:1",
+    "owner": "_ensure_gmail_smtp_ks",
+    "command": "nft add set inet killswitch gmail_smtp6 { type ipv6_addr; flags interval, timeout; timeout 1h; }",
+    "wrapped": false,
+    "reason": "Hot-adds SMTP sets and forward-chain accepts; ensure writes killswitch output, not forward."
+  },
+  {
+    "id": "85112631ff488dde4ac7a8834c2c9f05ddbca261b99e1c9718d89b6c6680b658:1",
+    "owner": "_ensure_gmail_smtp_ks",
+    "command": "nft insert rule inet killswitch forward handle ${_h} iifname br-lan ip daddr @gmail_smtp tcp dport { 465, 587 } accept",
+    "wrapped": false,
+    "reason": "Hot-adds SMTP sets and forward-chain accepts; ensure writes killswitch output, not forward."
+  },
+  {
+    "id": "4db6048810147a75403175cde5bf7c88bf70f07ee6b88fe7116f88a3774702e3:1",
+    "owner": "_ensure_gmail_smtp_ks",
+    "command": "nft add rule inet killswitch forward iifname br-lan ip daddr @gmail_smtp tcp dport { 465, 587 } accept",
+    "wrapped": false,
+    "reason": "Hot-adds SMTP sets and forward-chain accepts; ensure writes killswitch output, not forward."
+  },
+  {
+    "id": "a3b66de2b4fbeb0fca56ac8dfa15f3adea18227e9940159894a964c873f9b5b5:1",
+    "owner": "_ensure_gmail_smtp_ks",
+    "command": "nft insert rule inet killswitch forward handle ${_h} iifname br-lan ip6 daddr @gmail_smtp6 tcp dport { 465, 587 } accept",
+    "wrapped": false,
+    "reason": "Hot-adds SMTP sets and forward-chain accepts; ensure writes killswitch output, not forward."
+  },
+  {
+    "id": "c1bad23742658c06320e5e34e2911d67e6800be92f35a625e979539551cafb49:1",
+    "owner": "_ensure_gmail_smtp_ks",
+    "command": "nft add rule inet killswitch forward iifname br-lan ip6 daddr @gmail_smtp6 tcp dport { 465, 587 } accept",
+    "wrapped": false,
+    "reason": "Hot-adds SMTP sets and forward-chain accepts; ensure writes killswitch output, not forward."
+  },
+  {
+    "id": "a7d75dcb607ba6acf72ce7d6576249ad6a52e15f7ea151a302a08c1f211289c9:1",
+    "owner": "_ensure_surflare_control_ks",
+    "command": "nft add set inet killswitch surflare_control { type ipv4_addr; flags interval, timeout; timeout 1h; }",
+    "wrapped": false,
+    "reason": "Hot-adds control-plane set/forward accepts; no chain replacement."
+  },
+  {
+    "id": "07ad9b86c7c41d61d05ab4f165dd6978db554379e6c169e5c9f77f5ffb288125:1",
+    "owner": "_ensure_surflare_control_ks",
+    "command": "nft insert rule inet killswitch forward handle ${_h} iifname br-lan ip daddr @surflare_control accept",
+    "wrapped": false,
+    "reason": "Hot-adds control-plane set/forward accepts; no chain replacement."
+  },
+  {
+    "id": "fcae23b9ce7bc750fce9ea83a8362970e86abe359cf62cefd98b575ba9ce043c:1",
+    "owner": "_ensure_surflare_control_ks",
+    "command": "nft add rule inet killswitch forward iifname br-lan ip daddr @surflare_control accept",
+    "wrapped": false,
+    "reason": "Hot-adds control-plane set/forward accepts; no chain replacement."
+  },
+  {
+    "id": "5e3aa08c41546d1b88f6278608d746246b21cb23f821a03ae91b5d7cb285535d:1",
+    "owner": "_ensure_dns_enforce",
+    "command": "nft -f -",
+    "wrapped": false,
+    "reason": "Creates the separate dns_enforce table; ensure does not write that table."
+  },
+  {
+    "id": "8286542033e5dc654ecb112961a7eb3e202c2b8824532df3950a50f72384f135:1",
+    "owner": "_unarm_killswitch_output",
+    "command": "nft_apply_locked unarm killswitch output nft -f -",
+    "wrapped": true,
+    "reason": "Shared-lock transaction destroys the output chain. Runtime contention test must prove it never executes unlocked."
+  },
+  {
+    "id": "55c1db477440c31da2958b0a7104825d5fb02a594dc81b76e28e680237e8bf3f:1",
+    "owner": "_reinstall_killswitch_output",
+    "command": "nft_apply_locked killswitch output nft -f ${_ks_tmp}",
+    "wrapped": true,
+    "reason": "Shared-lock replacement of killswitch output; boot-lock deletion concerns a separate table."
+  },
+  {
+    "id": "1c2c6fd9ff57f972d8d40627026d102901542771266188ba5be54acd4d189a34:1",
+    "owner": "_reinstall_killswitch_output",
+    "command": "nft destroy table inet surflare_boot_lock",
+    "wrapped": false,
+    "reason": "Shared-lock replacement of killswitch output; boot-lock deletion concerns a separate table."
+  },
+  {
+    "id": "7c1568557b9ae3e99e29bc6f7d241b6b83b841fbcd0ec409653b56d96018ac33:1",
+    "owner": "_install_killswitch",
+    "command": "nft_apply_locked killswitch install nft -f ${_ks_tmp}",
+    "wrapped": true,
+    "reason": "The table replacement uses the shared wrapper; subsequent set refills do not replace chains. Boot-lock deletion concerns a separate table."
+  },
+  {
+    "id": "d588c552ecc1f47d0b7a72c53ee3d8c4020b852be9e1abb6c80bf861cb2e6250:1",
+    "owner": "_install_killswitch",
+    "command": "nft add element inet killswitch bypass_src { ${BYPASS_LAN_DEVICES} }",
+    "wrapped": false,
+    "reason": "The table replacement uses the shared wrapper; subsequent set refills do not replace chains. Boot-lock deletion concerns a separate table."
+  },
+  {
+    "id": "a323bcd82a86da6a149b2301eaa314a96c61e2206ade2e8b24d984af7c090070:1",
+    "owner": "_install_killswitch",
+    "command": "nft destroy table inet surflare_boot_lock",
+    "wrapped": false,
+    "reason": "The table replacement uses the shared wrapper; subsequent set refills do not replace chains. Boot-lock deletion concerns a separate table."
+  },
+  {
+    "id": "29562448ef86ae02654bb2220a3b084e025de284d946660552e29f9154fb7f98:1",
+    "owner": "_install_killswitch",
+    "command": "nft add element inet killswitch server_ips { ${_persist_csv} }",
+    "wrapped": false,
+    "reason": "The table replacement uses the shared wrapper; subsequent set refills do not replace chains. Boot-lock deletion concerns a separate table."
+  },
+  {
+    "id": "fa16297876bc187b28d16f5bd5553104baa3b1d8520c2b9817921679527f90ae:1",
+    "owner": "_install_killswitch",
+    "command": "nft add element inet killswitch bypass_ipv4 { ${bypass_v4} }",
+    "wrapped": false,
+    "reason": "The table replacement uses the shared wrapper; subsequent set refills do not replace chains. Boot-lock deletion concerns a separate table."
+  },
+  {
+    "id": "fe82c31f1cd08c1bcbc8bef81a33040ff596689fb95cf524afee9a2a9fc5cc1f:1",
+    "owner": "_install_killswitch",
+    "command": "nft add element inet killswitch bypass_ipv6 { ${bypass_v6} }",
+    "wrapped": false,
+    "reason": "The table replacement uses the shared wrapper; subsequent set refills do not replace chains. Boot-lock deletion concerns a separate table."
+  },
+  {
+    "id": "c7f5a74e5eb7285a36b14feff8bd2f6d5a35676aed484ff743e30717010588bc:1",
+    "owner": "_install_killswitch",
+    "command": "nft add element inet killswitch bypass_ipv4 { ${extra_v4} }",
+    "wrapped": false,
+    "reason": "The table replacement uses the shared wrapper; subsequent set refills do not replace chains. Boot-lock deletion concerns a separate table."
+  },
+  {
+    "id": "605e0bef3496f2e16524c32f245351cf19009f170c107753ee2dd5e2820447b1:1",
+    "owner": "_update_killswitch_server_ips",
+    "command": "nft -f ${_ks_tmp}",
+    "wrapped": false,
+    "reason": "Builds scratch killswitch_swap and swaps server endpoint set contents; does not replace the live killswitch output chain."
+  },
+  {
+    "id": "9ae0317ce7044f5e918aeb5393664fccbd77a277f2e2cf4a7d2be7951acf4dcf:1",
+    "owner": "_update_killswitch_server_ips",
+    "command": "nft add element inet killswitch_swap server_ips { ${ip_csv} }",
+    "wrapped": false,
+    "reason": "Builds scratch killswitch_swap and swaps server endpoint set contents; does not replace the live killswitch output chain."
+  },
+  {
+    "id": "97b1764ab4acf73d8e7fe5d869eedfa8bb19d2fc7d31f6aea56fd5093f1a6f1a:1",
+    "owner": "_update_killswitch_server_ips",
+    "command": "nft -f ${_swap_tmp}",
+    "wrapped": false,
+    "reason": "Builds scratch killswitch_swap and swaps server endpoint set contents; does not replace the live killswitch output chain."
+  },
+  {
+    "id": "97b1764ab4acf73d8e7fe5d869eedfa8bb19d2fc7d31f6aea56fd5093f1a6f1a:2",
+    "owner": "_update_killswitch_server_ips",
+    "command": "nft -f ${_swap_tmp}",
+    "wrapped": false,
+    "reason": "Builds scratch killswitch_swap and swaps server endpoint set contents; does not replace the live killswitch output chain."
+  },
+  {
+    "id": "118ffe6fa09390d2f5ec86198a7b327722a38420f20b4b41eb98867d7e7cea64:1",
+    "owner": "_update_killswitch_server_ips",
+    "command": "nft -f -",
+    "wrapped": false,
+    "reason": "Builds scratch killswitch_swap and swaps server endpoint set contents; does not replace the live killswitch output chain."
+  },
+  {
+    "id": "5b819908fb053dc78537ff793efc9cf3601800944294218dc8198637a50f5f2f:1",
+    "owner": "_update_killswitch_server_ips",
+    "command": "nft delete table inet killswitch_swap",
+    "wrapped": false,
+    "reason": "Builds scratch killswitch_swap and swaps server endpoint set contents; does not replace the live killswitch output chain."
+  },
+  {
+    "id": "5b819908fb053dc78537ff793efc9cf3601800944294218dc8198637a50f5f2f:2",
+    "owner": "_update_killswitch_server_ips",
+    "command": "nft delete table inet killswitch_swap",
+    "wrapped": false,
+    "reason": "Builds scratch killswitch_swap and swaps server endpoint set contents; does not replace the live killswitch output chain."
+  },
+  {
+    "id": "aa8240f555705ece6a27028c94ce956a1f3869ded7e849b0313794d80d000236:1",
+    "owner": "_remove_killswitch",
+    "command": "nft delete table inet killswitch",
+    "wrapped": false,
+    "reason": "Emergency manual removal kept unlocked so it remains usable against a wedged writer. This is an explicit override, not normal mutual exclusion."
+  },
+  {
+    "id": "db16f41286c62e922a338a74c4c8646b6ed70a9c4bc319aa3fe64859b5eb90ba:1",
+    "owner": "_tombstone_tproxy",
+    "command": "nft replace rule inet sw_lan_tproxy prerouting handle ${_handle} iifname br-lan meta l4proto tcp reject with tcp reset",
+    "wrapped": false,
+    "reason": "Replaces Surflare catch rules by handle, not the separately tagged Zoro rule; emergency rejection is intentionally not delayed."
+  },
+  {
+    "id": "71ab0fc9bc1cfde16c63335ffb884ec917ba6399ae30ea912cbc33aecc7e3dbc:1",
+    "owner": "_tombstone_tproxy",
+    "command": "nft replace rule inet sw_lan_tproxy prerouting handle ${_handle} iifname br-lan udp dport 443 reject",
+    "wrapped": false,
+    "reason": "Replaces Surflare catch rules by handle, not the separately tagged Zoro rule; emergency rejection is intentionally not delayed."
+  },
+  {
+    "id": "8a81ed4d2728e5f7fe514aa0994b547138d0702a3eb249fea29caf91b66da3ed:1",
+    "owner": "_tombstone_tproxy",
+    "command": "nft replace rule inet sw_lan_tproxy prerouting handle ${_handle} iifname br-lan reject",
+    "wrapped": false,
+    "reason": "Replaces Surflare catch rules by handle, not the separately tagged Zoro rule; emergency rejection is intentionally not delayed."
+  },
+  {
+    "id": "d87bf14c004281960304e2869eb5c4c63b2783853eba2f7e8fb262d5b65ad178:1",
+    "owner": "_remove_surflare_table",
+    "command": "nft_apply_locked remove surflare table nft -f -",
+    "wrapped": true,
+    "reason": "Shared-lock destroy transaction; runtime contention and failure propagation tests cover this call."
+  },
+  {
+    "id": "da4f9532576dd361f1d1f9e61680ae3be1ef0dbddd0c6eb04055547e85198fc2:1",
+    "owner": "_restore_tproxy",
+    "command": "nft_apply_locked LAN tproxy restore nft -f ${_restore_tmp}",
+    "wrapped": true,
+    "reason": "Table replacement uses the shared wrapper. Remaining writes restore bypass-set elements after that transaction."
+  },
+  {
+    "id": "bc68027f59746a6b0eae3182b97432a4204e8e4e28eece5de4b7a790de1223ba:1",
+    "owner": "_restore_tproxy",
+    "command": "nft add element inet sw_lan_tproxy bypass_devices { ${_saved_bypass} }",
+    "wrapped": false,
+    "reason": "Table replacement uses the shared wrapper. Remaining writes restore bypass-set elements after that transaction."
+  },
+  {
+    "id": "c891278b31963ab5b5ce04120b3ad622889787cfc40809e699b9b4abde88856a:1",
+    "owner": "_restore_tproxy",
+    "command": "nft add element inet sw_lan_tproxy bypass_devices6 { ${_saved_bypass6} }",
+    "wrapped": false,
+    "reason": "Table replacement uses the shared wrapper. Remaining writes restore bypass-set elements after that transaction."
+  },
+  {
+    "id": "1b18b30e1f0f5985b30b03cf93e838d7d6642d044ff49d11010a5208b7c4d3d9:1",
+    "owner": "_restore_tproxy",
+    "command": "nft add element inet sw_lan_tproxy auto_bypass { ${_saved_auto} }",
+    "wrapped": false,
+    "reason": "Table replacement uses the shared wrapper. Remaining writes restore bypass-set elements after that transaction."
+  },
+  {
+    "id": "fd082a15b6a42cb1357c7db7bc1d477c740694a801372a7e00db7cc7148db5d8:1",
+    "owner": "_enter_storm_cooldown",
+    "command": "nft flush set inet killswitch server_ips",
+    "wrapped": false,
+    "reason": "Clears server endpoint sets to close forwarding; emergency fail-closed set update, not a chain replacement."
+  },
+  {
+    "id": "c23ce2b23cfb05e3a07d669f32d157806d67f6b3eaaa0fa796c0c0e44758962b:1",
+    "owner": "_enter_storm_cooldown",
+    "command": "nft flush set inet killswitch server_ips6",
+    "wrapped": false,
+    "reason": "Clears server endpoint sets to close forwarding; emergency fail-closed set update, not a chain replacement."
+  },
+  {
+    "id": "835be292dc6f960b69238e592df353c241f160400112e18c9d06332a5043858c:1",
+    "owner": "_update_bypass_devices",
+    "command": "nft flush set inet sw_lan_tproxy bypass_devices6",
+    "wrapped": false,
+    "reason": "Refills bypass sets for device address changes. Set-level serialization is outside this change."
+  },
+  {
+    "id": "6ab2bdc342351cf33385436e55797b7f41445d8b2e1f8165bfee14166c8dda82:1",
+    "owner": "_update_bypass_devices",
+    "command": "nft add element inet sw_lan_tproxy bypass_devices6 { ${all_v6} }",
+    "wrapped": false,
+    "reason": "Refills bypass sets for device address changes. Set-level serialization is outside this change."
+  },
+  {
+    "id": "f42992362d48835b7bc0b0638b9d307736b337bfc01ed779d02a07dd82ce584e:1",
+    "owner": "_update_bypass_devices",
+    "command": "nft flush set inet sw_lan_tproxy bypass_devices",
+    "wrapped": false,
+    "reason": "Refills bypass sets for device address changes. Set-level serialization is outside this change."
+  },
+  {
+    "id": "6e7078c7785c4e422793b3a3a4f0919c93532b41491623c6cb2976e780765890:1",
+    "owner": "_update_bypass_devices",
+    "command": "nft add element inet sw_lan_tproxy bypass_devices { ${all_ips} }",
+    "wrapped": false,
+    "reason": "Refills bypass sets for device address changes. Set-level serialization is outside this change."
+  },
+  {
+    "id": "9d5166f12e960a9a0a5fcf5ad222d69b8aae0f5eb2704c4b2aa7d51058c0e210:1",
+    "owner": "_update_bypass_devices",
+    "command": "nft -f -",
+    "wrapped": false,
+    "reason": "Refills bypass sets for device address changes. Set-level serialization is outside this change."
+  },
+  {
+    "id": "9d5166f12e960a9a0a5fcf5ad222d69b8aae0f5eb2704c4b2aa7d51058c0e210:2",
+    "owner": "_update_bypass_devices",
+    "command": "nft -f -",
+    "wrapped": false,
+    "reason": "Refills bypass sets for device address changes. Set-level serialization is outside this change."
+  },
+  {
+    "id": "04144ae6017ea562753bc2ee4973a0bb8535acb607135562b8e6553a486feef2:1",
+    "owner": "_sync_dns_enforce_bypass",
+    "command": "nft -f -",
+    "wrapped": false,
+    "reason": "Updates bypass-set elements in dns_enforce and killswitch, not chain definitions."
+  },
+  {
+    "id": "3bc1e6cc09beb56b3645d6430dc5a4bcb6681e44cdeb82041aa03b530bcbb5dc:1",
+    "owner": "_sync_dns_enforce_bypass",
+    "command": "nft add element inet killswitch bypass_src { ${_auto} }",
+    "wrapped": false,
+    "reason": "Updates bypass-set elements in dns_enforce and killswitch, not chain definitions."
+  },
+  {
+    "id": "c2d113a8edf713a11118bc480315c9075f64a8cf10cbb68d1b7c4599b52fd3ec:1",
+    "owner": "_table_exists",
+    "command": "nft list table inet ${1}",
+    "wrapped": false,
+    "reason": "Dynamic table-name read is conservatively enrolled rather than interpreting expanded text as a trusted single read."
+  },
+  {
+    "id": "2c40b036e0f9553f989a040355ee0dfe3f8dbb5b0f51060e282ed8ac0dbd3899:1",
+    "owner": "_table_exists",
+    "command": "nft list table ip ${1}",
+    "wrapped": false,
+    "reason": "Dynamic table-name read is conservatively enrolled rather than interpreting expanded text as a trusted single read."
+  },
+  {
+    "id": "67063d06fd45f839c5302118f9e411b0d8e4278a1c501ea1eada54a3377b6b76:1",
+    "owner": "_block_unreachable_doh",
+    "command": "nft insert rule inet surflare output ip daddr { 1.1.1.1, 1.0.0.1, 8.8.8.8, 8.8.4.4 } tcp dport 443 reject",
+    "wrapped": false,
+    "reason": "Adds a resolver HTTPS reject, no chain replacement."
+  },
+  {
+    "id": "beb30bf7c4d6c82ee1cdb2d93f9faa3dd459cbfa6b9346c8d2807077010dd28b:1",
+    "owner": "_install_cn_dns_direct",
+    "command": "nft -f ${_cd_tmp}",
+    "wrapped": false,
+    "reason": "Creates a separate CN DNS-direct table, not an ensure-owned table."
+  },
+  {
+    "id": "5612fea40e882f053ef633f1ae23859dbf76f2992ba53676efd94986af4f4194:1",
+    "owner": "_install_cn_dns_direct",
+    "command": "nft -f ${_cd_tmp}",
+    "wrapped": false,
+    "reason": "Creates a separate CN DNS-direct table, not an ensure-owned table."
+  },
+  {
+    "id": "b4a694f7c6fe6e9f52c80283981f435e37de25f05b5909b175017308091d309a:1",
+    "owner": "_exempt_cn_output",
+    "command": "nft add set inet surflare cn_output { type ipv4_addr; flags interval; }",
+    "wrapped": false,
+    "reason": "Creates/refills a CN destination set and inserts a return rule, not a chain replacement."
+  },
+  {
+    "id": "4c459523c531c79212f772ffe067179d6a6977accdb1a985c2cbe2029b66f4cf:1",
+    "owner": "_exempt_cn_output",
+    "command": "nft -f ${_batch}",
+    "wrapped": false,
+    "reason": "Creates/refills a CN destination set and inserts a return rule, not a chain replacement."
+  },
+  {
+    "id": "bb356fcafa7eabb77f05e201f1729d8067efb038951074cfc66c4bb035b9ecf4:1",
+    "owner": "_exempt_cn_output",
+    "command": "nft insert rule inet surflare output ip daddr @cn_output accept",
+    "wrapped": false,
+    "reason": "Creates/refills a CN destination set and inserts a return rule, not a chain replacement."
+  },
+  {
+    "id": "4c3fadce682f37bcef4404e36ebdd8586e76e8a77da51ac6639695a97c39ef36:1",
+    "owner": "check_vpn_health",
+    "command": "nft get element inet killswitch bypass_ipv4 { ${_bare_ip} }",
+    "wrapped": false,
+    "reason": "Dynamic get-element read is conservatively enrolled; it tests a bypass-set member and does not replace a rule or chain."
+  },
+  {
+    "id": "4c3fadce682f37bcef4404e36ebdd8586e76e8a77da51ac6639695a97c39ef36:2",
+    "owner": "check_vpn_health",
+    "command": "nft get element inet killswitch bypass_ipv4 { ${_bare_ip} }",
+    "wrapped": false,
+    "reason": "Dynamic get-element read is conservatively enrolled; it tests a bypass-set member and does not replace a rule or chain."
+  },
+  {
+    "id": "eb91c90b4642a5ae42c7534a2051b69a236e1117b9e68df023af1f3de2754448:1",
+    "owner": "_detect_blocked_domains",
+    "command": "nft get element inet sw_lan_tproxy cn_domain_ips { ${_ip} }",
+    "wrapped": false,
+    "reason": "Dynamic get-element read is conservatively enrolled; this site does not mutate the cache set."
+  },
+  {
+    "id": "10438a526630af1759fc2a6bd8fd3357e400ab1d6e56131f9e8c4a9fead6ff10:1",
+    "owner": "start_packet_trace",
+    "command": "nft delete table ${_trace_table}",
+    "wrapped": false,
+    "reason": "Creates/removes its own trace table; ensure does not write it."
+  },
+  {
+    "id": "633cc548a2a2b7537e840d030da035f3c8685d69c0e4abc9b0ef763478b2359e:1",
+    "owner": "start_packet_trace",
+    "command": "nft -f -",
+    "wrapped": false,
+    "reason": "Creates/removes its own trace table; ensure does not write it."
+  },
+  {
+    "id": "10438a526630af1759fc2a6bd8fd3357e400ab1d6e56131f9e8c4a9fead6ff10:2",
+    "owner": "start_packet_trace",
+    "command": "nft delete table ${_trace_table}",
+    "wrapped": false,
+    "reason": "Creates/removes its own trace table; ensure does not write it."
+  },
+  {
+    "id": "eddce87ce689ff42b4718edbaf54c58b63dbc0e4d6651bca29add5f4c6dd7f0b:1",
+    "owner": "stop_packet_trace",
+    "command": "nft delete table ${_trace_table}",
+    "wrapped": false,
+    "reason": "Removes the trace table only; ensure does not write it."
+  },
+  {
+    "id": "cc21869be8621d32941afbd5c790cf60d5f3651144929e6a8aa45751940339e3:1",
+    "owner": "_check_trace_alive",
+    "command": "nft delete table ${_trace_table}",
+    "wrapped": false,
+    "reason": "Removes stale trace table only; ensure does not write it."
+  },
+  {
+    "id": "35dfd390c907d6c0aa53d561a2137d73782e86731621902f63927bf322b85396:1",
+    "owner": "_full_teardown",
+    "command": "nft delete table inet killswitch",
+    "wrapped": false,
+    "reason": "Normal stop and explicit teardown remove these tables without the shared lock so shutdown cannot wait behind a wedged writer. Normal recovery does not use this entry; this is not global serialization."
+  },
+  {
+    "id": "9c9567272c48938b2b088f2ca93c3a6e4b07365e901ada2b86047620dda876ad:1",
+    "owner": "_full_teardown",
+    "command": "nft delete table inet cn_dns_direct",
+    "wrapped": false,
+    "reason": "Normal stop and explicit teardown remove these tables without the shared lock so shutdown cannot wait behind a wedged writer. Normal recovery does not use this entry; this is not global serialization."
+  },
+  {
+    "id": "8cfd07e642e9a880f75401daf13477f83b053ef4656227c64ae379976c2ba2eb:1",
+    "owner": "_full_teardown",
+    "command": "nft delete table inet sw_lan_tproxy",
+    "wrapped": false,
+    "reason": "Normal stop and explicit teardown remove these tables without the shared lock so shutdown cannot wait behind a wedged writer. Normal recovery does not use this entry; this is not global serialization."
+  },
+  {
+    "id": "7d077a4dc1081f37c0135c9f271f92302d695aa0701a807e77321fb5eff95014:1",
+    "owner": "_full_teardown",
+    "command": "nft delete table ip dns_enforce",
+    "wrapped": false,
+    "reason": "Normal stop and explicit teardown remove these tables without the shared lock so shutdown cannot wait behind a wedged writer. Normal recovery does not use this entry; this is not global serialization."
+  },
+  {
+    "id": "be9c7fad8f378f574d44e9c8a00e800998f253fa26cb79c6848685501bf91506:1",
+    "owner": "_full_teardown",
+    "command": "nft delete table inet surflare",
+    "wrapped": false,
+    "reason": "Normal stop and explicit teardown remove these tables without the shared lock so shutdown cannot wait behind a wedged writer. Normal recovery does not use this entry; this is not global serialization."
+  },
+  {
+    "id": "93c303e922f2c9ffb12b6dd3099378b1ea94101f0959ded71652fec5565ad181:1",
+    "owner": "_full_teardown",
+    "command": "nft delete table inet surflare_moat",
+    "wrapped": false,
+    "reason": "Normal stop and explicit teardown remove these tables without the shared lock so shutdown cannot wait behind a wedged writer. Normal recovery does not use this entry; this is not global serialization."
+  },
+  {
+    "id": "e4d2a58ecd396ecac864b72fd6b4a16943d5a2c94d34dcaab0a34bc13c96bc7e:1",
+    "owner": "<top-level>",
+    "command": "nft delete table inet watchdog_trace",
+    "wrapped": false,
+    "reason": "Trace cleanup or IPv6 bypass-set refill; no replacement of ensure-owned chains at these exact sites."
+  },
+  {
+    "id": "6a08cf2fcaa426a52a6f21be24c7cb7f914130facc8d3af1a75493c6310a38f8:1",
+    "owner": "<top-level>",
+    "command": "nft add element inet sw_lan_tproxy bypass_devices6 { $(command) }",
+    "wrapped": false,
+    "reason": "Trace cleanup or IPv6 bypass-set refill; no replacement of ensure-owned chains at these exact sites."
+  },
+  {
+    "id": "3bfcb20f9be2ea4ae345e172aa472ce48dc9d26adaaf8b01ff718df3c65618d7:1",
+    "owner": "<top-level>",
+    "command": "nft add element inet killswitch bypass_src6 { $(command) }",
+    "wrapped": false,
+    "reason": "Trace cleanup or IPv6 bypass-set refill; no replacement of ensure-owned chains at these exact sites."
+  }
+]
