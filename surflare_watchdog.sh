@@ -2460,11 +2460,34 @@ _ensure_smartdns_loader_fix() {
 	fi
 }
 
+# Test the inherited proxy itself, not the CLI's separate TCP-ping path.
+# Older installations without the diagnostic inbound keep the CLI check.
+_inherited_proxy_responds() {
+	local _listeners _url _http _ping
+	_listeners=$(ss -ltn 2>/dev/null) || return 1
+	if printf '%s\n' "$_listeners" | grep -qE '127\.0\.0\.1:10808([[:space:]]|$)'; then
+		for _url in https://www.gstatic.com/generate_204 \
+			https://cp.cloudflare.com/generate_204; do
+			if _http=$(curl -q --noproxy '' \
+				--socks5-hostname 127.0.0.1:10808 \
+				--connect-timeout 5 --max-time 8 \
+				-s -o /dev/null -w '%{http_code}' "$_url"); then
+				[ "$_http" = 204 ] && return 0
+			fi
+		done
+		# A present but unusable proxy must not pass via a healthy CLI.
+		return 1
+	fi
+	if _ping=$(timeout -k 2 8 surflare ping google.com -p 443 2>/dev/null); then
+		printf '%s\n' "$_ping" | grep -q 'Loss:[[:space:]]*0\.0%'
+		return $?
+	fi
+	return 1
+}
+
 # _cleanup_on_startup: called once at the top of the main loop.
-# Unconditionally kill any inherited surflare-proxy and nuke stale
-# watchdog-managed nftables state.  This prevents ghost rules from a
-# crashed/killed watchdog, and stops orphan proxies from holding
-# port 10800 and blocking a fresh connection cycle.
+# Preserve a working inherited proxy; remove unusable proxies and stale
+# watchdog-managed state before a fresh connection cycle.
 _cleanup_on_startup() {
 	# /tmp writability gate: nft batch files, probe temp files, and
 	# conntrack operations all depend on /tmp.  If /tmp is full or
@@ -2498,7 +2521,7 @@ _cleanup_on_startup() {
 	if _proc_alive surflare-proxy >/dev/null 2>&1 \
 	   && ss -ltn 2>/dev/null | grep -qE ':10800(\s|$)' \
 	   && nft list table inet surflare >/dev/null 2>&1 \
-	   && timeout 8 surflare ping google.com -p 443 >/dev/null 2>&1; then
+	   && _inherited_proxy_responds; then
 		_adopt_proxy=1
 	fi
 
@@ -2677,7 +2700,7 @@ _cleanup_on_startup() {
 		#      so rate-limit and other rule updates take effect without
 		#      killing the proxy (zero-kill invariant).
 		# Stamp absent (first restart post-deploy) = treat as changed.
-		# Proxy is verified healthy (alive + port + ping at L958-961);
+		# The inherited proxy passed the startup forwarding probe;
 		# table rebuild via _restore_tproxy is safe (atomic nft -f).
 		local _tproxy_needs_restore=0
 		if nft list table inet sw_lan_tproxy >/dev/null 2>&1; then

@@ -556,8 +556,19 @@ Error classification (_classify_auth_error):
 
 ### Crash recovery (_cleanup_on_startup)
 
-On startup (or watchdog restart), the cleanup function restores a consistent
-state from any prior crash or unclean shutdown. Steps execute in order:
+On startup (or watchdog restart), the cleanup function first checks for an
+inherited proxy: its process must be alive, port 10800 must listen, and the
+`inet surflare` table must exist. When the loopback diagnostic inbound on
+127.0.0.1:10808 is present, an HTTPS request through it must return 204 from
+one of two independent targets within eight seconds per target. curl ignores
+its default config file and proxy-bypass environment for this check. A running
+but unresponsive diagnostic inbound cannot be rescued by a successful CLI ping.
+Older installations without that inbound retain the bounded CLI ping check,
+which must complete successfully and report zero packet loss.
+
+A working proxy is adopted without killing it or clearing its routing table.
+Otherwise the cleanup function restores a consistent state from any prior
+crash or unclean shutdown. Steps execute in order:
 
 ```
  1. Kill stale surflare-proxy holding port 10800
